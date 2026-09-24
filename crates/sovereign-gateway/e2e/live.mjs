@@ -238,6 +238,7 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
     done2 = got.find(e => e.type === 'message.complete' && e.session_id === sid)
     await new Promise(res => setTimeout(res, 200))
   }
+  if (!(done2 && /AGAIN/i.test(done2.payload.text))) console.log('     ws2 got:', JSON.stringify(got.map(e => e.type + (e.payload?.text ? ':' + e.payload.text.slice(0, 60) : ''))).slice(0, 600))
   check(done2 && /AGAIN/i.test(done2.payload.text), 'second connection receives its reply')
   ws2.close()
 }

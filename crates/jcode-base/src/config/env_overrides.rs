@@ -112,6 +112,13 @@ impl Config {
             self.dictation.timeout_secs = parsed;
         }
 
+        // Integration discovery (contacts the discovery endpoint when enabled).
+        if let Ok(v) = std::env::var("JCODE_SPONSORS_ENABLED")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.sponsors.enabled = parsed;
+        }
+
         // Tools
         if let Ok(v) = std::env::var("JCODE_TOOL_PROFILE") {
             self.tools.profile = v;
