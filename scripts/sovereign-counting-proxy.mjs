@@ -1,20 +1,33 @@
 #!/usr/bin/env node
 /**
  * Counting proxy in front of Ollama (or any OpenAI-compat upstream).
- * Tallies chat/completions + native /api/chat|/api/generate calls and tokens.
+ *
+ * Keeps the running totals file (SOVEREIGN_PROXY_STATS) and, when
+ * SOVEREIGN_PROXY_CALLS is set, appends one JSON line per model call with
+ * token usage, cache hits, tool-schema size and a purpose label, so every
+ * call can be attributed (main turn, tool follow-up, title, review, ...).
+ *
+ * Streaming /v1 requests get `stream_options.include_usage = true` when the
+ * client did not ask for it, because Ollama only reports usage on streams
+ * that request it. Ollama's `prompt_tokens` is the FULL prompt;
+ * `prompt_tokens_details.cached_tokens` is the part served from the KV cache.
  *
  *   SOVEREIGN_PROXY_UPSTREAM=http://127.0.0.1:11434 \
  *   SOVEREIGN_PROXY_LISTEN=127.0.0.1:18080 \
  *   SOVEREIGN_PROXY_STATS=/tmp/proxy-stats.json \
+ *   SOVEREIGN_PROXY_CALLS=/tmp/calls.jsonl SOVEREIGN_PROXY_TAG=sovereign \
  *   node scripts/sovereign-counting-proxy.mjs
  */
 import http from 'node:http'
 import { URL } from 'node:url'
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 
 const listen = process.env.SOVEREIGN_PROXY_LISTEN || '127.0.0.1:18080'
 const upstream = process.env.SOVEREIGN_PROXY_UPSTREAM || 'http://127.0.0.1:11434'
 const statsPath = process.env.SOVEREIGN_PROXY_STATS || ''
+const callsPath = process.env.SOVEREIGN_PROXY_CALLS || ''
+let tag = process.env.SOVEREIGN_PROXY_TAG || ''
 const [host, portStr] = listen.split(':')
 const port = Number(portStr || 18080)
 const up = new URL(upstream)
@@ -29,6 +42,7 @@ const stats = {
   api_generate: 0,
   other: 0,
   prompt_tokens: 0,
+  cached_tokens: 0,
   completion_tokens: 0,
   eval_count: 0,
   prompt_eval_count: 0,
@@ -37,61 +51,68 @@ const stats = {
   paths: {},
 }
 
-function bumpPath(p) {
-  stats.paths[p] = (stats.paths[p] || 0) + 1
-}
-
 function classify(pathname) {
-  if (pathname.includes('/chat/completions')) {
-    stats.chat_completions += 1
-    return 'chat_completions'
-  }
-  if (pathname === '/api/chat' || pathname.endsWith('/api/chat')) {
-    stats.api_chat += 1
-    return 'api_chat'
-  }
-  if (pathname === '/api/generate' || pathname.endsWith('/api/generate')) {
-    stats.api_generate += 1
-    return 'api_generate'
-  }
-  stats.other += 1
+  if (pathname.includes('/chat/completions')) return 'chat_completions'
+  if (pathname.endsWith('/api/chat')) return 'api_chat'
+  if (pathname.endsWith('/api/generate')) return 'api_generate'
   return 'other'
 }
 
-function harvestUsage(buf, kind) {
-  const text = buf.toString('utf8')
-  // Non-stream OpenAI JSON
-  try {
-    const j = JSON.parse(text)
+const textOf = content =>
+  typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map(part => (typeof part === 'string' ? part : part?.text || '')).join('')
+      : ''
+
+/** Purpose of a model call, read from its request body. */
+function purposeOf(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  const all = messages.map(m => textOf(m.content)).join('\n')
+  const last = messages[messages.length - 1] || {}
+  const lastText = textOf(last.content)
+  if (body.prompt !== undefined && !messages.length) return 'warm-up'
+  if (all.includes('You name chat sessions')) return 'title'
+  if (/Review the conversation above/.test(lastText)) return 'memory/skill review'
+  if (all.includes('[CONTEXT SUMMARY]') || /summari[sz]e (the|this) (conversation|transcript)/i.test(lastText)) {
+    return 'compression'
+  }
+  if (/extract (durable )?memor|memories from (this|the) (transcript|conversation)/i.test(all)) return 'memory extraction'
+  if (last.role === 'tool' || (last.role === 'user' && Array.isArray(last.content) && last.content.some(p => p?.type === 'tool_result'))) {
+    return 'tool follow-up'
+  }
+  if (last.role === 'user') return 'main turn'
+  return 'other'
+}
+
+function usageFrom(buf) {
+  const found = { prompt_tokens: null, cached_tokens: null, completion_tokens: null }
+  const take = j => {
     const u = j.usage || {}
-    if (typeof u.prompt_tokens === 'number') stats.prompt_tokens += u.prompt_tokens
-    if (typeof u.completion_tokens === 'number') stats.completion_tokens += u.completion_tokens
-    if (typeof j.prompt_eval_count === 'number') stats.prompt_eval_count += j.prompt_eval_count
-    if (typeof j.eval_count === 'number') stats.eval_count += j.eval_count
-    return
+    if (typeof u.prompt_tokens === 'number') found.prompt_tokens = u.prompt_tokens
+    if (typeof u.completion_tokens === 'number') found.completion_tokens = u.completion_tokens
+    const cached = u.prompt_tokens_details?.cached_tokens
+    if (typeof cached === 'number') found.cached_tokens = cached
+    if (typeof j.prompt_eval_count === 'number') found.prompt_tokens = j.prompt_eval_count
+    if (typeof j.eval_count === 'number') found.completion_tokens = j.eval_count
+  }
+  const text = buf.toString('utf8')
+  try {
+    take(JSON.parse(text))
+    return found
   } catch {
-    // SSE / NDJSON stream: scan lines
+    // SSE or NDJSON stream
   }
   for (const line of text.split('\n')) {
     const payload = line.startsWith('data:') ? line.slice(5).trim() : line.trim()
     if (!payload || payload === '[DONE]') continue
     try {
-      const j = JSON.parse(payload)
-      const u = j.usage || {}
-      if (typeof u.prompt_tokens === 'number') stats.prompt_tokens += u.prompt_tokens
-      if (typeof u.completion_tokens === 'number') stats.completion_tokens += u.completion_tokens
-      if (typeof j.prompt_eval_count === 'number') stats.prompt_eval_count += j.prompt_eval_count
-      if (typeof j.eval_count === 'number') stats.eval_count += j.eval_count
-      // Ollama stream final
-      if (j.done && kind === 'api_chat') {
-        if (typeof j.prompt_eval_count === 'number') {
-          /* already added */
-        }
-      }
+      take(JSON.parse(payload))
     } catch {
-      /* ignore */
+      // partial line
     }
   }
+  return found
 }
 
 function writeStats() {
@@ -101,10 +122,18 @@ function writeStats() {
 }
 
 const server = http.createServer((req, res) => {
-  stats.requests += 1
   const u = new URL(req.url || '/', `http://${host}:${port}`)
-  bumpPath(u.pathname)
+  // Control endpoint: relabel the calls that follow (one proxy, many runs).
+  if (u.pathname === '/__tag') {
+    tag = u.searchParams.get('tag') || ''
+    res.end('ok')
+    return
+  }
+  stats.requests += 1
+  stats.paths[u.pathname] = (stats.paths[u.pathname] || 0) + 1
   const kind = classify(u.pathname)
+  if (kind === 'other') stats.other += 1
+  else stats[kind] += 1
 
   const chunks = []
   req.on('data', c => {
@@ -112,39 +141,82 @@ const server = http.createServer((req, res) => {
     stats.bytes_in += c.length
   })
   req.on('end', () => {
-    const body = Buffer.concat(chunks)
+    let body = Buffer.concat(chunks)
+    let parsed = null
+    let injectedUsage = false
+    if (kind !== 'other' && body.length) {
+      try {
+        parsed = JSON.parse(body.toString('utf8'))
+        if (kind === 'chat_completions' && parsed.stream && !parsed.stream_options?.include_usage) {
+          parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true }
+          injectedUsage = true
+          body = Buffer.from(JSON.stringify(parsed))
+        }
+      } catch {
+        parsed = null
+      }
+    }
     const headers = { ...req.headers, host: up.host }
     delete headers['content-length']
+    if (body.length) headers['content-length'] = String(body.length)
+    const started = Date.now()
 
     const upReq = http.request(
-      {
-        protocol: up.protocol,
-        hostname: up.hostname,
-        port: up.port || 80,
-        path: u.pathname + u.search,
-        method: req.method,
-        headers,
-      },
+      { protocol: up.protocol, hostname: up.hostname, port: up.port || 80, path: u.pathname + u.search, method: req.method, headers },
       upRes => {
         const out = []
+        res.writeHead(upRes.statusCode || 502, upRes.headers)
         upRes.on('data', c => {
           out.push(c)
           stats.bytes_out += c.length
           res.write(c)
         })
         upRes.on('end', () => {
-          const buf = Buffer.concat(out)
-          if (kind === 'chat_completions' || kind === 'api_chat' || kind === 'api_generate') {
-            harvestUsage(buf, kind)
-          }
-          writeStats()
           res.end()
+          if (kind === 'other') {
+            writeStats()
+            return
+          }
+          const usage = usageFrom(Buffer.concat(out))
+          stats.prompt_tokens += usage.prompt_tokens || 0
+          stats.cached_tokens += usage.cached_tokens || 0
+          stats.completion_tokens += usage.completion_tokens || 0
+          writeStats()
+          if (!callsPath) return
+          const messages = Array.isArray(parsed?.messages) ? parsed.messages : []
+          const system = messages.filter(m => m.role === 'system').map(m => textOf(m.content)).join('\n')
+          const tools = Array.isArray(parsed?.tools) ? parsed.tools : []
+          const toolsJson = JSON.stringify(tools)
+          const lastUser = [...messages].reverse().find(m => m.role === 'user')
+          fs.appendFileSync(
+            callsPath,
+            JSON.stringify({
+              at: new Date(started).toISOString(),
+              tag,
+              endpoint: u.pathname,
+              status: upRes.statusCode,
+              model: parsed?.model ?? null,
+              stream: Boolean(parsed?.stream),
+              injected_usage: injectedUsage,
+              purpose: parsed ? purposeOf(parsed) : 'unparsed',
+              messages: messages.length,
+              tools: tools.length,
+              tool_schema_bytes: toolsJson.length,
+              tool_schema_tokens_est: Math.round(toolsJson.length / 4),
+              system_bytes: system.length,
+              system_sha256: crypto.createHash('sha256').update(system).digest('hex').slice(0, 16),
+              prompt_tokens: usage.prompt_tokens,
+              cached_tokens: usage.cached_tokens,
+              completion_tokens: usage.completion_tokens,
+              duration_ms: Date.now() - started,
+              last_user_head: lastUser ? textOf(lastUser.content).slice(0, 160) : null,
+            }) + '\n'
+          )
         })
-        res.writeHead(upRes.statusCode || 502, upRes.headers)
       }
     )
     upReq.on('error', err => {
-      res.writeHead(502, { 'content-type': 'text/plain' })
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' })
       res.end(String(err))
       writeStats()
     })
@@ -154,15 +226,13 @@ const server = http.createServer((req, res) => {
 })
 
 server.listen(port, host, () => {
-  console.error(`sovereign-counting-proxy listening on http://${host}:${port} → ${upstream}`)
+  console.error(`sovereign-counting-proxy listening on http://${host}:${port} -> ${upstream}`)
   writeStats()
 })
 
-process.on('SIGINT', () => {
-  writeStats()
-  process.exit(0)
-})
-process.on('SIGTERM', () => {
-  writeStats()
-  process.exit(0)
-})
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    writeStats()
+    process.exit(0)
+  })
+}

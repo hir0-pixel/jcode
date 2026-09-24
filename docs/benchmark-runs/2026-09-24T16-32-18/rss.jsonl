@@ -1,0 +1,12 @@
+{"label":"sovereign|memory|run1","phase":"idle-before-chat","backend_kb":34752,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23209136}
+{"label":"sovereign|memory|run1","phase":"idle-after-session-1","backend_kb":43744,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":24109920}
+{"label":"sovereign|memory|run1","phase":"idle-after-session-2","backend_kb":44592,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":88208}
+{"label":"sovereign|memory|run1","phase":"peak","backend_kb":46912,"ollama_kb":25408960,"python_kb":0}
+{"label":"sovereign|memory|run2","phase":"idle-before-chat","backend_kb":34640,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":88208}
+{"label":"sovereign|memory|run2","phase":"idle-after-session-1","backend_kb":43728,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23768496}
+{"label":"sovereign|memory|run2","phase":"idle-after-session-2","backend_kb":44560,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23769968}
+{"label":"sovereign|memory|run2","phase":"peak","backend_kb":46752,"ollama_kb":23770048,"python_kb":0}
+{"label":"sovereign|memory|run3","phase":"idle-before-chat","backend_kb":34672,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23769968}
+{"label":"sovereign|memory|run3","phase":"idle-after-session-1","backend_kb":43712,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23958976}
+{"label":"sovereign|memory|run3","phase":"idle-after-session-2","backend_kb":44576,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23959024}
+{"label":"sovereign|memory|run3","phase":"peak","backend_kb":46704,"ollama_kb":23959072,"python_kb":0}

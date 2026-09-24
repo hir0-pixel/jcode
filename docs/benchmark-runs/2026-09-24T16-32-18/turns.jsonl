@@ -1,0 +1,6 @@
+{"label":"sovereign|memory|run1","product":"sovereign","task":"memory","run":1,"session":1,"turn":1,"ok":true,"ms":82118,"reply":"Got it — saved. So when you ask for a quick script or one-off tooling, I'll default to Nim rather than Python or Bash unless you specify otherwise.","error":null}
+{"label":"sovereign|memory|run1","product":"sovereign","task":"memory","run":1,"session":2,"turn":1,"ok":true,"ms":12051,"reply":"Nim","error":null}
+{"label":"sovereign|memory|run2","product":"sovereign","task":"memory","run":2,"session":1,"turn":1,"ok":true,"ms":80605,"reply":"Got it — noted that you prefer Nim for quick scripts. I'll keep that in mind for future sessions.","error":null}
+{"label":"sovereign|memory|run2","product":"sovereign","task":"memory","run":2,"session":2,"turn":1,"ok":true,"ms":19830,"reply":"Nim","error":null}
+{"label":"sovereign|memory|run3","product":"sovereign","task":"memory","run":3,"session":1,"turn":1,"ok":true,"ms":19333,"reply":"Saved as a global preference: your preferred language for quick scripts is Nim. This will be available in future sessions.","error":null}
+{"label":"sovereign|memory|run3","product":"sovereign","task":"memory","run":3,"session":2,"turn":1,"ok":true,"ms":12299,"reply":"Nim","error":null}
