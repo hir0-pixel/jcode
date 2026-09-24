@@ -55,6 +55,27 @@ const SCHEMA: &str = "
     END;
     CREATE TABLE IF NOT EXISTS memory_graphs(scope TEXT PRIMARY KEY, graph TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS memory_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS obs_runs(
+        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_id TEXT, root_id TEXT NOT NULL,
+        kind TEXT NOT NULL, title TEXT, model TEXT NOT NULL, provider TEXT NOT NULL,
+        status TEXT NOT NULL, started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL, error TEXT, unpriced_calls INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS obs_runs_recent ON obs_runs(started_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS obs_runs_session ON obs_runs(session_id, started_at_ms DESC);
+    CREATE TABLE IF NOT EXISTS obs_spans(
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_id TEXT NOT NULL, root_id TEXT NOT NULL,
+        kind TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL,
+        started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL, error TEXT, model TEXT, provider TEXT,
+        attributes TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS obs_spans_run ON obs_spans(run_id, started_at_ms);
+    CREATE TABLE IF NOT EXISTS obs_content(id TEXT PRIMARY KEY, input TEXT, output TEXT);
 ";
 
 /// Everything in a `MemoryGraph` except the memories themselves.
@@ -102,7 +123,12 @@ fn with_db<R>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<R>) -> Resu
     f(map.get_mut(path).expect("inserted above"))
 }
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/// Gateway startup uses the same versioned schema migration as memory.
+pub fn migrate_sovereign_db(db: &mut Connection) -> Result<()> {
+    migrate(db)
+}
 
 /// Bring an existing database to `SCHEMA_VERSION`, then ensure the schema.
 /// v1 kept the entry JSON (with the embedding as JSON numbers) inline in

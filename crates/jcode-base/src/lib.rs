@@ -57,6 +57,7 @@ pub mod memory_agent;
 pub mod memory_graph;
 pub mod memory_recall;
 mod memory_store;
+pub use memory_store::migrate_sovereign_db;
 pub mod memory_log;
 pub mod memory_types;
 pub mod message;
