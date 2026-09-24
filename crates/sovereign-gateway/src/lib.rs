@@ -54,7 +54,13 @@ pub struct Config {
     pub model: String,
     /// Engine state directory, reported as the single profile's path.
     pub home: String,
+    /// One-shot model call `(system, user) -> text`, used by `/refine`.
+    pub complete: Option<Complete>,
 }
+
+pub type Complete = std::sync::Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> + Send + Sync,
+>;
 
 pub struct Gateway {
     listener: TcpListener,

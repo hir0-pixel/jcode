@@ -1042,6 +1042,15 @@ fn load_prompt_overlay_files_from_dir(working_dir: Option<&Path>) -> (Option<Str
         contents.push(content);
     }
 
+    // Continual Harness (sovereign engine): learned instructions refined on
+    // demand by `/refine`; size-capped by the writer.
+    if let Ok(learned) = crate::storage::jcode_dir().map(|dir| dir.join("harness").join("prompt.md"))
+        && let Some((content, size)) = load_file(&learned, "Learned Instructions (Continual Harness)")
+    {
+        total_chars += size;
+        contents.push(content);
+    }
+
     if contents.is_empty() {
         (None, 0)
     } else {

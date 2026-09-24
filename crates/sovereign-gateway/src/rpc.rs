@@ -315,10 +315,18 @@ impl Conn {
                     .collect();
                 Ok(json!({ "sessions": items }))
             }
-            "commands.catalog" => Ok(json!({
-                "pairs": [], "sub": {}, "canon": {}, "commands": {}, "categories": [],
-                "skills": {}, "skill_count": 0, "warning": "",
-            })),
+            "commands.catalog" => {
+                let pairs = json!([
+                    ["/refine", "Learn one durable improvement from this session (Continual Harness)"],
+                    ["/refine rollback", "Undo the last /refine"],
+                    ["/harness", "Show the learned instructions"],
+                ]);
+                Ok(json!({
+                    "pairs": pairs, "sub": {}, "canon": {}, "commands": {},
+                    "categories": [{ "name": "Harness", "pairs": pairs }],
+                    "skills": {}, "skill_count": 0, "warning": "",
+                }))
+            }
             "profiles.list" => Ok(json!({
                 "profiles": [{
                     "name": "default", "path": self.config.home, "is_default": true,
@@ -342,6 +350,10 @@ impl Conn {
             }
             "slash.exec" => {
                 let command = p["command"].as_str().unwrap_or_default().chars().take(80).collect::<String>();
+                let words: Vec<&str> = command.trim_start_matches('/').split_whitespace().collect();
+                if let Some(message) = self.harness_command(&words, p["session_id"].as_str()).await {
+                    return Ok(json!({ "status": "ok", "type": "exec", "output": message, "message": message }));
+                }
                 crate::note_unsupported("slash", &command);
                 let message = format!("/{} is not available in this engine yet.", command.trim_start_matches('/'));
                 Ok(json!({ "status": "error", "message": message, "output": message }))
@@ -486,6 +498,67 @@ impl Conn {
                 Err(RpcError::unsupported(method))
             }
         }
+    }
+
+    /// `/refine`, `/refine rollback`, `/harness`. `None` for other commands.
+    async fn harness_command(self: &Arc<Self>, words: &[&str], session_id: Option<&str>) -> Option<String> {
+        use sovereign_prime::harness::{Harness, Outcome, Turn};
+        let harness = Harness::new(std::path::Path::new(&self.config.home));
+        let result: anyhow::Result<String> = match words {
+            ["harness", ..] => Ok(match harness.current() {
+                text if text.trim().is_empty() => "No learned instructions yet. Run /refine after a session worth learning from.".into(),
+                text => format!("Learned instructions (applied to new sessions):\n\n{}", text.trim()),
+            }),
+            ["refine", "rollback", ..] => harness.rollback().map(|previous| {
+                if previous.trim().is_empty() {
+                    "Rolled back: learned instructions are empty again.".to_string()
+                } else {
+                    format!("Rolled back to the previous learned instructions:\n\n{}", previous.trim())
+                }
+            }),
+            ["refine", ..] => async {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/refine needs an open session"))?;
+                let complete = self.config.complete.clone().ok_or_else(|| anyhow!("no model is available for /refine"))?;
+                self.ensure_attached(sid).await?;
+                let history = self.call(json!({ "req": "get_history", "session_id": sid })).await?;
+                let turns: Vec<Turn> = history["messages"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .map(|m| Turn {
+                                role: m["role"].as_str().unwrap_or_default().to_string(),
+                                text: m["content"].as_str().unwrap_or_default().to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if turns.is_empty() {
+                    return Ok("Nothing to learn from yet: this session has no messages.".to_string());
+                }
+                let (system, user) = harness.refine_request(&turns);
+                let reply = complete(system, user).await?;
+                Ok(match harness.apply(&reply, &turns)? {
+                    Outcome::Updated { changes, added, removed } => {
+                        let mut text = format!("Learned: {changes}\n");
+                        for line in &added {
+                            text.push_str(&format!("+ {line}\n"));
+                        }
+                        for line in &removed {
+                            text.push_str(&format!("- {line}\n"));
+                        }
+                        text.push_str("Applies to new sessions. Undo with /refine rollback.");
+                        text
+                    }
+                    Outcome::NoChange { reason } => format!("No change: {reason}"),
+                })
+            }
+            .await,
+            _ => return None,
+        };
+        Some(match result {
+            Ok(message) => message,
+            Err(err) => format!("{err:#}"),
+        })
     }
 
     /// A reply to one of our server requests (currently only `approval`).

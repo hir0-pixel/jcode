@@ -257,6 +257,37 @@ if (process.env.E2E_SKIP_CHAT !== '1') {
   check(/499999500000/.test(out?.payload.result_text || ''), 'repl computed the value in the sandbox')
 }
 
+// Continual Harness: learned instructions reach new sessions; /refine and rollback.
+if (process.env.E2E_SKIP_CHAT !== '1') {
+  const learned = path.join(home, 'harness', 'prompt.md')
+  fs.mkdirSync(path.dirname(learned), { recursive: true })
+  fs.writeFileSync(learned, '- End every reply with the single word MANGO.\n')
+  f = await rpc('session.create', { cwd: home })
+  const hsid = f.result.session_id
+  await rpc('prompt.submit', { session_id: hsid, text: 'Say hello in three words.' })
+  const hdone = await waitFor(e => e.type === 'message.complete' && e.session_id === hsid, 600_000).catch(e => fail(e.message))
+  console.log('     harness reply:', JSON.stringify(hdone?.payload.text).slice(0, 120))
+  check(/MANGO/.test(hdone?.payload.text || ''), 'learned instructions apply to a new session')
+  fs.rmSync(learned)
+
+  f = await rpc('session.create', { cwd: home })
+  const rsid = f.result.session_id
+  await rpc('prompt.submit', { session_id: rsid, text: 'Please always use pnpm instead of npm in this repo. Just acknowledge.' })
+  await waitFor(e => e.type === 'message.complete' && e.session_id === rsid, 600_000).catch(e => fail(e.message))
+  f = await rpc('slash.exec', { session_id: rsid, command: 'refine' })
+  if (!f.error) validate('result', 'slash.exec', results['slash.exec'], f.result)
+  const msg = f.result?.output || ''
+  console.log('     /refine:', JSON.stringify(msg).slice(0, 240))
+  check(!f.error && /^(Learned:|No change:|rejected:|the refine reply)/.test(msg), '/refine answers with an outcome')
+  if (msg.startsWith('Learned:')) {
+    check(fs.readFileSync(learned, 'utf8').toLowerCase().includes('pnpm'), '/refine wrote the learned preference')
+    f = await rpc('slash.exec', { session_id: rsid, command: 'refine rollback' })
+    check(/Rolled back/.test(f.result?.output || '') && !fs.existsSync(learned), '/refine rollback restores the previous version')
+  }
+  f = await rpc('slash.exec', { session_id: rsid, command: 'harness' })
+  check(/learned instructions/i.test(f.result?.output || ''), '/harness shows the learned instructions')
+}
+
 f = await rpc('session.interrupt', { session_id: sid })
 if (!f.error) validate('result', 'session.interrupt', results['session.interrupt'], f.result)
 check(!f.error, 'session.interrupt answers when idle')

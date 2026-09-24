@@ -7757,6 +7757,7 @@ dependencies = [
  "jsonschema",
  "rand 0.8.6",
  "serde_json",
+ "sovereign-prime",
  "subtle",
  "tokio",
  "tokio-tungstenite",

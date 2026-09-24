@@ -1365,6 +1365,11 @@ async fn run_gateway(
 
     let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
     let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
+    let refine_provider = provider.clone();
+    let complete: sovereign_gateway::Complete = std::sync::Arc::new(move |system: String, user: String| {
+        let provider = refine_provider.clone();
+        Box::pin(async move { provider.complete_simple(&user, &system).await })
+    });
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let gateway = async {
@@ -1385,6 +1390,7 @@ async fn run_gateway(
             provider: provider_name,
             model: provider_model,
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
+            complete: Some(complete),
         })
         .await?;
         let port = gateway.local_addr().port();

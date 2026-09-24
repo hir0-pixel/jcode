@@ -10,6 +10,7 @@ anyhow = "1"
 futures-util = "0.3"
 httparse = "1"
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }
+sovereign-prime = { path = "../sovereign-prime" }
 rand = "0.8"
 serde_json = "1"
 subtle = "2"

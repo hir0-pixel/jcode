@@ -7,6 +7,7 @@
 //! memory-capped worker process so a runaway snippet cannot take the engine
 //! down.
 
+pub mod harness;
 pub mod host;
 pub mod worker;
 
