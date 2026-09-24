@@ -429,6 +429,28 @@ impl Observer {
             "message.complete" => {
                 let status = payload["status"].as_str().unwrap_or("complete");
                 let text = payload["text"].as_str().unwrap_or_default();
+                if let Some(started) = active.chat_started.take() {
+                    active.next += 1;
+                    self.send(Op::Usage {
+                        run: run.clone(),
+                        span: format!("{run}:chat:{}", active.next),
+                        root: active.root.clone().unwrap_or_else(|| run.clone()),
+                        kind: if active.run_kind == "cron" { "cron" } else if active.model_calls == 0 { "chat" } else { "tool_followup" },
+                        model: active.model.clone(),
+                        provider: active.provider.clone(),
+                        session: session.into(),
+                        input: 0,
+                        output: 0,
+                        cache_read: 0,
+                        cache_write: 0,
+                        cost: None,
+                        usage_known: false,
+                        error: Some(active.error.clone().unwrap_or_else(|| "token usage unavailable".into())),
+                        started,
+                        ended: now(),
+                    }, false);
+                    active.model_calls += 1;
+                }
                 self.send(
                     Op::RunEnd {
                         id: run.clone(),
@@ -1243,6 +1265,43 @@ mod tests {
         assert!(child["cost_usd"].is_null());
         drop(observer);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn records_unknown_usage_only_for_an_unreported_inflight_call() {
+        let mut db = Connection::open_in_memory().unwrap();
+        jcode_base::migrate_sovereign_db(&mut db).unwrap();
+        setup(&mut db).unwrap();
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let observer = Observer {
+            read_db: Mutex::new(Connection::open_in_memory().unwrap()),
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            capture_content: false,
+            sessions: Mutex::new(HashMap::new()),
+        };
+
+        observer.harness_event(&json!({"ev":"model_info","session_id":"s","provider":"openai","model":"gpt-5.4"}));
+        let completed = observer.start_turn("s", "prompt", "invoke_agent", None);
+        observer.harness_event(&json!({"ev":"connection_phase","session_id":"s"}));
+        observer.harness_event(&json!({"ev":"token_usage","session_id":"s","input":10,"output":2}));
+        observer.event("s", "message.complete", &json!({"status":"complete"}));
+
+        let interrupted = observer.start_turn("s", "prompt", "cron", None);
+        observer.harness_event(&json!({"ev":"connection_phase","session_id":"s"}));
+        observer.harness_event(&json!({"ev":"turn_stopped","session_id":"s","message":"cancelled"}));
+        observer.event("s", "message.complete", &json!({"status":"interrupted"}));
+
+        let ops: Vec<Op> = rx.try_iter().collect();
+        assert_eq!(ops.iter().filter(|op| matches!(op, Op::Usage { run, usage_known: true, .. } if run == &completed)).count(), 1);
+        assert_eq!(ops.iter().filter(|op| matches!(op, Op::Usage { run, usage_known: false, kind: "cron", model, provider, session, cost: None, error: Some(_), .. } if run == &interrupted && model == "gpt-5.4" && provider == "openai" && session == "s")).count(), 1);
+        write_batch(&mut db, ops).unwrap();
+        let (calls, unpriced, cost): (i64, i64, Option<f64>) = db.query_row(
+            "SELECT COUNT(*), MAX(r.unpriced_calls), MAX(r.cost_usd) FROM obs_runs r JOIN obs_spans s ON s.run_id=r.id WHERE r.id=?1 AND s.model IS NOT NULL",
+            [&interrupted], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((calls, unpriced, cost), (1, 1, None));
     }
 
     #[test]
