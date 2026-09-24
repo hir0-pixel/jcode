@@ -3,10 +3,17 @@
 //! One database file per engine (`sovereign.db` in the jcode home, WAL mode).
 //! Each memory is a row with its searchable text mirrored into an FTS5 index,
 //! so per-turn recall is an indexed full-text query instead of cloning and
-//! re-tokenising every memory (measured: 57 ms -> 4.9 ms per turn at 10k
-//! memories, see `memory_jev::recall_scaling`). Writes touch only the rows that
-//! changed; the rest of the graph (tags, clusters, edges) is one small row per
-//! scope. Scopes: `global`, and `project:<hash of the project dir>`.
+//! re-tokenising every memory. Writes touch only the rows that changed; the
+//! rest of the graph (tags, clusters, edges) is one small row per scope.
+//! Scopes: `global`, and `project:<hash of the project dir>`.
+//!
+//! Layout (measured, see `tests::scaling`): `memories` is kept lean (the
+//! searchable text plus scope/active) because the recall query reads a row
+//! for every match before it can rank and limit; the full entry JSON and the
+//! embedding (as little-endian f32 bytes, not JSON numbers) live in
+//! `memory_entries` and are fetched only for the final top results. With the
+//! entry inline, 10k memories with embeddings made recall 2.4x slower and
+//! the file 9x larger.
 
 use crate::memory_graph::{ClusterEntry, Edge, GraphMetadata, MemoryGraph, TagEntry};
 use crate::memory_types::MemoryEntry;
@@ -28,9 +35,9 @@ const SCHEMA: &str = "
         active INTEGER NOT NULL,
         content TEXT NOT NULL,
         tags TEXT NOT NULL,
-        entry TEXT NOT NULL,
         UNIQUE(scope, id)
     );
+    CREATE TABLE IF NOT EXISTS memory_entries(rid INTEGER PRIMARY KEY, entry TEXT NOT NULL, embedding BLOB);
     CREATE INDEX IF NOT EXISTS memories_scope_active ON memories(scope, active);
     CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
         content, tags, content='memories', content_rowid='rid', tokenize='porter unicode61'
@@ -40,6 +47,7 @@ const SCHEMA: &str = "
     END;
     CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
         INSERT INTO memories_fts(memories_fts, rowid, content, tags) VALUES ('delete', old.rid, old.content, old.tags);
+        DELETE FROM memory_entries WHERE rid = old.rid;
     END;
     CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
         INSERT INTO memories_fts(memories_fts, rowid, content, tags) VALUES ('delete', old.rid, old.content, old.tags);
@@ -87,11 +95,53 @@ fn with_db<R>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<R>) -> Resu
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        db.execute_batch(SCHEMA)?;
+        let mut db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        migrate(&mut db)?;
         map.insert(path.to_path_buf(), db);
     }
     f(map.get_mut(path).expect("inserted above"))
+}
+
+const SCHEMA_VERSION: i64 = 2;
+
+/// Bring an existing database to `SCHEMA_VERSION`, then ensure the schema.
+/// v1 kept the entry JSON (with the embedding as JSON numbers) inline in
+/// `memories`; v2 moves it to `memory_entries`.
+fn migrate(db: &mut Connection) -> Result<()> {
+    let has_inline_entry = db
+        .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name='entry'")?
+        .exists([])?;
+    if has_inline_entry {
+        let tx = db.transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS memory_entries(rid INTEGER PRIMARY KEY, entry TEXT NOT NULL, embedding BLOB);")?;
+        let rows: Vec<(i64, String)> = tx
+            .prepare("SELECT rid, entry FROM memories")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (rid, entry) in rows {
+            let entry: MemoryEntry = serde_json::from_str(&entry)?;
+            let (entry, embedding) = split_embedding(&entry)?;
+            tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, entry, embedding])?;
+        }
+        tx.execute_batch("DROP TRIGGER IF EXISTS memories_ad; ALTER TABLE memories DROP COLUMN entry;")?;
+        tx.commit()?;
+    }
+    db.execute_batch(SCHEMA)?;
+    db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES ('schema_version', ?1)", [SCHEMA_VERSION.to_string()])?;
+    Ok(())
+}
+
+/// Entry JSON without the embedding, plus the embedding as LE f32 bytes.
+fn split_embedding(entry: &MemoryEntry) -> Result<(String, Option<Vec<u8>>)> {
+    let mut lean = entry.clone();
+    let embedding = lean.embedding.take().map(|v| v.iter().flat_map(|f| f.to_le_bytes()).collect());
+    Ok((serde_json::to_string(&lean)?, embedding))
+}
+
+fn join_embedding(entry: &str, embedding: Option<Vec<u8>>) -> Result<MemoryEntry> {
+    let mut entry: MemoryEntry = serde_json::from_str(entry)?;
+    entry.embedding = embedding.map(|b| b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+    Ok(entry)
 }
 
 /// Drop the cached connection (before the file is deleted, e.g. in tests).
@@ -125,9 +175,12 @@ pub(crate) fn load_graph(path: &Path, scope: &str) -> Result<Option<MemoryGraph>
         graph.edges = shape.edges;
         graph.reverse_edges = shape.reverse_edges;
         graph.metadata = shape.metadata;
-        let mut stmt = db.prepare_cached("SELECT entry FROM memories WHERE scope=?1")?;
-        for entry in stmt.query_map([scope], |r| r.get::<_, String>(0))? {
-            let entry: MemoryEntry = serde_json::from_str(&entry?)?;
+        let mut stmt = db.prepare_cached(
+            "SELECT e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid WHERE m.scope=?1",
+        )?;
+        for row in stmt.query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))? {
+            let (entry, embedding) = row?;
+            let entry = join_embedding(&entry, embedding)?;
             graph.memories.insert(entry.id.clone(), entry);
         }
         Ok(Some(graph))
@@ -141,22 +194,22 @@ pub(crate) fn save_graph(path: &Path, scope: &str, graph: &MemoryGraph, previous
         let tx = db.transaction()?;
         {
             let mut upsert = tx.prepare_cached(
-                "INSERT INTO memories(id, scope, active, content, tags, entry) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(scope, id) DO UPDATE SET active=excluded.active, content=excluded.content,
-                 tags=excluded.tags, entry=excluded.entry",
+                "INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope, id) DO UPDATE SET active=excluded.active, content=excluded.content, tags=excluded.tags
+                 RETURNING rid",
             )?;
+            let mut put_entry =
+                tx.prepare_cached("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)")?;
             for (id, entry) in &graph.memories {
                 if previous.and_then(|p| p.memories.get(id)) == Some(entry) {
                     continue;
                 }
-                upsert.execute(params![
-                    id,
-                    scope,
-                    entry.active,
-                    entry.content,
-                    entry.tags.join(" "),
-                    serde_json::to_string(entry)?
-                ])?;
+                let rid: i64 = upsert.query_row(
+                    params![id, scope, entry.active, entry.content, entry.tags.join(" ")],
+                    |r| r.get(0),
+                )?;
+                let (json, embedding) = split_embedding(entry)?;
+                put_entry.execute(params![rid, json, embedding])?;
             }
             let mut delete = tx.prepare_cached("DELETE FROM memories WHERE scope=?1 AND id=?2")?;
             match previous {
@@ -201,10 +254,13 @@ pub(crate) fn search(path: &Path, scopes: &[String], terms: &[String], limit: us
     }
     let query = terms.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
     let scope_marks = (0..scopes.len()).map(|i| format!("?{}", i + 3)).collect::<Vec<_>>().join(",");
+    // Rank and limit on the lean table, then fetch full entries for the winners.
     let sql = format!(
-        "SELECT m.entry FROM memories_fts JOIN memories m ON m.rid = memories_fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.active = 1 AND m.scope IN ({scope_marks})
-         ORDER BY bm25(memories_fts) LIMIT ?2"
+        "SELECT e.entry, e.embedding FROM (
+             SELECT m.rid, bm25(memories_fts) AS score FROM memories_fts JOIN memories m ON m.rid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1 AND m.active = 1 AND m.scope IN ({scope_marks})
+             ORDER BY score LIMIT ?2
+         ) top JOIN memory_entries e ON e.rid = top.rid ORDER BY top.score"
     );
     with_db(path, |db| {
         let mut stmt = db.prepare_cached(&sql)?;
@@ -212,50 +268,69 @@ pub(crate) fn search(path: &Path, scopes: &[String], terms: &[String], limit: us
         for scope in scopes {
             args.push(scope);
         }
-        let rows = stmt.query_map(args.as_slice(), |r| r.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+        let rows = stmt.query_map(args.as_slice(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))?;
+        rows.map(|row| {
+            let (entry, embedding) = row?;
+            join_embedding(&entry, embedding)
+        })
+        .collect()
     })
+}
+
+/// Run `f` once per database, remembered under `key` in `memory_meta`.
+pub(crate) fn once(path: &Path, key: &str, f: impl FnOnce() -> Result<usize>) -> Result<usize> {
+    let done = with_db(path, |db| {
+        Ok(db.query_row("SELECT 1 FROM memory_meta WHERE key=?1", [key], |_| Ok(())).optional()?.is_some())
+    })?;
+    if done {
+        return Ok(0);
+    }
+    let n = f()?;
+    with_db(path, |db| {
+        db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES (?1, ?2)", params![key, n.to_string()])?;
+        Ok(())
+    })?;
+    Ok(n)
 }
 
 /// One-time import of the old JSON graphs (`memory/global.json`,
 /// `memory/projects/<hash>.json`); each file is renamed `*.json.imported`.
 pub(crate) fn import_json_once(db_path: &Path, memory_dir: &Path, load: impl Fn(&Path) -> Result<MemoryGraph>) -> Result<usize> {
-    let done = with_db(db_path, |db| {
-        Ok(db
-            .query_row("SELECT 1 FROM memory_meta WHERE key='json_imported'", [], |_| Ok(()))
-            .optional()?
-            .is_some())
-    })?;
-    if done {
-        return Ok(0);
-    }
-    let mut files: Vec<(PathBuf, String)> = Vec::new();
-    let global = memory_dir.join("global.json");
-    if global.is_file() {
-        files.push((global, "global".into()));
-    }
-    if let Ok(dir) = std::fs::read_dir(memory_dir.join("projects")) {
-        for file in dir.flatten() {
-            let path = file.path();
-            if path.extension().is_some_and(|e| e == "json")
-                && let Some(hash) = path.file_stem().and_then(|s| s.to_str())
-            {
-                files.push((path.clone(), format!("project:{hash}")));
+    once(db_path, "json_imported", || {
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        let global = memory_dir.join("global.json");
+        if global.is_file() {
+            files.push((global, "global".into()));
+        }
+        if let Ok(dir) = std::fs::read_dir(memory_dir.join("projects")) {
+            for file in dir.flatten() {
+                let path = file.path();
+                if path.extension().is_some_and(|e| e == "json")
+                    && let Some(hash) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    files.push((path.clone(), format!("project:{hash}")));
+                }
             }
         }
-    }
-    let mut imported = 0;
-    for (file, scope) in files {
-        let graph = load(&file).with_context(|| format!("reading {}", file.display()))?;
-        save_graph(db_path, &scope, &graph, None)?;
-        imported += graph.memories.len();
-        let _ = std::fs::rename(&file, file.with_extension("json.imported"));
-    }
-    with_db(db_path, |db| {
-        db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES ('json_imported', ?1)", [imported.to_string()])?;
-        Ok(())
-    })?;
-    Ok(imported)
+        let mut imported = 0;
+        for (file, scope) in files {
+            let graph = load(&file).with_context(|| format!("reading {}", file.display()))?;
+            save_graph(db_path, &scope, &graph, None)?;
+            imported += graph.memories.len();
+            let _ = std::fs::rename(&file, file.with_extension("json.imported"));
+        }
+        Ok(imported)
+    })
+}
+
+/// Entries of a Hermes memory file (`MEMORY.md` / `USER.md`): split on the
+/// full `\n§\n` delimiter; entries Hermes blocked as injected content skipped.
+pub(crate) fn hermes_entries(raw: &str) -> Vec<String> {
+    raw.split("\n§\n")
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.starts_with("[BLOCKED:"))
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -360,6 +435,44 @@ mod tests {
         assert!(memory_dir.join("global.json.imported").is_file());
         assert_eq!(load_graph(&path, "global").unwrap().unwrap().memories, g.memories);
         assert_eq!(load_graph(&path, "project:abc").unwrap().unwrap().memories.len(), 1);
+    }
+
+    #[test]
+    fn migrates_a_v1_database_with_inline_entries() {
+        let (_d, path) = db();
+        let mut entry = MemoryEntry::new(MemoryCategory::Preference, "The user prefers tabs over spaces");
+        entry.embedding = Some(vec![0.25; 4]);
+        {
+            // The v1 layout: entry JSON (embedding included) inline in `memories`.
+            let v1 = Connection::open(&path).unwrap();
+            v1.execute_batch(
+                "CREATE TABLE memories(rid INTEGER PRIMARY KEY, id TEXT NOT NULL, scope TEXT NOT NULL, active INTEGER NOT NULL,
+                     content TEXT NOT NULL, tags TEXT NOT NULL, entry TEXT NOT NULL, UNIQUE(scope, id));
+                 CREATE VIRTUAL TABLE memories_fts USING fts5(content, tags, content='memories', content_rowid='rid', tokenize='porter unicode61');
+                 CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                     INSERT INTO memories_fts(rowid, content, tags) VALUES (new.rid, new.content, new.tags); END;
+                 CREATE TABLE memory_graphs(scope TEXT PRIMARY KEY, graph TEXT NOT NULL);",
+            )
+            .unwrap();
+            v1.execute(
+                "INSERT INTO memories(id, scope, active, content, tags, entry) VALUES (?1, 'global', 1, ?2, '', ?3)",
+                (&entry.id, &entry.content, serde_json::to_string(&entry).unwrap()),
+            )
+            .unwrap();
+            v1.execute("INSERT INTO memory_graphs(scope, graph) VALUES ('global', '{\"graph_version\":1}')", []).unwrap();
+        }
+        let graph = load_graph(&path, "global").unwrap().unwrap();
+        assert_eq!(graph.memories.get(&entry.id), Some(&entry), "entry and embedding survive the move");
+        assert_eq!(recall(&path, &["global"], "tabs or spaces preference", 5).len(), 1);
+        let columns: Vec<String> = Connection::open(&path)
+            .unwrap()
+            .prepare("SELECT name FROM pragma_table_info('memories')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!columns.contains(&"entry".to_string()));
     }
 
     /// `cargo test -p jcode-base --release --lib memory_store::tests::scaling -- --ignored --nocapture`

@@ -854,9 +854,10 @@ mod scoped_tests {
             // validation must notice (data_version) and not use it.
             entry.content = "Database port is 6432".into();
             let db = rusqlite::Connection::open(manager(Some("/project/a")).db_path().unwrap()).unwrap();
+            db.execute("UPDATE memories SET content=?1 WHERE id=?2", (&entry.content, &entry.id)).unwrap();
             db.execute(
-                "UPDATE memories SET content=?1, entry=?2 WHERE id=?3",
-                (&entry.content, serde_json::to_string(&entry).unwrap(), &entry.id),
+                "UPDATE memory_entries SET entry=?1 WHERE rid=(SELECT rid FROM memories WHERE id=?2)",
+                (serde_json::to_string(&entry).unwrap(), &entry.id),
             )
             .unwrap();
             assert!(take_pending_memory_for_project("updated", Some("/project/a")).is_none());

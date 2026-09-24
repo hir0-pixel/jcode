@@ -522,3 +522,38 @@ async fn private_metadata_stays_local_but_full_original_is_returned() {
     assert!(candidate.get("id").is_none());
     assert!(candidate.get("embedding").is_none());
 }
+
+#[test]
+fn hermes_memories_are_imported_once_as_user_stated_memories() {
+    let _guard = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let hermes = tempfile::tempdir().unwrap();
+    let memories = hermes.path().join("memories");
+    std::fs::create_dir_all(&memories).unwrap();
+    let memory_md = "Deploys go through staging first\n§\n[BLOCKED: prompt injection]\n§\nDeploys go through staging first";
+    std::fs::write(memories.join("MEMORY.md"), memory_md).unwrap();
+    std::fs::write(memories.join("USER.md"), "The user writes quick scripts in Nim").unwrap();
+    let old = (std::env::var_os("JCODE_HOME"), std::env::var_os("HERMES_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("HERMES_HOME", hermes.path());
+    let result = std::panic::catch_unwind(|| {
+        let manager = MemoryManager::new();
+        let hits = manager.recall_local(None, "which language for a quick script", 5, MemoryScope::Global).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("Nim"));
+        assert_eq!(hits[0].trust, crate::memory_types::TrustLevel::High);
+        let all = manager.load_global_graph().unwrap();
+        assert_eq!(all.memories.len(), 2, "duplicate collapsed, blocked entry skipped");
+        // Once: a second manager (or restart) does not import again.
+        std::fs::write(memories.join("USER.md"), "Added later in Hermes").unwrap();
+        assert_eq!(MemoryManager::new().load_global_graph().unwrap().memories.len(), 2);
+        assert_eq!(std::fs::read_to_string(memories.join("MEMORY.md")).unwrap(), memory_md, "Hermes files untouched");
+    });
+    for (key, value) in [("JCODE_HOME", old.0), ("HERMES_HOME", old.1)] {
+        match value {
+            Some(value) => crate::env::set_var(key, value),
+            None => crate::env::remove_var(key),
+        }
+    }
+    result.unwrap();
+}

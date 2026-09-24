@@ -8,13 +8,22 @@ Status (2026-09-24): M1 built, M2 in progress. Where the build departed from thi
   goal is met differently: the engine answers every chat-bound RPC and REST method itself and
   never forwards one to Python, so Python never holds chat data (M1, commits 343029d,
   f817151, a52650f).
-- **Memory lives in the engine's own `sovereign.db`** (jcode home, WAL), not `state.db`:
-  memories are rows with an FTS5 index (Porter stemming) kept in sync by triggers; per-turn
-  recall is an indexed query; writes touch only changed rows (M2). Measured on a worst-case
-  corpus: recall 57 -> 16 ms and saving one memory 90 ms -> 7 ms at 10k memories
-  (`memory_store::tests::scaling`). jcode's behaviours are unchanged: recalled memory is
-  appended at the end of the prompt, each memory at most once per session, nothing when
-  nothing matches, at most 5.
+- **Memory lives in the engine's own `sovereign.db`** (jcode home, WAL), not `state.db`
+  (M2). A lean `memories` table (searchable text, scope, active) carries an FTS5 index
+  (Porter stemming) kept in sync by triggers; the full entry JSON and the embedding (as
+  binary f32, not JSON numbers) sit in `memory_entries` and are fetched only for the final
+  top results. Writes touch only changed rows. Measured on a worst-case corpus at 10k
+  memories: per-turn recall 57 ms -> 6.2 ms, saving one memory 90 ms (21 MB rewrite) ->
+  6.3 ms (`memory_store::tests::scaling`). Rejected on measurement: `detail=column` (2x
+  slower here), `temp_store=MEMORY` (no gain), large cache/mmap pragmas (RAM matters more).
+  jcode's behaviours are unchanged: recalled memory is appended at the end of the prompt,
+  each memory at most once per session, nothing when nothing matches, at most 5.
+- **No `memory_injections` table:** jcode already records each injection in the session
+  (persisted) and restores the inject-once set when a session is resumed; a table would
+  store the same fact twice.
+- **Hermes import:** on first run, `$HERMES_HOME/memories/MEMORY.md` (facts) and `USER.md`
+  (about the user) are imported once as user-stated memories, deduplicated; entries Hermes
+  blocked as injected content are skipped; Hermes's files are only read.
 
 
 Goal: one app with jcode-level token and RAM efficiency, Prime-style self-improvement and
