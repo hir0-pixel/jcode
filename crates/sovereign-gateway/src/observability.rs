@@ -76,6 +76,8 @@ enum Op {
         cache_read: u64,
         cache_write: u64,
         cost: Option<f64>,
+        usage_known: bool,
+        error: Option<String>,
         started: i64,
         ended: i64,
     },
@@ -315,11 +317,13 @@ impl Observer {
         drop(sessions);
         self.send(Op::RunStart { id: run.clone(), session: session.into(), parent: None, root: run.clone(), kind,
             title: title.map(str::to_string), model: model.clone(), provider: provider.clone(), status: "running", at: started }, false);
+        let cost = usage.and_then(|usage| cost_usd(&provider, &model, usage.input, usage.output, usage.cache_read, usage.cache_write));
+        let usage_known = usage.is_some();
         let usage = usage.unwrap_or(SimpleUsage { input: 0, output: 0, cache_read: 0, cache_write: 0 });
-        let cost = cost_usd(&provider, &model, usage.input, usage.output, usage.cache_read, usage.cache_write);
         self.send(Op::Usage { run: run.clone(), span: format!("{run}:model"), root: run.clone(), kind,
             model, provider, session: session.into(), input: usage.input, output: usage.output,
-            cache_read: usage.cache_read, cache_write: usage.cache_write, cost, started, ended: now() }, false);
+            cache_read: usage.cache_read, cache_write: usage.cache_write, cost, usage_known,
+            error: error.map(capped), started, ended: now() }, false);
         self.send(Op::RunEnd { id: run, status: if error.is_some() { "error" } else { "complete" }.into(),
             error: error.map(capped), at: now() }, false);
     }
@@ -518,6 +522,8 @@ impl Observer {
                         cache_read,
                         cache_write,
                         cost,
+                        usage_known: true,
+                        error: None,
                         started: active.chat_started.take().unwrap_or_else(now),
                         ended: now(),
                     },
@@ -789,21 +795,26 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 cache_read,
                 cache_write,
                 cost,
+                usage_known,
+                error,
                 started,
                 ended,
             } => {
-                let attributes = json!({
+                let mut attributes = json!({
                     "gen_ai.operation.name": "chat",
                     "gen_ai.provider.name": provider,
                     "gen_ai.request.model": model,
                     "gen_ai.response.model": model,
-                    "gen_ai.usage.input_tokens": input,
-                    "gen_ai.usage.output_tokens": output,
-                    "gen_ai.usage.cache_read.input_tokens": cache_read,
-                    "gen_ai.usage.cache_creation.input_tokens": cache_write,
                     "gen_ai.conversation.id": session,
-                }).to_string();
-                let inserted = tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call','complete',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![span,run,root,kind,started,ended,input,output,cache_read,cache_write,cost,model,provider,attributes])?;
+                });
+                if usage_known {
+                    attributes["gen_ai.usage.input_tokens"] = json!(input);
+                    attributes["gen_ai.usage.output_tokens"] = json!(output);
+                    attributes["gen_ai.usage.cache_read.input_tokens"] = json!(cache_read);
+                    attributes["gen_ai.usage.cache_creation.input_tokens"] = json!(cache_write);
+                }
+                let status = if error.is_some() { "error" } else { "complete" };
+                let inserted = tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![span,run,root,kind,status,started,ended,input,output,cache_read,cache_write,cost,error,model,provider,attributes.to_string()])?;
                 if inserted != 0 {
                     tx.execute("UPDATE obs_runs SET input_tokens=input_tokens+?2,output_tokens=output_tokens+?3,cache_read_tokens=cache_read_tokens+?4,cache_write_tokens=cache_write_tokens+?5,unpriced_calls=unpriced_calls+CASE WHEN ?6 IS NULL THEN 1 ELSE 0 END,cost_usd=CASE WHEN ?6 IS NULL OR unpriced_calls>0 THEN NULL ELSE COALESCE(cost_usd,0)+?6 END WHERE id=?1", params![run,input,output,cache_read,cache_write,cost])?;
                 }
@@ -1099,6 +1110,8 @@ mod tests {
                     cache_read: 20,
                     cache_write: 0,
                     cost: cost_usd("openai", "gpt-5.4", 100, 50, 20, 0),
+                    usage_known: true,
+                    error: None,
                     started: now(),
                     ended: now(),
                 },
@@ -1110,9 +1123,25 @@ mod tests {
             model: "gpt-5.4".into(), provider: "openai".into(), session: "s".into(),
             input: 100, output: 50, cache_read: 20, cache_write: 0,
             cost: cost_usd("openai", "gpt-5.4", 100, 50, 20, 0),
+            usage_known: true, error: None,
             started: now(), ended: now(),
         }]).unwrap();
         assert_eq!(db.query_row("SELECT input_tokens FROM obs_runs WHERE id='r'", [], |r| r.get::<_, i64>(0)).unwrap(), 100);
+        write_batch(&mut db, vec![Op::Usage {
+            run: "r".into(), span: "canceled".into(), root: "r".into(), kind: "other",
+            model: "gpt-5.4".into(), provider: "openai".into(), session: "s".into(),
+            input: 0, output: 0, cache_read: 0, cache_write: 0, cost: None,
+            usage_known: false, error: Some("interrupted".into()), started: now(), ended: now(),
+        }]).unwrap();
+        let (cost, unpriced): (Option<f64>, i64) = db.query_row(
+            "SELECT cost_usd,unpriced_calls FROM obs_runs WHERE id='r'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((cost, unpriced), (None, 1));
+        let (status, attributes): (String, String) = db.query_row(
+            "SELECT status,attributes FROM obs_spans WHERE id='canceled'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "error");
+        assert!(serde_json::from_str::<Value>(&attributes).unwrap().get("gen_ai.usage.input_tokens").is_none());
         assert!(cost_usd("openai", "gpt-5.4", 100, 50, 20, 0).unwrap() > 0.0);
         assert_eq!(cost_usd("unknown", "x", 100, 50, 0, 0), None);
         setup(&mut db).unwrap();
