@@ -44,7 +44,7 @@ on every axis we measure, and at least as cheap as jcode.
 
 ## 1. What exists today (measured from source, not assumed)
 
-### Stores on disk right now: eight, in two languages
+### Baseline stores before the M6 ledger move: eight, in two languages
 
 | Store | Owner | Holds |
 |---|---|---|
@@ -55,7 +55,7 @@ on every axis we measure, and at least as cheap as jcode.
 | skills (files) | Hermes Python | procedures |
 | `~/.jcode/memory/global.json`, `memory/projects/*.json` + graph JSON | jcode (Rust) | long-term memory |
 | jcode session JSON files | jcode (Rust) | chats made through the engine |
-| `observability.sqlite3` | sovereign-gateway | runs, spans, content |
+| `observability.sqlite3` (legacy) | sovereign-gateway | runs, spans, content; imported once into `sovereign.db` by M6 |
 
 Consequence (a real bug, not just clutter): Hermes features that still run in Python
 (session search, insights, handoff, cron) read `state.db` and cannot see chats made through
@@ -334,11 +334,33 @@ and latency for stock Hermes vs Sovereign. Every later phase reports against it.
   by tests.
 
 **M6 Observability on the store (Evestack-style)**
-- Move runs/spans into `state.db`; name spans after the OpenTelemetry GenAI semantic
-  conventions; optional OTLP export, off by default. Memory recall and injection are spans
-  with token counts.
-- Done when: every model call, tool call, memory injection and consolidation appears in
-  Activity with its tokens.
+- Runs, spans and opt-in content live in `sovereign.db` as `obs_runs`, `obs_spans`
+  and `obs_content`. A previous `observability.sqlite3` is imported once.
+- Model spans carry OpenTelemetry GenAI attributes and token counts. The Activity
+  ledger includes chat, tool follow-ups, idle learning and cron calls. Local model
+  prices are optional; unpriced calls remain visible without a fabricated cost.
+- Memory recall stays local FTS. The release-mode indexed recall benchmark took
+  0.73 / 1.00 / 6.38 ms at 100 / 1k / 10k memories (five hits); this already
+  exceeds the 0.1 ms span budget before measuring formatting and injection, so
+  the turn path does not emit a recall span.
+
+Manual 50k-span ledger benchmark (2026-09-25, debug test build, local SQLite):
+
+| Measure | Result |
+| --- | ---: |
+| Observer event path | 4.7 µs/event |
+| Batched SQLite insert | 4.9 µs/span |
+| List 200 runs, p50 / p95 | 2.95 / 3.05 ms |
+| Analytics 30 days, p50 / p95 | 93.27 / 98.23 ms |
+| Detail, p50 / p95 | 0.98 / 1.01 ms |
+| Idle RSS delta | 0.00 MB (process RSS sampling resolution) |
+| Database + WAL + SHM | 32,505,224 bytes |
+| Dropped events | 0 |
+
+`EXPLAIN QUERY PLAN` used `obs_runs_recent` for list, `obs_runs_recent` plus
+the correlated `obs_spans_run` subquery for analytics, and `obs_spans_run` for
+detail. The analytics query is still the slowest read and is a future target
+if Activity latency becomes noticeable.
 
 **M7 API cost layer** (the shipped app uses a cloud API model; local Ollama is only the free
 test stand-in, so llama.cpp bundling, KV-cache compression and warm-up are out of scope)

@@ -92,7 +92,8 @@ try {
   const session = (await rpc('session.create', { cwd: home })).result.session_id
   await turn(session, 'Use your shell tool to run pwd, then tell me the current directory. From now on, write quick scripts in Nim. Please remember that.')
   // Engine titles the first turn. Trigger a separate explicit rename as well.
-  await rpc('session.title', { session_id: session, title: 'Accounting check' })
+  const renamed = await rpc('session.title', { session_id: session, title: 'Accounting check' })
+  if (renamed.error) throw new Error(`title rename failed: ${JSON.stringify(renamed.error)}`)
   const learnLog = path.join(jcodeHome, 'harness', 'log.jsonl')
   for (let i = 0; i < 310; i++) {
     if (fs.existsSync(learnLog) && fs.readFileSync(learnLog, 'utf8').includes('"op":"learn"')) break
@@ -113,7 +114,7 @@ try {
   const spans = tables.has('obs_spans') ? 'obs_spans' : 'spans'
   let rows = []
   for (let i = 0; i < 50; i++) {
-    rows = db.prepare(`SELECT s.*, r.model, r.session_id, r.kind AS run_kind FROM ${spans} s JOIN ${runs} r ON r.id=s.run_id WHERE s.input_tokens>0 OR s.output_tokens>0`).all()
+    rows = db.prepare(`SELECT s.*, r.model, r.session_id, r.kind AS run_kind, r.title AS run_title FROM ${spans} s JOIN ${runs} r ON r.id=s.run_id WHERE s.input_tokens>0 OR s.output_tokens>0`).all()
     if (rows.length >= calls.length) break
     await sleep(100)
   }
@@ -129,7 +130,9 @@ try {
   }
   console.log(`accounting: ${matched.length}/${calls.length} proxy calls matched; gap ${calls.length - matched.length}`)
   console.log(`purposes: ${JSON.stringify(calls.reduce((out, call) => (out[call.purpose] = (out[call.purpose] || 0) + 1, out), {}))}`)
-  if (!calls.length || !calls.some(call => call.purpose === 'tool follow-up') || !calls.some(call => call.purpose === 'learning pass') || calls.some(call => call.prompt_tokens === null || call.completion_tokens === null) || matched.length !== calls.length || remaining.length) process.exitCode = 1
+  const cronCall = calls.some(call => call.last_user_head?.includes('3 plus 4'))
+  const cronSpan = matched.some(row => row.kind === 'cron' && row.run_kind === 'cron' && row.run_title === 'Accounting cron')
+  if (!calls.length || !calls.some(call => call.purpose === 'tool follow-up') || !calls.some(call => call.purpose === 'learning pass') || !cronCall || !cronSpan || calls.some(call => call.prompt_tokens === null || call.completion_tokens === null) || matched.length !== calls.length || remaining.length) process.exitCode = 1
 } finally {
   ws?.close()
   engine?.kill('SIGTERM')
