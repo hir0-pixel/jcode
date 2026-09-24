@@ -51,15 +51,31 @@ Root cause: Ollama’s OpenAI-compat `/v1/chat/completions` **ignores** per-requ
 
 Source: packaged chat journal token_usage on the first model call (`apps/desktop/release/sovereign-chat/` runs). Tool schemas are ~95% of that prefix. Lazy tool-loading (MEMORY_DESIGN M5) should cut this line item.
 
-## Efficiency vs stock Hermes (counting proxy — in progress)
+## Efficiency vs stock Hermes (counting proxy)
 
-| Metric | Stock Hermes Desktop | Sovereign packaged | Evidence |
-| --- | --- | --- | --- |
-| Idle Python while Cron closed | Always on (desktop `hermes serve`) | Stopped after `SOVEREIGN_FEATURE_IDLE_MS` | `sovereign-install/`, `sovereign-cron-due/` |
-| Cron still fires after idle | N/A (Python never idle-stopped) | Wake → fire → idle again | `sovereign-cron-due/log.json` |
-| Ollama resident after app quit | Depends on Ollama defaults | Unloaded (`keep_alive: 0`) | Engine unload + Electron quit hook |
-| Tool-schema tokens / turn | Full Hermes toolset (typically larger) | ~8.2k with Sovereign disabled-tool set | This doc |
-| Model calls / user turn (hidden review, title, etc.) | TBD via counting proxy | TBD | Next |
+Same prompt (`Reply with exactly one word: pong`), same machine, Ollama behind `scripts/sovereign-counting-proxy.mjs`.
+
+Evidence: `docs/benchmark-runs/2026-09-24T12-45-25/summary.json`.
+
+| Metric | Stock Hermes CLI (`-z`) | Sovereign (`run`) | Notes |
+| --- | ---: | ---: | --- |
+| Serving `num_ctx` | **65 536** (Hermes minimum) | **32 768** (product default) | Hermes Agent refuses windows &lt; 64k (`MINIMUM_CONTEXT_LENGTH`) |
+| `/v1/chat/completions` calls | **2** | **4** | Sovereign oneshot still does internal turns (tools/session); Hermes answered in 2 |
+| Prompt tokens (sum) | 12 560 | 13 422 | First-turn tool prefix still dominates; see line item above |
+| Completion tokens (sum) | 20 | 153 | |
+| Wall time | 100 s | 75 s | Cold-ish GPU; not the primary efficiency claim |
+| Idle Python while Cron closed | Always on (desktop `hermes serve`) | Stopped after `SOVEREIGN_FEATURE_IDLE_MS` | Packaged e2e |
+| Cron still fires after idle | N/A | Wake → fire → idle again | `sovereign-cron-due/` |
+| Ollama after app quit | Depends on Ollama defaults | Unloaded (`keep_alive: 0`) | Engine Drop + Electron `will-quit` |
+
+**Takeaway:** On a simple oneshot, call/token counts are in the same ballpark. The measured wins for Sovereign are (1) **half the KV budget Hermes requires** (32k vs ≥64k), (2) **no resident Python** until Cron/features, (3) **unload Ollama on quit**. Tool-schema prefix (~8.2k) remains the main per-request token cost and the lazy-tool-loading target.
+
+Re-run:
+
+```bash
+# needs release sovereign + hermes on PATH + Ollama with qwen3.8:27b
+node scripts/sovereign-vs-hermes-bench.mjs
+```
 
 ## How to re-measure Ollama RSS
 
@@ -69,5 +85,5 @@ curl -s http://127.0.0.1:11434/api/generate -d '{"model":"qwen3.8:27b","keep_ali
 # load at CTX
 curl -s http://127.0.0.1:11434/api/generate -d '{"model":"qwen3.8:27b","prompt":".","stream":false,"keep_alive":"10m","options":{"num_ctx":32768}}'
 # RSS: sum rss for Ollama / ollama / llama-server
-ps -axo rss,comm,args | … 
+ps -axo rss,comm,args | …
 ```

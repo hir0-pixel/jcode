@@ -354,6 +354,16 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         if host_reason.is_some() || !token_ok {
             return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
         }
+        // Packaged: only wake Python for explicit feature=1 (Cron UI, etc.).
+        if config.features.is_some() && bundled_startup_request(&req) {
+            note_unsupported("ws", &req.path);
+            return respond(
+                &mut stream,
+                "404 Not Found",
+                &json!({"detail": "not supported by engine", "reason": "feature_not_requested"}),
+            )
+            .await;
+        }
         return match config.features.clone() {
             Some(features) => proxy_http(stream, &req, &features, true).await,
             None => respond(&mut stream, "404 Not Found", &json!({"detail": "not supported by engine"})).await,
@@ -487,6 +497,28 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             respond(&mut stream, "200 OK", &json!({"cwd": config.default_cwd, "branch": null})).await
         }
         ("GET", "/api/cron/jobs") if bundled_startup_request(&req) => respond(&mut stream, "200 OK", &json!([])).await,
+        ("GET", "/api/cron/delivery-targets" | "/api/cron/blueprints") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!([])).await
+        }
+        ("GET", "/api/skills" | "/api/skills/hub/official" | "/api/skills/hub/sources")
+            if bundled_startup_request(&req) =>
+        {
+            respond(&mut stream, "200 OK", &json!([])).await
+        }
+        ("GET", "/api/mcp/servers" | "/api/mcp/catalog") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!([])).await
+        }
+        ("GET", "/api/memory") if bundled_startup_request(&req) => {
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"provider": null, "providers": [], "files": {}}),
+            )
+            .await
+        }
+        ("GET", "/api/plugins") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({"plugins": []})).await
+        }
         ("GET", "/api/host/identity") => {
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
@@ -511,6 +543,17 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             }
         }
         (_, path) if path.starts_with("/api/") && config.features.is_some() => {
+            // Without feature=1, refuse to start Python for unknown probes so a
+            // chat-only first paint on Windows/macOS stays Python-free.
+            if bundled_startup_request(&req) {
+                note_unsupported("http", &format!("{} {path}", req.method));
+                return respond(
+                    &mut stream,
+                    "404 Not Found",
+                    &json!({"detail": "not supported by engine", "reason": "feature_not_requested"}),
+                )
+                .await;
+            }
             let features = config.features.clone().expect("checked");
             proxy_http(stream, &req, &features, false).await
         }

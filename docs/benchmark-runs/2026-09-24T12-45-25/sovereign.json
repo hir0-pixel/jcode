@@ -1,0 +1,31 @@
+{
+  "kind": "sovereign",
+  "ok": true,
+  "status": 0,
+  "elapsed_ms": 74962,
+  "stdout": "{\n  \"session_id\": \"session_cactus_1790254078405_9eade5a9ecb27f04\",\n  \"provider\": \"openrouter\",\n  \"model\": \"sovereign/qwen3.8-27b:latest\",\n  \"text\": \"pong\",\n  \"usage\": {\n    \"input_tokens\": 9496,\n    \"output_tokens\": 23,\n    \"cache_read_input_tokens\": 0,\n    \"cache_creation_input_tokens\": null\n  }\n}\n",
+  "stderr": "",
+  "login_status": 0,
+  "login_stderr": "Setting up OpenAI-compatible...\nSee setup details: https://github.com/1jehuang/jcode#openai-compatible-providers\n\nYou can point this at a hosted OpenAI-compatible API or a local server such as LM Studio or Ollama.\n\nEndpoint: http://127.0.0.1:18080/v1\nThis provider uses a local OpenAI-compatible endpoint.\nAn API key is optional here. Press Enter to skip if your local server does not require one.\n\n\nSaved OpenAI-compatible local endpoint setup and optional API key.\nNext step: run jcode with a model available on this endpoint, for example `jcode --provider openai-compatible --model <model-id> run 'hello'`.\nStored at /var/folders/7z/q6rbz8rd6j11f0mbgzrfhyhc0000gn/T/bench-sov-bJJUys/.jcode/config/jcode/openai-compatible.env\n\nValidating OpenAI-compatible login with live auth/runtime checks...\n",
+  "stats": {
+    "started_at": "2026-09-24T12:47:32.330Z",
+    "upstream": "http://127.0.0.1:11434",
+    "listen": "127.0.0.1:18080",
+    "requests": 7,
+    "chat_completions": 4,
+    "api_chat": 0,
+    "api_generate": 0,
+    "other": 3,
+    "prompt_tokens": 13422,
+    "completion_tokens": 153,
+    "eval_count": 0,
+    "prompt_eval_count": 0,
+    "bytes_in": 50106,
+    "bytes_out": 25950,
+    "paths": {
+      "/v1/models": 3,
+      "/v1/chat/completions": 4
+    },
+    "updated_at": "2026-09-24T12:49:13.719Z"
+  }
+}

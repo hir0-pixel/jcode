@@ -10,79 +10,51 @@ ONE installable app for macOS and Windows that a non-developer can install on a 
 
 ### hermes-agent `feature/sovereign-observability`
 
-- `79e891073215ef1c62b66118dc3335c3188f5948` — desktop: bundle Sovereign engine and staged Python for packaged installs
-- `d3532d02c9795f15b5b63132d71a8e160545bb6a` — desktop e2e: packaged cron idle, due-wake, and orphan cleanup checks
+- Packaging, e2e, Windows NSIS workflow, Ollama unload-on-quit, path helpers for win-unpacked.
 
 Left unstaged (user theme/marketplace work): do **not** commit `vscode-marketplace*` or `themes/install*` deletions.
 
 ### sovereign-engine `feature/sovereign-observability`
 
-- `a0600e2c402777efc69a90e3d81f4846b8a6589b` — bundled Python env + `SOVEREIGN_FEATURE_IDLE_MS`
-- `cedc67e606e0ff01342d295222c7fcce0de0dc02` — packaged startup routes without waking Python
-- `870ec1325aff2df73e193c7bfccba3cdde0135c8` — parent-death watchdog
-- `b24ccc9409033dae423133c226a214760c7136f7` — wake Python before due cron jobs (`cron_wake.rs` + `HERMES_DESKTOP=1`)
+- Bundled Python env + idle stop, cron wake-before-due, Ollama alias warm (`num_ctx` pin, `keep_alive -1` / unload `0`), gateway startup stubs so Python is not woken by boot probes.
 
-## Cron scheduler finding + fix (verified)
+## Cron scheduler (verified)
 
-**Where it runs:** On Hermes Desktop, the cron scheduler is **not** a separate `hermes gateway` process. It ticks **inside the desktop-owned `hermes serve` / dashboard backend** when `HERMES_DESKTOP=1` **and** `HERMES_DASHBOARD_SESSION_TOKEN` is set (`hermes_cli/web_server.py` → `_start_desktop_cron_ticker`). The messaging gateway also has a ticker when that process is running; stock Desktop relies on the in-process ticker because no gateway is started.
-
-**Bug:** Sovereign idle-stopped that Python process after Cron UI closed, which also killed the ticker — scheduled jobs would never fire.
-
-**Fix:** Engine reads `$HERMES_HOME/cron/jobs.json` (and profile stores), starts the feature backend `SOVEREIGN_CRON_WAKE_LEAD_MS` (default 45s) before `next_run_at`, sets `HERMES_DESKTOP=1` so the ticker runs, holds until the job’s `next_run_at` advances (or hold cap), then idle-stop reclaims Python.
-
-**Packaged proof** (`e2e/sovereign-packaged-cron-due.mjs`, output `apps/desktop/release/sovereign-cron-due/log.json`):
-
-| Event | Time (UTC) | Python |
-| --- | --- | --- |
-| Cron closed / idle | 10:27:57 | stopped |
-| Engine wake (~28s before due) | 10:29:23 | started |
-| Job fired (`last_status=ok`, marker written) | 10:30:23 | running |
-| After completion / idle | 10:30:27 | stopped again |
-
-Marker: `fired-at=2026-09-24T10:30:23Z`. Job record: `state=completed`, `repeat.completed=1`.
-
-Also verified earlier: Cron open starts Python; close + idle (`SOVEREIGN_FEATURE_IDLE_MS=1500`) stops it (`e2e/sovereign-install-launch.mjs`). Orphan cleanup quit + `kill -9` clean within 5s (`e2e/sovereign-packaged-orphan-cleanup.mjs`).
+Desktop cron ticks inside `hermes serve` when `HERMES_DESKTOP=1`. Idle-stop killed that process; `cron_wake.rs` starts Python `SOVEREIGN_CRON_WAKE_LEAD_MS` before `next_run_at`, holds until the job advances, then idle-stop reclaims it. Packaged proof: `apps/desktop/release/sovereign-cron-due/`.
 
 ## Step 1 — macOS arm64 (verified)
 
-- [x] Packaged Cron opens; Python starts only then; stops after idle override
-- [x] Due job still fires after idle stop (wake-before-due)
-- [x] Quit + `kill -9`: no orphan sovereign/python within 5s
-- [x] Ollama chat + tool approval → Run → executes (`qwen3.8:27b`)
-- [x] API-key first-run; key in `…/config/jcode/openai.env` mode **600**; full key never in stdout
-- [x] Unsigned `.dmg` + `.zip` on disk (`Hermes-0.17.6-mac-arm64.{dmg,zip}`)
+Unsigned `Hermes-0.17.6-mac-arm64.{dmg,zip}`; Cron idle; due-wake; orphan cleanup; Ollama chat + approval; API-key mode 600.
 
-### Chat + approval root causes fixed
+## Step 2 — Windows x64 + macOS x64
 
-1. **Ollama 4k budget:** Tool prefix alone is ~8–10k tokens. Engine now warms the model (`SOVEREIGN_OLLAMA_NUM_CTX`, default 32768) then refreshes the model catalog so `context_window()` is 32k (not the hard 4k fallback).
-2. **Composer Enter:** Multi-line `keyboard.type` submitted on the first `\n`; e2e uses a single-line `fill()`.
-3. **Safe vs Low:** In-cwd `echo > out.txt` is `RiskLevel::Safe` (no approval card). Truncating redirect **outside** session cwd is `Low` → approval UI. E2e writes to `$sandbox/approval-out.txt`.
+- NSIS workflow builds unsigned installer; smoke steps for launch/orphan/apikey (+ optional chat if Ollama present).
+- Fix (2026-09-24): gateway no longer wakes Python for unknown `/api/*` probes without `feature=1` (Windows smoke had failed with “Python started before a feature opened”).
+- macOS x64: `.github/workflows/sovereign-macos-x64.yml` (Intel runner).
 
-**Proof:** `apps/desktop/release/sovereign-chat/` (`approval.png`, `chat-done.png`, `ok: true`, contents `sovereign-packaged-ok`).
+## Step 3 — Benchmark (done)
 
-**API-key proof:** `apps/desktop/release/sovereign-apikey/result.json` (`ok: true`, `mode: "600"`, `stdoutHasFullKey: false`).
+See `docs/BENCHMARK.md`:
 
-## Step 2 — Windows x64 (verified build)
+- Ollama RSS idle/chat at 16k vs 32k → default **32768**
+- Warm-up alias keeps CONTEXT **32768** across 3 `/v1` turns (no reload)
+- Keep-alive **-1** while open / **0** on quit (not `"2h"`)
+- Tool-schema prefix **~8 200 tokens** as its own line item
+- Counting proxy vs stock Hermes: `docs/benchmark-runs/2026-09-24T12-45-25/` (`scripts/sovereign-vs-hermes-bench.mjs`)
 
-- [x] Audit: `dist:win:nsis` + `extraResources` sovereign/sovereign-python already wired
-- [x] `stage-sovereign-python.mjs` extended for `win32-x64` (`runtime/python.exe`)
-- [x] `before-pack.mjs` validates Windows python + `sovereign.exe`
-- [x] GHA workflow `.github/workflows/sovereign-windows-nsis.yml`
-- [x] Engine: link `sovereign-gateway` on Windows (`Cargo.toml`); CI green
-- [x] Unsigned NSIS artifact from https://github.com/hir0-pixel/hermes-agent/actions/runs/35994371563
-- [ ] Smoke-launch on a real Windows box (not done from this Mac)
+## Step 4 — Docs
 
-Engine checkout: `hir0-pixel/jcode@feature/sovereign-observability`.
+- [INSTALL.md](../../hermes-agent/INSTALL.md) (end-user install)
+- This HANDOFF
 
-## Step 3 — Benchmark (partial)
+## Re-verify warm-up quickly
 
-- [x] Ollama RSS at 16k vs 32k (idle unloaded / idle loaded / after chat) → default **32768**
-- [x] Warm-up = chat context (alias `sovereign/…:latest`, no `/v1` reload); keep_alive **-1** while open, **0** on quit
-- [x] Tool-schema prefix called out (~8.2k tokens / turn) in `docs/BENCHMARK.md`
-- [ ] Full counting-proxy comparison of model calls vs stock Hermes Desktop
-
-## Step 4 — Docs (open)
-
-## Not verified yet
-
-Live Windows smoke on a Windows box, macOS x64 package, full stock-Hermes counting-proxy table, INSTALL.md.
+```bash
+ALIAS=sovereign/qwen3.8-27b:latest
+curl -s http://127.0.0.1:11434/api/generate -d "{\"model\":\"$ALIAS\",\"prompt\":\".\",\"stream\":false,\"keep_alive\":-1}" >/dev/null
+for i in 1 2 3; do
+  curl -s http://127.0.0.1:11434/v1/chat/completions -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$ALIAS\",\"messages\":[{\"role\":\"user\",\"content\":\"t$i\"}],\"max_tokens\":4}" >/dev/null
+  ollama ps   # CONTEXT must stay 32768
+done
+```

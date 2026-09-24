@@ -1,0 +1,41 @@
+{
+  "stamp": "2026-09-24T12-45-25",
+  "baseModel": "qwen3.8:27b",
+  "alias": "sovereign/qwen3.8-27b:latest",
+  "hermesAlias": "sovereign/bench-hermes-64k:latest",
+  "hermesNumCtx": 65536,
+  "prompt": "Reply with exactly one word: pong",
+  "note": "Counting proxy on OpenAI-compat /v1. Hermes requires ≥64k (MINIMUM_CONTEXT_LENGTH) so it uses a dedicated 64k alias; Sovereign uses the product default 32k alias.",
+  "hermes": {
+    "ok": true,
+    "elapsed_ms": 100359,
+    "model_http_calls": 2,
+    "chat_completions": 2,
+    "prompt_tokens": 12560,
+    "completion_tokens": 20,
+    "paths": {
+      "/api/v1/models": 1,
+      "/api/tags": 1,
+      "/api/show": 5,
+      "/v1/chat/completions": 2,
+      "/v1/models": 1
+    }
+  },
+  "sovereign": {
+    "ok": true,
+    "elapsed_ms": 74962,
+    "model_http_calls": 4,
+    "chat_completions": 4,
+    "prompt_tokens": 13422,
+    "completion_tokens": 153,
+    "paths": {
+      "/v1/models": 3,
+      "/v1/chat/completions": 4
+    }
+  },
+  "delta": {
+    "model_http_calls": -2,
+    "prompt_tokens": -862,
+    "elapsed_ms": 25397
+  }
+}

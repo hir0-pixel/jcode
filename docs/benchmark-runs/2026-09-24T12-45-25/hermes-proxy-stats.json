@@ -1,0 +1,24 @@
+{
+  "started_at": "2026-09-24T12:45:38.622Z",
+  "upstream": "http://127.0.0.1:11434",
+  "listen": "127.0.0.1:18080",
+  "requests": 10,
+  "chat_completions": 2,
+  "api_chat": 0,
+  "api_generate": 0,
+  "other": 8,
+  "prompt_tokens": 12560,
+  "completion_tokens": 20,
+  "eval_count": 0,
+  "prompt_eval_count": 0,
+  "bytes_in": 53976,
+  "bytes_out": 142454,
+  "paths": {
+    "/api/v1/models": 1,
+    "/api/tags": 1,
+    "/api/show": 5,
+    "/v1/chat/completions": 2,
+    "/v1/models": 1
+  },
+  "updated_at": "2026-09-24T12:47:19.822Z"
+}
