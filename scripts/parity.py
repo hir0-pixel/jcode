@@ -93,8 +93,7 @@ def main() -> None:
 
     rest = hermes_rest_routes()
     served = rest_routes_handled()
-    served_paths = {p for _, p in served}
-    rest_done = [r for r in rest if (r[0], r[1]) in served or r[1] in served_paths]
+    rest_done = [r for r in rest if (r[0], r[1]) in served]
     out.append("")
     out.append(f"**HTTP routes in Hermes ({len(rest)}):** {len(rest_done)} served by the engine; the rest answer "
                "404 `not_supported_by_engine` (the desktop has fallbacks for missing routes).")
@@ -106,8 +105,8 @@ def main() -> None:
         by_router[r[2]].append(r)
     for router in sorted(by_router):
         rs = by_router[router]
-        done = [f"`{m} {p}`" for m, p, _ in rs if (m, p) in served or p in served_paths]
-        todo = [f"`{m} {p}`" for m, p, _ in rs if not ((m, p) in served or p in served_paths)]
+        done = [f"`{m} {p}`" for m, p, _ in rs if (m, p) in served]
+        todo = [f"`{m} {p}`" for m, p, _ in rs if (m, p) not in served]
         out.append(f"| {router} | {', '.join(done) or '–'} | {', '.join(todo) or '–'} |")
     print("\n".join(out))
 
