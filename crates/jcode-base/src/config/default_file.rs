@@ -466,28 +466,9 @@ swarm_max_concurrent_agents = 32
 # Env override: JCODE_SWARM_STRIP_LAYOUT
 # swarm_strip_layout = "vertical"
 #
-# Recall uses Jev typed Decisions directly, without embeddings or a sidecar LLM.
-# Provider values: auto, jcode, openrouter, typesafe, aimlapi.
-# auto prefers Jcode, then OpenRouter, TypeSafe, AI/ML API credentials.
-# Env override: JCODE_MEMORY_JEV_PROVIDER
-# memory_jev_provider = "auto"
-# Minimum relevance probability (0.8..=1.0). Invalid values fail closed.
-# memory_jev_threshold = 0.8
-# BYOK: OPENROUTER_API_KEY, TYPESAFE_API_KEY, or AIMLAPI_API_KEY.
-# Jcode requires an eligible subscription and gateway memory_jev capability.
-# With a Jcode login and an older gateway, explicitly select a BYOK provider.
-# No fallback after entitlement, auth, billing, or network failure; no silent BYOK spend.
-# Memories remain local; the query and candidate memories go to the selected provider.
-# No keys? Local memory list/search/remember/forget still work.
-#
-# Optional text-generating extraction is separate from recall. Disable it to
-# learn only through the main agent's explicit memory writes.
-# (OpenAI defaults to gpt-5.6-luna with reasoning effort "none").
-# Env overrides: JCODE_MEMORY_SIDECAR_ENABLED, JCODE_MEMORY_MODEL
-# memory_sidecar_enabled = true
-# memory_model = "gpt-5.6-luna"
-# Legacy memory_rerank_* and memory_embedding_* settings are accepted for
-# backwards compatibility, but have no effect on Jev recall.
+# Memory recall is local: an indexed full-text search over stored memories,
+# no model call and nothing sent anywhere. Learning from chats is the Prime
+# learning loop (SOVEREIGN_LEARNING=off|on|local-idle).
 
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.

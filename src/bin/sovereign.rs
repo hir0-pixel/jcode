@@ -102,9 +102,6 @@ fn main() -> Result<()> {
     // anonymous usage telemetry is disabled unconditionally.
     // SAFETY: single-threaded here, before the runtime starts.
     unsafe { std::env::set_var("JCODE_NO_TELEMETRY", "1") };
-    // Memory recall is local; remote Jev relevance calls are disabled.
-    // SAFETY: as above.
-    unsafe { std::env::set_var("SOVEREIGN_LOCAL_MEMORY", "1") };
     // Hermes does not stamp user messages with times; jcode's stamps cost
     // tokens and read to models like injected text.
     if std::env::var_os("JCODE_MESSAGE_TIMESTAMPS").is_none() {
@@ -114,13 +111,6 @@ fn main() -> Result<()> {
     // No integration discovery (it contacts a remote endpoint).
     // SAFETY: as above.
     unsafe { std::env::set_var("JCODE_SPONSORS_ENABLED", "0") };
-    // No hidden model spend: jcode's memory-extraction sidecar would call the
-    // model every 12 turns and on every disconnect. Learning belongs to the
-    // Prime loop (evidence-gated, signal-triggered, at most one pass per idle).
-    if std::env::var_os("JCODE_MEMORY_SIDECAR_ENABLED").is_none() {
-        // SAFETY: as above.
-        unsafe { std::env::set_var("JCODE_MEMORY_SIDECAR_ENABLED", "0") };
-    }
     // Token budget: tool definitions are ~97% of every request. Drop tools
     // that reach third parties or that the desktop cannot render. Override
     // with JCODE_DISABLED_TOOLS (set it to empty to keep everything).

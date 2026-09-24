@@ -501,7 +501,8 @@ impl App {
         if !enabled {
             crate::memory::clear_pending_memory(&self.session.id);
             crate::memory::clear_activity();
-            crate::memory_agent::reset();
+            crate::memory::clear_all_pending_memory();
+            crate::memory::clear_all_injected_memories();
             self.last_injected_memory_signature = None;
         }
     }
@@ -514,20 +515,6 @@ impl App {
     pub(super) fn set_autojudge_feature_enabled(&mut self, enabled: bool) {
         self.autojudge_enabled = enabled;
         self.session.autojudge_enabled = Some(enabled);
-    }
-
-    pub(super) fn trigger_save_memory_extraction(&self) {
-        let provider_messages = self.materialized_provider_messages();
-        if self.is_remote || !self.memory_enabled || provider_messages.len() < 4 {
-            return;
-        }
-
-        let transcript = crate::memory_agent::build_transcript_for_extraction(&provider_messages);
-        crate::memory_agent::trigger_final_extraction_with_dir(
-            transcript,
-            self.session.id.clone(),
-            self.session.working_dir.clone(),
-        );
     }
 
     pub(super) fn memory_prompt_signature(prompt: &str) -> String {

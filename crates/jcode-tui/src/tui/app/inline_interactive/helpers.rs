@@ -48,7 +48,6 @@ pub(super) fn agent_model_target_label(target: AgentModelTarget) -> &'static str
         AgentModelTarget::Swarm => "Swarm / subagent",
         AgentModelTarget::Review => "Code review",
         AgentModelTarget::Judge => "Judge",
-        AgentModelTarget::Memory => "Memory extraction",
         AgentModelTarget::Ambient => "Ambient",
     }
 }
@@ -58,7 +57,6 @@ pub(super) fn agent_model_target_slug(target: AgentModelTarget) -> &'static str 
         AgentModelTarget::Swarm => "swarm",
         AgentModelTarget::Review => "review",
         AgentModelTarget::Judge => "judge",
-        AgentModelTarget::Memory => "memory",
         AgentModelTarget::Ambient => "ambient",
     }
 }
@@ -68,7 +66,6 @@ pub(super) fn agent_model_target_config_path(target: AgentModelTarget) -> &'stat
         AgentModelTarget::Swarm => "agents.swarm_model",
         AgentModelTarget::Review => "autoreview.model",
         AgentModelTarget::Judge => "autojudge.model",
-        AgentModelTarget::Memory => "agents.memory_model",
         AgentModelTarget::Ambient => "ambient.model",
     }
 }
@@ -79,7 +76,6 @@ pub(super) fn load_agent_model_override(target: AgentModelTarget) -> Option<Stri
         AgentModelTarget::Swarm => cfg.agents.swarm_model,
         AgentModelTarget::Review => cfg.autoreview.model,
         AgentModelTarget::Judge => cfg.autojudge.model,
-        AgentModelTarget::Memory => cfg.agents.memory_model,
         AgentModelTarget::Ambient => cfg.ambient.model,
     }
 }
@@ -97,7 +93,6 @@ pub(super) fn save_agent_model_override(
         AgentModelTarget::Swarm => cfg.agents.swarm_model = value,
         AgentModelTarget::Review => cfg.autoreview.model = value,
         AgentModelTarget::Judge => cfg.autojudge.model = value,
-        AgentModelTarget::Memory => cfg.agents.memory_model = value,
         AgentModelTarget::Ambient => cfg.ambient.model = value,
     }
     cfg.save()
@@ -196,7 +191,6 @@ pub(super) fn model_entry_saved_spec(entry: &PickerEntry) -> String {
 
 pub(super) fn agent_model_inherit_fallback_label(target: AgentModelTarget) -> &'static str {
     match target {
-        AgentModelTarget::Memory => "extraction auto-select",
         AgentModelTarget::Swarm
         | AgentModelTarget::Review
         | AgentModelTarget::Judge
@@ -239,7 +233,6 @@ pub(super) fn agent_model_default_summary(target: AgentModelTarget, app: &App) -
             .or_else(|| super::commands::preferred_one_shot_review_override().map(|(m, _)| m))
             .or_else(|| app.session.model.clone())
             .or_else(|| Some(app.provider.model())),
-        AgentModelTarget::Memory => load_agent_model_override(target),
         AgentModelTarget::Ambient => load_agent_model_override(target),
     };
 
@@ -250,28 +243,6 @@ pub(super) fn agent_model_default_summary(target: AgentModelTarget, app: &App) -
 mod tests {
     use super::*;
     use crate::tui::{PickerAction, PickerEntry, PickerOption};
-
-    #[test]
-    fn memory_model_picker_describes_extraction_not_recall() {
-        let target = AgentModelTarget::Memory;
-        assert_eq!(agent_model_target_label(target), "Memory extraction");
-        assert_eq!(
-            agent_model_target_config_path(target),
-            "agents.memory_model"
-        );
-        assert_eq!(agent_model_target_slug(target), "memory");
-        for summary in [
-            None,
-            Some(""),
-            Some("unknown"),
-            Some("(sidecar auto-select)"),
-        ] {
-            assert_eq!(
-                normalize_agent_model_summary(target, summary.map(str::to_string)),
-                "extraction auto-select"
-            );
-        }
-    }
 
     fn entry(model: &str, route: PickerOption) -> PickerEntry {
         PickerEntry {

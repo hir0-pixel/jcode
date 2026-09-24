@@ -184,7 +184,7 @@ impl Tool for MemoryTool {
                 let scope = Self::parse_scope(input.scope.as_deref(), MemoryScope::All)?;
                 let mode = input.mode.as_deref().unwrap_or_else(|| {
                     if input.query.is_some() {
-                        "jev"
+                        "ranked"
                     } else {
                         "recent"
                     }
@@ -217,14 +217,11 @@ impl Tool for MemoryTool {
                         memory::set_state(MemoryState::Idle);
                         result
                     }
-                    "jev" | "semantic" | "cascade" => {
+                    // Older mode names are accepted as aliases of the local ranked recall.
+                    "ranked" | "jev" | "semantic" | "cascade" => {
                         let query = match &input.query {
                             Some(q) => q.clone(),
-                            None => {
-                                return Err(anyhow::anyhow!(
-                                    "query required for Jev recall (including semantic/cascade aliases)"
-                                ));
-                            }
+                            None => return Err(anyhow::anyhow!("query required for ranked recall")),
                         };
                         memory::set_state(MemoryState::ToolAction {
                             action: "recall".into(),
@@ -234,10 +231,9 @@ impl Tool for MemoryTool {
                         let results = if limit == 0 {
                             Ok(Vec::new())
                         } else {
-                            crate::memory_jev::recall(&manager, &query, limit, scope).await
+                            crate::memory_recall::recall(&manager, &query, limit, scope)
                         };
-                        // A missing Jev credential or failed request must not leave
-                        // the widget busy or silently fall back to unjudged recall.
+                        // A failed search must not leave the widget busy.
                         memory::set_state(MemoryState::Idle);
                         let results = results?;
 
@@ -277,7 +273,7 @@ impl Tool for MemoryTool {
                         }
                     }
                     other => Err(anyhow::anyhow!(
-                        "Unknown mode: {}. Use recent or jev (semantic/cascade are Jev aliases)",
+                        "Unknown mode: {}. Use recent or ranked",
                         other
                     )),
                 }
@@ -542,7 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queried_recall_uses_jev_for_default_and_legacy_aliases() {
+    async fn queried_recall_is_local_for_default_and_legacy_aliases() {
         let _guard = crate::storage::lock_test_env();
         let home = tempfile::tempdir().unwrap();
         let _env = OfflineEnv::new(home.path());
@@ -550,47 +546,36 @@ mod tests {
         let tool = MemoryTool::new();
         let ctx = || test_ctx(Some(project.path().to_path_buf()));
         tool.execute(
-            json!({"action":"remember", "content":"jev-only-recall-probe", "scope":"project"}),
+            json!({"action":"remember", "content":"the staging deploy needs two approvals", "scope":"project"}),
             ctx(),
         )
         .await
         .unwrap();
 
-        for mode in [None, Some("jev"), Some("semantic"), Some("cascade")] {
-            let mut input =
-                json!({"action":"recall", "query":"jev-only-recall-probe", "scope":"project"});
+        // Recall works offline with no credentials, for the default and every old alias.
+        for mode in [None, Some("ranked"), Some("jev"), Some("semantic"), Some("cascade")] {
+            let mut input = json!({"action":"recall", "query":"staging deploy approvals", "scope":"project"});
             if let Some(mode) = mode {
                 input["mode"] = json!(mode);
             }
-            let error = tool
-                .execute(input.clone(), ctx())
-                .await
-                .expect_err("populated query recall without credentials must fail closed");
-            assert!(error.to_string().contains("Jev"), "{mode:?}: {error}");
-            assert!(!error.to_string().contains("jev-only-recall-probe"));
+            let output = tool.execute(input.clone(), ctx()).await.unwrap();
+            assert!(output.output.contains("two approvals"), "{mode:?}: {}", output.output);
 
             input["limit"] = json!(0);
-            let output = tool
-                .execute(input, ctx())
-                .await
-                .expect("zero limit must not require a key or a network request");
+            let output = tool.execute(input, ctx()).await.unwrap();
             assert!(!output.output.contains("id:"), "{}", output.output);
         }
 
-        // An empty selected scope is not allowed to borrow candidates from
-        // another scope (which would also require unavailable Jev credentials).
+        // A scope never borrows memories from another scope.
         let empty = tool
-            .execute(
-                json!({"action":"recall", "query":"probe", "scope":"global"}),
-                ctx(),
-            )
+            .execute(json!({"action":"recall", "query":"staging deploy", "scope":"global"}), ctx())
             .await
             .unwrap();
         assert!(empty.output.starts_with("No memories found"));
         let other_project = tempfile::tempdir().unwrap();
         let empty = tool
             .execute(
-                json!({"action":"recall", "query":"probe", "scope":"project"}),
+                json!({"action":"recall", "query":"staging deploy", "scope":"project"}),
                 test_ctx(Some(other_project.path().to_path_buf())),
             )
             .await

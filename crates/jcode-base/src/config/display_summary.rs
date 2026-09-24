@@ -102,8 +102,7 @@ impl Config {
 - Spawn hook: {}
 - Review: {}
 - Judge: {}
-- Memory recall: Jev ({})
-- Memory extraction sidecar: {}
+- Memory recall: local (indexed search)
 - Ambient: {}
 
 **Gateway:**
@@ -294,12 +293,6 @@ impl Config {
                 .model
                 .as_deref()
                 .unwrap_or("(inherit current session)"),
-            self.agents.memory_jev_provider,
-            if self.agents.memory_sidecar_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
             self.ambient
                 .model
                 .as_deref()

@@ -1112,22 +1112,6 @@ pub(super) async fn handle_comm_stop(
         remove_background_tool_signal(&target_session);
         if let Ok(mut agent) = agent_arc.try_lock() {
             agent.mark_closed();
-            let memory_enabled = agent.memory_enabled();
-            let transcript = if memory_enabled {
-                Some(agent.build_transcript_for_extraction())
-            } else {
-                None
-            };
-            let sid = target_session.clone();
-            let working_dir = agent.working_dir().map(|dir| dir.to_string());
-            drop(agent);
-            if let Some(transcript) = transcript {
-                crate::memory_agent::trigger_final_extraction_with_dir(
-                    transcript,
-                    sid,
-                    working_dir,
-                );
-            }
         }
     }
 

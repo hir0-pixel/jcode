@@ -626,36 +626,6 @@ pub(super) async fn handle_rename_session(
     );
 }
 
-pub(super) async fn handle_trigger_memory_extraction(
-    id: u64,
-    agent: &Arc<Mutex<Agent>>,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-) {
-    let extraction = {
-        let agent_guard = agent.lock().await;
-        if !agent_guard.memory_enabled() {
-            None
-        } else {
-            let transcript = agent_guard.build_transcript_for_extraction();
-            if transcript.len() < 200 {
-                None
-            } else {
-                Some((
-                    transcript,
-                    agent_guard.session_id().to_string(),
-                    agent_guard.working_dir().map(|dir| dir.to_string()),
-                ))
-            }
-        }
-    };
-
-    if let Some((transcript, session_id, working_dir)) = extraction {
-        crate::memory_agent::trigger_final_extraction_with_dir(transcript, session_id, working_dir);
-    }
-
-    let _ = client_event_tx.send(ServerEvent::Done { id });
-}
-
 fn clone_split_session(
     parent_session_id: &str,
     live_parent: Option<&Session>,

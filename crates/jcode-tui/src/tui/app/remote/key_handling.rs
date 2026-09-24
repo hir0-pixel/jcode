@@ -1897,14 +1897,6 @@ async fn handle_remote_key_internal(
                     // this it would persist `saved: false` on its next save.
                     remote.set_session_saved(true, label.clone()).await?;
                     crate::tui::session_picker::invalidate_session_list_cache();
-                    if app.memory_enabled
-                        && let Err(err) = remote.trigger_memory_extraction().await
-                    {
-                        crate::logging::info(&format!(
-                            "Failed to trigger memory extraction for saved remote session: {}",
-                            err
-                        ));
-                    }
                     let name = app.session.display_name().to_string();
                     let msg = if let Some(ref lbl) = app.session.save_label {
                         format!(

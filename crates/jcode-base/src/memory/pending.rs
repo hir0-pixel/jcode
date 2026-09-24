@@ -666,22 +666,6 @@ pub fn has_any_pending_memory() -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn begin_memory_check(session_id: &str) -> bool {
-    if let Ok(mut guard) = MEMORY_CHECK_IN_PROGRESS.lock() {
-        let set = guard.get_or_insert_with(HashSet::new);
-        return set.insert(session_id.to_string());
-    }
-    false
-}
-
-pub(super) fn finish_memory_check(session_id: &str) {
-    if let Ok(mut guard) = MEMORY_CHECK_IN_PROGRESS.lock()
-        && let Some(set) = guard.as_mut()
-    {
-        set.remove(session_id);
-    }
-}
-
 #[cfg(test)]
 pub(super) fn insert_pending_memory_for_test(session_id: &str, pending: PendingMemory) {
     let mut guard = PENDING_MEMORY.lock().expect("pending memory lock");

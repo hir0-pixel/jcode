@@ -343,29 +343,6 @@ fn format_context_includes_roles_and_tools() {
 }
 
 #[test]
-fn extraction_context_keeps_tool_io_details() {
-    let messages = vec![
-        Message::user("Hello world"),
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "memory".to_string(),
-                input: json!({"action": "list"}),
-                thought_signature: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
-        Message::tool_result("tool-1", "ok", false),
-    ];
-
-    let context = format_context_for_extraction(&messages);
-    assert!(context.contains("[Tool: memory input:"));
-    assert!(context.contains("[Tool result: ok]"));
-}
-
-#[test]
 fn memory_store_format_groups_by_category() {
     let mut store = MemoryStore::new();
     let now = Utc::now();

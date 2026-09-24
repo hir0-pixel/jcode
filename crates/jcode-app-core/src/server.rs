@@ -1418,13 +1418,6 @@ impl Server {
         // "N streaming" and toggles a best-effort OS power inhibitor accordingly.
         Self::spawn_power_inhibitor(Arc::clone(&self.swarm_state.members));
 
-        // Initialize the memory agent early so it's ready for all sessions
-        if crate::config::config().features.memory {
-            tokio::spawn(async {
-                let _ = crate::memory_agent::init().await;
-            });
-        }
-
         // Spawn the background ambient/schedule loop.
         if let Some(ref runner) = self.ambient_runner {
             let ambient_handle = runner.clone();

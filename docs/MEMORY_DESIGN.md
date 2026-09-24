@@ -1,6 +1,7 @@
 # Sovereign memory and storage: design and build plan
 
-Status (2026-09-24): M1 built, M2 in progress. Where the build departed from this proposal:
+Status (2026-09-25): M1 and M2 built, M3 built (gate pending). Where the build departed from
+this proposal:
 
 - **Chats stay in jcode's session store** (snapshot + append-only journal), not Hermes's
   `state.db`: about 30 jcode modules read those files directly (crash recovery, replay,
@@ -18,6 +19,18 @@ Status (2026-09-24): M1 built, M2 in progress. Where the build departed from thi
   slower here), `temp_store=MEMORY` (no gain), large cache/mmap pragmas (RAM matters more).
   jcode's behaviours are unchanged: recalled memory is appended at the end of the prompt,
   each memory at most once per session, nothing when nothing matches, at most 5.
+- **M3 hidden spend, found and removed:** Hermes's skill curator ran from `hermes serve`'s
+  maintenance tick (it can fork a background agent that spends model calls) together with
+  skill-sync pulls; that auto-trigger is removed from the serve tick (the curator module stays
+  for manual `hermes curator run`). jcode's LLM memory-extraction sidecar (a model call every
+  12 turns and on every disconnect), its rerank/judge path, the remote Jev relevance service
+  (memory, browser handoff, voice intent) and their config keys are removed from the engine.
+- **M3 learning loop** (`sovereign-prime/src/learning.rs`, `sovereign-gateway/src/learn.rs`):
+  automatic after a chat goes idle (or after 10 unexamined turns), signal-gated with no model
+  call when there is no signal, one call per pass, evidence from user/assistant messages only,
+  at most 3 memories plus one instruction change through the `/refine` gates, a per-chat
+  watermark so nothing is examined twice. `SOVEREIGN_LEARNING=off|on|local-idle` (default:
+  learns only on a local model).
 - **No `memory_injections` table:** jcode already records each injection in the session
   (persisted) and restores the inject-once set when a session is resumed; a table would
   store the same fact twice.

@@ -13,7 +13,6 @@ use crate::memory_types::{
     StepStatus,
     ranking::{top_k_by_ord, top_k_by_score},
 };
-use crate::sidecar::Sidecar;
 use crate::storage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -54,15 +53,11 @@ pub use pending::{
 };
 #[cfg(test)]
 use pending::{backdate_injected_memory_for_test, insert_pending_memory_for_test};
-use pending::{begin_memory_check, finish_memory_check};
-pub(crate) use prompt_support::format_context_for_extraction;
 pub use prompt_support::{
     focus_query_text, format_context_for_relevance, format_focused_query_for_relevance,
 };
 
 const LEGACY_NOTE_CATEGORY: &str = "note";
-const MEMORY_RELEVANCE_MAX_CANDIDATES: usize = 30;
-const MEMORY_RELEVANCE_MAX_RESULTS: usize = 10;
 
 /// Producer of synthetic [`MemoryEntry`] values contributed by a higher layer.
 ///
@@ -115,30 +110,6 @@ struct LegacyNoteEntry {
 }
 
 pub type MemoryEventSink = Arc<dyn Fn(crate::protocol::ServerEvent) + Send + Sync>;
-
-/// Optional text-generating extraction is independent of Jev recall.
-pub fn memory_sidecar_enabled() -> bool {
-    crate::config::config().agents.memory_sidecar_enabled
-}
-
-/// Availability of the optional extraction sidecar, never used to gate recall.
-pub fn memory_llm_judge_available() -> bool {
-    memory_sidecar_enabled() && crate::sidecar::Sidecar::llm_backend_available()
-}
-
-/// Recall requires a Jev credential route. Subscription entitlement is checked
-/// by the gateway, not inferred from a cached client tier.
-pub fn memory_runtime_active() -> bool {
-    // Sovereign recalls locally; it never needs a remote Jev provider.
-    crate::memory_jev::local_mode() || crate::jev::JevClient::available()
-}
-
-fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {
-    let (Some(event_tx), Some(activity)) = (event_tx, activity_snapshot()) else {
-        return;
-    };
-    (event_tx)(crate::protocol::ServerEvent::MemoryActivity { activity });
-}
 
 trait MemoryEntryEmbeddingExt {
     fn ensure_embedding(&mut self) -> bool;
@@ -835,37 +806,6 @@ impl MemoryManager {
         format_entries_for_prompt(&all_entries, limit)
     }
 
-    pub async fn relevant_prompt_for_messages(
-        &self,
-        messages: &[crate::message::Message],
-    ) -> Result<Option<String>> {
-        let context = format_context_for_relevance(messages);
-        if context.is_empty() {
-            return Ok(None);
-        }
-        self.relevant_prompt_for_context(
-            &context,
-            MEMORY_RELEVANCE_MAX_CANDIDATES,
-            MEMORY_RELEVANCE_MAX_RESULTS,
-        )
-        .await
-    }
-
-    pub async fn relevant_prompt_for_context(
-        &self,
-        context: &str,
-        max_candidates: usize,
-        limit: usize,
-    ) -> Result<Option<String>> {
-        let relevant = self
-            .get_relevant_for_context(context, max_candidates)
-            .await?;
-        if relevant.is_empty() {
-            return Ok(None);
-        }
-        Ok(format_relevant_prompt(&relevant, limit))
-    }
-
     pub fn search(&self, query: &str) -> Result<Vec<MemoryEntry>> {
         self.search_scoped(query, MemoryScope::All)
     }
@@ -916,267 +856,14 @@ impl MemoryManager {
 
     // === Sidecar Integration ===
 
-    /// Extract memories from a session transcript using the Haiku sidecar
-    pub async fn extract_from_transcript(
-        &self,
-        transcript: &str,
-        session_id: &str,
-    ) -> Result<Vec<String>> {
-        if !memory_llm_judge_available() {
-            crate::logging::info("Memory transcript extraction skipped: LLM judge unavailable");
-            return Ok(Vec::new());
-        }
-
-        let sidecar = Sidecar::new();
-        let extracted = sidecar.extract_memories(transcript).await?;
-
-        let mut ids = Vec::new();
-        for memory in extracted {
-            let category: MemoryCategory = memory.category.parse().unwrap_or(MemoryCategory::Fact);
-            let trust = match memory.trust.as_str() {
-                "high" => TrustLevel::High,
-                "medium" => TrustLevel::Medium,
-                _ => TrustLevel::Low,
-            };
-
-            let entry = MemoryEntry::new(category, memory.content)
-                .with_source(session_id)
-                .with_trust(trust);
-
-            // Store in project scope by default
-            let id = self.remember_project(entry)?;
-            ids.push(id);
-        }
-
-        Ok(ids)
-    }
-
-    /// Recall directly through Jev. The legacy `max_candidates` argument now
-    /// limits output, not the input pool: old memories must remain discoverable.
-    pub async fn get_relevant_for_context(
-        &self,
-        context: &str,
-        max_candidates: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        Ok(
-            crate::memory_jev::recall(self, context, max_candidates, MemoryScope::All)
-                .await?
-                .into_iter()
-                .map(|(entry, _)| entry)
-                .collect(),
-        )
-    }
-
-    /// Local keyword lookup, available without a remote decision provider.
-    pub fn get_relevant_keywords(
-        &self,
-        keywords: &[&str],
-        limit: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        let normalized_keywords: Vec<String> = keywords
-            .iter()
-            .map(|keyword| normalize_search_text(keyword))
-            .filter(|keyword| !keyword.is_empty())
-            .collect();
-        if normalized_keywords.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let matches: Vec<_> = top_k_by_ord(
-            self.collect_memories_scoped(MemoryScope::All)?
-                .into_iter()
-                .filter(|entry| {
-                    let content_lower = normalize_search_text(&entry.content);
-                    normalized_keywords
-                        .iter()
-                        .any(|kw| content_lower.contains(kw))
-                })
-                .map(|entry| {
-                    let updated_at = entry.updated_at.timestamp_millis();
-                    (entry, updated_at)
-                }),
-            limit,
-        )
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .collect();
-
-        Ok(matches)
-    }
-
     // === Async Memory Checking ===
-
-    /// Spawn a background task to check memory relevance for a specific session.
-    /// Results are stored in PENDING_MEMORY keyed by session_id and can be retrieved
-    /// with take_pending_memory(session_id).
-    /// This method returns immediately and never blocks the caller.
-    /// Only ONE memory check runs at a time per session - additional calls are ignored.
-    pub fn spawn_relevance_check(
-        &self,
-        session_id: &str,
-        messages: std::sync::Arc<[crate::message::Message]>,
-        event_tx: Option<MemoryEventSink>,
-    ) {
-        let sid = session_id.to_string();
-
-        if !begin_memory_check(&sid) {
-            return;
-        }
-
-        let manager = self.clone();
-
-        tokio::spawn(async move {
-            match manager
-                .get_relevant_parallel(&sid, &messages, event_tx.clone())
-                .await
-            {
-                Ok(MemoryRelevanceResult {
-                    prompt: Some(prompt),
-                    display_prompt,
-                    selected_entries,
-                }) => {
-                    let count = selected_entries.len();
-                    set_pending_memory_for_project_with_selection(
-                        &sid,
-                        prompt,
-                        count,
-                        &selected_entries,
-                        display_prompt,
-                        manager
-                            .project_dir
-                            .as_deref()
-                            .and_then(|path| path.to_str()),
-                    );
-                    emit_memory_activity(event_tx.as_ref());
-                }
-                Ok(MemoryRelevanceResult { prompt: None, .. }) => {
-                    clear_pending_memory(&sid);
-                    set_state(MemoryState::Idle);
-                    emit_memory_activity(event_tx.as_ref());
-                }
-                Err(e) => {
-                    clear_pending_memory(&sid);
-                    crate::logging::error(&format!("Background memory check failed: {}", e));
-                    add_event(MemoryEventKind::Error {
-                        message: e.to_string(),
-                    });
-                    set_state(MemoryState::Idle);
-                    emit_memory_activity(event_tx.as_ref());
-                }
-            }
-
-            finish_memory_check(&sid);
-        });
-    }
-
-    /// Jev-only automatic recall. Storage and per-session dedup remain local;
-    /// there is no embedding, conventional LLM, or unjudged fallback path.
-    pub async fn get_relevant_parallel(
-        &self,
-        session_id: &str,
-        messages: &[crate::message::Message],
-        event_tx: Option<MemoryEventSink>,
-    ) -> Result<MemoryRelevanceResult> {
-        let query = format_focused_query_for_relevance(messages);
-        let query = crate::util::truncate_str(&query, crate::memory_jev::MAX_QUERY_BYTES);
-        if query.trim().is_empty() {
-            return Ok(MemoryRelevanceResult::default());
-        }
-        pipeline_start();
-        let local = crate::memory_jev::local_mode();
-        // Local recall queries the index directly; loading every memory is only
-        // needed to hand them to the remote relevance service.
-        let loaded = if local { Ok(Vec::new()) } else { crate::memory_jev::collect_scoped(self, MemoryScope::All) };
-        let entries = match loaded {
-            Ok(entries) => entries,
-            Err(error) => {
-                clear_pending_memory(session_id);
-                pipeline_update(|p| {
-                    p.search = StepStatus::Error;
-                    p.verify = StepStatus::Skipped;
-                    p.inject = StepStatus::Skipped;
-                });
-                set_state(MemoryState::Idle);
-                emit_memory_activity(event_tx.as_ref());
-                return Err(error);
-            }
-        };
-        let entries: Vec<_> = entries
-            .into_iter()
-            .filter(|entry| entry.active && !is_memory_injected(session_id, &entry.id))
-            .collect();
-        pipeline_update(|p| {
-            p.search = StepStatus::Done;
-            p.search_result = Some(StepResult {
-                summary: format!("{} local memories", entries.len()),
-                latency_ms: 0,
-            });
-            p.verify = StepStatus::Running;
-            p.maintain = StepStatus::Skipped;
-        });
-        set_state(MemoryState::SidecarChecking {
-            count: entries.len(),
-        });
-        emit_memory_activity(event_tx.as_ref());
-        let started = Instant::now();
-        let result = async {
-            if local {
-                return Ok(self.recall_local(Some(session_id), query, 5, MemoryScope::All)?.into_iter().map(|e| (e, 1.0)).collect());
-            }
-            if entries.is_empty() {
-                return Ok(Vec::new());
-            }
-            let client = crate::jev::JevClient::new()?;
-            crate::memory_jev::select(&client, query, entries, 5).await
-        }
-        .await;
-        let relevant: Vec<MemoryEntry> = match result {
-            Ok(results) => results.into_iter().map(|(entry, _)| entry).collect(),
-            Err(error) => {
-                clear_pending_memory(session_id);
-                pipeline_update(|p| {
-                    p.verify = StepStatus::Error;
-                    p.inject = StepStatus::Skipped;
-                });
-                set_state(MemoryState::Idle);
-                emit_memory_activity(event_tx.as_ref());
-                return Err(error);
-            }
-        };
-        let count = relevant.len();
-        pipeline_update(|p| {
-            p.verify = StepStatus::Done;
-            p.verify_result = Some(StepResult {
-                summary: format!("Jev: {count} relevant"),
-                latency_ms: started.elapsed().as_millis() as u64,
-            });
-            p.inject = if count == 0 {
-                StepStatus::Skipped
-            } else {
-                StepStatus::Pending
-            };
-        });
-        let prompt = format_relevant_prompt(&relevant, 5);
-        let display = format_relevant_display_prompt(&relevant, 5);
-        set_state(if count == 0 {
-            MemoryState::Idle
-        } else {
-            MemoryState::FoundRelevant { count }
-        });
-        emit_memory_activity(event_tx.as_ref());
-        Ok(MemoryRelevanceResult {
-            prompt,
-            display_prompt: display,
-            selected_entries: relevant,
-        })
-    }
 
     /// Local recall (sovereign): an indexed full-text query over the stored
     /// memories instead of loading and scanning all of them. Skips memories
     /// already injected into `session_id`, applies the never-pad floor
-    /// (`memory_jev::meets_term_floor`) and returns at most `limit`, best first.
+    /// (`memory_recall::meets_term_floor`) and returns at most `limit`, best first.
     pub fn recall_local(&self, session_id: Option<&str>, query: &str, limit: usize, scope: MemoryScope) -> Result<Vec<MemoryEntry>> {
-        let mut terms = crate::memory_jev::local_terms(query);
+        let mut terms = crate::memory_recall::local_terms(query);
         terms.sort();
         terms.dedup();
         if terms.is_empty() || limit == 0 {
@@ -1200,7 +887,7 @@ impl MemoryManager {
         Ok(candidates
             .into_iter()
             .filter(|e| session_id.is_none_or(|s| !is_memory_injected(s, &e.id)))
-            .filter(|e| crate::memory_jev::meets_term_floor(&terms, e))
+            .filter(|e| crate::memory_recall::meets_term_floor(&terms, e))
             .take(limit)
             .collect())
     }

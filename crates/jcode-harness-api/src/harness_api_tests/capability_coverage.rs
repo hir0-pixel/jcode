@@ -82,7 +82,6 @@ const LEDGER: &[(&str, Disposition)] = &[
     ("InvalidateOpenAiUsage", Covered),
     ("Transcript", ClientInternal),
     ("Transfer", ClientInternal),
-    ("TriggerMemoryExtraction", ClientInternal),
 ];
 
 /// Requests the reference clients (TUI) send to the daemon.

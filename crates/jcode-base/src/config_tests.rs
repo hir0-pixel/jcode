@@ -539,33 +539,6 @@ fn test_env_override_focus_hook() {
 }
 
 #[test]
-fn test_memory_sidecar_enabled_defaults_true() {
-    // The LLM precision-judge path is the only reliably productive memory mode,
-    // so memory uses it by default. Users opt into the no-LLM hybrid path
-    // explicitly by setting this false.
-    let cfg = Config::default();
-    assert!(cfg.agents.memory_sidecar_enabled);
-}
-
-#[test]
-fn test_env_override_memory_sidecar() {
-    let _guard = crate::storage::lock_test_env();
-    let prev_model = std::env::var_os("JCODE_MEMORY_MODEL");
-    let prev_enabled = std::env::var_os("JCODE_MEMORY_SIDECAR_ENABLED");
-    crate::env::set_var("JCODE_MEMORY_MODEL", "claude-haiku-4");
-    crate::env::set_var("JCODE_MEMORY_SIDECAR_ENABLED", "true");
-
-    let mut cfg = Config::default();
-    cfg.apply_env_overrides();
-
-    assert_eq!(cfg.agents.memory_model.as_deref(), Some("claude-haiku-4"));
-    assert!(cfg.agents.memory_sidecar_enabled);
-
-    restore_env_var("JCODE_MEMORY_MODEL", prev_model);
-    restore_env_var("JCODE_MEMORY_SIDECAR_ENABLED", prev_enabled);
-}
-
-#[test]
 fn tool_config_defaults_to_full_toolset() {
     let config = ToolConfig::default();
     let selection = config.selection();
@@ -773,9 +746,8 @@ fn test_generated_default_config_has_expected_user_defaults() {
         "generated default config should document agent spawn defaults"
     );
     assert!(
-        content.contains("memory_model = \"gpt-5.6-luna\"")
-            && content.contains("reasoning effort \"none\""),
-        "generated default config should document the Luna memory sidecar default"
+        content.contains("Memory recall is local"),
+        "generated default config should document local memory recall"
     );
 
     // Effort keys come from the per-platform keybinding registry; the template

@@ -1791,7 +1791,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             return true;
         }
         crate::tui::session_picker::invalidate_session_list_cache();
-        app.trigger_save_memory_extraction();
         let name = app.session.display_name().to_string();
         let msg = if let Some(ref lbl) = app.session.save_label {
             format!(
@@ -3048,7 +3047,6 @@ fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
         "judge" | "judging" | "execution-judge" | "autojudge" => {
             Some(crate::tui::AgentModelTarget::Judge)
         }
-        "memory" | "memories" | "sidecar" => Some(crate::tui::AgentModelTarget::Memory),
         "ambient" => Some(crate::tui::AgentModelTarget::Ambient),
         _ => None,
     }

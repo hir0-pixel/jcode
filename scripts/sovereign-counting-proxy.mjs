@@ -73,6 +73,7 @@ function purposeOf(body) {
   const lastText = textOf(last.content)
   if (body.prompt !== undefined && !messages.length) return 'warm-up'
   if (all.includes('You name chat sessions')) return 'title'
+  if (all.includes('You learn durable lessons')) return 'learning pass'
   if (/Review the conversation above/.test(lastText)) return 'memory/skill review'
   if (all.includes('[CONTEXT SUMMARY]') || /summari[sz]e (the|this) (conversation|transcript)/i.test(lastText)) {
     return 'compression'

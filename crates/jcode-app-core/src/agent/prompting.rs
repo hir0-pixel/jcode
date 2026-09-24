@@ -84,23 +84,6 @@ impl Agent {
             None
         };
 
-        // Use the persistent memory-agent pipeline as the single source of truth.
-        // Running both this and the legacy MemoryManager background retrieval path
-        // can prepare overlapping pending prompts for the same turn, which makes
-        // memory injection feel overly aggressive.
-        // Relevance results are consumed only at the start of a fresh user turn.
-        // Enqueuing again after every tool result runs the local embedding model
-        // for each provider continuation without creating an additional injection
-        // opportunity. One update per user turn keeps memory current while avoiding
-        // redundant 512-token inference during tool-heavy agent loops.
-        if fresh_user_turn {
-            crate::memory_agent::update_context_sync_with_dir(
-                session_id,
-                messages,
-                self.session.working_dir.clone(),
-            );
-        }
-
         pending
     }
 

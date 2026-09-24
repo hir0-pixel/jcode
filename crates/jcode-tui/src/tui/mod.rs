@@ -1443,7 +1443,6 @@ pub enum AgentModelTarget {
     Swarm,
     Review,
     Judge,
-    Memory,
     Ambient,
 }
 

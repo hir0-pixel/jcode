@@ -1642,15 +1642,13 @@ async fn run_memory_command_for_dir(
 
         MemorySubcommand::Search { query, semantic } => {
             if semantic {
-                match crate::memory_jev::recall(&manager, &query, 20, memory::MemoryScope::All)
-                    .await
-                {
+                match crate::memory_recall::recall(&manager, &query, 20, memory::MemoryScope::All) {
                     Ok(results) => {
                         if results.is_empty() {
                             println!("No memories found matching '{}'", query);
                         } else {
                             println!(
-                                "Found {} memories matching '{}' (Jev relevance):\n",
+                                "Found {} memories matching '{}' (ranked):\n",
                                 results.len(),
                                 query
                             );

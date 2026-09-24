@@ -327,7 +327,7 @@ pub(crate) fn import_json_once(db_path: &Path, memory_dir: &Path, load: impl Fn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_jev::{local_terms, meets_term_floor};
+    use crate::memory_recall::{local_terms, meets_term_floor};
     use crate::memory_types::MemoryCategory;
 
     fn db() -> (tempfile::TempDir, PathBuf) {
