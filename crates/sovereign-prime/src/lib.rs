@@ -8,6 +8,7 @@
 //! down.
 
 pub mod harness;
+pub mod learning;
 pub mod host;
 pub mod worker;
 

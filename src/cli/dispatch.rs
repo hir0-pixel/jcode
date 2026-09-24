@@ -1411,6 +1411,7 @@ async fn run_gateway(
         let provider = refine_provider.clone();
         Box::pin(async move { provider.complete_simple(&user, &system).await })
     });
+    let learning = sovereign_learning(&provider_choice);
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let default_cwd = std::env::var("HERMES_DESKTOP_CWD")
@@ -1447,6 +1448,7 @@ async fn run_gateway(
             complete: Some(complete),
             approval_secret: approval_secret.clone(),
             features: hermes_feature_command().map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd))),
+            learning: learning.clone(),
         })
         .await?;
         let port = gateway.local_addr().port();
@@ -1851,3 +1853,54 @@ async fn run_server_keepalive(
 #[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod dispatch_tests;
+
+/// The Prime learning loop's switch: `SOVEREIGN_LEARNING=off|on|local-idle`.
+/// The default (`local-idle`) learns automatically only on a local model, so
+/// a paid API never gets extra calls unless the user turns learning on.
+fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::learn::Learning> {
+    let loopback = |base: &str| ["://127.0.0.1", "://localhost", "://[::1]"].iter().any(|host| base.contains(host));
+    // The active named profile's base URL lives in config.toml, not the env.
+    let profile_base = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        .ok()
+        .and_then(|name| crate::config::config().providers.get(&name).map(|p| p.base_url.clone()));
+    let local = matches!(provider, ProviderChoice::Ollama | ProviderChoice::Lmstudio)
+        || profile_base.as_deref().is_some_and(loopback)
+        || ["JCODE_OPENROUTER_API_BASE", "JCODE_OPENAI_COMPAT_API_BASE", "JCODE_ANTHROPIC_API_BASE"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .any(|base| loopback(&base));
+    let on = match std::env::var("SOVEREIGN_LEARNING").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "off" => false,
+        "on" => true,
+        _ => local,
+    };
+    eprintln!("sovereign: learning {} (local model: {local})", if on { "on" } else { "off" });
+    if !on {
+        return None;
+    }
+    let idle_ms = std::env::var("SOVEREIGN_LEARN_IDLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120_000);
+    let remember: sovereign_gateway::learn::Remember = std::sync::Arc::new(|memories, cwd: Option<String>| {
+        use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
+        // Learned lessons are about the user and how they work: global scope,
+        // with the chat's project attached so project scope can be added later.
+        let manager = match cwd {
+            Some(dir) => MemoryManager::new().with_project_dir(dir),
+            None => MemoryManager::new(),
+        };
+        let before = manager.load_global_graph()?.memories.len();
+        for m in memories {
+            let category = match m.kind.as_str() {
+                "preference" => MemoryCategory::Preference,
+                "correction" => MemoryCategory::Correction,
+                _ => MemoryCategory::Fact,
+            };
+            let mut entry = MemoryEntry::new(category, m.text);
+            entry.trust = if m.user_stated { TrustLevel::High } else { TrustLevel::Medium };
+            entry.source = Some("prime-learning".to_string());
+            manager.remember_global(entry)?;
+        }
+        Ok(manager.load_global_graph()?.memories.len().saturating_sub(before))
+    });
+    Some(sovereign_gateway::learn::Learning { idle: std::time::Duration::from_millis(idle_ms), remember })
+}
+

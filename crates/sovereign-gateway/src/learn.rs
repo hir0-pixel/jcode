@@ -1,0 +1,86 @@
+//! Automatic learning (the Prime loop) for chats served by this gateway.
+//!
+//! After every completed turn a timer starts. When it fires and the chat is
+//! still idle (no newer turn, nothing running), one pass looks at the messages
+//! no earlier pass has seen: with no learning signal it records the watermark
+//! and stops (no model call); with one it makes a single call, stores the
+//! evidenced memories and applies an evidenced instruction change through the
+//! Continual Harness gates. Long chats that never go idle for long get a short
+//! timer once ten turns have gone unexamined, like Hermes's review cadence.
+
+use crate::rpc::Conn;
+use serde_json::json;
+use sovereign_prime::harness::{Harness, Outcome, Turn};
+use sovereign_prime::learning::{self, Memory};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Store learned memories; `cwd` is the chat's working directory. Returns how
+/// many were new (duplicates only reinforce).
+pub type Remember = Arc<dyn Fn(Vec<Memory>, Option<String>) -> anyhow::Result<usize> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct Learning {
+    /// Idle time after a turn before a pass runs.
+    pub idle: Duration,
+    pub remember: Remember,
+}
+
+/// Unexamined turns after which the short timer applies.
+pub const CADENCE_TURNS: usize = 10;
+pub const CADENCE_IDLE: Duration = Duration::from_secs(15);
+
+/// One learning pass over `session`'s unexamined messages. Returns a short
+/// human summary when something was learned.
+pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -> anyhow::Result<Option<String>> {
+    let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
+    let harness = Harness::new(std::path::Path::new(&conn.config().home));
+    let history = conn.history(session).await?;
+    let turns: Vec<Turn> = history["messages"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|m| Turn {
+                    role: m["role"].as_str().unwrap_or_default().to_string(),
+                    text: m["content"].as_str().unwrap_or_default().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // An undo or rewind can leave fewer messages than the watermark.
+    let seen = harness.watermark(session).min(turns.len());
+    let fresh = &turns[seen..];
+    if fresh.is_empty() {
+        return Ok(None);
+    }
+    let signals = learning::signals(fresh);
+    if !signals.any() {
+        harness.set_watermark(session, turns.len())?;
+        return Ok(None);
+    }
+    let (system, user) = learning::request(&harness, fresh);
+    let reply = complete(system, user).await?;
+    let learned = learning::apply(&harness, &reply, fresh).map_err(anyhow::Error::msg)?;
+    let cwd = conn.session_cwd(session).await;
+    let stored = if learned.memories.is_empty() { 0 } else { (learning.remember)(learned.memories, cwd)? };
+    harness.set_watermark(session, turns.len())?;
+    let rule = match &learned.harness {
+        Ok(Outcome::Updated { changes, .. }) => Some(changes.clone()),
+        _ => None,
+    };
+    harness.log(json!({
+        "op": "learn",
+        "session": session,
+        "signals": {"correction": signals.correction, "explicit": signals.explicit, "effort": signals.effort},
+        "memories_stored": stored,
+        "rejected": learned.rejected,
+        "rule": rule,
+        "rule_rejected": learned.harness.as_ref().err(),
+    }))?;
+    Ok(match (stored, rule) {
+        (0, None) => None,
+        (n, None) => Some(format!("Learned {n} new memor{} from this chat.", if n == 1 { "y" } else { "ies" })),
+        (0, Some(rule)) => Some(format!("Learned: {rule}")),
+        (n, Some(rule)) => Some(format!("Learned {n} memor{} and: {rule}", if n == 1 { "y" } else { "ies" })),
+    })
+}

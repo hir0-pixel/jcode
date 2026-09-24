@@ -11,6 +11,7 @@ pub mod approvals;
 pub mod auth;
 pub mod cron_wake;
 pub mod features;
+pub mod learn;
 pub mod map;
 pub mod observability;
 mod rpc;
@@ -77,6 +78,8 @@ pub struct Config {
     pub approval_secret: String,
     /// Hermes's Python backend for everything the Rust harness does not own.
     pub features: Option<Arc<features::Features>>,
+    /// Automatic learning (Prime loop); `None` when switched off.
+    pub learning: Option<learn::Learning>,
 }
 
 pub type Complete = std::sync::Arc<

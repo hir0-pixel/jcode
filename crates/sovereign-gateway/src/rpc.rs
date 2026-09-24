@@ -80,7 +80,7 @@ impl Drop for Upstream {
 const UPSTREAM_REQUEST_PREFIX: &str = "up-";
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
 
-struct Conn {
+pub(crate) struct Conn {
     config: Arc<Config>,
     to_ws: mpsc::Sender<Message>,
     /// Control link: session-less requests (list, ping).
@@ -95,6 +95,10 @@ struct Conn {
     /// Sessions created here that have not had a turn yet, so jcode has not
     /// persisted them; only these are merged into `session.list` from `known`.
     fresh: Mutex<std::collections::HashSet<String>>,
+    /// Per chat: (turn generation, turns since the last learning pass). A
+    /// learning timer only fires if its generation is still current.
+    learn_state: Mutex<HashMap<String, (u64, usize)>>,
+    learning_now: Mutex<std::collections::HashSet<String>>,
     next_id: AtomicU64,
     next_server_request: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
@@ -239,7 +243,7 @@ impl Conn {
         self.send_json(json!({ "jsonrpc": "2.0", "method": "event", "params": params })).await;
     }
 
-    async fn on_harness_frame(&self, frame: Value) {
+    async fn on_harness_frame(self: &Arc<Self>, frame: Value) {
         if std::env::var_os("SOVEREIGN_GATEWAY_TRACE").is_some() {
             eprintln!("sovereign-gateway: harness {}", frame.to_string().chars().take(300).collect::<String>());
         }
@@ -262,7 +266,11 @@ impl Conn {
             match out {
                 Out::Event { ty, session_id, payload } => {
                     self.observer.event(&session_id, ty, &payload);
+                    let completed = ty == "message.complete";
                     self.emit(ty, Some(&session_id), payload).await;
+                    if completed {
+                        self.schedule_learning(session_id);
+                    }
                 }
                 Out::Approval { session_id, request_id, tool_name, description } => {
                     let id = format!("srv-{}", self.next_server_request.fetch_add(1, Ordering::Relaxed));
@@ -286,6 +294,57 @@ impl Conn {
                 }
             }
         }
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Full conversation of `session` (attaching this connection if needed).
+    pub(crate) async fn history(self: &Arc<Self>, session: &str) -> Result<Value> {
+        self.ensure_attached(session).await?;
+        self.call(json!({ "req": "get_history", "session_id": session })).await
+    }
+
+    pub(crate) async fn session_cwd(&self, session: &str) -> Option<String> {
+        self.known.lock().await.get(session).and_then(|info| info["working_dir"].as_str().map(str::to_string))
+    }
+
+    /// Start the learning timer for `session` after a completed turn.
+    fn schedule_learning(self: &Arc<Self>, session: String) {
+        let Some(learning) = self.config.learning.clone() else { return };
+        let conn = self.clone();
+        tokio::spawn(async move {
+            let (generation, delay) = {
+                let mut state = conn.learn_state.lock().await;
+                let entry = state.entry(session.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += 1;
+                let delay = if entry.1 >= crate::learn::CADENCE_TURNS { crate::learn::CADENCE_IDLE.min(learning.idle) } else { learning.idle };
+                (entry.0, delay)
+            };
+            tokio::time::sleep(delay).await;
+            // A newer turn started or finished: its own timer takes over.
+            if conn.learn_state.lock().await.get(&session).map(|e| e.0) != Some(generation) {
+                return;
+            }
+            if conn.sessions.lock().await.get(&session).is_some_and(SessionState::turn_active) {
+                return;
+            }
+            if !conn.learning_now.lock().await.insert(session.clone()) {
+                return;
+            }
+            let result = crate::learn::pass(&conn, &session, &learning).await;
+            conn.learning_now.lock().await.remove(&session);
+            if let Some(entry) = conn.learn_state.lock().await.get_mut(&session) {
+                entry.1 = 0;
+            }
+            match result {
+                Ok(Some(text)) => conn.emit("status.update", Some(&session), json!({ "kind": "learning", "text": text })).await,
+                Ok(None) => {}
+                Err(err) => eprintln!("sovereign: learning pass for {session} failed: {err:#}"),
+            }
+        });
     }
 
     async fn resolve_approval(&self, session_id: &str, request_id: &str, choice: &str) -> Result<()> {
@@ -644,6 +703,7 @@ impl Conn {
                     }
                 }
                 self.fresh.lock().await.remove(&id);
+                self.learn_state.lock().await.entry(id.clone()).or_default().0 += 1;
                 let run = self.observer.start_turn(&id, &text);
                 if let Err(err) = self.submit(&id, &text).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
@@ -936,6 +996,8 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Obser
         link_tasks: Mutex::new(Vec::new()),
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
+        learn_state: Mutex::new(HashMap::new()),
+        learning_now: Mutex::new(std::collections::HashSet::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),

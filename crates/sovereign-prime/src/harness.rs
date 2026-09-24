@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_PROMPT_CHARS: usize = 4_000;
 /// "Small, evidence-backed" update: at most this many changed lines per refine.
 pub const MAX_CHANGED_LINES: usize = 12;
-const MIN_EVIDENCE_CHARS: usize = 12;
+pub(crate) const MIN_EVIDENCE_CHARS: usize = 12;
 const MAX_TRANSCRIPT_CHARS: usize = 60_000;
 
 pub struct Harness {
@@ -36,7 +36,7 @@ pub enum Outcome {
     NoChange { reason: String },
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
@@ -51,6 +51,23 @@ impl Harness {
 
     fn history_dir(&self) -> PathBuf {
         self.dir.join("history")
+    }
+
+    /// How many messages of `session` a learning pass has already seen, so a
+    /// restart never re-learns them. Stored beside the learned instructions.
+    pub fn watermark(&self, session: &str) -> usize {
+        std::fs::read(self.dir.join("learned.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v[session].as_u64())
+            .unwrap_or(0) as usize
+    }
+
+    pub fn set_watermark(&self, session: &str, seen: usize) -> Result<()> {
+        let path = self.dir.join("learned.json");
+        let mut all = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).unwrap_or_else(|| json!({}));
+        all[session] = json!(seen);
+        write_atomic(&path, &all.to_string())
     }
 
     pub fn current(&self) -> String {
@@ -162,7 +179,7 @@ impl Harness {
         write_atomic(&self.history_dir().join(format!("{stamp:024}.md")), old)
     }
 
-    fn log(&self, mut entry: Value) -> Result<()> {
+    pub fn log(&self, mut entry: Value) -> Result<()> {
         use std::io::Write as _;
         std::fs::create_dir_all(&self.dir)?;
         entry["at_ms"] = json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0));
@@ -172,12 +189,12 @@ impl Harness {
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
 /// First top-level JSON object in `text` (models often wrap it in prose or fences).
-fn parse_json_object(text: &str) -> Option<Value> {
+pub(crate) fn parse_json_object(text: &str) -> Option<Value> {
     let start = text.find('{')?;
     let mut depth = 0i32;
     let mut in_string = false;
