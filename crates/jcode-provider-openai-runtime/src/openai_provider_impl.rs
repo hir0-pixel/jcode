@@ -1206,6 +1206,7 @@ impl Provider for OpenAIProvider {
         Ok(jcode_provider_core::NativeCompactionResult {
             summary_text: None,
             openai_encrypted_content: Some(encrypted_content),
+            usage: parse_compaction_usage(&body),
         })
     }
 
@@ -1259,5 +1260,41 @@ impl Provider for OpenAIProvider {
         }
 
         self.clear_persistent_ws("credentials invalidated").await;
+    }
+}
+
+fn parse_compaction_usage(body: &Value) -> Option<jcode_provider_core::SimpleUsage> {
+    let usage = body.get("usage")?;
+    Some(jcode_provider_core::SimpleUsage {
+        input: usage.get("input_tokens")?.as_u64()?,
+        output: usage.get("output_tokens")?.as_u64()?,
+        cache_read: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_write: 0,
+    })
+}
+
+#[cfg(test)]
+mod compaction_usage_tests {
+    use super::parse_compaction_usage;
+
+    #[test]
+    fn parses_openai_compaction_usage_and_cached_input() {
+        let body = serde_json::json!({
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 32,
+                "input_tokens_details": { "cached_tokens": 45 }
+            }
+        });
+
+        let usage = parse_compaction_usage(&body).expect("usage should parse");
+        assert_eq!(usage.input, 120);
+        assert_eq!(usage.output, 32);
+        assert_eq!(usage.cache_read, 45);
+        assert_eq!(usage.cache_write, 0);
     }
 }

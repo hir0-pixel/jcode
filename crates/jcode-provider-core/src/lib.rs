@@ -73,6 +73,19 @@ use std::time::Duration;
 /// Stream of events from a provider.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SimpleUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+pub struct SimpleCompletion {
+    pub text: String,
+    pub usage: Option<SimpleUsage>,
+}
+
 /// Provider trait for LLM backends.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -464,8 +477,8 @@ pub trait Provider: Send + Sync {
         ))
     }
 
-    /// Simple completion that returns text directly (no streaming).
-    async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
+    /// Simple completion with the provider's final token accounting.
+    async fn complete_simple_with_usage(&self, prompt: &str, system: &str) -> Result<SimpleCompletion> {
         use futures::StreamExt;
 
         let messages = vec![Message {
@@ -480,17 +493,31 @@ pub trait Provider: Send + Sync {
 
         let response = self.complete(&messages, &[], system, None).await?;
         let mut result = String::new();
+        let mut usage = None;
         tokio::pin!(response);
 
         while let Some(event) = response.next().await {
             match event {
                 Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
+                Ok(StreamEvent::TokenUsage { input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens }) => {
+                    usage = Some(SimpleUsage {
+                        input: input_tokens.unwrap_or(0),
+                        output: output_tokens.unwrap_or(0),
+                        cache_read: cache_read_input_tokens.unwrap_or(0),
+                        cache_write: cache_creation_input_tokens.unwrap_or(0),
+                    });
+                }
                 Ok(_) => {}
                 Err(err) => return Err(err),
             }
         }
 
-        Ok(result)
+        Ok(SimpleCompletion { text: result, usage })
+    }
+
+    /// Simple completion that returns text directly (no streaming).
+    async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
+        Ok(self.complete_simple_with_usage(prompt, system).await?.text)
     }
 }
 
@@ -677,6 +704,7 @@ pub fn fresh_transport_client() -> reqwest::Client {
 pub struct NativeCompactionResult {
     pub summary_text: Option<String>,
     pub openai_encrypted_content: Option<String>,
+    pub usage: Option<SimpleUsage>,
 }
 
 /// A single route to access a model: model + provider + API method
