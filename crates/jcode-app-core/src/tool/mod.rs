@@ -57,6 +57,51 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock};
+
+/// Receives usage for REPL `llm_query` model calls when an observer is registered.
+pub type ReplLlmQueryObserver = Arc<
+    dyn Fn(&str, String, String, i64, Option<jcode_provider_core::SimpleUsage>, Option<&str>)
+        + Send
+        + Sync,
+>;
+
+static REPL_LLM_QUERY_OBSERVER: OnceLock<StdMutex<Option<ReplLlmQueryObserver>>> = OnceLock::new();
+
+/// Replace or clear the process-wide REPL subquery observer.
+pub fn set_repl_llm_query_observer(observer: Option<ReplLlmQueryObserver>) {
+    *REPL_LLM_QUERY_OBSERVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+}
+
+fn repl_llm_query_observer() -> Option<ReplLlmQueryObserver> {
+    REPL_LLM_QUERY_OBSERVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+mod repl_llm_query_observer_tests {
+    use super::*;
+
+    #[test]
+    fn registration_replaces_and_clears_observer() {
+        let first: ReplLlmQueryObserver = Arc::new(|_, _, _, _, _, _| {});
+        set_repl_llm_query_observer(Some(first.clone()));
+        assert!(Arc::ptr_eq(&repl_llm_query_observer().unwrap(), &first));
+
+        let second: ReplLlmQueryObserver = Arc::new(|_, _, _, _, _, _| {});
+        set_repl_llm_query_observer(Some(second.clone()));
+        assert!(Arc::ptr_eq(&repl_llm_query_observer().unwrap(), &second));
+
+        set_repl_llm_query_observer(None);
+        assert!(repl_llm_query_observer().is_none());
+    }
+}
 
 pub(crate) fn tool_name_is_allowed(allowed: &HashSet<String>, name: &str) -> bool {
     allowed.contains(name)
