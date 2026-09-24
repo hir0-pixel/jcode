@@ -1367,7 +1367,34 @@ async fn run_gateway(
         .map_err(|_| anyhow::anyhow!("invalid --host {host}"))?;
 
     let approval_secret = sovereign_gateway::auth::generate_token();
+    // Ollama's OpenAI-compat path serves a small num_ctx by default (4096). The
+    // Sovereign tool schema alone exceeds that, so every turn emergency-compacts
+    // and chat appears broken. Load the model with a usable window first; jcode
+    // then reads the real serving size from /api/ps.
+    if matches!(provider_choice, ProviderChoice::Ollama)
+        || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
+    {
+        warm_ollama_serving_context(model.unwrap_or("qwen3.8:27b")).await;
+    }
     let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
+    // Catalog enrichment (GET /api/ps) only runs on fetch_models. Until then
+    // Ollama's context_window() hard-falls back to 4096 and every tool-heavy
+    // turn emergency-compacts. Refresh now that the model is warm.
+    if matches!(provider_choice, ProviderChoice::Ollama)
+        || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
+    {
+        match provider.refresh_model_catalog().await {
+            Ok(_) => {
+                eprintln!(
+                    "sovereign: Ollama context_window={} after catalog refresh",
+                    provider.context_window()
+                );
+            }
+            Err(err) => {
+                eprintln!("sovereign: Ollama catalog refresh failed ({err}); context may stay at 4k");
+            }
+        }
+    }
     let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
     let refine_provider = provider.clone();
     let complete: sovereign_gateway::Complete = std::sync::Arc::new(move |system: String, user: String| {
@@ -1375,6 +1402,14 @@ async fn run_gateway(
         Box::pin(async move { provider.complete_simple(&user, &system).await })
     });
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
+
+    let default_cwd = std::env::var("HERMES_DESKTOP_CWD")
+        .or_else(|_| std::env::var("TERMINAL_CWD"))
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".".into())
+        });
 
     let gateway = async {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1389,7 +1424,7 @@ async fn run_gateway(
             token,
             version: env!("CARGO_PKG_VERSION").to_string(),
             legacy_socket: socket.clone(),
-            default_cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+            default_cwd,
             allow_non_loopback: allow_remote,
             provider: provider_name,
             model: provider_model,
@@ -1418,6 +1453,50 @@ async fn run_gateway(
     };
     let _ = std::fs::remove_file(&socket);
     result
+}
+
+/// Load an Ollama model with a serving window large enough for Sovereign's
+/// system+tools prefix (~10k tokens). Best-effort: chat still starts if Ollama
+/// is down (deferred auth / later failure).
+async fn warm_ollama_serving_context(model: &str) {
+    let num_ctx: u64 = std::env::var("SOVEREIGN_OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 8192)
+        .unwrap_or(32_768);
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": ".",
+        "stream": false,
+        "keep_alive": "2h",
+        "options": { "num_ctx": num_ctx },
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    match client
+        .post("http://127.0.0.1:11434/api/generate")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            eprintln!("sovereign: warmed Ollama {model} with num_ctx={num_ctx}");
+        }
+        Ok(resp) => {
+            eprintln!(
+                "sovereign: Ollama warm returned HTTP {}; chat may emergency-compact until OLLAMA_CONTEXT_LENGTH is raised",
+                resp.status()
+            );
+        }
+        Err(err) => {
+            eprintln!("sovereign: Ollama warm skipped ({err})");
+        }
+    }
 }
 
 /// Command that starts Hermes's Python backend for the features the Rust

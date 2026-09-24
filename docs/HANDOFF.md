@@ -43,14 +43,24 @@ Marker: `fired-at=2026-09-24T10:30:23Z`. Job record: `state=completed`, `repeat.
 
 Also verified earlier: Cron open starts Python; close + idle (`SOVEREIGN_FEATURE_IDLE_MS=1500`) stops it (`e2e/sovereign-install-launch.mjs`). Orphan cleanup quit + `kill -9` clean within 5s (`e2e/sovereign-packaged-orphan-cleanup.mjs`).
 
-## Step 1 — macOS arm64 (partial)
+## Step 1 — macOS arm64 (verified)
 
 - [x] Packaged Cron opens; Python starts only then; stops after idle override
 - [x] Due job still fires after idle stop (wake-before-due)
 - [x] Quit + `kill -9`: no orphan sovereign/python within 5s
-- [ ] Ollama chat + tool approval → Run → executes (`qwen3.8:27b`) — script written, not yet green
-- [ ] API-key first-run; key in keychain or 0600 file; never logged
-- [ ] Final unsigned `.dmg` and `.zip`
+- [x] Ollama chat + tool approval → Run → executes (`qwen3.8:27b`)
+- [x] API-key first-run; key in `…/config/jcode/openai.env` mode **600**; full key never in stdout
+- [x] Unsigned `.dmg` + `.zip` on disk (`Hermes-0.17.6-mac-arm64.{dmg,zip}`)
+
+### Chat + approval root causes fixed
+
+1. **Ollama 4k budget:** Tool prefix alone is ~8–10k tokens. Engine now warms the model (`SOVEREIGN_OLLAMA_NUM_CTX`, default 32768) then refreshes the model catalog so `context_window()` is 32k (not the hard 4k fallback).
+2. **Composer Enter:** Multi-line `keyboard.type` submitted on the first `\n`; e2e uses a single-line `fill()`.
+3. **Safe vs Low:** In-cwd `echo > out.txt` is `RiskLevel::Safe` (no approval card). Truncating redirect **outside** session cwd is `Low` → approval UI. E2e writes to `$sandbox/approval-out.txt`.
+
+**Proof:** `apps/desktop/release/sovereign-chat/` (`approval.png`, `chat-done.png`, `ok: true`, contents `sovereign-packaged-ok`).
+
+**API-key proof:** `apps/desktop/release/sovereign-apikey/result.json` (`ok: true`, `mode: "600"`, `stdoutHasFullKey: false`).
 
 ## Step 2 — Windows x64 (open)
 
@@ -60,4 +70,4 @@ Also verified earlier: Cron open starts Python; close + idle (`SOVEREIGN_FEATURE
 
 ## Not verified yet
 
-Chat+approval e2e, API-key first-run storage, final DMG/ZIP, Windows, macOS x64, benchmarks, INSTALL.md.
+Windows NSIS, macOS x64, benchmarks vs stock Hermes, INSTALL.md. Desktop `main.ts` still has uncommitted theme/marketplace noise — only packaging e2e scripts should be committed until those land separately.
