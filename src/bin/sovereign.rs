@@ -33,6 +33,10 @@ fn translate(args: Vec<String>) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
+    // Sovereign: nothing leaves the machine except model calls. jcode's
+    // anonymous usage telemetry is disabled unconditionally.
+    // SAFETY: single-threaded here, before the runtime starts.
+    unsafe { std::env::set_var("JCODE_NO_TELEMETRY", "1") };
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let argv = translate(std::env::args().skip(1).collect());
     tokio::runtime::Builder::new_multi_thread()

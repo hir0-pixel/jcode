@@ -1364,6 +1364,7 @@ async fn run_gateway(
         .map_err(|_| anyhow::anyhow!("invalid --host {host}"))?;
 
     let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
+    let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let gateway = async {
@@ -1381,6 +1382,9 @@ async fn run_gateway(
             legacy_socket: socket.clone(),
             default_cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
             allow_non_loopback: allow_remote,
+            provider: provider_name,
+            model: provider_model,
+            home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
         })
         .await?;
         let port = gateway.local_addr().port();

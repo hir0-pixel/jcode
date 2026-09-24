@@ -28,6 +28,17 @@ const MAX_CONNECTIONS: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Log each unsupported method/route once per process (stderr), so parity
+/// gaps show up in the engine log without flooding it.
+pub(crate) fn note_unsupported(kind: &str, what: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let key = format!("{kind} {what}");
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(key.clone()) {
+        eprintln!("sovereign-gateway: unsupported {}", key.chars().take(200).collect::<String>());
+    }
+}
+
 pub struct Config {
     pub bind: SocketAddr,
     pub token: String,
@@ -38,6 +49,11 @@ pub struct Config {
     pub default_cwd: String,
     /// Binding a non-loopback address must be asked for explicitly.
     pub allow_non_loopback: bool,
+    /// Provider and model the engine started with (reported to setup screens).
+    pub provider: String,
+    pub model: String,
+    /// Engine state directory, reported as the single profile's path.
+    pub home: String,
 }
 
 pub struct Gateway {
@@ -148,7 +164,8 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -
     let host_reason = auth::host_origin_reason(req.header("host"), req.header("origin"), local.port(), &bound_ip);
     let token_ok = auth::token_matches(
         &config.token,
-        auth::presented_token(req.query.as_deref(), req.header("authorization")).as_deref(),
+        auth::presented_token(req.query.as_deref(), req.header("authorization"), req.header("x-hermes-session-token"))
+            .as_deref(),
     );
     let wants_ws = req.header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
@@ -197,7 +214,8 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
         }
-        _ => {
+        (method, path) => {
+            note_unsupported("http", &format!("{method} {path}"));
             let body = json!({"detail": "not supported by engine", "reason": "not_supported_by_engine"});
             respond(&mut stream, "404 Not Found", &body).await
         }

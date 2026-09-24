@@ -196,6 +196,89 @@ impl Conn {
         let call = |req: Value| async move { self.call(req).await.map_err(RpcError::internal) };
         match method {
             "ping" | "gateway.ping" => Ok(json!({})),
+            "setup.status" => Ok(json!({
+                "provider_configured": true,
+                "ready": true,
+                "ok": true,
+                "free_tier": false,
+                "other_providers": false,
+                "inference_provider": self.config.provider,
+            })),
+            "setup.runtime_check" => Ok(json!({
+                "ok": true,
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "source": "engine",
+            })),
+            "free_tier.status" => Ok(json!({
+                "has_guest": false, "enabled": false, "available": false,
+                "notice_pending": false, "model": "", "label": "",
+            })),
+            "model.options" => Ok(json!({
+                "providers": [{
+                    "slug": self.config.provider,
+                    "name": self.config.provider,
+                    "models": [self.config.model],
+                    "total_models": 1,
+                    "is_current": true,
+                    "authenticated": true,
+                }],
+                "model": self.config.model,
+                "provider": self.config.provider,
+            })),
+            "wake.status" => Ok(json!({
+                "listening": false, "owned_by_caller": false, "phrase": "", "provider": "",
+                "configured_surface": "", "input_device": {}, "available": false,
+                "hint": "Wake word is not available in this engine.", "enabled": false,
+                "audio_silent": false, "capture": "off", "local_input_available": false,
+                "sample_rate": 16000, "frame_length": 512,
+            })),
+            "session.active_list" => {
+                let sessions = self.sessions.lock().await;
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let items: Vec<Value> = sessions
+                    .iter()
+                    .filter(|(_, s)| s.turn_active())
+                    .map(|(id, s)| json!({
+                        "current": false, "id": id, "session_key": id, "last_active": now, "started_at": now,
+                        "message_count": 0, "model": s.model.clone().unwrap_or_default(), "preview": "",
+                        "status": "streaming", "title": "",
+                    }))
+                    .collect();
+                Ok(json!({ "sessions": items }))
+            }
+            "commands.catalog" => Ok(json!({
+                "pairs": [], "sub": {}, "canon": {}, "commands": {}, "categories": [],
+                "skills": {}, "skill_count": 0, "warning": "",
+            })),
+            "profiles.list" => Ok(json!({
+                "profiles": [{
+                    "name": "default", "path": self.config.home, "is_default": true,
+                    "model": self.config.model, "provider": self.config.provider,
+                    "display_name": "Default", "description": "", "skill_count": 0,
+                }],
+                "bot_mode_protocol": false,
+            })),
+            "pet.info" => Ok(json!({ "enabled": false })),
+            "subagent.list" => Ok(json!({ "subagents": [], "delegations": [] })),
+            "process.list" => Ok(json!({ "processes": [] })),
+            "session.control.read" => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                Ok(json!({ "control": { "goal": null, "loop": null, "heartbeat": null, "revision": "0", "updated_at": now } }))
+            }
+            "complete.path" => {
+                let word = p["word"].as_str().unwrap_or_default().to_string();
+                let cwd = p["cwd"].as_str().unwrap_or(&self.config.default_cwd).to_string();
+                let items = tokio::task::spawn_blocking(move || map::complete_path(&word, &cwd)).await.unwrap_or_default();
+                Ok(json!({ "items": items }))
+            }
+            "slash.exec" => {
+                let command = p["command"].as_str().unwrap_or_default().chars().take(80).collect::<String>();
+                crate::note_unsupported("slash", &command);
+                let message = format!("/{} is not available in this engine yet.", command.trim_start_matches('/'));
+                Ok(json!({ "status": "error", "message": message, "output": message }))
+            }
+            "projects.tree" => Ok(json!({ "projects": [], "active_id": null, "scoped_session_ids": [] })),
             "gateway.capabilities" => Ok(json!({ "per_session_exclusive_submit": false })),
             "client.capabilities" => Ok(json!({ "server_requests": ["approval"] })),
             "session.create" => {
@@ -321,7 +404,10 @@ impl Conn {
                 }
                 Ok(json!({ "resolved": resolved }))
             }
-            _ => Err(RpcError::unsupported(method)),
+            _ => {
+                crate::note_unsupported("rpc", method);
+                Err(RpcError::unsupported(method))
+            }
         }
     }
 

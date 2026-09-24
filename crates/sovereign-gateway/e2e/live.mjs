@@ -157,6 +157,13 @@ f = await rpc('prompt.submit', {})
 check(f.error?.code === -32602, 'missing session_id returns invalid params')
 f = await rpc('ping')
 check(!f.error, 'ping answers')
+for (const m of ['setup.status', 'setup.runtime_check', 'free_tier.status', 'model.options', 'wake.status',
+  'session.active_list', 'commands.catalog', 'profiles.list', 'pet.info', 'projects.tree',
+  'gateway.capabilities', 'client.capabilities']) {
+  f = await rpc(m)
+  if (f.error) fail(`${m} errored: ${f.error.message}`)
+  else { validate('result', m, results[m], f.result); ok(`${m} answers within contract`) }
+}
 
 f = await rpc('session.create', { cwd: home })
 check(!f.error, 'session.create succeeds')

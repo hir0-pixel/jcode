@@ -278,7 +278,49 @@ pub fn live_info(session_id: &str, state: Option<&SessionState>, cwd: &str, vers
         "title": "",
         "stored_session_id": session_id,
         "version": version,
+        // The desktop warns below contract 8. The engine speaks the v8
+        // protocol; methods it lacks answer `not_supported_by_engine`.
+        "desktop_contract": 8,
     })
+}
+
+/// Complete a filesystem path fragment relative to `cwd` (at most 50 items;
+/// dotfiles only when the fragment asks for them).
+pub fn complete_path(word: &str, cwd: &str) -> Vec<Value> {
+    let (dir_part, prefix) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word),
+    };
+    let dir = if let Some(rest) = dir_part.strip_prefix("~/") {
+        std::env::var("HOME").map(|h| std::path::Path::new(&h).join(rest)).unwrap_or_default()
+    } else if dir_part.starts_with('/') {
+        std::path::PathBuf::from(dir_part)
+    } else {
+        std::path::Path::new(cwd).join(dir_part)
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut items: Vec<(String, bool)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let hidden_ok = !name.starts_with('.') || prefix.starts_with('.');
+            (name.starts_with(prefix) && hidden_ok).then(|| (name, e.file_type().is_ok_and(|t| t.is_dir())))
+        })
+        .collect();
+    items.sort();
+    items
+        .into_iter()
+        .take(50)
+        .map(|(name, is_dir)| {
+            let suffix = if is_dir { "/" } else { "" };
+            json!({
+                "text": format!("{dir_part}{name}{suffix}"),
+                "display": format!("{name}{suffix}"),
+                "meta": if is_dir { "dir" } else { "file" },
+                "kind": if is_dir { "dir" } else { "file" },
+            })
+        })
+        .collect()
 }
 
 /// Text of a `prompt.submit` `text` field, which may be a string or a list of
@@ -414,5 +456,25 @@ mod tests {
         assert_eq!(prompt_text(&json!("hi")), "hi");
         assert_eq!(prompt_text(&json!([{"type":"text","text":"a"}, "b"])), "a\nb");
         assert_eq!(prompt_text(&json!(null)), "");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::complete_path;
+
+    #[test]
+    fn completes_relative_paths_and_hides_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("sov-complete-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("setup.py"), "").unwrap();
+        std::fs::write(dir.join(".secret"), "").unwrap();
+        let cwd = dir.to_string_lossy();
+        let texts: Vec<String> = complete_path("s", &cwd).iter().map(|i| i["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(texts, ["setup.py", "src/"]);
+        assert!(complete_path("", &cwd).iter().all(|i| !i["text"].as_str().unwrap().starts_with('.')));
+        assert_eq!(complete_path(".s", &cwd).len(), 1);
+        assert!(complete_path("nope/x", &cwd).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

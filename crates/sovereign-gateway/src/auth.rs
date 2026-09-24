@@ -23,8 +23,16 @@ pub fn token_matches(expected: &str, presented: Option<&str>) -> bool {
     }
 }
 
-/// The token from `?token=` or `Authorization: Bearer`.
-pub fn presented_token<'a>(query: Option<&'a str>, authorization: Option<&'a str>) -> Option<String> {
+/// The token from `X-Hermes-Session-Token` (desktop REST), `Authorization:
+/// Bearer`, or `?token=` (WebSocket).
+pub fn presented_token<'a>(
+    query: Option<&'a str>,
+    authorization: Option<&'a str>,
+    session_header: Option<&'a str>,
+) -> Option<String> {
+    if let Some(value) = session_header.filter(|v| !v.is_empty()) {
+        return Some(value.trim().to_string());
+    }
     if let Some(value) = authorization.and_then(|v| v.strip_prefix("Bearer ")) {
         return Some(value.trim().to_string());
     }
@@ -129,9 +137,10 @@ mod tests {
 
     #[test]
     fn token_sources() {
-        assert_eq!(presented_token(Some("token=a%2Bb&x=1"), None).as_deref(), Some("a+b"));
-        assert_eq!(presented_token(None, Some("Bearer xyz")).as_deref(), Some("xyz"));
-        assert_eq!(presented_token(Some("ticket=1"), None), None);
+        assert_eq!(presented_token(Some("token=a%2Bb&x=1"), None, None).as_deref(), Some("a+b"));
+        assert_eq!(presented_token(None, Some("Bearer xyz"), None).as_deref(), Some("xyz"));
+        assert_eq!(presented_token(None, None, Some("hdr")).as_deref(), Some("hdr"));
+        assert_eq!(presented_token(Some("ticket=1"), None, None), None);
         assert_eq!(query_param("token=%zz", "token").as_deref(), Some("%zz"));
         assert_eq!(query_param("token=%4", "token").as_deref(), Some("%4"));
     }
