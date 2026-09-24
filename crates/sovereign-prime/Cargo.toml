@@ -7,6 +7,7 @@ description = "Prime-style recursive REPL (RLM) for the sovereign engine: a Mont
 
 [dependencies]
 anyhow = "1"
+jcode-storage = { path = "../jcode-storage" }
 monty = "0.0.23"
 monty-alloc = "0.0.23"
 monty-types = "0.0.23"

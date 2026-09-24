@@ -19,6 +19,11 @@ pub struct Skill {
     pub allowed_tools: Option<Vec<String>>,
     pub content: String,
     pub path: PathBuf,
+    /// Whether this skill is currently active in the prompt. Persisted as a
+    /// sibling `.disabled` marker file next to `SKILL.md` (see `set_enabled`),
+    /// so disabling survives a `reload_global`/process restart without needing
+    /// any new schema.
+    pub enabled: bool,
     search_text: String,
 }
 
@@ -531,6 +536,7 @@ impl SkillRegistry {
             AllowedTools::Sequence(tools) => tools,
         });
         let search_text = build_skill_search_text(&name, &description, &body);
+        let enabled = !Self::disabled_marker_path(path).exists();
 
         Ok(Skill {
             name,
@@ -538,8 +544,38 @@ impl SkillRegistry {
             allowed_tools,
             content: body,
             path: path.to_path_buf(),
+            enabled,
             search_text,
         })
+    }
+
+    /// Path of the `.disabled` marker sitting beside a skill's `SKILL.md`.
+    fn disabled_marker_path(skill_md_path: &Path) -> PathBuf {
+        skill_md_path
+            .parent()
+            .map(|dir| dir.join(".disabled"))
+            .unwrap_or_else(|| skill_md_path.with_extension("disabled"))
+    }
+
+    /// Enable or disable a skill by writing/removing its `.disabled` marker
+    /// file, and update the in-memory copy to match. Returns `Ok(false)` if
+    /// no skill with that name is loaded.
+    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<bool> {
+        let Some(skill) = self.skills.get(name) else {
+            return Ok(false);
+        };
+        let marker = Self::disabled_marker_path(&skill.path);
+        if enabled {
+            if marker.exists() {
+                std::fs::remove_file(&marker)?;
+            }
+        } else {
+            std::fs::write(&marker, "")?;
+        }
+        if let Some(skill) = self.skills.get_mut(name) {
+            skill.enabled = enabled;
+        }
+        Ok(true)
     }
 
     /// Parse YAML frontmatter from markdown
@@ -988,6 +1024,7 @@ mod tests {
             allowed_tools: None,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
+            enabled: true,
             search_text: build_skill_search_text(name, description, content),
         }
     }

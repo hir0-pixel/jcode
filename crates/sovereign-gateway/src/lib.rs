@@ -496,9 +496,10 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             respond(&mut stream, "200 OK", &json!({"ok": true, "stamped": 0, "profile": "default"})).await
         }
         ("GET", "/api/profiles") => {
+            let skill_count = jcode_base::skill::SkillRegistry::shared_snapshot().list().len();
             let body = json!({"profiles": [{
                 "name": "default", "display_name": "Default", "path": config.home, "is_default": true,
-                "has_env": false, "model": config.model, "provider": config.provider, "skill_count": 0,
+                "has_env": false, "model": config.model, "provider": config.provider, "skill_count": skill_count,
             }]});
             respond(&mut stream, "200 OK", &body).await
         }
@@ -543,9 +544,58 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         ("GET", "/api/cron/delivery-targets" | "/api/cron/blueprints") if bundled_startup_request(&req) => {
             respond(&mut stream, "200 OK", &json!([])).await
         }
-        ("GET", "/api/skills" | "/api/skills/hub/official" | "/api/skills/hub/sources")
-            if bundled_startup_request(&req) =>
-        {
+        // The engine owns skills end-to-end: real list/view/enable-disable
+        // over the jcode skill registry (~/.jcode/skills + project overlays).
+        // Hub browse/install stays refused — that surface has no jcode
+        // backing and Hermes Python must not run its own skill maintenance.
+        ("GET", "/api/skills") => {
+            let registry = jcode_base::skill::SkillRegistry::shared_snapshot();
+            let skills: Vec<Value> = registry
+                .list()
+                .iter()
+                .map(|skill| json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "category": "general",
+                    "enabled": skill.enabled,
+                    "provenance": "agent",
+                }))
+                .collect();
+            respond(&mut stream, "200 OK", &json!(skills)).await
+        }
+        ("GET", "/api/skills/content") => {
+            let Some(name) = auth::query_param(req.query.as_deref().unwrap_or_default(), "name") else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail": "name is required"})).await;
+            };
+            let registry = jcode_base::skill::SkillRegistry::shared_snapshot();
+            match registry.get(&name) {
+                Some(skill) => {
+                    let content = std::fs::read_to_string(&skill.path).unwrap_or_else(|_| skill.content.clone());
+                    let body = json!({
+                        "content": content,
+                        "name": skill.name,
+                        "path": skill.path.to_string_lossy(),
+                    });
+                    respond(&mut stream, "200 OK", &body).await
+                }
+                None => respond(&mut stream, "404 Not Found", &json!({"detail": "skill not found"})).await,
+            }
+        }
+        ("PUT", "/api/skills/toggle") => {
+            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let (Some(name), Some(enabled)) = (body["name"].as_str(), body["enabled"].as_bool()) else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail": "name and enabled are required"})).await;
+            };
+            let registry = jcode_base::skill::SkillRegistry::shared_registry();
+            let mut registry = registry.write().await;
+            match registry.set_enabled(name, enabled) {
+                Ok(true) => respond(&mut stream, "200 OK", &json!({"ok": true, "name": name, "enabled": enabled})).await,
+                Ok(false) => respond(&mut stream, "404 Not Found", &json!({"detail": "skill not found"})).await,
+                Err(err) => respond(&mut stream, "500 Internal Server Error", &json!({"detail": err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/skills/hub/official" | "/api/skills/hub/sources") => {
             respond(&mut stream, "200 OK", &json!([])).await
         }
         ("GET", "/api/mcp/servers" | "/api/mcp/catalog") if bundled_startup_request(&req) => {

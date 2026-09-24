@@ -7755,6 +7755,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "httparse",
+ "jcode-base",
  "jcode-command-risk",
  "jcode-harness-api-server",
  "jcode-provider-core",
@@ -7773,6 +7774,7 @@ name = "sovereign-prime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jcode-storage",
  "monty",
  "monty-alloc",
  "monty-types",

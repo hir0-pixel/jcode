@@ -896,3 +896,45 @@ fn prompt_guidance_missing_or_unreadable_project_keeps_global_content() {
         }
     });
 }
+
+/// M5.2: skill bodies must stay out of the static system prompt. The prompt
+/// should carry only name + one-line description per skill (small, roughly
+/// constant per skill); the full SKILL.md body loads lazily on demand via the
+/// skill tool, not eagerly here. This measures the "before" (a naive eager
+/// inclusion of every skill's full body) vs the "after" (today's lazy
+/// name+description-only section) prompt byte cost with 20 installed skills,
+/// and asserts lazy is far smaller.
+#[test]
+fn skills_section_is_lazy_summary_not_full_bodies_with_20_skills() {
+    let skill_body =
+        "Full instructions body.\n".repeat(200); // ~4.6KB, representative of a real SKILL.md
+    let skills: Vec<SkillInfo> = (0..20)
+        .map(|i| SkillInfo {
+            name: format!("skill-{i}"),
+            description: format!("Does thing number {i} reliably and repeatably."),
+        })
+        .collect();
+
+    // "after": today's actual behavior — lazy summary section.
+    let lazy_section = build_available_skills_section(&skills).expect("section");
+    let lazy_bytes = lazy_section.len();
+
+    // "before": hypothetical eager inclusion of every skill's full body inline.
+    let mut eager_bytes = lazy_bytes;
+    for _ in &skills {
+        eager_bytes += skill_body.len();
+    }
+
+    // Lazy stays small and roughly linear in (name + description) only, not body size.
+    assert!(
+        lazy_bytes < 4_000,
+        "lazy skills section should be a few hundred bytes for 20 skills, got {lazy_bytes}"
+    );
+    assert!(
+        eager_bytes > lazy_bytes * 20,
+        "eager-body baseline ({eager_bytes}) should dwarf the lazy summary ({lazy_bytes})"
+    );
+
+    // Full body text must never leak into the static section.
+    assert!(!lazy_section.contains("Full instructions body"));
+}

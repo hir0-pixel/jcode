@@ -431,14 +431,14 @@ impl Conn {
                 Ok(json!({
                     "pairs": pairs, "sub": {}, "canon": {}, "commands": {},
                     "categories": [{ "name": "Harness", "pairs": pairs }],
-                    "skills": {}, "skill_count": 0, "warning": "",
+                    "skills": {}, "skill_count": jcode_base::skill::SkillRegistry::shared_snapshot().list().len(), "warning": "",
                 }))
             }
             "profiles.list" => Ok(json!({
                 "profiles": [{
                     "name": "default", "path": self.config.home, "is_default": true,
                     "model": self.config.model, "provider": self.config.provider,
-                    "display_name": "Default", "description": "", "skill_count": 0,
+                    "display_name": "Default", "description": "", "skill_count": jcode_base::skill::SkillRegistry::shared_snapshot().list().len(),
                 }],
                 "bot_mode_protocol": false,
             })),

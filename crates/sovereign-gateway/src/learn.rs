@@ -11,7 +11,7 @@
 use crate::rpc::Conn;
 use serde_json::json;
 use sovereign_prime::harness::{Harness, Outcome, Turn};
-use sovereign_prime::learning::{self, Memory};
+use sovereign_prime::learning::{self, Memory, SkillOutcome};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,14 +58,19 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
         harness.set_watermark(session, turns.len())?;
         return Ok(None);
     }
-    let (system, user) = learning::request(&harness, fresh);
+    let (system, user) = learning::request(&harness, fresh, signals.effort);
     let reply = complete(system, user).await?;
-    let learned = learning::apply(&harness, &reply, fresh).map_err(anyhow::Error::msg)?;
+    let learned = learning::apply(&harness, &reply, fresh, signals.effort).map_err(anyhow::Error::msg)?;
     let cwd = conn.session_cwd(session).await;
     let stored = if learned.memories.is_empty() { 0 } else { (learning.remember)(learned.memories, cwd)? };
     harness.set_watermark(session, turns.len())?;
     let rule = match &learned.harness {
         Ok(Outcome::Updated { changes, .. }) => Some(changes.clone()),
+        _ => None,
+    };
+    let skill_name = match &learned.skill {
+        Ok(Some(SkillOutcome::Created { name })) => Some(format!("new skill \"{name}\"")),
+        Ok(Some(SkillOutcome::Updated { name })) => Some(format!("updated skill \"{name}\"")),
         _ => None,
     };
     harness.log(json!({
@@ -76,11 +81,18 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
         "rejected": learned.rejected,
         "rule": rule,
         "rule_rejected": learned.harness.as_ref().err(),
+        "skill": skill_name,
+        "skill_rejected": learned.skill.as_ref().err(),
     }))?;
-    Ok(match (stored, rule) {
-        (0, None) => None,
-        (n, None) => Some(format!("Learned {n} new memor{} from this chat.", if n == 1 { "y" } else { "ies" })),
-        (0, Some(rule)) => Some(format!("Learned: {rule}")),
-        (n, Some(rule)) => Some(format!("Learned {n} memor{} and: {rule}", if n == 1 { "y" } else { "ies" })),
-    })
+    let mut parts = Vec::new();
+    if stored > 0 {
+        parts.push(format!("{stored} new memor{}", if stored == 1 { "y" } else { "ies" }));
+    }
+    if let Some(rule) = &rule {
+        parts.push(format!("instructions: {rule}"));
+    }
+    if let Some(skill) = &skill_name {
+        parts.push(skill.clone());
+    }
+    Ok((!parts.is_empty()).then(|| format!("Learned {}.", parts.join("; "))))
 }

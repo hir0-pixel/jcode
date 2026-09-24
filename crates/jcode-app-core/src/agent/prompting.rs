@@ -127,6 +127,7 @@ impl Agent {
             .current_skills_snapshot()
             .list()
             .iter()
+            .filter(|skill| skill.enabled)
             .map(|skill| crate::prompt::SkillInfo {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
