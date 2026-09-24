@@ -79,8 +79,16 @@ fn local_terms(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() >= 3 && !STOP.contains(w))
-        .map(str::to_owned)
+        .map(singular)
         .collect()
+}
+
+/// Fold simple plurals so "scripts" matches "script" ("class" stays).
+fn singular(word: &str) -> String {
+    match word.strip_suffix('s') {
+        Some(stem) if stem.len() >= 3 && !stem.ends_with('s') => stem.to_owned(),
+        _ => word.to_owned(),
+    }
 }
 
 /// Local relevance: BM25-style scoring over content, tags and category.
@@ -364,6 +372,21 @@ mod local_tests {
         assert!(hits[0].0.content.contains("pnpm"));
         assert!(select_local("what is the weather in Lahore today", entries(), 5).is_empty());
         assert!(select_local("", entries(), 5).is_empty());
+    }
+
+    #[test]
+    fn matches_plurals_and_a_fresh_question_about_a_preference() {
+        let prefs = vec![MemoryEntry::new(
+            MemoryCategory::Preference,
+            "The user's preferred language for quick scripts is Nim",
+        )];
+        let hits = select_local(
+            "Which programming language should you use when you write a quick script for me?",
+            prefs,
+            5,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.content.contains("Nim"));
     }
 
     #[test]

@@ -129,7 +129,8 @@ pub fn memory_llm_judge_available() -> bool {
 /// Recall requires a Jev credential route. Subscription entitlement is checked
 /// by the gateway, not inferred from a cached client tier.
 pub fn memory_runtime_active() -> bool {
-    crate::jev::JevClient::available()
+    // Sovereign recalls locally; it never needs a remote Jev provider.
+    crate::memory_jev::local_mode() || crate::jev::JevClient::available()
 }
 
 fn emit_memory_activity(event_tx: Option<&MemoryEventSink>) {

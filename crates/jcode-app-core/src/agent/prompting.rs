@@ -68,6 +68,13 @@ impl Agent {
         let session_id = &self.session.id;
 
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
+        if fresh_user_turn {
+            crate::memory_agent::recall_local_now(
+                session_id,
+                &messages,
+                self.session.working_dir.as_deref(),
+            );
+        }
         let pending = if fresh_user_turn {
             crate::memory::take_pending_memory_for_project(
                 session_id,

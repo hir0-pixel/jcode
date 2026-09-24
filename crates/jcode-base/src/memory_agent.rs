@@ -262,6 +262,11 @@ impl MemoryAgent {
         {
             return Ok(());
         }
+        // Local recall already ran synchronously for this turn (recall_local_now);
+        // a second, delayed pass would only re-inject last turn's matches.
+        if crate::memory_jev::local_mode() {
+            return Ok(());
+        }
         ss.last_query = Some(query);
         ss.last_check = Some(Instant::now());
         let manager = manager_for_working_dir(ss.working_dir.as_deref());
@@ -295,6 +300,53 @@ impl MemoryAgent {
             .failed_at = None;
         Ok(())
     }
+}
+
+/// Sovereign's local recall, run inline for the user turn being answered.
+///
+/// jcode's remote relevance check is slow, so it runs in the background and
+/// its matches are injected on the *next* turn. Local BM25 takes
+/// microseconds, so recall happens now and the first question of a new
+/// session can already use what was remembered. Matches are published as
+/// pending memory, which the caller takes right away (inject-once and
+/// never-pad bookkeeping stay in one place).
+pub fn recall_local_now(
+    session_id: &str,
+    messages: &[crate::message::Message],
+    working_dir: Option<&str>,
+) {
+    if !crate::memory_jev::local_mode() {
+        return;
+    }
+    let query = memory::format_focused_query_for_relevance(messages);
+    let query = crate::util::truncate_str(&query, crate::memory_jev::MAX_QUERY_BYTES);
+    if query.trim().is_empty() {
+        return;
+    }
+    let manager = manager_for_working_dir(working_dir);
+    let Ok(entries) = crate::memory_jev::collect_scoped(&manager, memory::MemoryScope::All) else {
+        return;
+    };
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.active && !memory::is_memory_injected(session_id, &entry.id))
+        .collect();
+    let relevant: Vec<memory::MemoryEntry> = crate::memory_jev::select_local(query, entries, 5)
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect();
+    let Some(prompt) = memory::format_relevant_prompt(&relevant, 5) else {
+        return;
+    };
+    let display = memory::format_relevant_display_prompt(&relevant, 5);
+    memory::set_pending_memory_for_project_with_selection(
+        session_id,
+        prompt,
+        relevant.len(),
+        &relevant,
+        display,
+        working_dir,
+    );
 }
 
 pub async fn init() -> Result<MemoryAgentHandle> {
