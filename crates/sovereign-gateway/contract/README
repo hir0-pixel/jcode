@@ -1,0 +1,3 @@
+gateway-contract.openrpc.json is copied verbatim from hermes-agent
+(apps/shared/src/gateway-contract.openrpc.json), MIT License, Copyright (c) 2025 Nous Research.
+Refresh it when the desktop app updates its gateway contract.

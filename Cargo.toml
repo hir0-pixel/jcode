@@ -30,6 +30,7 @@ members = [
     "crates/jcode-fuzzy",
     "crates/jcode-harness-api",
     "crates/jcode-harness-api-server",
+    "crates/sovereign-gateway",
     "crates/jcode-sdk",
     "crates/jcode-memory-types",
     "crates/jcode-message-types",
@@ -98,6 +99,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "jcode"
 path = "src/main.rs"
+
+[[bin]]
+name = "sovereign"
+path = "src/bin/sovereign.rs"
 
 [[bin]]
 name = "test_api"
@@ -238,6 +243,7 @@ pdf = ["jcode-tui/pdf"]
 # bridge listens on a Unix socket.
 [target.'cfg(unix)'.dependencies]
 jcode-harness-api-server = { path = "crates/jcode-harness-api-server" }
+sovereign-gateway = { path = "crates/sovereign-gateway" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

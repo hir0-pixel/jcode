@@ -3186,6 +3186,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sovereign-gateway",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -7173,6 +7174,22 @@ checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "sovereign-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "httparse",
+ "jcode-harness-api-server",
+ "jsonschema",
+ "rand 0.8.6",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

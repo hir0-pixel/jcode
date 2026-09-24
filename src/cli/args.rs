@@ -167,6 +167,20 @@ pub(crate) enum Command {
         server_name: Option<String>,
     },
 
+    /// Run the agent server in-process behind a Hermes-desktop-compatible
+    /// gateway (HTTP + /api/ws JSON-RPC). Token from HERMES_DASHBOARD_SESSION_TOKEN.
+    #[command(hide = true)]
+    Gateway {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 0 picks a free port; the chosen one is announced on stdout.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Allow binding a non-loopback address (the token is still required).
+        #[arg(long)]
+        allow_remote: bool,
+    },
+
     /// Run as an Agent Client Protocol (ACP) adapter backed by the Jcode daemon
     Acp,
 

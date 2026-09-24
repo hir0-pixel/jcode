@@ -18,7 +18,20 @@ fn sync_output_style_from_config() {
 pub async fn run() -> Result<()> {
     // Parse once, before startup side effects. Invalid arguments and --help
     // must not harden credential files or create configuration/telemetry state.
-    let args = Args::parse();
+    run_with_args(Args::parse()).await
+}
+
+/// Run with an explicit argv (used by the `sovereign` binary, which accepts
+/// the Hermes backend command line and translates it).
+pub async fn run_from<I, T>(argv: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    run_with_args(Args::parse_from(argv)).await
+}
+
+async fn run_with_args(args: Args) -> Result<()> {
     // Credential import must refuse existing stores without normal startup
     // hardening, migrations, telemetry, or provider discovery touching them.
     if args.ssh.is_none()
@@ -484,6 +497,7 @@ fn should_spawn_background_update_check_with_config(args: &Args, check_updates: 
             args.command,
             Some(Command::Update)
                 | Some(Command::Serve { .. })
+                | Some(Command::Gateway { .. })
                 | Some(Command::Server { .. })
                 | Some(Command::Acp)
         )

@@ -1,0 +1,20 @@
+[package]
+name = "sovereign-gateway"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Hermes tui_gateway-compatible HTTP/WebSocket front end for the jcode harness API"
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+httparse = "1"
+jcode-harness-api-server = { path = "../jcode-harness-api-server" }
+rand = "0.8"
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+jsonschema = { version = "0.49", default-features = false }

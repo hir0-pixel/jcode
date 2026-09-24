@@ -1,0 +1,232 @@
+// Live end-to-end check of the sovereign engine against the Hermes gateway
+// contract. Launches the real binary the way the Hermes desktop does, then
+// drives it over HTTP + WebSocket, validating every frame against the contract.
+//
+//   node crates/sovereign-gateway/e2e/live.mjs
+//
+// Env: SOVEREIGN_BIN (default target/release/sovereign), HERMES_AGENT_DIR
+// (for the ws/ajv packages; default ../hermes-agent), E2E_PROVIDER / E2E_MODEL
+// (default ollama / qwen3.8:27b), E2E_SKIP_CHAT=1 to skip model calls.
+
+import { spawn, execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const repo = path.resolve(here, '../../..')
+const hermes = process.env.HERMES_AGENT_DIR || path.resolve(repo, '../hermes-agent')
+const require = createRequire(path.join(hermes, 'package.json'))
+const WebSocket = require('ws')
+const Ajv = require('ajv')
+
+const contract = JSON.parse(fs.readFileSync(path.join(here, '../contract/gateway-contract.openrpc.json'), 'utf8'))
+const ajv = new Ajv({ strict: false, allErrors: true })
+const validators = new Map()
+function validate(kind, name, schema, value) {
+  const key = `${kind}:${name}`
+  if (!validators.has(key)) validators.set(key, ajv.compile({ ...schema, components: contract.components }))
+  const fn = validators.get(key)
+  if (!fn(value)) fail(`${key} violates the contract: ${ajv.errorsText(fn.errors)}\n${JSON.stringify(value).slice(0, 400)}`)
+}
+const notif = Object.fromEntries(contract['x-notifications'].map(n => [n.name, n.params[0].schema]))
+const results = Object.fromEntries(contract.methods.map(m => [m.name, m.result.schema]))
+
+let failures = 0
+const passed = []
+function fail(msg) { failures++; console.error('FAIL', msg) }
+function ok(msg) { passed.push(msg); console.log('ok  ', msg) }
+function check(cond, msg) { cond ? ok(msg) : fail(msg) }
+
+const bin = process.env.SOVEREIGN_BIN || path.join(repo, 'target/release/sovereign')
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sovereign-e2e-'))
+const token = crypto.randomBytes(32).toString('hex')
+const provider = process.env.E2E_PROVIDER || 'ollama'
+const model = process.env.E2E_MODEL || 'qwen3.8:27b'
+const readyFile = path.join(home, 'ready.json')
+
+const child = spawn(bin, ['--provider', provider, '--model', model, '--profile', 'x', 'serve', '--host', '127.0.0.1', '--port', '0'], {
+  env: { ...process.env, JCODE_HOME: home, HERMES_DASHBOARD_SESSION_TOKEN: token, HERMES_DESKTOP_READY_FILE: readyFile },
+  cwd: home,
+  stdio: ['ignore', 'pipe', 'pipe']
+})
+let stderr = ''
+child.stderr.on('data', d => { stderr += d })
+const port = await new Promise((resolve, reject) => {
+  let buf = ''
+  const timer = setTimeout(() => reject(new Error(`no READY line in 60s\n${stderr}`)), 60_000)
+  child.stdout.on('data', d => {
+    buf += d
+    const m = buf.match(/^HERMES_BACKEND_READY port=(\d+)/m)
+    if (m) { clearTimeout(timer); resolve(Number(m[1])) }
+  })
+  child.on('exit', code => { clearTimeout(timer); reject(new Error(`engine exited ${code}\n${stderr}`)) })
+})
+ok(`engine announced port ${port}`)
+check(JSON.parse(fs.readFileSync(readyFile, 'utf8')).port === port, 'ready file carries the port')
+check((fs.statSync(readyFile).mode & 0o077) === 0, 'ready file is owner-only')
+
+const base = `http://127.0.0.1:${port}`
+const get = (p, headers = {}) => fetch(base + p, { headers })
+let r = await get('/api/health')
+check(r.status === 200 && (await r.json()).ok === true, '/api/health is public and ok')
+r = await get('/api/status')
+check(r.status === 200, '/api/status is public')
+r = await get('/api/host/identity')
+check(r.status === 401, 'token-gated route refuses a missing token')
+r = await get('/api/host/identity', { authorization: 'Bearer wrong' })
+check(r.status === 401, 'token-gated route refuses a wrong token')
+r = await get('/api/host/identity', { authorization: `Bearer ${token}` })
+check(r.status === 200, 'token-gated route accepts the token')
+// fetch forbids overriding Host, so exercise the rebinding check with a raw socket
+const raw = await new Promise(resolve => {
+  const net = require('node:net')
+  const s = net.connect(port, '127.0.0.1', () => s.write('GET /api/health HTTP/1.1\r\nHost: evil.example\r\n\r\n'))
+  let out = ''
+  s.on('data', d => { out += d })
+  s.on('close', () => resolve(out))
+})
+check(raw.startsWith('HTTP/1.1 403'), 'DNS-rebinding Host header is refused')
+const huge = await new Promise(resolve => {
+  const net = require('node:net')
+  const s = net.connect(port, '127.0.0.1', () => s.write('GET / HTTP/1.1\r\nX: ' + 'a'.repeat(40_000) + '\r\n\r\n'))
+  s.on('error', () => resolve('reset'))
+  s.on('close', () => resolve('closed'))
+})
+check(huge === 'closed' || huge === 'reset', 'oversized headers are dropped')
+
+function openWs(query, headers = {}) {
+  return new WebSocket(`ws://127.0.0.1:${port}/api/ws${query}`, { headers })
+}
+function closeCode(ws) {
+  return new Promise(resolve => ws.on('close', code => resolve(code)))
+}
+check((await closeCode(openWs(''))) === 4401, 'websocket without token closes 4401')
+check((await closeCode(openWs('?token=nope'))) === 4401, 'websocket with wrong token closes 4401')
+check((await closeCode(openWs(`?token=${token}`, { origin: 'https://evil.example' }))) === 4403, 'cross-site origin closes 4403')
+
+// Authenticated client
+const ws = openWs(`?token=${token}`, { origin: 'file://' })
+const events = []
+const pending = new Map()
+let nextId = 1
+ws.on('message', data => {
+  const frame = JSON.parse(data.toString())
+  if (frame.method === 'event') {
+    events.push(frame.params)
+    const schema = notif[frame.params.type]
+    if (!schema) fail(`unknown event type ${frame.params.type}`)
+    else validate('event', frame.params.type, schema, frame.params.payload ?? {})
+  } else if (frame.id && pending.has(frame.id)) {
+    pending.get(frame.id)(frame)
+    pending.delete(frame.id)
+  } else if (frame.method === 'approval') {
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { choice: 'deny' } }))
+  }
+})
+await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject) })
+function rpc(method, params = {}) {
+  const id = `c${nextId++}`
+  ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${method} timed out`)), 120_000)
+    pending.set(id, f => { clearTimeout(t); resolve(f) })
+  })
+}
+const waitFor = (pred, ms) => new Promise((resolve, reject) => {
+  const t0 = Date.now()
+  const tick = () => {
+    const hit = events.find(pred)
+    if (hit) return resolve(hit)
+    if (Date.now() - t0 > ms) return reject(new Error('timed out waiting for event'))
+    setTimeout(tick, 100)
+  }
+  tick()
+})
+await waitFor(e => e.type === 'gateway.ready', 5000)
+ok('gateway.ready received')
+
+let f = await rpc('definitely.not.a.method')
+check(f.error?.code === -32601 && f.error?.data?.reason === 'not_supported_by_engine', 'unknown methods return -32601 not_supported_by_engine')
+ws.send('{not json')
+await new Promise(res => setTimeout(res, 200))
+f = await rpc('prompt.submit', {})
+check(f.error?.code === -32602, 'missing session_id returns invalid params')
+f = await rpc('ping')
+check(!f.error, 'ping answers')
+
+f = await rpc('session.create', { cwd: home })
+check(!f.error, 'session.create succeeds')
+if (!f.error) validate('result', 'session.create', results['session.create'], f.result)
+const sid = f.result?.session_id
+
+f = await rpc('session.list', { limit: 20 })
+if (!f.error) validate('result', 'session.list', results['session.list'], f.result)
+check(f.result?.sessions?.some(s => s.id === sid), 'session.list includes the new session')
+
+if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
+  const t0 = Date.now()
+  f = await rpc('prompt.submit', { session_id: sid, text: 'Reply with exactly the word PONG and nothing else.' })
+  check(!f.error, 'prompt.submit accepted')
+  if (!f.error) validate('result', 'prompt.submit', results['prompt.submit'], f.result)
+  const done = await waitFor(e => e.type === 'message.complete' && e.session_id === sid, 600_000).catch(e => fail(e.message))
+  if (done) {
+    console.log('     reply:', JSON.stringify(done.payload.text).slice(0, 200), `(${((Date.now() - t0) / 1000).toFixed(1)}s)`)
+    check(done.payload.status === 'complete', 'turn completed')
+    check(/PONG/i.test(done.payload.text), 'reply streamed back through the gateway')
+    const seqs = events.filter(e => e.session_id === sid).map(e => e.seq)
+    check(seqs.every((s, i) => i === 0 || s > seqs[i - 1]), 'per-session seq is monotonic')
+    check(events.some(e => e.type === 'message.start'), 'message.start emitted')
+  }
+  f = await rpc('session.history', { session_id: sid })
+  if (!f.error) validate('result', 'session.history', results['session.history'], f.result)
+  check((f.result?.count ?? 0) >= 2, 'history holds the exchange')
+
+  // resume returns the same transcript
+  f = await rpc('session.resume', { session_id: sid })
+  if (!f.error) validate('result', 'session.resume', results['session.resume'], f.result)
+  check(!f.error && f.result.message_count >= 2, 'session.resume returns the transcript')
+}
+
+// A reconnecting client submits without resuming first: the gateway must attach.
+if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
+  const ws2 = openWs(`?token=${token}`, { origin: 'file://' })
+  const got = []
+  const replies = new Map()
+  ws2.on('message', d => {
+    const fr = JSON.parse(d.toString())
+    if (fr.method === 'event') got.push(fr.params)
+    else if (fr.id && replies.has(fr.id)) replies.get(fr.id)(fr)
+  })
+  await new Promise(res => ws2.on('open', res))
+  const sub = await new Promise(res => {
+    replies.set('r1', res)
+    ws2.send(JSON.stringify({ jsonrpc: '2.0', id: 'r1', method: 'prompt.submit', params: { session_id: sid, text: 'Reply with exactly the word AGAIN.' } }))
+  })
+  check(!sub.error, 'submit on a fresh connection auto-attaches')
+  const t0 = Date.now()
+  let done2 = null
+  while (!done2 && Date.now() - t0 < 600_000) {
+    done2 = got.find(e => e.type === 'message.complete' && e.session_id === sid)
+    await new Promise(res => setTimeout(res, 200))
+  }
+  check(done2 && /AGAIN/i.test(done2.payload.text), 'second connection receives its reply')
+  ws2.close()
+}
+
+f = await rpc('session.interrupt', { session_id: sid })
+if (!f.error) validate('result', 'session.interrupt', results['session.interrupt'], f.result)
+check(!f.error, 'session.interrupt answers when idle')
+
+const rssKb = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(child.pid)]).toString().trim())
+console.log(`     engine RSS: ${(rssKb / 1024).toFixed(1)} MB`)
+
+ws.close()
+child.kill('SIGTERM')
+await new Promise(res => child.on('exit', res))
+fs.rmSync(home, { recursive: true, force: true })
+console.log(`\n${passed.length} passed, ${failures} failed`)
+process.exit(failures ? 1 : 0)

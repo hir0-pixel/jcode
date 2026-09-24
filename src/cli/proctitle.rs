@@ -11,6 +11,7 @@ use crate::process_title::{compact_process_title, session_name, set_title};
 pub(crate) fn initial_title(args: &Args) -> String {
     match &args.command {
         Some(Command::Serve { .. }) => "jcode:server".to_string(),
+        Some(Command::Gateway { .. }) => "sovereign:gateway".to_string(),
         Some(Command::Acp) => "jcode acp".to_string(),
         Some(Command::Server { .. }) => "jcode server".to_string(),
         Some(Command::Connect) => "jcode:client".to_string(),

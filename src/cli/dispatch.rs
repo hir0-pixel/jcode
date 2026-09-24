@@ -162,6 +162,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             ));
             server.run().await?;
         }
+        Some(Command::Gateway {
+            host,
+            port,
+            allow_remote,
+        }) => {
+            crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
+            run_gateway(&args.provider, args.model.as_deref(), &host, port, allow_remote).await?;
+        }
         Some(Command::Acp) => {
             acp::run_acp_command(
                 args.provider,
@@ -1326,6 +1334,95 @@ async fn detect_bootstrap_credentials() -> BootstrapCredentialState {
     BootstrapCredentialState {
         has_any: has_claude || has_openai || has_openrouter || has_copilot || has_api_key,
     }
+}
+
+/// Server + Hermes-compatible gateway in one process. The daemon listens on a
+/// private per-process socket so it never collides with a user's own jcode.
+async fn run_gateway(
+    provider_choice: &ProviderChoice,
+    model: Option<&str>,
+    host: &str,
+    port: u16,
+    allow_remote: bool,
+) -> Result<()> {
+    let socket = crate::storage::runtime_dir().join(format!("sovereign-{}.sock", std::process::id()));
+    server::set_socket_path(&socket.to_string_lossy());
+
+    let token = match std::env::var("HERMES_DASHBOARD_SESSION_TOKEN") {
+        Ok(token) if token.len() >= 32 => token,
+        _ => {
+            let token = sovereign_gateway::auth::generate_token();
+            let path = crate::storage::jcode_dir()?.join("sovereign-gateway.token");
+            write_private_file(&path, &token)?;
+            eprintln!("sovereign: token written to {}", path.display());
+            token
+        }
+    };
+    let bind: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .or_else(|_| format!("[{host}]:{port}").parse())
+        .map_err(|_| anyhow::anyhow!("invalid --host {host}"))?;
+
+    let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
+    let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
+
+    let gateway = async {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !server_is_running_at(&socket).await {
+            if Instant::now() > deadline {
+                anyhow::bail!("engine server did not start");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let gateway = sovereign_gateway::Gateway::bind(sovereign_gateway::Config {
+            bind,
+            token,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            legacy_socket: socket.clone(),
+            default_cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
+            allow_non_loopback: allow_remote,
+        })
+        .await?;
+        let port = gateway.local_addr().port();
+        if let Ok(ready_file) = std::env::var("HERMES_DESKTOP_READY_FILE") {
+            write_private_file(std::path::Path::new(&ready_file), &format!("{{\"port\":{port}}}"))?;
+        }
+        // The exact line the Hermes desktop waits for.
+        println!("HERMES_BACKEND_READY port={port}");
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        gateway.serve().await
+    };
+    let result = tokio::select! {
+        result = server.run() => result,
+        result = gateway => result,
+    };
+    let _ = std::fs::remove_file(&socket);
+    result
+}
+
+/// Write a file readable only by the current user (tokens, ready files).
+fn write_private_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    // A pre-existing tmp file would keep its old permissions; start fresh.
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub(crate) async fn spawn_server(
