@@ -59,8 +59,10 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
         return Ok(None);
     }
     let (system, user) = learning::request(&harness, fresh, signals.effort);
-    let reply = complete(system, user).await?;
-    let learned = learning::apply(&harness, &reply, fresh, signals.effort).map_err(anyhow::Error::msg)?;
+    let started = crate::observability::now();
+    let reply = complete(system, user).await;
+    conn.observer.record_aux(session, "learning", Some("Learning pass"), None, None, started, reply.as_ref().ok().and_then(|done| done.usage), reply.as_ref().err().map(|err| err.to_string()).as_deref());
+    let learned = learning::apply(&harness, &reply?.text, fresh, signals.effort).map_err(anyhow::Error::msg)?;
     let cwd = conn.session_cwd(session).await;
     let stored = if learned.memories.is_empty() { 0 } else { (learning.remember)(learned.memories, cwd)? };
     harness.set_watermark(session, turns.len())?;

@@ -1,0 +1,7 @@
+{
+  "sovereign/bench-hermes-64k:latest": {
+    "input": 3,
+    "cached": 0.3,
+    "output": 15
+  }
+}

@@ -10,6 +10,7 @@ anyhow = "1"
 futures-util = "0.3"
 httparse = "1"
 jcode-base = { path = "../jcode-base" }
+jcode-app-core = { path = "../jcode-app-core" }
 jcode-command-risk = { path = "../jcode-command-risk" }
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }
 sovereign-prime = { path = "../sovereign-prime" }
@@ -18,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 jcode-provider-core = { path = "../jcode-provider-core" }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 subtle = "2"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time", "process"] }
 tokio-tungstenite = "0.24"

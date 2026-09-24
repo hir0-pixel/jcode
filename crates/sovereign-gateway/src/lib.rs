@@ -72,7 +72,7 @@ pub struct Config {
     pub model: String,
     /// Engine state directory, reported as the single profile's path.
     pub home: String,
-    /// One-shot model call `(system, user) -> text`, used by `/refine`.
+    /// One-shot model call `(system, user) -> text and usage`, used by learning and `/refine`.
     pub complete: Option<Complete>,
     /// Lets the `pre_tool` hook create approval prompts (never answer them).
     pub approval_secret: String,
@@ -83,7 +83,7 @@ pub struct Config {
 }
 
 pub type Complete = std::sync::Arc<
-    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> + Send + Sync,
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jcode_provider_core::SimpleCompletion>> + Send>> + Send + Sync,
 >;
 
 pub struct Gateway {

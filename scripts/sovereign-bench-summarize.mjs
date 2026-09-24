@@ -35,14 +35,11 @@ const parse = tag => {
 }
 const modelCalls = calls.filter(c => c.purpose !== 'warm-up')
 
-// Dummy API pricing (USD per million tokens): treat Ollama as a paid API so
-// token savings show up as money. Override with BENCH_PRICE_* to match the
-// provider you ship with.
-const PRICE = {
-  input: Number(process.env.BENCH_PRICE_INPUT ?? 3),
-  cached: Number(process.env.BENCH_PRICE_CACHED ?? 0.3),
-  output: Number(process.env.BENCH_PRICE_OUTPUT ?? 15),
-}
+// The engine reads this same per-model table when SOVEREIGN_PRICE_TABLE points
+// to it; local model pricing is opt-in at runtime.
+const prices = JSON.parse(fs.readFileSync(new URL('./sovereign-prices.json', import.meta.url)))
+const PRICE = prices[config.MODEL]
+if (!PRICE) throw new Error(`No benchmark price for ${config.MODEL}`)
 const costOf = c => {
   const prompt = c.prompt_tokens || 0
   const cached = Math.min(c.cached_tokens || 0, prompt)

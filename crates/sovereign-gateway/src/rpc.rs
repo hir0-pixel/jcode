@@ -114,7 +114,9 @@ pub(crate) struct Conn {
     hub: Arc<Hub>,
     /// This connection as seen by the approval hub.
     client: Arc<Client>,
-    observer: Arc<Observer>,
+    pub(crate) observer: Arc<Observer>,
+    run_kind: &'static str,
+    run_title: Option<String>,
 }
 
 impl Conn {
@@ -712,7 +714,7 @@ impl Conn {
                 }
                 self.fresh.lock().await.remove(&id);
                 self.learn_state.lock().await.entry(id.clone()).or_default().0 += 1;
-                let run = self.observer.start_turn(&id, &text);
+                let run = self.observer.start_turn(&id, &text, self.run_kind, self.run_title.as_deref());
                 if let Err(err) = self.submit(&id, &text).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
@@ -841,7 +843,10 @@ impl Conn {
                     return Ok("Nothing to learn from yet: this session has no messages.".to_string());
                 }
                 let (system, user) = harness.refine_request(&turns);
-                let reply = complete(system, user).await?;
+                let started = crate::observability::now();
+                let reply = complete(system, user).await;
+                self.observer.record_aux(sid, "other", Some("Refine instructions"), None, None, started, reply.as_ref().ok().and_then(|done| done.usage), reply.as_ref().err().map(|err| err.to_string()).as_deref());
+                let reply = reply?.text;
                 Ok(match harness.apply(&reply, &turns)? {
                     Outcome::Updated { changes, added, removed } => {
                         let mut text = format!("Learned: {changes}\n");
@@ -1028,6 +1033,8 @@ pub(crate) async fn agent_run(
         hub: hub.clone(),
         client,
         observer,
+        run_kind: "cron",
+        run_title: title.map(str::to_string),
     });
 
     let control = conn.open_link().await.context("engine unavailable")?;
@@ -1126,6 +1133,8 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Obser
         hub: hub.clone(),
         client: client.clone(),
         observer,
+        run_kind: "invoke_agent",
+        run_title: None,
     });
 
     // Control link first: if the engine is unreachable, refuse the client.

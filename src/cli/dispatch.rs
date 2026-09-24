@@ -1409,7 +1409,7 @@ async fn run_gateway(
     let refine_provider = provider.clone();
     let complete: sovereign_gateway::Complete = std::sync::Arc::new(move |system: String, user: String| {
         let provider = refine_provider.clone();
-        Box::pin(async move { provider.complete_simple(&user, &system).await })
+        Box::pin(async move { provider.complete_simple_with_usage(&user, &system).await })
     });
     let learning = sovereign_learning(&provider_choice);
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
@@ -1908,4 +1908,3 @@ fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::le
     });
     Some(sovereign_gateway::learn::Learning { idle: std::time::Duration::from_millis(idle_ms), remember })
 }
-
