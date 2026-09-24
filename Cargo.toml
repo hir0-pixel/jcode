@@ -31,6 +31,7 @@ members = [
     "crates/jcode-harness-api",
     "crates/jcode-harness-api-server",
     "crates/sovereign-gateway",
+    "crates/sovereign-prime",
     "crates/jcode-sdk",
     "crates/jcode-memory-types",
     "crates/jcode-message-types",
@@ -244,6 +245,8 @@ pdf = ["jcode-tui/pdf"]
 [target.'cfg(unix)'.dependencies]
 jcode-harness-api-server = { path = "crates/jcode-harness-api-server" }
 sovereign-gateway = { path = "crates/sovereign-gateway" }
+sovereign-prime = { path = "crates/sovereign-prime" }
+monty-alloc = "0.0.23"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

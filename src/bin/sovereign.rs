@@ -8,6 +8,12 @@
 
 use anyhow::Result;
 
+// Counts allocations so a REPL worker (this binary with `__repl-worker`) can
+// enforce a hard memory ceiling. The engine process never arms a limit, so
+// for it this is the system allocator plus one counter.
+#[global_allocator]
+static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
+
 fn translate(args: Vec<String>) -> Vec<String> {
     let mut out = vec!["sovereign".to_string()];
     let mut rest = args.into_iter().peekable();
@@ -33,6 +39,14 @@ fn translate(args: Vec<String>) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
+    // Prime REPL worker mode: no runtime, no jcode startup, no environment.
+    if std::env::args().nth(1).as_deref() == Some("__repl-worker") {
+        return Ok(sovereign_prime::worker::run(sovereign_prime::worker::Limits::default())?);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // SAFETY: single-threaded here, before the runtime starts.
+        unsafe { std::env::set_var("SOVEREIGN_REPL_WORKER", exe) };
+    }
     // Sovereign: nothing leaves the machine except model calls. jcode's
     // anonymous usage telemetry is disabled unconditionally.
     // SAFETY: single-threaded here, before the runtime starts.

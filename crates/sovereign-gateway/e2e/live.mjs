@@ -242,6 +242,21 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
   ws2.close()
 }
 
+// Prime REPL: the model can run code in the sandboxed worker through the tool.
+if (process.env.E2E_SKIP_CHAT !== '1') {
+  f = await rpc('session.create', { cwd: home })
+  const psid = f.result?.session_id; console.log('     sid', sid, 'psid', psid, f.error ? JSON.stringify(f.error) : '')
+  f = await rpc('prompt.submit', { session_id: psid, text: 'Use the repl tool to evaluate sum(range(10**6)) and then reply with only the resulting number.' })
+  check(psid && psid !== sid, 'a second session on the same socket is a distinct session')
+  check(!f.error, 'prime prompt accepted')
+  const pdone = await waitFor(e => e.type === 'message.complete' && e.session_id === psid, 600_000).catch(e => fail(e.message))
+  const tools = events.filter(e => e.session_id === psid && e.type === 'tool.start').map(e => e.payload.name)
+  console.log('     prime tools used:', tools.join(', ') || '(none)', '| reply:', JSON.stringify(pdone?.payload.text).slice(0, 120))
+  check(tools.includes('repl'), 'model called the repl tool')
+  const out = events.find(e => e.session_id === psid && e.type === 'tool.complete' && e.payload.name === 'repl')
+  check(/499999500000/.test(out?.payload.result_text || ''), 'repl computed the value in the sandbox')
+}
+
 f = await rpc('session.interrupt', { session_id: sid })
 if (!f.error) validate('result', 'session.interrupt', results['session.interrupt'], f.result)
 check(!f.error, 'session.interrupt answers when idle')

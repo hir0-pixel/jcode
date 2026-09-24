@@ -1,0 +1,21 @@
+[package]
+name = "sovereign-prime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Prime-style recursive REPL (RLM) for the sovereign engine: a Monty sandbox in a memory-capped worker process"
+
+[dependencies]
+anyhow = "1"
+monty = "0.0.23"
+monty-alloc = "0.0.23"
+monty-types = "0.0.23"
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "process", "io-util", "sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "prime-worker"
+path = "src/bin/prime-worker.rs"

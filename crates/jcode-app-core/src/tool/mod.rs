@@ -34,6 +34,7 @@ mod open;
 mod panel;
 mod patch;
 mod read;
+mod repl;
 mod replace;
 pub(crate) mod sdk;
 pub mod selfdev;
@@ -517,6 +518,11 @@ impl Registry {
             "conversation_search",
             conversation_search::ConversationSearchTool::new(compaction),
         );
+        // Prime-style REPL: only inside the sovereign engine, which sets
+        // SOVEREIGN_REPL_WORKER to its own binary.
+        if let Some(repl) = repl::ReplTool::from_env() {
+            Self::insert_tool(&mut tools_map, "repl", repl);
+        }
         // Integration discovery is on by default (opt-out); when disabled the
         // tool is never registered and no discovery endpoint is ever
         // contacted.
