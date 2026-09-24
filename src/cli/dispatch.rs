@@ -1367,16 +1367,26 @@ async fn run_gateway(
         .map_err(|_| anyhow::anyhow!("invalid --host {host}"))?;
 
     let approval_secret = sovereign_gateway::auth::generate_token();
-    // Ollama's OpenAI-compat path serves a small num_ctx by default (4096). The
-    // Sovereign tool schema alone exceeds that, so every turn emergency-compacts
-    // and chat appears broken. Load the model with a usable window first; jcode
-    // then reads the real serving size from /api/ps.
+    // Ollama's OpenAI-compat `/v1` path ignores per-request num_ctx and reloads
+    // the base model at its trained window (262k here), wiping a warm load.
+    // Pin num_ctx on a local alias (`sovereign/…`) so warm-up and chat share
+    // one serving size, then load it for the life of this process.
+    let mut serve_model = model.map(str::to_owned);
     if matches!(provider_choice, ProviderChoice::Ollama)
         || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
     {
-        warm_ollama_serving_context(model.unwrap_or("qwen3.8:27b")).await;
+        let base = model.unwrap_or("qwen3.8:27b");
+        match warm_ollama_serving_context(base).await {
+            Some(alias) => {
+                serve_model = Some(alias);
+            }
+            None => {
+                eprintln!("sovereign: Ollama warm failed; continuing with {base}");
+            }
+        }
     }
-    let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
+    let provider =
+        provider_init::init_provider_for_serve(provider_choice, serve_model.as_deref()).await?;
     // Catalog enrichment (GET /api/ps) only runs on fetch_models. Until then
     // Ollama's context_window() hard-falls back to 4096 and every tool-heavy
     // turn emergency-compacts. Refresh now that the model is warm.
@@ -1410,6 +1420,11 @@ async fn run_gateway(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| ".".into())
         });
+
+    let ollama_unload = serve_model.clone().filter(|_| {
+        matches!(provider_choice, ProviderChoice::Ollama)
+            || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
+    });
 
     let gateway = async {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1450,34 +1465,103 @@ async fn run_gateway(
     let result = tokio::select! {
         result = server.run() => result,
         result = gateway => result,
+        _ = shutdown_signal() => Ok(()),
     };
     let _ = std::fs::remove_file(&socket);
+    if let Some(model) = ollama_unload {
+        unload_ollama_model(&model).await;
+    }
     result
 }
 
-/// Load an Ollama model with a serving window large enough for Sovereign's
-/// system+tools prefix (~10k tokens). Best-effort: chat still starts if Ollama
-/// is down (deferred auth / later failure).
-async fn warm_ollama_serving_context(model: &str) {
-    let num_ctx: u64 = std::env::var("SOVEREIGN_OLLAMA_NUM_CTX")
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = ctrl_c.await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
+
+fn ollama_num_ctx() -> u64 {
+    std::env::var("SOVEREIGN_OLLAMA_NUM_CTX")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n >= 8192)
-        .unwrap_or(32_768);
+        .unwrap_or(32_768)
+}
+
+fn ollama_alias_name(base_model: &str) -> String {
+    // Ollama model names: namespace/name; strip tags' ':' for the alias leaf.
+    // Always include `:latest` so it matches `/v1/models` / catalog ids —
+    // without it context_window() misses the cache and falls back to 4096.
+    let leaf = base_model.replace(':', "-");
+    format!("sovereign/{leaf}:latest")
+}
+
+/// Pin `num_ctx` on a local Ollama alias and load it for the life of this
+/// process (`keep_alive: -1`). Returns the alias to use for chat, or `None`
+/// if Ollama is unreachable (deferred auth / later failure).
+async fn warm_ollama_serving_context(base_model: &str) -> Option<String> {
+    let num_ctx = ollama_num_ctx();
+    let alias = ollama_alias_name(base_model);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .ok()?;
+
+    // Integer num_ctx required — a string value makes later loads fail with
+    // `option "num_ctx" must be of type integer`.
+    let create = serde_json::json!({
+        "model": alias,
+        "from": base_model,
+        "stream": false,
+        "parameters": { "num_ctx": num_ctx },
+    });
+    match client
+        .post("http://127.0.0.1:11434/api/create")
+        .json(&create)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            eprintln!(
+                "sovereign: Ollama create {} returned HTTP {}; chat may reload at a different num_ctx",
+                alias,
+                resp.status()
+            );
+            return None;
+        }
+        Err(err) => {
+            eprintln!("sovereign: Ollama create skipped ({err})");
+            return None;
+        }
+    }
+
+    // -1 = stay loaded until we send keep_alive:0 (app quit). Do not use a
+    // wall-clock TTL that keeps the model resident after Hermes exits.
     let body = serde_json::json!({
-        "model": model,
+        "model": alias,
         "prompt": ".",
         "stream": false,
-        "keep_alive": "2h",
-        "options": { "num_ctx": num_ctx },
+        "keep_alive": -1,
     });
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
     match client
         .post("http://127.0.0.1:11434/api/generate")
         .json(&body)
@@ -1485,17 +1569,54 @@ async fn warm_ollama_serving_context(model: &str) {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            eprintln!("sovereign: warmed Ollama {model} with num_ctx={num_ctx}");
+            eprintln!("sovereign: warmed Ollama {alias} (from {base_model}) with num_ctx={num_ctx}, keep_alive=-1");
+            if let Ok(home) = crate::storage::jcode_dir() {
+                let meta = serde_json::json!({ "model": alias, "base": base_model, "num_ctx": num_ctx });
+                let _ = write_private_file(&home.join("sovereign-ollama-warm.json"), &meta.to_string());
+            }
+            Some(alias)
         }
         Ok(resp) => {
             eprintln!(
-                "sovereign: Ollama warm returned HTTP {}; chat may emergency-compact until OLLAMA_CONTEXT_LENGTH is raised",
+                "sovereign: Ollama warm returned HTTP {}; chat may emergency-compact until num_ctx is pinned",
                 resp.status()
             );
+            None
         }
         Err(err) => {
             eprintln!("sovereign: Ollama warm skipped ({err})");
+            None
         }
+    }
+}
+
+async fn unload_ollama_model(model: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let body = serde_json::json!({ "model": model, "keep_alive": 0 });
+    match client
+        .post("http://127.0.0.1:11434/api/generate")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            eprintln!("sovereign: unloaded Ollama {model}");
+        }
+        Ok(resp) => {
+            eprintln!("sovereign: Ollama unload HTTP {}", resp.status());
+        }
+        Err(err) => {
+            eprintln!("sovereign: Ollama unload skipped ({err})");
+        }
+    }
+    if let Ok(home) = crate::storage::jcode_dir() {
+        let _ = std::fs::remove_file(home.join("sovereign-ollama-warm.json"));
     }
 }
 

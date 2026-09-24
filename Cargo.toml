@@ -139,6 +139,7 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 
 # Async runtime
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+signal-hook = "0.3"
 futures = "0.3"
 async-trait = "0.1"
 

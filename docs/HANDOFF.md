@@ -74,10 +74,15 @@ Also verified earlier: Cron open starts Python; close + idle (`SOVEREIGN_FEATURE
 
 Engine checkout: `hir0-pixel/jcode@feature/sovereign-observability`.
 
-## Step 3 — Benchmark (open)
+## Step 3 — Benchmark (partial)
+
+- [x] Ollama RSS at 16k vs 32k (idle unloaded / idle loaded / after chat) → default **32768**
+- [x] Warm-up = chat context (alias `sovereign/…:latest`, no `/v1` reload); keep_alive **-1** while open, **0** on quit
+- [x] Tool-schema prefix called out (~8.2k tokens / turn) in `docs/BENCHMARK.md`
+- [ ] Full counting-proxy comparison of model calls vs stock Hermes Desktop
 
 ## Step 4 — Docs (open)
 
 ## Not verified yet
 
-Live Windows smoke test, macOS x64, benchmarks vs stock Hermes, INSTALL.md. Desktop `main.ts` still has uncommitted theme/marketplace noise — only packaging e2e/scripts should be committed until those land separately.
+Live Windows smoke on a Windows box, macOS x64 package, full stock-Hermes counting-proxy table, INSTALL.md.

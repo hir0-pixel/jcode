@@ -58,12 +58,19 @@ fn main() -> Result<()> {
         let file = jcode::storage::jcode_dir().map(|d| d.join("sovereign-approval.json")).unwrap_or_default();
         std::process::exit(sovereign_gateway::approvals::hook::run(&file));
     }
+
+    // Always unload a warmed Ollama alias on process exit (including SIGTERM),
+    // so keep_alive=-1 never leaves the model resident after the desktop closes.
+    let _ollama_guard = OllamaUnloadOnDrop;
+    install_ollama_signal_unload();
+
     #[cfg(unix)]
     if let Some(parent) = std::env::var("HERMES_PARENT_PID").ok().and_then(|pid| pid.parse::<libc::pid_t>().ok()) {
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
             // A direct Electron child is reparented when the app is force-killed.
             if unsafe { libc::getppid() } != parent {
+                unload_ollama_from_warm_file();
                 std::process::exit(0);
             }
         });
@@ -120,6 +127,66 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(jcode::cli::startup::run_from(argv))
+}
+
+/// Best-effort Ollama unload when the process exits for any reason other than
+/// `std::process::exit` / abort. Complements the async unload in `run_gateway`.
+struct OllamaUnloadOnDrop;
+
+impl Drop for OllamaUnloadOnDrop {
+    fn drop(&mut self) {
+        unload_ollama_from_warm_file();
+    }
+}
+
+fn unload_ollama_from_warm_file() {
+    let Ok(home) = jcode::storage::jcode_dir() else {
+        return;
+    };
+    let path = home.join("sovereign-ollama-warm.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(model) = meta.get("model").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let body = format!(r#"{{"model":"{model}","keep_alive":0}}"#);
+    let _ = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-m",
+            "5",
+            "http://127.0.0.1:11434/api/generate",
+            "-d",
+            &body,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(path);
+    eprintln!("sovereign: unloaded Ollama {model}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+fn install_ollama_signal_unload() {
+    #[cfg(unix)]
+    {
+        // Catch SIGTERM before the default terminate-without-destructors path.
+        std::thread::spawn(|| {
+            let mut signals = match signal_hook::iterator::Signals::new([libc::SIGTERM, libc::SIGINT])
+            {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            for _ in signals.forever() {
+                unload_ollama_from_warm_file();
+                std::process::exit(0);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
