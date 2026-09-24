@@ -182,6 +182,23 @@ if (!f.error) validate('result', 'session.create', results['session.create'], f.
 const sid = f.result?.session_id
 
 const auth = { 'x-hermes-session-token': token }
+const obsRuns = async () => {
+  const response = await get('/api/sovereign/observability/runs?limit=200', auth)
+  if (response.status !== 200) throw new Error(`observability list returned ${response.status}`)
+  return (await response.json()).runs || []
+}
+const obsRun = async id => (await (await get(`/api/sovereign/observability/run?id=${encodeURIComponent(id)}`, auth)).json())
+const waitRun = async predicate => {
+  for (let i = 0; i < 100; i++) {
+    const found = (await obsRuns()).find(predicate)
+    if (found) return found
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error('observability run did not arrive')
+}
+r = await get('/api/sovereign/observability/runs')
+check(r.status === 401, 'observability requires the desktop token')
+check(Array.isArray(await obsRuns()), 'observability run list is served by Rust')
 r = await get('/api/profiles/sessions?limit=20&offset=0&min_messages=0&archived=false&order=recent&profile=all')
 check(r.status === 401, 'session REST route refuses a missing token')
 for (const route of ['/api/model/info', '/api/profiles', '/api/profiles/active', '/api/hermes/update/check', '/api/fs/default-cwd', '/api/cron/jobs']) {
@@ -209,6 +226,12 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
     const seqs = events.filter(e => e.session_id === sid).map(e => e.seq)
     check(seqs.every((s, i) => i === 0 || s > seqs[i - 1]), 'per-session seq is monotonic')
     check(events.some(e => e.type === 'message.start'), 'message.start emitted')
+    const run = await waitRun(x => x.session_id === sid && x.status === 'complete')
+    const detail = await obsRun(run.id)
+    check(run.root_id === run.id && run.parent_id === null, 'chat has a root run record')
+    check(run.input_tokens > 0 && run.output_tokens > 0 && detail.spans.some(s => s.kind === 'chat'), 'chat model usage is recorded in tier 1')
+    check(run.cost_usd === 0, 'local Ollama has explicit zero API cost')
+    check(detail.content === null && detail.spans.every(s => s.input === null && s.output === null), 'tier 2 off keeps run metadata but drops content')
   }
   f = await rpc('session.list', { limit: 20 })
   console.log('     listed row:', JSON.stringify(f.result?.sessions?.find(x => x.id === sid)))
@@ -273,6 +296,25 @@ if (process.env.E2E_SKIP_CHAT !== '1') {
   check(tools.includes('repl'), 'model called the repl tool')
   const out = events.find(e => e.session_id === psid && e.type === 'tool.complete' && e.payload.name === 'repl')
   check(/499999500000/.test(out?.payload.result_text || ''), 'repl computed the value in the sandbox')
+  const run = await waitRun(x => x.session_id === psid && x.status === 'complete')
+  const detail = await obsRun(run.id)
+  check(detail.spans.some(s => s.kind === 'execute_tool' && s.name === 'repl' && s.status === 'complete'), 'tool call has a tier-1 span')
+}
+
+// Explicit subagent invocation creates a child run with a stable parent/root.
+if (process.env.E2E_OBSERVABILITY === '1' && process.env.E2E_SKIP_CHAT !== '1') {
+  f = await rpc('session.create', { cwd: home })
+  const subSid = f.result.session_id
+  await rpc('prompt.submit', { session_id: subSid, text: 'You must call the swarm tool exactly once with {"action":"spawn","label":"Observer check","prompt":"Reply READY"}. This is a tool invocation test. Do not explain or substitute another tool. After the tool returns, reply SPAWNED.' })
+  await waitFor(e => e.type === 'message.complete' && e.session_id === subSid, 600_000)
+  const root = await waitRun(x => x.session_id === subSid && x.parent_id === null && x.status === 'complete')
+  const called = events.some(e => e.session_id === subSid && e.type === 'tool.start' && e.payload.name === 'swarm')
+  if (called) {
+    const childRun = await waitRun(x => x.parent_id === root.id)
+    check(childRun.root_id === root.id && childRun.kind === 'invoke_agent' && childRun.session_id !== subSid, 'subagent has real session, parent and root ids')
+  } else {
+    console.log('skip subagent live assertion: this model declined the swarm tool; the persisted-child fixture is covered in Rust')
+  }
 }
 
 // Continual Harness: learned instructions reach new sessions; /refine and rollback.
@@ -409,14 +451,54 @@ check(!f.error, 'session.interrupt answers when idle')
 const rssKb = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(child.pid)]).toString().trim())
 console.log(`     engine RSS: ${(rssKb / 1024).toFixed(1)} MB`)
 
-ws.close()
+if (process.env.E2E_OBSERVABILITY === '1' && process.env.E2E_SKIP_CHAT !== '1') {
+  f = await rpc('session.create', { cwd: home })
+  const stopSid = f.result.session_id
+  await rpc('prompt.submit', { session_id: stopSid, text: 'Write a detailed 1,000-word analysis of local software observability, then summarize it.' })
+  const active = await waitRun(x => x.session_id === stopSid && x.status === 'running')
+  const stopped = await rpc('session.interrupt', { session_id: stopSid })
+  check(!stopped.error && stopped.result?.interrupted === true, 'Stop interrupts a live run')
+  await waitFor(e => e.type === 'message.complete' && e.session_id === stopSid, 600_000)
+  const saved = await waitRun(x => x.id === active.id && x.status === 'interrupted')
+  check(saved.status === 'interrupted', 'stopped run is persisted as interrupted')
+}
+
+let interruptedId = null
+if (process.env.E2E_SKIP_CHAT !== '1') {
+  f = await rpc('session.create', { cwd: home })
+  const crashSid = f.result.session_id
+  await rpc('prompt.submit', { session_id: crashSid, text: 'Write a detailed 1,000-word analysis of local software observability, then summarize it.' })
+  const running = await waitRun(x => x.session_id === crashSid && x.status === 'running')
+  interruptedId = running.id
+}
 child.kill('SIGKILL')
 await new Promise(res => child.on('exit', res))
+if (interruptedId) {
+  const restarted = spawn(bin, ['--provider', provider, '--model', model, '--profile', 'x', 'serve', '--host', '127.0.0.1', '--port', '0'], {
+    env: { ...process.env, JCODE_HOME: home, HERMES_HOME: path.join(home, 'hermes-home'), HERMES_DASHBOARD_SESSION_TOKEN: token, HERMES_DESKTOP_READY_FILE: readyFile },
+    cwd: home, stdio: ['ignore', 'pipe', 'pipe']
+  })
+  const restartedPort = await new Promise((resolve, reject) => {
+    let output = ''
+    restarted.stdout.on('data', d => {
+      output += d
+      const match = output.match(/^HERMES_BACKEND_READY port=(\d+)/m)
+      if (match) resolve(Number(match[1]))
+    })
+    restarted.on('exit', code => reject(new Error(`restarted engine exited ${code}`)))
+  })
+  const response = await fetch(`http://127.0.0.1:${restartedPort}/api/sovereign/observability/runs`, { headers: auth })
+  const recovered = (await response.json()).runs.find(x => x.id === interruptedId)
+  check(recovered?.status === 'interrupted', 'restart marks an unfinished run interrupted without retrying it')
+  restarted.kill('SIGKILL')
+  await new Promise(res => restarted.on('exit', res))
+}
 if (process.env.E2E_SKIP_FEATURES !== '1') {
   let left = 1
   for (let i = 0; i < 40 && left; i++) { await new Promise(res => setTimeout(res, 250)); left = pyCount() }
   check(left === 0, 'the Python feature backend exits when the engine is killed')
 }
-fs.rmSync(home, { recursive: true, force: true })
+if (process.env.E2E_KEEP_HOME === '1') console.log(`     retained isolated home: ${home}`)
+else fs.rmSync(home, { recursive: true, force: true })
 console.log(`\n${passed.length} passed, ${failures} failed`)
 process.exit(failures ? 1 : 0)
