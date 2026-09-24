@@ -467,6 +467,11 @@ export class JcodeClient extends EventEmitter {
     await this.requestOk({ req: "archive_session", session_id: sessionId });
   }
 
+  /** Permanently delete a session's stored transcript. */
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.requestOk({ req: "delete_session", session_id: sessionId });
+  }
+
   async restoreSession(sessionId: string): Promise<void> {
     await this.requestOk({ req: "restore_session", session_id: sessionId });
   }

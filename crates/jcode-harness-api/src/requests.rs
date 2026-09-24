@@ -51,6 +51,9 @@ pub enum ApiRequest {
     /// Reversibly hide a session from the default list. Its transcript remains
     /// on disk and can be restored at any time.
     ArchiveSession { session_id: String },
+    /// Permanently delete a session's stored transcript. Refused by callers
+    /// while the session is live.
+    DeleteSession { session_id: String },
 
     /// Put an archived session back in the default list.
     RestoreSession { session_id: String },

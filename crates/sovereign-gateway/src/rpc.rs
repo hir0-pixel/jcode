@@ -466,6 +466,141 @@ impl Conn {
                 }
                 Ok(json!({ "sessions": rows }))
             }
+            // Chats live only in the engine's store, so every chat-bound method
+            // is answered here; forwarding one to Hermes's Python backend would
+            // act on a database that has never seen these sessions.
+            "session.close" => {
+                let id = sid()?;
+                let closed = self.links.lock().await.remove(id).is_some();
+                self.client.sessions.lock().await.remove(id);
+                Ok(json!({ "closed": closed }))
+            }
+            "session.delete" => {
+                let id = sid()?.to_string();
+                if self.sessions.lock().await.get(&id).is_some_and(SessionState::turn_active) || self.observer.has_active_run(&id) {
+                    return Err(RpcError::params("session is running; stop it before deleting"));
+                }
+                self.links.lock().await.remove(&id);
+                self.client.sessions.lock().await.remove(&id);
+                call(json!({ "req": "delete_session", "session_id": id })).await?;
+                self.known.lock().await.remove(&id);
+                self.sessions.lock().await.remove(&id);
+                Ok(json!({ "deleted": true }))
+            }
+            "session.set_hidden" => {
+                let id = sid()?;
+                let hidden = p["hidden"].as_bool().unwrap_or(true);
+                let req = if hidden { "archive_session" } else { "restore_session" };
+                call(json!({ "req": req, "session_id": id })).await?;
+                if hidden {
+                    // session.list re-adds known-but-unlisted sessions (new, still
+                    // empty ones); an archived one must not come back that way.
+                    self.known.lock().await.remove(id);
+                }
+                Ok(json!({ "hidden": hidden, "session_key": id }))
+            }
+            "session.most_recent" => {
+                let reply = call(json!({ "req": "list_sessions", "limit": 1 })).await.ok();
+                let top = reply.as_ref().and_then(|r| r["sessions"].as_array()).and_then(|list| list.first()).cloned();
+                Ok(match top {
+                    Some(info) => {
+                        let row = map::session_row(&info);
+                        json!({ "session_id": row["id"], "title": row["title"], "started_at": row["started_at"], "source": "sovereign" })
+                    }
+                    None => json!({ "session_id": null }),
+                })
+            }
+            "session.branch" => {
+                let id = sid()?.to_string();
+                self.ensure_attached(&id).await.map_err(RpcError::internal)?;
+                let forked = call(json!({ "req": "fork_session", "session_id": id })).await?;
+                let child = forked["session"]["session_id"].as_str().unwrap_or_default().to_string();
+                if child.is_empty() {
+                    return Err(RpcError::internal(anyhow!("engine did not return the branched session")));
+                }
+                let attached = self.ensure_attached(&child).await.map_err(RpcError::internal)?;
+                let title = p["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string);
+                if let Some(title) = &title {
+                    let _ = self.call(json!({ "req": "rename_session", "session_id": child, "title": title })).await;
+                }
+                let history = call(json!({ "req": "get_history", "session_id": child })).await?;
+                let messages = map::transcript(&history["messages"]);
+                let cwd = attached["session"]["working_dir"].as_str().unwrap_or(&self.config.default_cwd).to_string();
+                let sessions = self.sessions.lock().await;
+                Ok(json!({
+                    "session_id": child,
+                    "stored_session_id": child,
+                    "title": title.unwrap_or_else(|| "Branch".into()),
+                    "parent": id,
+                    "message_count": messages.len(),
+                    "messages": messages,
+                    "info": map::live_info(&child, sessions.get(&child), &cwd, &self.config.version, &self.config.model, &self.config.provider),
+                }))
+            }
+            "session.undo" => {
+                let id = sid()?;
+                if self.sessions.lock().await.get(id).is_some_and(SessionState::turn_active) {
+                    return Err(RpcError::params("session is running; undo works on an idle session"));
+                }
+                self.ensure_attached(id).await.map_err(RpcError::internal)?;
+                let history = call(json!({ "req": "get_history", "session_id": id })).await?;
+                let messages = history["messages"].as_array().cloned().unwrap_or_default();
+                let Some(last_user) = messages.iter().rposition(|m| m["role"] == "user") else {
+                    return Ok(json!({ "removed": 0 }));
+                };
+                let removed = messages.len() - last_user;
+                if last_user == 0 {
+                    call(json!({ "req": "clear", "session_id": id })).await?;
+                } else {
+                    call(json!({ "req": "rewind", "session_id": id, "message_index": last_user })).await?;
+                }
+                Ok(json!({ "removed": removed }))
+            }
+            "session.status" => {
+                let id = sid()?;
+                let title = self.known.lock().await.get(id).and_then(|info| info["title"].as_str().map(str::to_string)).unwrap_or_else(|| "Untitled".into());
+                let sessions = self.sessions.lock().await;
+                let state = sessions.get(id);
+                let usage = state.map(SessionState::usage_json).unwrap_or_else(|| json!({}));
+                let output = format!(
+                    "Session: {title}\nID: {id}\nModel: {} ({})\nState: {}\nTokens: {} in, {} out",
+                    self.config.model,
+                    self.config.provider,
+                    if state.is_some_and(SessionState::turn_active) { "running" } else { "idle" },
+                    usage["input"].as_u64().unwrap_or(0),
+                    usage["output"].as_u64().unwrap_or(0),
+                );
+                Ok(json!({ "output": output }))
+            }
+            "session.save" => {
+                let id = sid()?.to_string();
+                self.ensure_attached(&id).await.map_err(RpcError::internal)?;
+                let history = call(json!({ "req": "get_history", "session_id": id })).await?;
+                let dir = std::path::Path::new(&self.config.home).join("sessions").join("saved");
+                let file = dir.join(format!("{id}-{}.json", chrono::Utc::now().format("%Y%m%d-%H%M%S")));
+                let body = serde_json::to_vec_pretty(&json!({ "session_id": id, "messages": map::transcript(&history["messages"]) }))
+                    .map_err(|e| RpcError::internal(anyhow!(e)))?;
+                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, body)).map_err(|e| RpcError::internal(anyhow!(e)))?;
+                Ok(json!({ "file": file.to_string_lossy() }))
+            }
+            "session.redirect" => {
+                let id = sid()?;
+                let text = map::prompt_text(&p["text"]);
+                self.ensure_attached(id).await.map_err(RpcError::internal)?;
+                call(json!({ "req": "soft_interrupt", "session_id": id, "content": text })).await?;
+                Ok(json!({ "status": "queued", "text": text }))
+            }
+            // No replay buffer: tell a reconnecting client to refetch state.
+            "session.events.since" => Ok(json!({
+                "events": [], "latest_seq": 0, "truncated": true, "count": 0, "epoch": 0, "open_requests": [],
+            })),
+            "session.events.stats" => Ok(json!({
+                "sessions": 0, "events": 0, "bytes": 0, "max_per_session": 0, "max_bytes_per_session": 0, "max_bytes_process": 0,
+            })),
+            "session.cwd.set" | "session.control" | "session.workspace.move" | "session.context_breakdown" | "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
+                crate::note_unsupported("rpc", method);
+                Err(RpcError::unsupported(method))
+            }
             "prompt.submit" => {
                 let id = sid()?.to_string();
                 let text = map::prompt_text(&p["text"]);

@@ -25,6 +25,11 @@ HERMES = Path(sys.argv[1] if len(sys.argv) > 1 else ENGINE.parent / "hermes-agen
 PLACEHOLDER = {
     "free_tier.status", "wake.status", "pet.info", "projects.tree", "subagent.list",
     "process.list", "session.control.read", "profiles.list", "session.active_list",
+    # Chat-bound but not built yet: refused by the engine, never forwarded
+    # (Python's store has never seen these sessions).
+    "session.events.since", "session.events.stats", "session.cwd.set", "session.control",
+    "session.workspace.move", "session.context_breakdown", "session.foreign.import",
+    "session.foreign.list", "session.foreign.preview",
 }
 # Where each missing namespace gets built (docs/SOVEREIGN_PLAN.md modules).
 PLAN = {

@@ -137,6 +137,7 @@ export type ApiRequest =
   | { req: "hello"; min_version: number; max_version: number; client: string }
   | { req: "list_sessions"; include_archived?: boolean; limit?: number }
   | { req: "archive_session"; session_id: string }
+  | { req: "delete_session"; session_id: string }
   | { req: "restore_session"; session_id: string }
   | { req: "set_retention_policy"; archive_after_days?: number }
   | { req: "create_session"; working_dir?: string; system_prompt?: string }
@@ -402,6 +403,7 @@ export const KNOWN_REQUEST_KINDS = [
   "hello",
   "list_sessions",
   "archive_session",
+  "delete_session",
   "restore_session",
   "set_retention_policy",
   "create_session",

@@ -483,6 +483,28 @@ impl BridgeState {
                     Err(message) => Self::error_reply(api_id, ErrorCode::Internal, &message),
                 }
             }
+            "delete_session" => {
+                // Permanent: the snapshot, its journal and any archive entry.
+                // The caller refuses sessions that are live (turn running).
+                let session_id = request["session_id"].as_str().unwrap_or_default();
+                let Some(path) = Self::session_record_path(session_id).filter(|path| path.is_file()) else {
+                    return Self::error_reply(
+                        api_id,
+                        ErrorCode::UnknownSession,
+                        "session does not exist",
+                    );
+                };
+                let _write_guard = Self::state_write_guard();
+                if let Err(err) = std::fs::remove_file(&path) {
+                    return Self::error_reply(api_id, ErrorCode::Internal, &err.to_string());
+                }
+                let _ = std::fs::remove_file(path.with_extension("journal.jsonl"));
+                let mut archive = Self::load_archive_state();
+                if archive.sessions.remove(session_id).is_some() {
+                    let _ = Self::save_archive_state(&archive);
+                }
+                vec![Outbound::Reply(ServerFrame::reply(api_id, ApiEvent::Ok))]
+            }
             "restore_session" => {
                 let session_id = request["session_id"].as_str().unwrap_or_default();
                 if Self::session_record_path(session_id).is_none_or(|path| !path.is_file()) {
