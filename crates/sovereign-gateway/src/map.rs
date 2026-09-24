@@ -29,8 +29,42 @@ struct Turn {
 struct Tool {
     name: String,
     args: Option<Value>,
+    /// Streamed input JSON (`tool_input_delta`), parsed at `tool_exec`.
+    input: String,
     started_at: Instant,
     announced: bool,
+}
+
+impl Tool {
+    fn new(name: String) -> Self {
+        Self { name, args: None, input: String::new(), started_at: Instant::now(), announced: false }
+    }
+
+    fn args(&self) -> Option<Value> {
+        self.args
+            .clone()
+            .or_else(|| serde_json::from_str::<Value>(&self.input).ok())
+            .filter(Value::is_object)
+            .map(|mut v| {
+                // jcode adds an `intent` field to every tool call; it is not an argument.
+                if let Some(map) = v.as_object_mut() {
+                    map.remove("intent");
+                }
+                v
+            })
+    }
+}
+
+/// Emit `tool.start` once, with the arguments known so far.
+fn announce(state: &mut SessionState, sid: &str, call_id: &str, out: &mut Vec<Out>) {
+    ensure_started(state, sid, out);
+    let Some(tool) = state.turn.tools.get_mut(call_id) else { return };
+    if tool.announced {
+        return;
+    }
+    tool.announced = true;
+    tool.started_at = Instant::now();
+    out.push(event("tool.start", sid, json!({ "tool_id": call_id, "name": tool.name, "args": tool.args() })));
 }
 
 #[derive(Default)]
@@ -119,39 +153,31 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
         }
         "tool_call" => {
             let call_id = text("call_id");
-            let tool = state.turn.tools.entry(call_id).or_insert_with(|| Tool {
-                name: text("name"),
-                args: None,
-                started_at: Instant::now(),
-                announced: false,
-            });
+            let tool = state.turn.tools.entry(call_id).or_insert_with(|| Tool::new(text("name")));
             tool.args = Some(ev["input"].clone());
         }
         "tool_start" => {
             ensure_started(state, sid, &mut out);
-            let call_id = text("call_id");
-            let tool = state.turn.tools.entry(call_id.clone()).or_insert_with(|| Tool {
-                name: text("name"),
-                args: None,
-                started_at: Instant::now(),
-                announced: false,
-            });
-            if !tool.announced {
-                tool.announced = true;
-                tool.started_at = Instant::now();
-                let args = tool.args.clone().filter(Value::is_object);
-                out.push(event(
-                    "tool.start",
-                    sid,
-                    json!({ "tool_id": call_id, "name": tool.name, "args": args }),
-                ));
+            state.turn.tools.entry(text("call_id")).or_insert_with(|| Tool::new(text("name")));
+        }
+        "tool_input_delta" => {
+            let tool = state.turn.tools.entry(text("call_id")).or_insert_with(|| Tool::new(text("name")));
+            if tool.input.len() < 256 * 1024 {
+                tool.input.push_str(&text("delta"));
             }
+        }
+        "tool_exec" => {
+            let call_id = text("call_id");
+            state.turn.tools.entry(call_id.clone()).or_insert_with(|| Tool::new(text("name")));
+            announce(state, sid, &call_id, &mut out);
         }
         "tool_done" => {
             let call_id = text("call_id");
+            state.turn.tools.entry(call_id.clone()).or_insert_with(|| Tool::new(text("name")));
+            announce(state, sid, &call_id, &mut out);
             let tool = state.turn.tools.remove(&call_id);
             let name = tool.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| text("name"));
-            let args = tool.as_ref().and_then(|t| t.args.clone()).filter(Value::is_object);
+            let args = tool.as_ref().and_then(Tool::args);
             let duration = tool.as_ref().map(|t| t.started_at.elapsed().as_secs_f64());
             let result = match ev["error"].as_str() {
                 Some(err) => format!("Error: {err}\n{}", text("output")),
@@ -398,16 +424,20 @@ mod tests {
     }
 
     #[test]
-    fn tools_carry_args_and_results() {
+    fn tools_carry_streamed_args_and_results() {
+        // jcode's real order: start, streamed input, exec, done (no tool_call).
         let out = run(&[
-            json!({"ev":"tool_call","session_id":"s","call_id":"c1","name":"bash","input":{"command":"ls"}}),
             json!({"ev":"tool_start","session_id":"s","call_id":"c1","name":"bash"}),
-            json!({"ev":"tool_start","session_id":"s","call_id":"c1","name":"bash"}),
+            json!({"ev":"tool_input_delta","session_id":"s","call_id":"c1","delta":"{\"command\":\"ls\","}),
+            json!({"ev":"tool_input_delta","session_id":"s","call_id":"c1","delta":"\"intent\":\"list\"}"}),
+            json!({"ev":"tool_exec","session_id":"s","call_id":"c1","name":"bash"}),
+            json!({"ev":"tool_exec","session_id":"s","call_id":"c1","name":"bash"}),
             json!({"ev":"tool_done","session_id":"s","call_id":"c1","name":"bash","output":"a.txt","error":null}),
         ]);
         assert_eq!(types(&out), ["message.start", "tool.start", "tool.complete"]);
         let Out::Event { payload, .. } = &out[1] else { panic!() };
         assert_eq!(payload["args"]["command"], "ls");
+        assert!(payload["args"].get("intent").is_none(), "jcode's intent field is not an argument");
         let Out::Event { payload, .. } = &out[2] else { panic!() };
         assert_eq!(payload["result_text"], "a.txt");
     }
@@ -502,5 +532,27 @@ mod path_tests {
         assert_eq!(complete_path(".s", &cwd).len(), 1);
         assert!(complete_path("nope/x", &cwd).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_order_tests {
+    use super::*;
+
+    #[test]
+    fn a_tool_that_never_executes_is_still_announced_before_completing() {
+        let mut sessions = HashMap::new();
+        let mut types = Vec::new();
+        for e in [
+            json!({"ev":"tool_start","session_id":"s","call_id":"c","name":"bash"}),
+            json!({"ev":"tool_done","session_id":"s","call_id":"c","name":"bash","output":"","error":"blocked"}),
+        ] {
+            for o in map_event(&e, &mut sessions) {
+                if let Out::Event { ty, .. } = o {
+                    types.push(ty);
+                }
+            }
+        }
+        assert_eq!(types, ["message.start", "tool.start", "tool.complete"]);
     }
 }

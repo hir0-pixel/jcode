@@ -46,8 +46,9 @@ fn every_mapped_event_matches_its_notification_schema() {
     let frames = [
         json!({"ev":"reasoning_delta","session_id":"s","text":"think"}),
         json!({"ev":"text_delta","session_id":"s","text":"Hi"}),
-        json!({"ev":"tool_call","session_id":"s","call_id":"c","name":"bash","input":{"command":"ls"}}),
         json!({"ev":"tool_start","session_id":"s","call_id":"c","name":"bash"}),
+        json!({"ev":"tool_input_delta","session_id":"s","call_id":"c","delta":"{\"command\":\"ls\"}"}),
+        json!({"ev":"tool_exec","session_id":"s","call_id":"c","name":"bash"}),
         json!({"ev":"tool_done","session_id":"s","call_id":"c","name":"bash","output":"x","error":"boom"}),
         json!({"ev":"token_usage","session_id":"s","input":5,"output":3,"cache_read_input":1}),
         json!({"ev":"session_renamed","session_id":"s","display_title":"T"}),
