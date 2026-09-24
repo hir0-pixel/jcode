@@ -119,6 +119,33 @@ try {
   check(!(await listIds()).includes(c), 'deleted session is gone from the list')
   check(!fs.existsSync(path.join(jcodeHome, 'sessions', `${c}.json`)), 'deleted session file is removed from disk')
 
+  // REST surface the desktop sidebar uses (/api/sessions/*).
+  const http = (method, p, body) =>
+    fetch(`http://127.0.0.1:${port}${p}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    }).then(async r => ({ status: r.status, body: await r.json().catch(() => null) }))
+  await turn(a, 'Reply with exactly the word THREE.')
+  const msgs = await http('GET', `/api/sessions/${a}/messages`)
+  check(msgs.status === 200 && JSON.stringify(msgs.body.messages).includes('THREE'), 'REST transcript includes the newest turn (snapshot + journal)')
+  const page = await http('GET', `/api/sessions/${a}/messages?limit=1`)
+  check(page.body?.messages?.length === 1 && JSON.stringify(page.body.messages).includes('THREE'), 'REST latest page of 1 is the newest message')
+  const renamed = await http('PATCH', `/api/sessions/${a}`, { title: 'Renamed via REST' })
+  check(renamed.status === 200, 'REST rename accepted')
+  const got = await http('GET', `/api/sessions/${a}`)
+  check(got.body?.title === 'Renamed via REST', `REST get shows the new title (${got.body?.title})`)
+  const found = await http('GET', `/api/sessions/search?q=three`)
+  check(found.body?.results?.some(r => r.session_id === a), 'REST search finds the session by message text')
+  await http('PATCH', `/api/sessions/${a}`, { archived: true })
+  check(!(await listIds()).includes(a), 'REST archive hides the session')
+  await http('PATCH', `/api/sessions/${a}`, { archived: false })
+  check((await listIds()).includes(a), 'REST unarchive restores it')
+  const gone = await http('DELETE', `/api/sessions/${a}`)
+  check(gone.status === 200 && !(await listIds()).includes(a), 'REST delete removes the session')
+  const other = await http('POST', `/api/sessions/bulk-delete`, { ids: [] })
+  check(other.status === 404 && other.body?.reason === 'not_supported_by_engine', 'unbuilt /api/sessions routes are refused, not proxied')
+
   check(!/forward RPC session\./.test(stderr), 'no session method was forwarded to Python')
 } catch (err) {
   failures++

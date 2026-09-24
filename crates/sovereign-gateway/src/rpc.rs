@@ -92,6 +92,9 @@ struct Conn {
     /// jcode `SessionInfo` for sessions this client created or attached, so a
     /// new, still-empty session (not yet persisted) appears in `session.list`.
     known: Mutex<HashMap<String, Value>>,
+    /// Sessions created here that have not had a turn yet, so jcode has not
+    /// persisted them; only these are merged into `session.list` from `known`.
+    fresh: Mutex<std::collections::HashSet<String>>,
     next_id: AtomicU64,
     next_server_request: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
@@ -409,6 +412,7 @@ impl Conn {
                 self.links.lock().await.insert(id.clone(), link);
                 self.client.sessions.lock().await.insert(id.clone());
                 self.known.lock().await.insert(id.clone(), reply["session"].clone());
+                self.fresh.lock().await.insert(id.clone());
                 if let Some(title) = p["title"].as_str().filter(|t| !t.is_empty()) {
                     let _ = self.call(json!({ "req": "rename_session", "session_id": id, "title": title })).await;
                 }
@@ -459,8 +463,9 @@ impl Conn {
                     .as_array()
                     .map(|list| list.iter().filter(|s| s["parent_session_id"].is_null()).map(map::session_row).collect())
                     .unwrap_or_default();
+                let fresh = self.fresh.lock().await;
                 for (id, info) in self.known.lock().await.iter() {
-                    if info["parent_session_id"].is_null() && !rows.iter().any(|r| r["id"] == id.as_str()) {
+                    if fresh.contains(id) && info["parent_session_id"].is_null() && !rows.iter().any(|r| r["id"] == id.as_str()) {
                         rows.insert(0, map::session_row(info));
                     }
                 }
@@ -492,11 +497,6 @@ impl Conn {
                 let hidden = p["hidden"].as_bool().unwrap_or(true);
                 let req = if hidden { "archive_session" } else { "restore_session" };
                 call(json!({ "req": req, "session_id": id })).await?;
-                if hidden {
-                    // session.list re-adds known-but-unlisted sessions (new, still
-                    // empty ones); an archived one must not come back that way.
-                    self.known.lock().await.remove(id);
-                }
                 Ok(json!({ "hidden": hidden, "session_key": id }))
             }
             "session.most_recent" => {
@@ -622,6 +622,7 @@ impl Conn {
                         }
                     }
                 }
+                self.fresh.lock().await.remove(&id);
                 let run = self.observer.start_turn(&id, &text);
                 if let Err(err) = self.submit(&id, &text).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
@@ -913,6 +914,7 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Obser
         links: Mutex::new(HashMap::new()),
         link_tasks: Mutex::new(Vec::new()),
         known: Mutex::new(HashMap::new()),
+        fresh: Mutex::new(std::collections::HashSet::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),

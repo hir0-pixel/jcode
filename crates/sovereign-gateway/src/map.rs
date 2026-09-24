@@ -297,7 +297,7 @@ pub fn session_info(info: &Value) -> Value {
         "started_at": secs,
         "last_active": secs,
         "ended_at": null,
-        "is_active": info["status"] == "running",
+        "is_active": info["status"] == "running" || info["status"] == "processing",
         "message_count": 0,
         "tool_call_count": 0,
         "input_tokens": 0,

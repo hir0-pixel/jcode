@@ -55,9 +55,24 @@ def rpc_methods_handled() -> set[str]:
     return handled
 
 
+# Served by crates/sovereign-gateway/src/sessions_rest.rs (Hermes path spelling).
+SESSIONS_REST = {
+    ("GET", "/api/sessions"), ("GET", "/api/sessions/search"), ("GET", "/api/sessions/{session_id}"),
+    ("GET", "/api/sessions/{session_id}/messages"), ("GET", "/api/sessions/{session_id}/messages/around"),
+    ("GET", "/api/sessions/{session_id}/timeline"), ("DELETE", "/api/sessions/{session_id}"),
+    ("PATCH", "/api/sessions/{session_id}"),
+}
+
+
 def rest_routes_handled() -> set[tuple[str, str]]:
     src = (ENGINE / "crates/sovereign-gateway/src/lib.rs").read_text()
-    return set(re.findall(r'\("(GET|POST|PUT|DELETE|PATCH)", "(/api/[^"]+)"\)', src)) | {("GET", "/api/ws")}
+    inline = set(re.findall(r'\("(GET|POST|PUT|DELETE|PATCH)", "(/api/[^"]+)"\)', src))
+    return inline | SESSIONS_REST | {("GET", "/api/ws")}
+
+
+def rest_route_refused(path: str) -> bool:
+    """Chat-bound routes the engine answers 'not supported' instead of proxying."""
+    return path.startswith("/api/sessions")
 
 
 def hermes_rest_routes() -> list[tuple[str, str, str]]:
@@ -100,19 +115,22 @@ def main() -> None:
     served = rest_routes_handled()
     rest_done = [r for r in rest if (r[0], r[1]) in served]
     out.append("")
-    out.append(f"**HTTP routes in Hermes ({len(rest)}):** {len(rest_done)} served by the Rust engine; the rest are "
-               "reverse-proxied to Hermes's Python backend.")
+    refused = [r for r in rest if (r[0], r[1]) not in served and rest_route_refused(r[1])]
+    out.append(f"**HTTP routes in Hermes ({len(rest)}):** {len(rest_done)} served by the Rust engine, {len(refused)} "
+               "chat-bound routes refused by the engine (not built yet; never proxied, since chats are not in Python's "
+               "database); the rest are reverse-proxied to Hermes's Python backend.")
     out.append("")
-    out.append("| Router | Rust | Forwarded |")
-    out.append("|---|---|---|")
+    out.append("| Router | Rust | Refused by engine | Forwarded |")
+    out.append("|---|---|---|---|")
     by_router = defaultdict(list)
     for r in rest:
         by_router[r[2]].append(r)
     for router in sorted(by_router):
         rs = by_router[router]
         done = [f"`{m} {p}`" for m, p, _ in rs if (m, p) in served]
-        todo = [f"`{m} {p}`" for m, p, _ in rs if (m, p) not in served]
-        out.append(f"| {router} | {', '.join(done) or '–'} | {', '.join(todo) or '–'} |")
+        no = [f"`{m} {p}`" for m, p, _ in rs if (m, p) not in served and rest_route_refused(p)]
+        todo = [f"`{m} {p}`" for m, p, _ in rs if (m, p) not in served and not rest_route_refused(p)]
+        out.append(f"| {router} | {', '.join(done) or '–'} | {', '.join(no) or '–'} | {', '.join(todo) or '–'} |")
     print("\n".join(out))
 
 

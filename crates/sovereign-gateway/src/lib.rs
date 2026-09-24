@@ -14,6 +14,7 @@ pub mod features;
 pub mod map;
 pub mod observability;
 mod rpc;
+mod sessions_rest;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -288,6 +289,12 @@ fn bundled_defaults() -> Value {
 /// One request/reply against the engine over a short-lived in-process bridge,
 /// for HTTP routes that have no WebSocket connection to ride on.
 async fn harness_request(legacy_socket: &std::path::Path, request: Value) -> Result<Value> {
+    harness_requests(legacy_socket, &[request]).await
+}
+
+/// Send requests in order on one bridge connection (e.g. attach, then act);
+/// returns the reply to the last one.
+async fn harness_requests(legacy_socket: &std::path::Path, requests: &[Value]) -> Result<Value> {
     let (ours, theirs) = tokio::io::duplex(MAX_FRAME_BYTES);
     let (their_read, their_write) = tokio::io::split(theirs);
     let bridge = tokio::spawn(jcode_harness_api_server::run_bridge_stream(
@@ -301,20 +308,25 @@ async fn harness_request(legacy_socket: &std::path::Path, request: Value) -> Res
         let hello = json!({"v": 1, "id": 0, "req": "hello", "min_version": 1, "max_version": 1, "client": "sovereign-gateway-http"});
         our_write.write_all(format!("{hello}\n").as_bytes()).await?;
         lines.next_line().await?.context("engine closed")?;
-        let mut frame = request;
-        frame["v"] = json!(1);
-        frame["id"] = json!(1);
-        our_write.write_all(format!("{frame}\n").as_bytes()).await?;
-        loop {
-            let line = lines.next_line().await?.context("engine closed")?;
-            let reply: Value = serde_json::from_str(&line)?;
-            if reply["reply_to"] == 1 {
-                if reply["ev"] == "error" {
-                    bail!("{}", reply["message"].as_str().unwrap_or("engine error"));
+        let mut last = Value::Null;
+        for (i, request) in requests.iter().enumerate() {
+            let id = i as u64 + 1;
+            let mut frame = request.clone();
+            frame["v"] = json!(1);
+            frame["id"] = json!(id);
+            our_write.write_all(format!("{frame}\n").as_bytes()).await?;
+            last = loop {
+                let line = lines.next_line().await?.context("engine closed")?;
+                let reply: Value = serde_json::from_str(&line)?;
+                if reply["reply_to"] == id {
+                    if reply["ev"] == "error" {
+                        bail!("{}", reply["message"].as_str().unwrap_or("engine error"));
+                    }
+                    break reply;
                 }
-                return Ok(reply);
-            }
+            };
         }
+        Ok(last)
     };
     let result = tokio::time::timeout(Duration::from_secs(20), result).await.context("engine timed out")?;
     bridge.abort();
@@ -409,6 +421,12 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         return respond(&mut stream, "200 OK", &json!({"choice": choice})).await;
     }
     let public = json!({"ok": true, "version": config.version, "auth_required": false});
+    // Chats live only in the engine's store; never proxy these to Python.
+    if req.path != "/api/sessions/owner-backfill"
+        && let Some(result) = sessions_rest::route(&mut stream, &req, &config).await
+    {
+        return result;
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/health") => respond(&mut stream, "200 OK", &public).await,
         ("GET", "/api/status") => {

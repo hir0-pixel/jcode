@@ -3159,15 +3159,22 @@ impl BridgeState {
         let Some(path) = Self::session_record_path(session_id) else {
             return vec![];
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(text) = std::fs::read_to_string(&path) else {
             return vec![];
         };
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             return vec![];
         };
-        let Some(messages) = value["messages"].as_array() else {
-            return vec![];
-        };
+        let mut messages = value["messages"].as_array().cloned().unwrap_or_default();
+        // New messages are appended to the journal and only folded into the
+        // snapshot at the next checkpoint, so the snapshot alone is stale.
+        if let Ok(journal) = std::fs::read_to_string(path.with_extension("journal.jsonl")) {
+            for entry in journal.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()) {
+                if let Some(appended) = entry["append_messages"].as_array() {
+                    messages.extend(appended.iter().cloned());
+                }
+            }
+        }
         messages
             .iter()
             .rev()
