@@ -1396,6 +1396,7 @@ async fn run_gateway(
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
             complete: Some(complete),
             approval_secret: approval_secret.clone(),
+            features: hermes_feature_command().map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd))),
         })
         .await?;
         let port = gateway.local_addr().port();
@@ -1417,6 +1418,26 @@ async fn run_gateway(
     };
     let _ = std::fs::remove_file(&socket);
     result
+}
+
+/// Command that starts Hermes's Python backend for the features the Rust
+/// harness does not own: `SOVEREIGN_HERMES_CMD` (empty disables), else the
+/// managed install, else `hermes` on PATH.
+fn hermes_feature_command() -> Option<Vec<String>> {
+    if let Ok(cmd) = std::env::var("SOVEREIGN_HERMES_CMD") {
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
+        return (!parts.is_empty()).then_some(parts);
+    }
+    let managed = dirs::home_dir()?.join(".hermes/hermes-agent/venv/bin/hermes");
+    if managed.is_file() {
+        return Some(vec![managed.to_string_lossy().into_owned()]);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("hermes"))
+            .find(|p| p.is_file())
+            .map(|p| vec![p.to_string_lossy().into_owned()])
+    })
 }
 
 /// Write a file readable only by the current user (tokens, ready files).
