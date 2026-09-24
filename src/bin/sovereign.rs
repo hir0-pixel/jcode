@@ -86,6 +86,12 @@ fn main() -> Result<()> {
     // Memory recall is local; remote Jev relevance calls are disabled.
     // SAFETY: as above.
     unsafe { std::env::set_var("SOVEREIGN_LOCAL_MEMORY", "1") };
+    // Hermes does not stamp user messages with times; jcode's stamps cost
+    // tokens and read to models like injected text.
+    if std::env::var_os("JCODE_MESSAGE_TIMESTAMPS").is_none() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("JCODE_MESSAGE_TIMESTAMPS", "0") };
+    }
     // No integration discovery (it contacts a remote endpoint).
     // SAFETY: as above.
     unsafe { std::env::set_var("JCODE_SPONSORS_ENABLED", "0") };

@@ -34,6 +34,8 @@ pub struct Client {
 pub struct Hub {
     clients: Mutex<Vec<Arc<Client>>>,
     pending: Mutex<HashMap<String, (String, oneshot::Sender<String>)>>,
+    /// Params of open prompts, for `approval.pending`.
+    shown: Mutex<HashMap<String, (String, Value)>>,
     /// Sessions where the user chose "session" (allow for the rest of it).
     session_grants: Mutex<HashSet<String>>,
     /// The user chose "always": allow until the engine restarts.
@@ -76,22 +78,18 @@ impl Hub {
         let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id.clone(), (session_id.to_string(), tx));
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "approval",
-            "params": {
-                "session_id": session_id,
-                "request_id": request_id,
-                "command": command.chars().take(4000).collect::<String>(),
-                "description": reason,
-                "tool_name": tool,
-                "choices": ["once", "session", "always", "deny"],
-                "allow_permanent": true,
-                "allow_session": true,
-            }
-        })
-        .to_string();
+        let params = json!({
+            "session_id": session_id,
+            "request_id": request_id,
+            "command": command.chars().take(4000).collect::<String>(),
+            "description": reason,
+            "tool_name": tool,
+            "choices": ["once", "session", "always", "deny"],
+            "allow_permanent": true,
+            "allow_session": true,
+        });
+        self.shown.lock().await.insert(request_id.clone(), (session_id.to_string(), params.clone()));
+        let frame = json!({ "jsonrpc": "2.0", "id": request_id, "method": "approval", "params": params }).to_string();
         for client in &clients {
             let _ = client.to_ws.send(Message::Text(frame.clone())).await;
         }
@@ -100,6 +98,7 @@ impl Hub {
             _ => "deny".into(),
         };
         self.pending.lock().await.remove(&request_id);
+        self.shown.lock().await.remove(&request_id);
         match choice.as_str() {
             "session" => {
                 self.session_grants.lock().await.insert(session_id.to_string());
@@ -108,6 +107,25 @@ impl Hub {
             _ => {}
         }
         if matches!(choice.as_str(), "once" | "session" | "always") { choice } else { "deny".into() }
+    }
+
+    /// Open prompts for a session (`approval.pending`, e.g. after a reload).
+    pub async fn pending_for(&self, session_id: &str) -> Vec<Value> {
+        self.shown
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, (sid, _))| sid == session_id)
+            .map(|(id, (_, params))| {
+                // PendingApproval carries no session_id (the caller named it).
+                let mut p = params.clone();
+                if let Some(map) = p.as_object_mut() {
+                    map.remove("session_id");
+                }
+                p["request_id"] = json!(id);
+                p
+            })
+            .collect()
     }
 
     /// A desktop answered a prompt by replying to the server request.

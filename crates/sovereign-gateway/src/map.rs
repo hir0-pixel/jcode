@@ -191,6 +191,9 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
                     "name": name,
                     "args": args,
                     "duration_s": duration,
+                    // The desktop renders `result`; `result_text` is the
+                    // plain-text twin other clients read.
+                    "result": truncate_chars(&result, TOOL_RESULT_MAX_CHARS),
                     "result_text": truncate_chars(&result, TOOL_RESULT_MAX_CHARS),
                 }),
             ));
@@ -321,10 +324,10 @@ pub fn transcript(messages: &Value) -> Vec<Value> {
 }
 
 /// `SessionLiveInfo` for create/resume results.
-pub fn live_info(session_id: &str, state: Option<&SessionState>, cwd: &str, version: &str) -> Value {
+pub fn live_info(session_id: &str, state: Option<&SessionState>, cwd: &str, version: &str, model: &str, provider: &str) -> Value {
     json!({
-        "model": state.and_then(|s| s.model.clone()).unwrap_or_default(),
-        "provider": "",
+        "model": state.and_then(|s| s.model.clone()).unwrap_or_else(|| model.to_string()),
+        "provider": provider,
         "cwd": cwd,
         "running": state.is_some_and(SessionState::turn_active),
         "title": "",
@@ -440,6 +443,7 @@ mod tests {
         assert!(payload["args"].get("intent").is_none(), "jcode's intent field is not an argument");
         let Out::Event { payload, .. } = &out[2] else { panic!() };
         assert_eq!(payload["result_text"], "a.txt");
+        assert_eq!(payload["result"], "a.txt");
     }
 
     #[test]

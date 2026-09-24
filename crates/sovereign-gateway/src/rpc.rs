@@ -389,7 +389,7 @@ impl Conn {
                     "stored_session_id": id,
                     "message_count": 0,
                     "messages": [],
-                    "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version),
+                    "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version, &self.config.model, &self.config.provider),
                 }))
             }
             "session.resume" => {
@@ -410,7 +410,7 @@ impl Conn {
                     "message_count": messages.len(),
                     "messages": messages,
                     "running": running,
-                    "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version),
+                    "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version, &self.config.model, &self.config.provider),
                 }))
             }
             "session.history" => {
@@ -482,6 +482,14 @@ impl Conn {
                 let sessions = self.sessions.lock().await;
                 let usage = sessions.get(id).map(SessionState::usage_json).unwrap_or_else(|| json!({}));
                 Ok(usage)
+            }
+            "approval.received" => {
+                sid()?;
+                Ok(json!({ "acknowledged": true }))
+            }
+            "approval.pending" => {
+                let id = sid()?;
+                Ok(json!({ "approvals": self.hub.pending_for(id).await }))
             }
             "approval.respond" => {
                 let id = sid()?.to_string();
@@ -647,6 +655,9 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>) -> Result<()> {
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(_) => continue,
         };
+        if std::env::var_os("SOVEREIGN_GATEWAY_TRACE").is_some() {
+            eprintln!("sovereign-gateway: client {}", text.chars().take(300).collect::<String>());
+        }
         let frame: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => {

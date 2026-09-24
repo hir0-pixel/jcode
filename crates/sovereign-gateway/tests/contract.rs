@@ -94,7 +94,7 @@ fn method_results_match() {
     let c = contract();
     let mut state = map::SessionState::default();
     state.model = Some("gpt-5".into());
-    let info = map::live_info("s1", Some(&state), "/tmp", "0.1.0");
+    let info = map::live_info("s1", Some(&state), "/tmp", "0.1.0", "gpt-5", "openai");
     let history = map::transcript(&json!([{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]));
 
     let cases = [
