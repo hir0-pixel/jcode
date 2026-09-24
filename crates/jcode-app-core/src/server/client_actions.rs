@@ -805,33 +805,46 @@ pub(super) async fn handle_transfer(
         agent_guard.provider_fork()
     };
 
-    let transfer_compaction = match crate::compaction::build_transfer_compaction_state(
-        provider,
-        transfer_active_messages(&parent),
-        parent.compaction.clone(),
-    )
-    .await
-    {
-        Ok(compaction) => compaction,
-        Err(error) => {
-            crate::logging::event_warn(
-                "SESSION_LIFECYCLE",
-                vec![
-                    ("phase", "transfer_compaction_error".to_string()),
-                    ("request_id", id.to_string()),
-                    ("session_id", client_session_id.to_string()),
-                    ("error", crate::util::format_error_chain(&error)),
-                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
-                ],
-            );
-            let _ = client_event_tx.send(ServerEvent::Error {
-                id,
-                message: format!("Failed to compact session for transfer: {error}"),
-                retry_after_secs: None,
-            });
-            return;
-        }
-    };
+    let transfer_session_id = client_session_id.to_string();
+    let transfer_compaction =
+        match crate::compaction::build_transfer_compaction_state_with_model_calls(
+            provider,
+            transfer_active_messages(&parent),
+            parent.compaction.clone(),
+            move |call| {
+                crate::tool::report_aux_model_call(
+                    "Compaction",
+                    &transfer_session_id,
+                    call.provider,
+                    call.model,
+                    call.started_ms,
+                    call.usage,
+                    call.error.as_deref(),
+                );
+            },
+        )
+        .await
+        {
+            Ok(compaction) => compaction,
+            Err(error) => {
+                crate::logging::event_warn(
+                    "SESSION_LIFECYCLE",
+                    vec![
+                        ("phase", "transfer_compaction_error".to_string()),
+                        ("request_id", id.to_string()),
+                        ("session_id", client_session_id.to_string()),
+                        ("error", crate::util::format_error_chain(&error)),
+                        ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                    ],
+                );
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: format!("Failed to compact session for transfer: {error}"),
+                    retry_after_secs: None,
+                });
+                return;
+            }
+        };
 
     let (new_session_id, new_session_name) =
         match create_transfer_child_session(client_session_id, &parent, transfer_compaction) {

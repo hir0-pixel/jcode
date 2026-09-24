@@ -78,25 +78,25 @@ impl Tool for ReplTool {
                 let result = provider
                     .complete_simple_with_usage(&prompt, SUBQUERY_SYSTEM)
                     .await;
-                if let Some(observer) = super::repl_llm_query_observer() {
-                    match &result {
-                        Ok(reply) => observer(
-                            &session_id,
-                            provider_name,
-                            model,
-                            started,
-                            reply.usage,
-                            None,
-                        ),
-                        Err(error) => observer(
-                            &session_id,
-                            provider_name,
-                            model,
-                            started,
-                            None,
-                            Some(&error.to_string()),
-                        ),
-                    }
+                match &result {
+                    Ok(reply) => super::report_aux_model_call(
+                        "REPL subquery",
+                        &session_id,
+                        provider_name,
+                        model,
+                        started,
+                        reply.usage,
+                        None,
+                    ),
+                    Err(error) => super::report_aux_model_call(
+                        "REPL subquery",
+                        &session_id,
+                        provider_name,
+                        model,
+                        started,
+                        None,
+                        Some(&error.to_string()),
+                    ),
                 }
                 result.map(|reply| reply.text)
             })

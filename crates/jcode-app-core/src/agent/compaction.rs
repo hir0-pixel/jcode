@@ -10,17 +10,30 @@ impl Agent {
 
     pub fn poll_compaction_completion_event(&mut self) -> Option<CompactionEvent> {
         let provider_messages = self.session.messages_for_provider();
+        let session_id = self.session.id.clone();
         let compaction = self.registry.compaction();
-        let event = match compaction.try_write() {
+        let (event, model_calls) = match compaction.try_write() {
             Ok(mut manager) => {
                 let event = manager.poll_compaction_event_with(&provider_messages);
                 if event.is_some() {
                     self.sync_session_compaction_state_from_manager(&manager);
                 }
-                event
+                (event, manager.take_model_calls())
             }
             Err(_) => return None,
         };
+
+        for call in model_calls {
+            crate::tool::report_aux_model_call(
+                "Compaction",
+                &session_id,
+                call.provider,
+                call.model,
+                call.started_ms,
+                call.usage,
+                call.error.as_deref(),
+            );
+        }
 
         if event.is_some() {
             self.note_compaction_applied();

@@ -59,29 +59,50 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
-/// Receives usage for REPL `llm_query` model calls when an observer is registered.
-pub type ReplLlmQueryObserver = Arc<
-    dyn Fn(&str, String, String, i64, Option<jcode_provider_core::SimpleUsage>, Option<&str>)
-        + Send
+/// Receives usage for auxiliary model calls when an observer is registered.
+pub type AuxModelObserver = Arc<
+    dyn Fn(
+            &'static str,
+            &str,
+            String,
+            String,
+            i64,
+            Option<jcode_provider_core::SimpleUsage>,
+            Option<&str>,
+        ) + Send
         + Sync,
 >;
 
-static REPL_LLM_QUERY_OBSERVER: OnceLock<StdMutex<Option<ReplLlmQueryObserver>>> = OnceLock::new();
+static AUX_MODEL_OBSERVER: OnceLock<StdMutex<Option<AuxModelObserver>>> = OnceLock::new();
 
-/// Replace or clear the process-wide REPL subquery observer.
-pub fn set_repl_llm_query_observer(observer: Option<ReplLlmQueryObserver>) {
-    *REPL_LLM_QUERY_OBSERVER
+/// Replace or clear the process-wide auxiliary model observer.
+pub fn set_aux_model_observer(observer: Option<AuxModelObserver>) {
+    *AUX_MODEL_OBSERVER
         .get_or_init(|| StdMutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
 }
 
-fn repl_llm_query_observer() -> Option<ReplLlmQueryObserver> {
-    REPL_LLM_QUERY_OBSERVER
+fn aux_model_observer() -> Option<AuxModelObserver> {
+    AUX_MODEL_OBSERVER
         .get_or_init(|| StdMutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+pub(crate) fn report_aux_model_call(
+    title: &'static str,
+    session: &str,
+    provider: String,
+    model: String,
+    started_ms: i64,
+    usage: Option<jcode_provider_core::SimpleUsage>,
+    error: Option<&str>,
+) {
+    if let Some(observer) = aux_model_observer() {
+        observer(title, session, provider, model, started_ms, usage, error);
+    }
 }
 
 #[cfg(test)]
@@ -90,16 +111,16 @@ mod repl_llm_query_observer_tests {
 
     #[test]
     fn registration_replaces_and_clears_observer() {
-        let first: ReplLlmQueryObserver = Arc::new(|_, _, _, _, _, _| {});
-        set_repl_llm_query_observer(Some(first.clone()));
-        assert!(Arc::ptr_eq(&repl_llm_query_observer().unwrap(), &first));
+        let first: AuxModelObserver = Arc::new(|_, _, _, _, _, _, _| {});
+        set_aux_model_observer(Some(first.clone()));
+        assert!(Arc::ptr_eq(&aux_model_observer().unwrap(), &first));
 
-        let second: ReplLlmQueryObserver = Arc::new(|_, _, _, _, _, _| {});
-        set_repl_llm_query_observer(Some(second.clone()));
-        assert!(Arc::ptr_eq(&repl_llm_query_observer().unwrap(), &second));
+        let second: AuxModelObserver = Arc::new(|_, _, _, _, _, _, _| {});
+        set_aux_model_observer(Some(second.clone()));
+        assert!(Arc::ptr_eq(&aux_model_observer().unwrap(), &second));
 
-        set_repl_llm_query_observer(None);
-        assert!(repl_llm_query_observer().is_none());
+        set_aux_model_observer(None);
+        assert!(aux_model_observer().is_none());
     }
 }
 

@@ -21,12 +21,32 @@ impl Provider for MockSummaryProvider {
         "mock-summary"
     }
 
+    fn model(&self) -> String {
+        "mock-summary-model".to_string()
+    }
+
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(MockSummaryProvider)
     }
 
     async fn complete_simple(&self, prompt: &str, _system: &str) -> Result<String> {
         Ok(format!("summary({} chars)", prompt.len()))
+    }
+
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        _system: &str,
+    ) -> Result<jcode_provider_core::SimpleCompletion> {
+        Ok(jcode_provider_core::SimpleCompletion {
+            text: format!("summary({} chars)", prompt.len()),
+            usage: Some(jcode_provider_core::SimpleUsage {
+                input: 17,
+                output: 5,
+                cache_read: 3,
+                cache_write: 0,
+            }),
+        })
     }
 }
 
@@ -189,6 +209,11 @@ async fn test_force_compact_applies_summary() {
         manager.stats().has_summary,
         "summary should be applied after compaction task completes"
     );
+    let calls = manager.take_model_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].provider, "mock-summary");
+    assert_eq!(calls[0].model, "mock-summary-model");
+    assert_eq!(calls[0].usage.unwrap().input, 17);
 
     // After compaction, compacted_count should be > 0
     assert!(manager.compacted_count > 0);

@@ -21,9 +21,10 @@ use crate::provider::openai_request::{
     openai_encrypted_content_fallback_summary, openai_encrypted_content_is_sendable,
 };
 use anyhow::Result;
+use jcode_provider_core::SimpleUsage;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
 pub use jcode_compaction_core::{
@@ -50,6 +51,21 @@ struct CompactionResult {
     covers_up_to_turn: usize,
     duration_ms: u64,
     summarized_messages: usize,
+}
+
+struct GeneratedCompaction {
+    result: Result<CompactionResult>,
+    model_calls: Vec<CompactionModelCall>,
+}
+
+/// Usage for a model request made while compacting one session.
+#[derive(Debug, Clone)]
+pub struct CompactionModelCall {
+    pub provider: String,
+    pub model: String,
+    pub started_ms: i64,
+    pub usage: Option<SimpleUsage>,
+    pub error: Option<String>,
 }
 
 struct CompactionOutcomeLog<'a> {
@@ -148,7 +164,7 @@ pub struct CompactionManager {
     active_chars: ActiveCharEstimate,
 
     /// Background compaction task handle
-    pending_task: Option<JoinHandle<Result<CompactionResult>>>,
+    pending_task: Option<JoinHandle<GeneratedCompaction>>,
 
     /// User-facing trigger label for the currently running background compaction.
     pending_trigger: Option<String>,
@@ -176,6 +192,9 @@ pub struct CompactionManager {
 
     /// Last compaction event (if any)
     last_compaction: Option<CompactionEvent>,
+
+    /// Model requests from the latest completed compaction, including failures.
+    last_model_calls: Vec<CompactionModelCall>,
 
     // ── Mode & strategy ────────────────────────────────────────────────────
     /// Active compaction mode (set from config at construction)
@@ -225,6 +244,7 @@ impl CompactionManager {
             model_token_budget: DEFAULT_TOKEN_BUDGET,
             observed_input_tokens: None,
             last_compaction: None,
+            last_model_calls: Vec::new(),
             mode,
             compaction_config: cfg,
             token_history: VecDeque::with_capacity(TOKEN_HISTORY_WINDOW + 1),
@@ -927,7 +947,7 @@ impl CompactionManager {
         // Spawn background task that notifies via Bus when done
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
+            let mut generated =
                 generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
                     .await;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -938,11 +958,11 @@ impl CompactionManager {
                 msg_count,
             ));
             crate::bus::Bus::global().publish(crate::bus::BusEvent::CompactionFinished);
-            result.map(|mut result| {
+            if let Ok(result) = &mut generated.result {
                 result.duration_ms = duration_ms;
                 result.summarized_messages = msg_count;
-                result
-            })
+            }
+            generated
         }));
     }
 
@@ -1141,7 +1161,7 @@ impl CompactionManager {
 
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
+            let mut generated =
                 generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
                     .await;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -1151,11 +1171,11 @@ impl CompactionManager {
                 msg_count,
             ));
             crate::bus::Bus::global().publish(crate::bus::BusEvent::CompactionFinished);
-            result.map(|mut result| {
+            if let Ok(result) = &mut generated.result {
                 result.duration_ms = duration_ms;
                 result.summarized_messages = msg_count;
-                result
-            })
+            }
+            generated
         }));
 
         Ok(())
@@ -1179,118 +1199,127 @@ impl CompactionManager {
 
         // Get result
         match futures::executor::block_on(task) {
-            Ok(Ok(result)) => {
-                let trigger = self
-                    .pending_trigger
-                    .clone()
-                    .unwrap_or_else(|| self.mode_trigger_label().to_string());
-                self.log_compaction_state("apply_start", &trigger, all_messages);
+            Ok(generated) => {
+                self.last_model_calls = generated.model_calls;
+                match generated.result {
+                    Ok(result) => {
+                        let trigger = self
+                            .pending_trigger
+                            .clone()
+                            .unwrap_or_else(|| self.mode_trigger_label().to_string());
+                        self.log_compaction_state("apply_start", &trigger, all_messages);
 
-                // Defense-in-depth: `pending_cutoff` was computed against the
-                // active slice as it existed when the background task started. If
-                // the active slice has since shrunk (e.g. an interleaving hard
-                // compaction advanced `compacted_count`), the produced summary no
-                // longer aligns with the current offsets, and applying the stale
-                // cutoff would over-advance `compacted_count` and wipe out live
-                // messages (observed as "kept 0 recent messages"). A soft
-                // compaction must always leave a healthy active tail, so detect
-                // the mismatch and discard the stale result instead of applying
-                // it. Hard compacts already abort the pending task, so this is a
-                // belt-and-suspenders guard.
-                let active_len = self.active_messages(all_messages).len();
-                let leaves_no_healthy_tail =
-                    self.pending_cutoff > active_len.saturating_sub(MIN_TURNS_TO_KEEP);
-                if !all_messages.is_empty() && leaves_no_healthy_tail {
-                    crate::logging::warn(&format!(
-                        "[compaction] Discarding stale background compaction result (pending_cutoff={}, active_len={}, trigger={}) — context changed since it started",
-                        self.pending_cutoff, active_len, trigger,
-                    ));
-                    self.pending_cutoff = 0;
-                    self.pending_trigger = None;
-                    return;
+                        // Defense-in-depth: `pending_cutoff` was computed against the
+                        // active slice as it existed when the background task started. If
+                        // the active slice has since shrunk (e.g. an interleaving hard
+                        // compaction advanced `compacted_count`), the produced summary no
+                        // longer aligns with the current offsets, and applying the stale
+                        // cutoff would over-advance `compacted_count` and wipe out live
+                        // messages (observed as "kept 0 recent messages"). A soft
+                        // compaction must always leave a healthy active tail, so detect
+                        // the mismatch and discard the stale result instead of applying
+                        // it. Hard compacts already abort the pending task, so this is a
+                        // belt-and-suspenders guard.
+                        let active_len = self.active_messages(all_messages).len();
+                        let leaves_no_healthy_tail =
+                            self.pending_cutoff > active_len.saturating_sub(MIN_TURNS_TO_KEEP);
+                        if !all_messages.is_empty() && leaves_no_healthy_tail {
+                            crate::logging::warn(&format!(
+                                "[compaction] Discarding stale background compaction result (pending_cutoff={}, active_len={}, trigger={}) — context changed since it started",
+                                self.pending_cutoff, active_len, trigger,
+                            ));
+                            self.pending_cutoff = 0;
+                            self.pending_trigger = None;
+                            return;
+                        }
+
+                        let pre_tokens = self.effective_token_count_with(all_messages) as u64;
+                        let compacted_chars: usize = self
+                            .active_messages(all_messages)
+                            .iter()
+                            .take(self.pending_cutoff)
+                            .map(message_char_count)
+                            .sum();
+                        let summary = Summary {
+                            text: result.summary_text,
+                            openai_encrypted_content: result.openai_encrypted_content,
+                            covers_up_to_turn: result.covers_up_to_turn,
+                            original_turn_count: self.pending_cutoff,
+                        };
+
+                        // Advance the compacted count — these messages are now summarized
+                        self.compacted_count =
+                            self.compacted_count.saturating_add(self.pending_cutoff);
+                        if !all_messages.is_empty() {
+                            self.compacted_count = self.compacted_count.min(all_messages.len());
+                        }
+                        self.active_chars.set_exact(
+                            self.active_message_chars_with(all_messages)
+                                .saturating_sub(compacted_chars),
+                        );
+
+                        // Store summary
+                        self.active_summary = Some(summary);
+                        self.discard_oversized_openai_native_compaction();
+                        self.observed_input_tokens = None;
+                        let post_tokens = self.effective_token_count_with(all_messages) as u64;
+                        self.last_compaction = Some(CompactionEvent {
+                            trigger: trigger.clone(),
+                            pre_tokens: Some(pre_tokens),
+                            post_tokens: Some(post_tokens),
+                            tokens_saved: Some(pre_tokens.saturating_sub(post_tokens)),
+                            duration_ms: Some(result.duration_ms),
+                            messages_dropped: None,
+                            messages_compacted: Some(result.summarized_messages),
+                            summary_chars: self
+                                .active_summary
+                                .as_ref()
+                                .map(|summary| summary.text.len()),
+                            active_messages: Some(self.active_messages_count()),
+                        });
+                        crate::logging::info(&format!(
+                            "[TIMING] compaction_complete: trigger={}, duration={}ms, pre_tokens={}, post_tokens={}, tokens_saved={}, messages_compacted={}, summary_chars={}, active_messages={}",
+                            self.last_compaction
+                                .as_ref()
+                                .map(|event| event.trigger.as_str())
+                                .unwrap_or("unknown"),
+                            result.duration_ms,
+                            pre_tokens,
+                            post_tokens,
+                            pre_tokens.saturating_sub(post_tokens),
+                            result.summarized_messages,
+                            self.active_summary
+                                .as_ref()
+                                .map(|summary| summary.text.len())
+                                .unwrap_or(0),
+                            self.active_messages_count(),
+                        ));
+                        self.log_compaction_outcome(CompactionOutcomeLog {
+                            trigger: &trigger,
+                            pre_tokens,
+                            post_tokens,
+                            messages_compacted: result.summarized_messages,
+                            messages_dropped: None,
+                            duration_ms: result.duration_ms,
+                            all_messages,
+                        });
+
+                        // Reset cooldown counter so proactive/semantic modes don't
+                        // fire again immediately after a successful compaction.
+                        self.turns_since_last_compact = 0;
+
+                        self.pending_cutoff = 0;
+                        self.pending_trigger = None;
+                    }
+                    Err(e) => {
+                        crate::logging::error(&format!(
+                            "[compaction] Failed to generate summary: {}",
+                            e
+                        ));
+                        self.pending_trigger = None;
+                        self.pending_cutoff = 0;
+                    }
                 }
-
-                let pre_tokens = self.effective_token_count_with(all_messages) as u64;
-                let compacted_chars: usize = self
-                    .active_messages(all_messages)
-                    .iter()
-                    .take(self.pending_cutoff)
-                    .map(message_char_count)
-                    .sum();
-                let summary = Summary {
-                    text: result.summary_text,
-                    openai_encrypted_content: result.openai_encrypted_content,
-                    covers_up_to_turn: result.covers_up_to_turn,
-                    original_turn_count: self.pending_cutoff,
-                };
-
-                // Advance the compacted count — these messages are now summarized
-                self.compacted_count = self.compacted_count.saturating_add(self.pending_cutoff);
-                if !all_messages.is_empty() {
-                    self.compacted_count = self.compacted_count.min(all_messages.len());
-                }
-                self.active_chars.set_exact(
-                    self.active_message_chars_with(all_messages)
-                        .saturating_sub(compacted_chars),
-                );
-
-                // Store summary
-                self.active_summary = Some(summary);
-                self.discard_oversized_openai_native_compaction();
-                self.observed_input_tokens = None;
-                let post_tokens = self.effective_token_count_with(all_messages) as u64;
-                self.last_compaction = Some(CompactionEvent {
-                    trigger: trigger.clone(),
-                    pre_tokens: Some(pre_tokens),
-                    post_tokens: Some(post_tokens),
-                    tokens_saved: Some(pre_tokens.saturating_sub(post_tokens)),
-                    duration_ms: Some(result.duration_ms),
-                    messages_dropped: None,
-                    messages_compacted: Some(result.summarized_messages),
-                    summary_chars: self
-                        .active_summary
-                        .as_ref()
-                        .map(|summary| summary.text.len()),
-                    active_messages: Some(self.active_messages_count()),
-                });
-                crate::logging::info(&format!(
-                    "[TIMING] compaction_complete: trigger={}, duration={}ms, pre_tokens={}, post_tokens={}, tokens_saved={}, messages_compacted={}, summary_chars={}, active_messages={}",
-                    self.last_compaction
-                        .as_ref()
-                        .map(|event| event.trigger.as_str())
-                        .unwrap_or("unknown"),
-                    result.duration_ms,
-                    pre_tokens,
-                    post_tokens,
-                    pre_tokens.saturating_sub(post_tokens),
-                    result.summarized_messages,
-                    self.active_summary
-                        .as_ref()
-                        .map(|summary| summary.text.len())
-                        .unwrap_or(0),
-                    self.active_messages_count(),
-                ));
-                self.log_compaction_outcome(CompactionOutcomeLog {
-                    trigger: &trigger,
-                    pre_tokens,
-                    post_tokens,
-                    messages_compacted: result.summarized_messages,
-                    messages_dropped: None,
-                    duration_ms: result.duration_ms,
-                    all_messages,
-                });
-
-                // Reset cooldown counter so proactive/semantic modes don't
-                // fire again immediately after a successful compaction.
-                self.turns_since_last_compact = 0;
-
-                self.pending_cutoff = 0;
-                self.pending_trigger = None;
-            }
-            Ok(Err(e)) => {
-                crate::logging::error(&format!("[compaction] Failed to generate summary: {}", e));
-                self.pending_trigger = None;
-                self.pending_cutoff = 0;
             }
             Err(e) => {
                 crate::logging::error(&format!("[compaction] Task panicked: {}", e));
@@ -1309,6 +1338,11 @@ impl CompactionManager {
     /// Take the last compaction event (if any)
     pub fn take_compaction_event(&mut self) -> Option<CompactionEvent> {
         self.last_compaction.take()
+    }
+
+    /// Take model requests captured by the latest completed compaction task.
+    pub fn take_model_calls(&mut self) -> Vec<CompactionModelCall> {
+        std::mem::take(&mut self.last_model_calls)
     }
 
     /// Get messages for API call (with summary if compacted).
@@ -1699,8 +1733,9 @@ async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
-) -> Result<CompactionResult> {
+) -> GeneratedCompaction {
     let start = Instant::now();
+    let mut model_calls = Vec::new();
     if let Some(summary) = existing_summary.as_mut()
         && let Some(encrypted_content) = summary.openai_encrypted_content.as_ref()
         && !openai_encrypted_content_is_sendable(encrypted_content)
@@ -1723,7 +1758,14 @@ async fn generate_compaction_artifact(
         }
     }
 
-    if let Ok(native) = provider
+    let native_started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let native_provider = provider.name().to_string();
+    let native_model = provider.model();
+    let trace_native_error = provider.native_compaction_mode().as_deref() == Some("explicit");
+    match provider
         .native_compact(
             &messages,
             existing_summary
@@ -1735,48 +1777,112 @@ async fn generate_compaction_artifact(
         )
         .await
     {
-        if let Some(encrypted_content) = native.openai_encrypted_content.as_ref()
-            && !openai_encrypted_content_is_sendable(encrypted_content)
-        {
-            crate::logging::warn(&format!(
-                "[compaction] OpenAI native compaction returned oversized encrypted_content ({} chars); falling back to text summary",
-                encrypted_content.len(),
-            ));
-        } else {
-            return Ok(CompactionResult {
-                summary_text: native.summary_text.unwrap_or_default(),
-                openai_encrypted_content: native.openai_encrypted_content,
-                covers_up_to_turn: messages.len(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                summarized_messages: messages.len(),
+        Ok(native) => {
+            model_calls.push(CompactionModelCall {
+                provider: native_provider,
+                model: native_model,
+                started_ms: native_started_ms,
+                usage: native.usage,
+                error: None,
+            });
+            if let Some(encrypted_content) = native.openai_encrypted_content.as_ref()
+                && !openai_encrypted_content_is_sendable(encrypted_content)
+            {
+                crate::logging::warn(&format!(
+                    "[compaction] OpenAI native compaction returned oversized encrypted_content ({} chars); falling back to text summary",
+                    encrypted_content.len(),
+                ));
+            } else {
+                return GeneratedCompaction {
+                    result: Ok(CompactionResult {
+                        summary_text: native.summary_text.unwrap_or_default(),
+                        openai_encrypted_content: native.openai_encrypted_content,
+                        covers_up_to_turn: messages.len(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        summarized_messages: messages.len(),
+                    }),
+                    model_calls,
+                };
+            }
+        }
+        Err(error) if trace_native_error => {
+            model_calls.push(CompactionModelCall {
+                provider: native_provider,
+                model: native_model,
+                started_ms: native_started_ms,
+                usage: None,
+                error: Some(error.to_string()),
             });
         }
+        Err(_) => {}
     }
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
     let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
 
     // Generate summary using simple completion
+    let started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let provider_name = provider.name().to_string();
+    let model = provider.model();
     let summary = provider
-        .complete_simple(
+        .complete_simple_with_usage(
             &prompt,
             "You are a helpful assistant that summarizes conversations.",
         )
-        .await?;
-
-    Ok(CompactionResult {
-        summary_text: summary,
-        openai_encrypted_content: None,
-        covers_up_to_turn: messages.len(),
-        duration_ms: start.elapsed().as_millis() as u64,
-        summarized_messages: messages.len(),
-    })
+        .await;
+    match summary {
+        Ok(summary) => {
+            model_calls.push(CompactionModelCall {
+                provider: provider_name,
+                model,
+                started_ms,
+                usage: summary.usage,
+                error: None,
+            });
+            GeneratedCompaction {
+                result: Ok(CompactionResult {
+                    summary_text: summary.text,
+                    openai_encrypted_content: None,
+                    covers_up_to_turn: messages.len(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    summarized_messages: messages.len(),
+                }),
+                model_calls,
+            }
+        }
+        Err(error) => {
+            model_calls.push(CompactionModelCall {
+                provider: provider_name,
+                model,
+                started_ms,
+                usage: None,
+                error: Some(error.to_string()),
+            });
+            GeneratedCompaction {
+                result: Err(error),
+                model_calls,
+            }
+        }
+    }
 }
 
 pub async fn build_transfer_compaction_state(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     existing_state: Option<crate::session::StoredCompactionState>,
+) -> Result<Option<crate::session::StoredCompactionState>> {
+    build_transfer_compaction_state_with_model_calls(provider, messages, existing_state, |_| {})
+        .await
+}
+
+pub async fn build_transfer_compaction_state_with_model_calls(
+    provider: Arc<dyn Provider>,
+    messages: Vec<Message>,
+    existing_state: Option<crate::session::StoredCompactionState>,
+    mut on_model_call: impl FnMut(CompactionModelCall),
 ) -> Result<Option<crate::session::StoredCompactionState>> {
     let existing_summary = existing_state.as_ref().map(|state| Summary {
         text: state.summary_text.clone(),
@@ -1796,7 +1902,12 @@ pub async fn build_transfer_compaction_state(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let result = generate_compaction_artifact(provider, messages.clone(), existing_summary).await?;
+    let generated =
+        generate_compaction_artifact(provider, messages.clone(), existing_summary).await;
+    for call in generated.model_calls {
+        on_model_call(call);
+    }
+    let result = generated.result?;
     let total_turns = prior_turns + messages.len();
 
     Ok(Some(crate::session::StoredCompactionState {
