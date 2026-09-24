@@ -62,15 +62,17 @@ Also verified earlier: Cron open starts Python; close + idle (`SOVEREIGN_FEATURE
 
 **API-key proof:** `apps/desktop/release/sovereign-apikey/result.json` (`ok: true`, `mode: "600"`, `stdoutHasFullKey: false`).
 
-## Step 2 — Windows x64 (in progress)
+## Step 2 — Windows x64 (verified build)
 
 - [x] Audit: `dist:win:nsis` + `extraResources` sovereign/sovereign-python already wired
 - [x] `stage-sovereign-python.mjs` extended for `win32-x64` (`runtime/python.exe`)
 - [x] `before-pack.mjs` validates Windows python + `sovereign.exe`
-- [x] GHA workflow `.github/workflows/sovereign-windows-nsis.yml` (manual `workflow_dispatch`)
-- [ ] Run workflow and download unsigned NSIS; smoke-launch on a Windows box
+- [x] GHA workflow `.github/workflows/sovereign-windows-nsis.yml`
+- [x] Engine: link `sovereign-gateway` on Windows (`Cargo.toml`); CI green
+- [x] Unsigned NSIS artifact from https://github.com/hir0-pixel/hermes-agent/actions/runs/35994371563
+- [ ] Smoke-launch on a real Windows box (not done from this Mac)
 
-Engine checkout defaults to `1jehuang/jcode@feature/sovereign-observability`. Private repos need `SOVEREIGN_ENGINE_CHECKOUT_TOKEN`.
+Engine checkout: `hir0-pixel/jcode@feature/sovereign-observability`.
 
 ## Step 3 — Benchmark (open)
 
@@ -78,4 +80,4 @@ Engine checkout defaults to `1jehuang/jcode@feature/sovereign-observability`. Pr
 
 ## Not verified yet
 
-Windows NSIS artifact from CI, macOS x64, benchmarks vs stock Hermes, INSTALL.md. Desktop `main.ts` still has uncommitted theme/marketplace noise — only packaging e2e/scripts should be committed until those land separately.
+Live Windows smoke test, macOS x64, benchmarks vs stock Hermes, INSTALL.md. Desktop `main.ts` still has uncommitted theme/marketplace noise — only packaging e2e/scripts should be committed until those land separately.
