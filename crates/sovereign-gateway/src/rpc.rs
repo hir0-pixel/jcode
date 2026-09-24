@@ -4,7 +4,7 @@
 use crate::approvals::{Client, Hub};
 use crate::map::{self, Out, SessionState};
 use crate::{Config, MAX_FRAME_BYTES};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -59,6 +59,26 @@ impl RpcError {
     }
 }
 
+/// A WebSocket to the Hermes feature backend for one desktop connection.
+struct Upstream {
+    tx: mpsc::Sender<String>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Server requests from the backend are relayed to the desktop under this
+/// prefix so their ids can never collide with ours.
+const UPSTREAM_REQUEST_PREFIX: &str = "up-";
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
+
 struct Conn {
     config: Arc<Config>,
     to_ws: mpsc::Sender<Message>,
@@ -80,6 +100,9 @@ struct Conn {
     in_flight: Arc<tokio::sync::Semaphore>,
     /// `prompt.submit` callers waiting for jcode's `message_accepted`.
     accept_waiters: Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>,
+    /// Connection to Hermes's Python backend, opened on first forwarded call.
+    upstream: Mutex<Option<Arc<Upstream>>>,
+    next_forward: AtomicU64,
     hub: Arc<Hub>,
     /// This connection as seen by the approval hub.
     client: Arc<Client>,
@@ -542,10 +565,7 @@ impl Conn {
                 }
                 Ok(json!({ "resolved": resolved }))
             }
-            _ => {
-                crate::note_unsupported("rpc", method);
-                Err(RpcError::unsupported(method))
-            }
+            _ => self.forward(method, p).await,
         }
     }
 
@@ -610,9 +630,104 @@ impl Conn {
         })
     }
 
-    /// A reply to one of our server requests (currently only `approval`).
+    /// Forward a method the Rust harness does not own to Hermes's backend.
+    async fn forward(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
+        // Only methods Hermes actually defines may wake the Python backend;
+        // anything else is answered here without starting it.
+        if !crate::contract_methods().contains(method) {
+            return Err(RpcError { code: METHOD_NOT_FOUND, message: format!("unknown method {method}"), data: None });
+        }
+        let Some(features) = self.config.features.clone() else {
+            crate::note_unsupported("rpc", method);
+            return Err(RpcError::unsupported(method));
+        };
+        let upstream = self.upstream(&features).await.map_err(RpcError::internal)?;
+        let id = format!("fwd-{}", self.next_forward.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        upstream.pending.lock().await.insert(id.clone(), tx);
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        upstream.tx.send(frame.to_string()).await.map_err(|_| RpcError::internal(anyhow!("feature backend connection closed")))?;
+        let reply = tokio::time::timeout(FORWARD_TIMEOUT, rx)
+            .await
+            .map_err(|_| RpcError::internal(anyhow!("{method} timed out in the feature backend")))?
+            .map_err(|_| RpcError::internal(anyhow!("the feature backend restarted; try again")))?;
+        features.touch();
+        match reply.get("error") {
+            Some(err) => Err(RpcError {
+                code: err["code"].as_i64().unwrap_or(INTERNAL),
+                message: err["message"].as_str().unwrap_or("feature backend error").to_string(),
+                data: err.get("data").cloned(),
+            }),
+            None => Ok(reply["result"].clone()),
+        }
+    }
+
+    /// The live upstream connection, (re)opened as needed.
+    async fn upstream(self: &Arc<Self>, features: &crate::features::Features) -> Result<Arc<Upstream>> {
+        let mut slot = self.upstream.lock().await;
+        if let Some(up) = slot.as_ref() {
+            if !up.tx.is_closed() {
+                return Ok(up.clone());
+            }
+        }
+        let port = features.port().await?;
+        let url = format!("ws://127.0.0.1:{port}/api/ws?token={}", features.token);
+        let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connecting to the feature backend")?;
+        let (mut ws_tx, mut ws_rx) = ws.split();
+        let (tx, mut rx) = mpsc::channel::<String>(256);
+        let writer = tokio::spawn(async move {
+            while let Some(text) = rx.recv().await {
+                if ws_tx.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let up = Arc::new_cyclic(|weak: &std::sync::Weak<Upstream>| {
+            let weak_up = weak.clone();
+            let conn = Arc::downgrade(self);
+            let reader = tokio::spawn(async move {
+                while let Some(Ok(msg)) = ws_rx.next().await {
+                    let Message::Text(text) = msg else { continue };
+                    let Ok(mut frame) = serde_json::from_str::<Value>(&text) else { continue };
+                    let (Some(conn), Some(up)) = (conn.upgrade(), weak_up.upgrade()) else { break };
+                    if frame.get("method").is_none() {
+                        if let Some(id) = frame["id"].as_str() {
+                            if let Some(tx) = up.pending.lock().await.remove(id) {
+                                let _ = tx.send(frame);
+                            }
+                        }
+                    } else if frame["method"] == "event" {
+                        // The desktop already has our own gateway.ready.
+                        if frame["params"]["type"] != "gateway.ready" {
+                            conn.send_json(frame).await;
+                        }
+                    } else if frame.get("id").is_some() {
+                        let raw = match &frame["id"] {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        frame["id"] = json!(format!("{UPSTREAM_REQUEST_PREFIX}{raw}"));
+                        conn.send_json(frame).await;
+                    }
+                }
+            });
+            Upstream { tx, pending: Mutex::new(HashMap::new()), tasks: vec![writer.abort_handle(), reader.abort_handle()] }
+        });
+        *slot = Some(up.clone());
+        Ok(up)
+    }
+
+    /// A reply to one of our server requests (approvals, or relayed ones).
     async fn on_client_reply(&self, frame: &Value) {
         let Some(id) = frame["id"].as_str() else { return };
+        if let Some(raw) = id.strip_prefix(UPSTREAM_REQUEST_PREFIX) {
+            if let Some(up) = self.upstream.lock().await.clone() {
+                let mut reply = frame.clone();
+                reply["id"] = raw.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(raw));
+                let _ = up.tx.send(reply.to_string()).await;
+            }
+            return;
+        }
         let choice = frame["result"]["choice"].as_str().unwrap_or("deny");
         if self.hub.answer(id, choice).await {
             return;
@@ -656,6 +771,8 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>) -> Result<()> {
         approvals: Mutex::new(HashMap::new()),
         in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
         accept_waiters: Mutex::new(HashMap::new()),
+        upstream: Mutex::new(None),
+        next_forward: AtomicU64::new(1),
         hub: hub.clone(),
         client: client.clone(),
     });

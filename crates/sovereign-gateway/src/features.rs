@@ -69,6 +69,13 @@ impl Features {
             .args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
             .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
+            // Hermes's parent-death watchdog: exit within ~2 s if the engine
+            // dies, even by SIGKILL (kill_on_drop only covers clean exits).
+            // A start marker without a matching nonce would disarm it, so drop
+            // any inherited from the desktop that launched us.
+            .env("HERMES_PARENT_PID", std::process::id().to_string())
+            .env_remove("HERMES_PARENT_START_MARKER")
+            .env_remove("HERMES_PARENT_NONCE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

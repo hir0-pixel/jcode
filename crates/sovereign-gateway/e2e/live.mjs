@@ -49,7 +49,8 @@ const model = process.env.E2E_MODEL || 'qwen3.8:27b'
 const readyFile = path.join(home, 'ready.json')
 
 const child = spawn(bin, ['--provider', provider, '--model', model, '--profile', 'x', 'serve', '--host', '127.0.0.1', '--port', '0'], {
-  env: { ...process.env, JCODE_HOME: home, HERMES_DASHBOARD_SESSION_TOKEN: token, HERMES_DESKTOP_READY_FILE: readyFile },
+  // HERMES_HOME isolates the on-demand Python feature backend from the user's real profile.
+  env: { ...process.env, JCODE_HOME: home, HERMES_HOME: path.join(home, 'hermes-home'), HERMES_DASHBOARD_SESSION_TOKEN: token, HERMES_DESKTOP_READY_FILE: readyFile },
   cwd: home,
   stdio: ['ignore', 'pipe', 'pipe']
 })
@@ -155,7 +156,7 @@ await waitFor(e => e.type === 'gateway.ready', 5000)
 ok('gateway.ready received')
 
 let f = await rpc('definitely.not.a.method')
-check(f.error?.code === -32601 && f.error?.data?.reason === 'not_supported_by_engine', 'unknown methods return -32601 not_supported_by_engine')
+check(f.error?.code === -32601, 'unknown methods return -32601 (method not found)')
 ws.send('{not json')
 await new Promise(res => setTimeout(res, 200))
 f = await rpc('prompt.submit', {})
@@ -377,6 +378,30 @@ if (process.env.E2E_SKIP_CHAT !== '1') {
   check(approvals.length === n2, 'safe commands ran without a prompt')
 }
 
+// Hybrid: features the Rust harness does not own are served by Hermes's own
+// Python backend, started on demand. Chat above must not have started it.
+const pyCount = () => {
+  // Real Python backends only: shells whose command line merely mentions it do not count.
+  const lines = execFileSync('ps', ['-Ao', 'command']).toString().split('\n')
+  return lines.filter(l => /Python|python/.test(l.split(' ')[0]) && l.includes('serve --host 127.0.0.1 --port 0 --skip-build')).length
+}
+check(pyCount() === 0, 'chat alone never started the Python feature backend')
+if (process.env.E2E_SKIP_FEATURES !== '1') {
+  const t0 = Date.now()
+  f = await rpc('config.show', {})
+  if (!f.error) validate('result', 'config.show', results['config.show'], f.result)
+  check(!f.error && Array.isArray(f.result?.sections), `config.show is served by the Python feature backend (${Date.now() - t0} ms incl. cold start)`)
+  check(pyCount() === 1, 'the Python feature backend started on demand')
+  const t1 = Date.now()
+  f = await rpc('config.show', {})
+  console.log(`     forwarded call, warm: ${Date.now() - t1} ms`)
+  r = await get('/api/config', { 'x-hermes-session-token': token })
+  const cfg = await r.json().catch(() => null)
+  check(r.status === 200 && cfg && typeof cfg === 'object', 'HTTP routes are forwarded (/api/config)')
+  r = await get('/api/config')
+  check(r.status === 401, 'forwarded routes still require the desktop token')
+}
+
 f = await rpc('session.interrupt', { session_id: sid })
 if (!f.error) validate('result', 'session.interrupt', results['session.interrupt'], f.result)
 check(!f.error, 'session.interrupt answers when idle')
@@ -385,8 +410,13 @@ const rssKb = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(child.pid)])
 console.log(`     engine RSS: ${(rssKb / 1024).toFixed(1)} MB`)
 
 ws.close()
-child.kill('SIGTERM')
+child.kill('SIGKILL')
 await new Promise(res => child.on('exit', res))
+if (process.env.E2E_SKIP_FEATURES !== '1') {
+  let left = 1
+  for (let i = 0; i < 40 && left; i++) { await new Promise(res => setTimeout(res, 250)); left = pyCount() }
+  check(left === 0, 'the Python feature backend exits when the engine is killed')
+}
 fs.rmSync(home, { recursive: true, force: true })
 console.log(`\n${passed.length} passed, ${failures} failed`)
 process.exit(failures ? 1 : 0)

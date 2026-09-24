@@ -30,6 +30,18 @@ const MAX_CONNECTIONS: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Method names in the vendored Hermes gateway contract (parsed once).
+pub(crate) fn contract_methods() -> &'static std::collections::HashSet<String> {
+    static METHODS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    METHODS.get_or_init(|| {
+        let contract: Value = serde_json::from_str(include_str!("../contract/gateway-contract.openrpc.json")).unwrap_or_default();
+        contract["methods"]
+            .as_array()
+            .map(|list| list.iter().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Log each unsupported method/route once per process (stderr), so parity
 /// gaps show up in the engine log without flooding it.
 pub(crate) fn note_unsupported(kind: &str, what: &str) {
@@ -60,6 +72,8 @@ pub struct Config {
     pub complete: Option<Complete>,
     /// Lets the `pre_tool` hook create approval prompts (never answer them).
     pub approval_secret: String,
+    /// Hermes's Python backend for everything the Rust harness does not own.
+    pub features: Option<Arc<features::Features>>,
 }
 
 pub type Complete = std::sync::Arc<
@@ -91,6 +105,15 @@ impl Gateway {
     }
 
     pub async fn serve(self) -> Result<()> {
+        if let Some(features) = self.config.features.clone() {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    features.stop_if_idle().await;
+                }
+            });
+        }
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
             let (stream, _) = self.listener.accept().await?;
@@ -196,6 +219,45 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<(
     Ok(())
 }
 
+/// Reverse-proxy one request (or WebSocket upgrade) to the Hermes feature
+/// backend. The client's credential is replaced by the backend's private
+/// token; bytes then flow both ways untouched.
+async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::Features, upgrade: bool) -> Result<()> {
+    let port = features.port().await?;
+    let mut upstream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let query: Vec<&str> = req
+        .query
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|kv| !kv.is_empty() && !kv.starts_with("token=") && !kv.starts_with("ticket="))
+        .collect();
+    let target = if query.is_empty() { req.path.clone() } else { format!("{}?{}", req.path, query.join("&")) };
+    let mut head = format!("{} {} HTTP/1.1\r\n", req.method, target);
+    for (name, value) in &req.headers {
+        let lower = name.to_ascii_lowercase();
+        let dropped = matches!(lower.as_str(), "host" | "x-hermes-session-token" | "authorization" | "origin")
+            || (!upgrade && lower == "connection");
+        if !dropped {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str(&format!("Host: 127.0.0.1:{port}\r\nX-Hermes-Session-Token: {}\r\n", features.token));
+    if upgrade {
+        // WebSocket routes authenticate by query token on the backend.
+        let sep = if target.contains('?') { '&' } else { '?' };
+        head = head.replacen(&target, &format!("{target}{sep}token={}", features.token), 1);
+    } else {
+        head.push_str("Connection: close\r\n");
+    }
+    head.push_str("\r\n");
+    upstream.write_all(head.as_bytes()).await?;
+    upstream.write_all(&req.body_prefix).await?;
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    features.touch();
+    Ok(())
+}
+
 fn query_u64(req: &Request, key: &str) -> Option<u64> {
     auth::query_param(req.query.as_deref()?, key)?.parse().ok()
 }
@@ -265,6 +327,15 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
     );
     let wants_ws = req.header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
+    if wants_ws && req.path != "/api/ws" {
+        if host_reason.is_some() || !token_ok {
+            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+        }
+        return match config.features.clone() {
+            Some(features) => proxy_http(stream, &req, &features, true).await,
+            None => respond(&mut stream, "404 Not Found", &json!({"detail": "not supported by engine"})).await,
+        };
+    }
     if wants_ws && req.path == "/api/ws" {
         let Some(key) = req.header("sec-websocket-key") else {
             return respond(&mut stream, "400 Bad Request", &json!({"detail": "missing websocket key"})).await;
@@ -371,10 +442,25 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
         }
+        (_, path) if path.starts_with("/api/") && config.features.is_some() => {
+            let features = config.features.clone().expect("checked");
+            proxy_http(stream, &req, &features, false).await
+        }
         (method, path) => {
             note_unsupported("http", &format!("{method} {path}"));
             let body = json!({"detail": "not supported by engine", "reason": "not_supported_by_engine"});
             respond(&mut stream, "404 Not Found", &body).await
         }
+    }
+}
+
+#[cfg(test)]
+mod contract_gate_tests {
+    #[test]
+    fn only_contract_methods_are_forwardable() {
+        let methods = super::contract_methods();
+        assert_eq!(methods.len(), 235);
+        assert!(methods.contains("cron.manage") && methods.contains("config.show"));
+        assert!(!methods.contains("definitely.not.a.method"));
     }
 }
