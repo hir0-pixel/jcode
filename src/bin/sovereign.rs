@@ -114,6 +114,13 @@ fn main() -> Result<()> {
     // No integration discovery (it contacts a remote endpoint).
     // SAFETY: as above.
     unsafe { std::env::set_var("JCODE_SPONSORS_ENABLED", "0") };
+    // No hidden model spend: jcode's memory-extraction sidecar would call the
+    // model every 12 turns and on every disconnect. Learning belongs to the
+    // Prime loop (evidence-gated, signal-triggered, at most one pass per idle).
+    if std::env::var_os("JCODE_MEMORY_SIDECAR_ENABLED").is_none() {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("JCODE_MEMORY_SIDECAR_ENABLED", "0") };
+    }
     // Token budget: tool definitions are ~97% of every request. Drop tools
     // that reach third parties or that the desktop cannot render. Override
     // with JCODE_DISABLED_TOOLS (set it to empty to keep everything).
