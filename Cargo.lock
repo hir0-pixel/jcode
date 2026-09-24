@@ -7751,12 +7751,15 @@ name = "sovereign-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures-util",
  "httparse",
  "jcode-command-risk",
  "jcode-harness-api-server",
+ "jcode-provider-core",
  "jsonschema",
  "rand 0.8.6",
+ "rusqlite",
  "serde_json",
  "sovereign-prime",
  "subtle",

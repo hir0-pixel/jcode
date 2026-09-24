@@ -13,6 +13,9 @@ jcode-command-risk = { path = "../jcode-command-risk" }
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }
 sovereign-prime = { path = "../sovereign-prime" }
 rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+jcode-provider-core = { path = "../jcode-provider-core" }
 serde_json = "1"
 subtle = "2"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time", "process"] }

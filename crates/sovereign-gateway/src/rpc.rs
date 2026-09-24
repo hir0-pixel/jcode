@@ -3,6 +3,7 @@
 
 use crate::approvals::{Client, Hub};
 use crate::map::{self, Out, SessionState};
+use crate::observability::Observer;
 use crate::{Config, MAX_FRAME_BYTES};
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
@@ -106,6 +107,7 @@ struct Conn {
     hub: Arc<Hub>,
     /// This connection as seen by the approval hub.
     client: Arc<Client>,
+    observer: Arc<Observer>,
 }
 
 impl Conn {
@@ -251,10 +253,14 @@ impl Conn {
                 return;
             }
         }
+        self.observer.harness_event(&frame);
         let outs = map::map_event(&frame, &mut *self.sessions.lock().await);
         for out in outs {
             match out {
-                Out::Event { ty, session_id, payload } => self.emit(ty, Some(&session_id), payload).await,
+                Out::Event { ty, session_id, payload } => {
+                    self.observer.event(&session_id, ty, &payload);
+                    self.emit(ty, Some(&session_id), payload).await;
+                }
                 Out::Approval { session_id, request_id, tool_name, description } => {
                     let id = format!("srv-{}", self.next_server_request.fetch_add(1, Ordering::Relaxed));
                     self.approvals.lock().await.insert(id.clone(), (session_id.clone(), request_id.clone()));
@@ -481,7 +487,11 @@ impl Conn {
                         }
                     }
                 }
-                self.submit(&id, &text).await.map_err(RpcError::internal)?;
+                let run = self.observer.start_turn(&id, &text);
+                if let Err(err) = self.submit(&id, &text).await {
+                    self.observer.failed_submit(&id, &run, &err.to_string());
+                    return Err(RpcError::internal(err));
+                }
                 Ok(json!({ "status": if busy { "queued" } else { "streaming" } }))
             }
             "session.steer" => {
@@ -493,7 +503,8 @@ impl Conn {
             }
             "session.interrupt" => {
                 let id = sid()?;
-                let busy = self.sessions.lock().await.get(id).is_some_and(SessionState::turn_active);
+                let busy = self.sessions.lock().await.get(id).is_some_and(SessionState::turn_active)
+                    || self.observer.has_active_run(id);
                 self.ensure_attached(id).await.map_err(RpcError::internal)?;
                 call(json!({ "req": "cancel", "session_id": id })).await?;
                 Ok(json!({
@@ -752,7 +763,7 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
-pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>) -> Result<()> {
+pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
     let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
@@ -775,6 +786,7 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>) -> Result<()> {
         next_forward: AtomicU64::new(1),
         hub: hub.clone(),
         client: client.clone(),
+        observer,
     });
 
     // Control link first: if the engine is unreachable, refuse the client.

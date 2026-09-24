@@ -11,6 +11,7 @@ pub mod approvals;
 pub mod auth;
 pub mod features;
 pub mod map;
+pub mod observability;
 mod rpc;
 
 use anyhow::{Context, Result, bail};
@@ -85,6 +86,7 @@ pub struct Gateway {
     local: SocketAddr,
     config: Arc<Config>,
     hub: Arc<approvals::Hub>,
+    observer: Arc<observability::Observer>,
 }
 
 impl Gateway {
@@ -97,7 +99,8 @@ impl Gateway {
         }
         let listener = TcpListener::bind(config.bind).await.context("binding gateway")?;
         let local = listener.local_addr()?;
-        Ok(Self { listener, local, config: Arc::new(config), hub: Arc::default() })
+        let observer = observability::Observer::open(std::path::Path::new(&config.home), &config.provider, &config.model)?;
+        Ok(Self { listener, local, config: Arc::new(config), hub: Arc::default(), observer })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -123,10 +126,11 @@ impl Gateway {
             };
             let config = self.config.clone();
             let hub = self.hub.clone();
+            let observer = self.observer.clone();
             let local = self.local;
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle(stream, local, config, hub).await;
+                let _ = handle(stream, local, config, hub, observer).await;
             });
         }
     }
@@ -316,7 +320,7 @@ async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> R
         .unwrap_or_default())
 }
 
-async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, hub: Arc<approvals::Hub>) -> Result<()> {
+async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, hub: Arc<approvals::Hub>, observer: Arc<observability::Observer>) -> Result<()> {
     let req = tokio::time::timeout(HEADER_TIMEOUT, read_request(&mut stream)).await??;
     let bound_ip = local.ip().to_string();
     let host_reason = auth::host_origin_reason(req.header("host"), req.header("origin"), local.port(), &bound_ip);
@@ -357,7 +361,7 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         if !token_ok {
             return rpc::close(ws, 4401, "unauthorized").await;
         }
-        return rpc::run(ws, config, hub).await;
+        return rpc::run(ws, config, hub, observer).await;
     }
 
     if host_reason.is_some() {
@@ -441,6 +445,25 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         ("GET", "/api/host/identity") => {
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
+        }
+        ("GET", "/api/sovereign/observability/runs") => {
+            let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
+            let result = tokio::task::spawn_blocking(move || observer.list(limit)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/sovereign/observability/run") => {
+            let Some(id) = auth::query_param(req.query.as_deref().unwrap_or_default(), "id") else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail":"id is required"})).await;
+            };
+            let result = tokio::task::spawn_blocking(move || observer.detail(&id)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(rusqlite::Error::QueryReturnedNoRows) => respond(&mut stream, "404 Not Found", &json!({"detail":"run not found"})).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
         }
         (_, path) if path.starts_with("/api/") && config.features.is_some() => {
             let features = config.features.clone().expect("checked");
