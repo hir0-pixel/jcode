@@ -110,7 +110,7 @@ impl Gateway {
     pub async fn serve(self) -> Result<()> {
         if let Some(features) = self.config.features.clone() {
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                let mut tick = tokio::time::interval(features::idle_stop_after().clamp(Duration::from_secs(1), Duration::from_secs(60)));
                 loop {
                     tick.tick().await;
                     features.stop_if_idle().await;

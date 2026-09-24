@@ -1424,6 +1424,9 @@ async fn run_gateway(
 /// harness does not own: `SOVEREIGN_HERMES_CMD` (empty disables), else the
 /// managed install, else `hermes` on PATH.
 fn hermes_feature_command() -> Option<Vec<String>> {
+    if let Ok(python) = std::env::var("SOVEREIGN_HERMES_PYTHON") {
+        return (!python.is_empty()).then(|| vec![python, "-m".into(), "hermes_cli.main".into()]);
+    }
     if let Ok(cmd) = std::env::var("SOVEREIGN_HERMES_CMD") {
         let parts: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
         return (!parts.is_empty()).then_some(parts);

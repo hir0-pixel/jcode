@@ -19,6 +19,15 @@ use tokio::sync::Mutex;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 pub const IDLE_STOP_AFTER: Duration = Duration::from_secs(10 * 60);
 
+pub fn idle_stop_after() -> Duration {
+    std::env::var("SOVEREIGN_FEATURE_IDLE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(IDLE_STOP_AFTER)
+}
+
 struct Running {
     child: Child,
     port: u16,
@@ -65,8 +74,16 @@ impl Features {
             *running = None; // exited: start a fresh one
         }
         let (program, args) = self.command.split_first().context("no Hermes backend command configured")?;
-        let mut child = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        if let Ok(pythonpath) = std::env::var("SOVEREIGN_HERMES_PYTHONPATH") {
+            command.env("PYTHONPATH", pythonpath);
+        }
+        if let Ok(tools_dir) = std::env::var("SOVEREIGN_HERMES_TOOLS_DIR") {
+            let mut paths = vec![std::path::PathBuf::from(tools_dir)];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            command.env("PATH", std::env::join_paths(paths)?);
+        }
+        let mut child = command.args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
             .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
             // Hermes's parent-death watchdog: exit within ~2 s if the engine
@@ -110,7 +127,7 @@ impl Features {
 
     /// Stop the backend if it has been idle for `IDLE_STOP_AFTER`.
     pub async fn stop_if_idle(&self) {
-        if self.idle_for() < IDLE_STOP_AFTER {
+        if self.idle_for() < idle_stop_after() {
             return;
         }
         if let Some(mut r) = self.running.lock().await.take() {
