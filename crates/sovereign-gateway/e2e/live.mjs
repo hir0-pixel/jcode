@@ -162,6 +162,11 @@ f = await rpc('prompt.submit', {})
 check(f.error?.code === -32602, 'missing session_id returns invalid params')
 f = await rpc('ping')
 check(!f.error, 'ping answers')
+fs.mkdirSync(path.join(home, 'repo', '.git'), { recursive: true })
+fs.writeFileSync(path.join(home, 'repo', '.git', 'HEAD'), 'ref: refs/heads/main\n')
+f = await rpc('config.get', { key: 'project', cwd: path.join(home, 'repo') })
+if (!f.error) validate('result', 'config.get', results['config.get'], f.result)
+check(f.result?.branch === 'main', 'config.get project reports the git branch')
 for (const m of ['setup.status', 'setup.runtime_check', 'free_tier.status', 'model.options', 'wake.status',
   'session.active_list', 'commands.catalog', 'profiles.list', 'pet.info', 'projects.tree',
   'gateway.capabilities', 'client.capabilities']) {
@@ -222,6 +227,9 @@ r = await get('/api/profiles/sessions?limit=20&offset=0&min_messages=0&archived=
   f = await rpc('session.resume', { session_id: sid })
   if (!f.error) validate('result', 'session.resume', results['session.resume'], f.result)
   check(!f.error && f.result.message_count >= 2, 'session.resume returns the transcript')
+  f = await rpc('session.activate', { session_id: sid })
+  if (!f.error) validate('result', 'session.activate', results['session.activate'], f.result)
+  check(!f.error && f.result.message_count >= 2, 'session.activate (chat switching) returns the transcript')
 }
 
 // A reconnecting client submits without resuming first: the gateway must attach.

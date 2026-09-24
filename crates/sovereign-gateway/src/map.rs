@@ -378,6 +378,36 @@ pub fn complete_path(word: &str, cwd: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Current git branch for `cwd` (walks up to the repository root; worktrees
+/// and `.git` files supported). Short commit id when detached. No subprocess.
+pub fn git_branch(cwd: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(cwd).to_path_buf();
+    loop {
+        let dot_git = dir.join(".git");
+        let git_dir = if dot_git.is_dir() {
+            Some(dot_git)
+        } else if dot_git.is_file() {
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let target = text.trim().strip_prefix("gitdir:")?.trim().to_string();
+            let path = std::path::Path::new(&target);
+            Some(if path.is_absolute() { path.to_path_buf() } else { dir.join(path) })
+        } else {
+            None
+        };
+        if let Some(git_dir) = git_dir {
+            let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+            let head = head.trim();
+            return Some(match head.strip_prefix("ref: refs/heads/") {
+                Some(branch) => branch.to_string(),
+                None => head.chars().take(7).collect(),
+            });
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Title for an untitled session from its first prompt: the desktop's
 /// `title_preview` when given, else the first non-empty line, capped at 60
 /// characters on a word boundary. No model call.
@@ -523,6 +553,19 @@ mod tests {
     #[test]
     fn events_without_a_session_are_ignored() {
         assert!(run(&[json!({"ev":"text_delta","text":"x"})]).is_empty());
+    }
+
+    #[test]
+    fn git_branch_reads_head_without_git() {
+        let root = std::env::temp_dir().join(format!("gb-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(git_branch(root.join("src/deep").to_str().unwrap()).as_deref(), Some("feature/x"));
+        std::fs::write(root.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_branch(root.to_str().unwrap()).as_deref(), Some("0123456"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(git_branch("/definitely/not/a/repo"), None);
     }
 
     #[test]

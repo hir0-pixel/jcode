@@ -392,7 +392,7 @@ impl Conn {
                     "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version, &self.config.model, &self.config.provider),
                 }))
             }
-            "session.resume" => {
+            "session.resume" | "session.activate" => {
                 let id = sid()?.to_string();
                 let attached = self.ensure_attached(&id).await.map_err(RpcError::internal)?;
                 let cwd = attached["session"]["working_dir"].as_str().unwrap_or(&self.config.default_cwd).to_string();
@@ -496,6 +496,23 @@ impl Conn {
                 let sessions = self.sessions.lock().await;
                 let usage = sessions.get(id).map(SessionState::usage_json).unwrap_or_else(|| json!({}));
                 Ok(usage)
+            }
+            "config.get" => {
+                let key = p["key"].as_str().unwrap_or_default();
+                match key {
+                    "project" => {
+                        let cwd = p["cwd"].as_str().filter(|c| !c.is_empty()).unwrap_or(&self.config.default_cwd).to_string();
+                        let lookup = cwd.clone();
+                        let branch = tokio::task::spawn_blocking(move || map::git_branch(&lookup)).await.ok().flatten();
+                        Ok(json!({ "cwd": cwd, "branch": branch }))
+                    }
+                    "model" | "provider" => Ok(json!({
+                        "value": if key == "model" { &self.config.model } else { &self.config.provider },
+                        "model": self.config.model,
+                        "provider": self.config.provider,
+                    })),
+                    _ => Ok(json!({ "value": null })),
+                }
             }
             "approval.received" => {
                 sid()?;
