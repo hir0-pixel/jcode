@@ -111,6 +111,11 @@ impl Features {
             // desktop does the same). Without this, waking Python for a due job
             // would serve Cron HTTP but never fire schedules.
             .env("HERMES_DESKTOP", "1")
+            // No hidden model spend or network pulls from this backend: learning
+            // belongs to the engine's Prime loop, so Hermes's skill curator (which
+            // can fork a background agent) is off, and so is skill sync.
+            .env("HERMES_CURATOR_DISABLED", "1")
+            .env("HERMES_SYNC_ENABLED", "0")
             // Hermes's parent-death watchdog: exit within ~2 s if the engine
             // dies, even by SIGKILL (kill_on_drop only covers clean exits).
             // A start marker without a matching nonce would disarm it, so drop
@@ -223,6 +228,31 @@ mod tests {
         let f = Features::new(vec![script.to_string_lossy().into_owned()]);
         assert!(f.port().await.unwrap_err().to_string().contains("exited before"));
         assert!(Features::new(vec![]).port().await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn backend_starts_with_hidden_spend_switched_off() {
+        let dir = std::env::temp_dir().join(format!("features-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("env-hermes");
+        let seen = dir.join("env.txt");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nenv > '{}'\necho 'HERMES_BACKEND_READY port=4343'\nexec sleep 30\n", seen.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let f = Features::new(vec![script.to_string_lossy().into_owned()]);
+        assert_eq!(f.port().await.unwrap(), 4343);
+        let env = std::fs::read_to_string(&seen).unwrap();
+        assert!(env.lines().any(|l| l == "HERMES_CURATOR_DISABLED=1"), "curator off");
+        assert!(env.lines().any(|l| l == "HERMES_SYNC_ENABLED=0"), "skill sync off");
+        f.stop().await;
         let _ = std::fs::remove_dir_all(dir);
     }
 }
