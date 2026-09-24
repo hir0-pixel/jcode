@@ -10,7 +10,7 @@
 use anyhow::{Context, Result, bail};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -41,6 +41,8 @@ pub struct Features {
     /// Milliseconds since `epoch` of the last forwarded call.
     last_used_ms: AtomicU64,
     epoch: Instant,
+    /// Unix millis: do not idle-stop while `now < cron_hold_until_ms` (cron wake hold).
+    cron_hold_until_ms: AtomicU64,
 }
 
 impl Features {
@@ -51,11 +53,30 @@ impl Features {
             running: Mutex::new(None),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            cron_hold_until_ms: AtomicU64::new(0),
         }
     }
 
     pub fn touch(&self) {
         self.last_used_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_cron_hold_until(&self, until: SystemTime) {
+        let ms = until.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        self.cron_hold_until_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    pub fn clear_cron_hold(&self) {
+        self.cron_hold_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    pub fn cron_held(&self) -> bool {
+        let until = self.cron_hold_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            return false;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        now < until
     }
 
     fn idle_for(&self) -> Duration {
@@ -86,6 +107,10 @@ impl Features {
         let mut child = command.args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
             .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
+            // Desktop-owned serve runs the in-process cron ticker (stock Hermes
+            // desktop does the same). Without this, waking Python for a due job
+            // would serve Cron HTTP but never fire schedules.
+            .env("HERMES_DESKTOP", "1")
             // Hermes's parent-death watchdog: exit within ~2 s if the engine
             // dies, even by SIGKILL (kill_on_drop only covers clean exits).
             // A start marker without a matching nonce would disarm it, so drop
@@ -127,6 +152,14 @@ impl Features {
 
     /// Stop the backend if it has been idle for `IDLE_STOP_AFTER`.
     pub async fn stop_if_idle(&self) {
+        if self.cron_held() {
+            return;
+        }
+        if let Ok(home) = std::env::var("HERMES_HOME") {
+            if crate::cron_wake::due_within_wake_lead(std::path::Path::new(&home)) {
+                return;
+            }
+        }
         if self.idle_for() < idle_stop_after() {
             return;
         }

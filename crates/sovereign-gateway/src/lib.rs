@@ -9,6 +9,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod cron_wake;
 pub mod features;
 pub mod map;
 pub mod observability;
@@ -109,13 +110,15 @@ impl Gateway {
 
     pub async fn serve(self) -> Result<()> {
         if let Some(features) = self.config.features.clone() {
+            let idle = features.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(features::idle_stop_after().clamp(Duration::from_secs(1), Duration::from_secs(60)));
                 loop {
                     tick.tick().await;
-                    features.stop_if_idle().await;
+                    idle.stop_if_idle().await;
                 }
             });
+            tokio::spawn(cron_wake::run(features));
         }
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
