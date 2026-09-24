@@ -25,7 +25,7 @@ has one row per model call or tool invocation: `id`, `run_id`, `parent_id`,
 `chat`, and `execute_tool`. IDs come from session/turn sequence and harness
 tool call IDs. A root turn owns its child runs and spans.
 
-Tier 2 adds `span_content(span_id, input, output)` for prompt, tool arguments,
+Tier 2 adds `content(id, input, output)` for prompt, tool arguments,
 and result text. It is disabled by default and can be enabled in local
 `observability.json` with `{"capture_content":true}`. Content is size capped
 before enqueue; the queue discards tier 2 first when under pressure. Tier 1
@@ -38,17 +38,22 @@ explicit zero *API* price. An unknown model has `NULL` cost and appears as
 is the estimate recorded at the time of each call; a later catalog change
 does not silently rewrite history.
 
+For local Ollama runs, the desktop separately shows a Grok 4.7 xHigh
+equivalent estimate using the user-provided rates of $2 per million input
+tokens and $6 per million output tokens. Cache-read tokens are already part of
+the input count and are not added twice. This comparison is not an API charge.
+
 ## Writer and retention
 
-SQLite uses WAL, one writer, 4 KiB pages, and transactions of at most 128
+SQLite uses WAL, `synchronous=FULL`, one writer, 4 KiB pages, and transactions of at most 128
 events or 100 ms. `busy_timeout` is confined to the writer. The chat path does
 one bounded `try_send`; no `await`, SQLite call, network call, or model call is
 added. A separate read connection serves UI queries concurrently with WAL
-writes. At a rough 300-byte tier-1 event, 1,000 turns with one model call and
-two tools each cost about 1.2 MB before indexes and SQLite page overhead; the
-actual per-1,000-turn figure must be measured on the built implementation.
-A 1,024-event queue at that size is about 0.3 MB, well under the 5 MB idle RAM
-budget. The writer reports a dropped tier-1 counter if even the reserved queue
+writes. A measured 1,000-turn run with one model call per turn
+used 2,793,176 bytes including indexes and SQLite pages; enqueue cost
+was 0.9 microseconds per event in the release benchmark. A 1,024-event
+queue is bounded well under the 5 MB idle RAM budget. The writer reports a
+dropped tier-1 counter if even the reserved queue
 fills, so a disk failure cannot be mistaken for complete history. We do not
 promise impossible lossless capture under an indefinitely stalled disk while
 also bounding memory and refusing to block the agent.
@@ -56,8 +61,12 @@ also bounding memory and refusing to block the agent.
 Tier-2 content is removed after 7 days. Detailed tool and model spans are
 removed after 30 days, while per-run tier-1 summaries remain indefinitely.
 Pruning occurs in the writer on startup and daily, never on the chat path.
-Rows with `running` status are changed to `interrupted` on startup before new
-work begins. WAL is checkpointed periodically and on clean shutdown.
+On startup, queued and running runs become `interrupted`. Spawned children are
+first reconciled from their persisted session transcripts, then any unfinished
+children become `interrupted`. The writer refreshes child transcripts while
+running. SQLite auto-checkpoints WAL; the writer also checkpoints on clean
+shutdown. A hard kill can lose events still in the queue, so the database is
+authoritative only for committed records.
 
 ## Source and tradeoffs
 
@@ -80,3 +89,10 @@ but it has one writer. Batching and WAL absorb this workload; a genuinely
 multi-writer or remote deployment would need a different store. OTLP export is
 deferred: adding network egress by default would violate Sovereign's local
 privacy rule. If offered later, it must be an explicit opt-in.
+
+The system-design diagnostic scores this local design 6/10 (five of eight
+checks). Requirements, measured storage and latency, a single-writer scaling
+ceiling, queued writes, and failure counters are covered. Replicas, a read
+cache, and a rolling deployment plan are absent because this is one local
+desktop process with a small, indexed read view. A remote multi-user version
+would need replicated storage, measured read caching, and a staged rollout.
