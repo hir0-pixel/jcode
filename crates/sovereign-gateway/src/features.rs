@@ -43,6 +43,10 @@ pub struct Features {
     epoch: Instant,
     /// Unix millis: do not idle-stop while `now < cron_hold_until_ms` (cron wake hold).
     cron_hold_until_ms: AtomicU64,
+    /// This gateway's own REST base URL and auth token, so cron (`run_job`)
+    /// can call `/api/agent/run` instead of its own `AIAgent`. `None` until
+    /// `set_engine_env` runs, right after the gateway binds its port.
+    engine_env: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl Features {
@@ -54,7 +58,14 @@ impl Features {
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             cron_hold_until_ms: AtomicU64::new(0),
+            engine_env: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Record the engine's own REST URL and token, passed to the Python
+    /// backend on its next (re)spawn as `SOVEREIGN_ENGINE_URL`/`_TOKEN`.
+    pub fn set_engine_env(&self, url: String, token: String) {
+        *self.engine_env.lock().unwrap_or_else(|e| e.into_inner()) = Some((url, token));
     }
 
     pub fn touch(&self) {
@@ -103,6 +114,9 @@ impl Features {
             let mut paths = vec![std::path::PathBuf::from(tools_dir)];
             paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
             command.env("PATH", std::env::join_paths(paths)?);
+        }
+        if let Some((url, token)) = self.engine_env.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            command.env("SOVEREIGN_ENGINE_URL", url).env("SOVEREIGN_ENGINE_TOKEN", token);
         }
         let mut child = command.args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])

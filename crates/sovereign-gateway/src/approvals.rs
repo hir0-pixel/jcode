@@ -41,6 +41,9 @@ pub struct Hub {
     /// The user chose "always": allow until the engine restarts.
     always: std::sync::atomic::AtomicBool,
     next: AtomicU64,
+    /// Sessions running unattended (`/api/agent/run`): every approval is
+    /// denied immediately, with no desktop prompt and no grant ever applying.
+    headless: Mutex<HashSet<String>>,
 }
 
 impl Hub {
@@ -56,9 +59,24 @@ impl Hub {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub async fn mark_headless(&self, session_id: &str) {
+        self.headless.lock().await.insert(session_id.to_string());
+    }
+
+    pub async fn unmark_headless(&self, session_id: &str) {
+        self.headless.lock().await.remove(session_id);
+    }
+
+    pub async fn is_headless(&self, session_id: &str) -> bool {
+        self.headless.lock().await.contains(session_id)
+    }
+
     /// Ask the user whether `command` may run. Returns the Hermes choice
     /// (`once` / `session` / `always` / `deny`).
     pub async fn decide(&self, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
+        if self.headless.lock().await.contains(session_id) {
+            return "deny".into();
+        }
         if self.always.load(Ordering::Relaxed) || self.session_grants.lock().await.contains(session_id) {
             return "session".into();
         }
@@ -277,6 +295,22 @@ mod tests {
         let id = request_id(rx2.recv().await.unwrap());
         assert!(hub.answer(&id, "deny").await);
         assert_eq!(asked.await.unwrap(), "deny");
+    }
+
+    #[tokio::test]
+    async fn headless_denies_without_prompting_the_desktop() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "s").await;
+        hub.mark_headless("s").await;
+        assert_eq!(hub.decide("s", "bash", "rm -rf x", "r").await, "deny");
+        assert!(rx.try_recv().is_err(), "no approval frame should reach the desktop client");
+        hub.unmark_headless("s").await;
+        // Ordinary sessions still prompt afterwards.
+        let h = hub.clone();
+        let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf x", "r").await });
+        let id = request_id(rx.recv().await.unwrap());
+        assert!(hub.answer(&id, "once").await);
+        assert_eq!(asked.await.unwrap(), "once");
     }
 
     #[tokio::test]

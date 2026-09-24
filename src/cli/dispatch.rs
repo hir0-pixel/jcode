@@ -1427,6 +1427,8 @@ async fn run_gateway(
             || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
     });
 
+    let features = hermes_feature_command().map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd)));
+
     let gateway = async {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         while !server_is_running_at(&socket).await {
@@ -1437,7 +1439,7 @@ async fn run_gateway(
         }
         let gateway = sovereign_gateway::Gateway::bind(sovereign_gateway::Config {
             bind,
-            token,
+            token: token.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             legacy_socket: socket.clone(),
             default_cwd,
@@ -1447,11 +1449,14 @@ async fn run_gateway(
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
             complete: Some(complete),
             approval_secret: approval_secret.clone(),
-            features: hermes_feature_command().map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd))),
+            features: features.clone(),
             learning: learning.clone(),
         })
         .await?;
         let port = gateway.local_addr().port();
+        if let Some(features) = &features {
+            features.set_engine_env(format!("http://127.0.0.1:{port}"), token.clone());
+        }
         // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval.
         let approval = serde_json::json!({ "addr": gateway.local_addr().to_string(), "secret": approval_secret });
         write_private_file(&crate::storage::jcode_dir()?.join("sovereign-approval.json"), &approval.to_string())?;

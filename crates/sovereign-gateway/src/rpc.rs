@@ -5,7 +5,7 @@ use crate::approvals::{Client, Hub};
 use crate::map::{self, Out, SessionState};
 use crate::observability::Observer;
 use crate::{Config, MAX_FRAME_BYTES};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -273,6 +273,14 @@ impl Conn {
                     }
                 }
                 Out::Approval { session_id, request_id, tool_name, description } => {
+                    if self.hub.is_headless(&session_id).await {
+                        // Headless (`/api/agent/run`): deny outright, no desktop prompt.
+                        let conn = self.clone();
+                        tokio::spawn(async move {
+                            let _ = conn.resolve_approval(&session_id, &request_id, "deny").await;
+                        });
+                        continue;
+                    }
                     let id = format!("srv-{}", self.next_server_request.fetch_add(1, Ordering::Relaxed));
                     self.approvals.lock().await.insert(id.clone(), (session_id.clone(), request_id.clone()));
                     self.send_json(json!({
@@ -981,6 +989,114 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
         error["data"] = data;
     }
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
+}
+
+/// `/api/agent/run`: one headless prompt on its own hidden session, run to
+/// completion (or `timeout`), with every tool approval denied outright and no
+/// desktop involved at all. Mirrors [`run`]'s `Conn` setup, minus the
+/// WebSocket: `to_ws` just feeds a channel this function drains itself.
+pub(crate) async fn agent_run(
+    config: Arc<Config>,
+    hub: Arc<Hub>,
+    observer: Arc<Observer>,
+    prompt: &str,
+    cwd: Option<&str>,
+    title: Option<&str>,
+    timeout: Duration,
+) -> Result<Value> {
+    let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
+    let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
+    let conn = Arc::new(Conn {
+        config,
+        to_ws,
+        control: Mutex::new(None),
+        links: Mutex::new(HashMap::new()),
+        link_tasks: Mutex::new(Vec::new()),
+        known: Mutex::new(HashMap::new()),
+        fresh: Mutex::new(std::collections::HashSet::new()),
+        learn_state: Mutex::new(HashMap::new()),
+        learning_now: Mutex::new(std::collections::HashSet::new()),
+        next_id: AtomicU64::new(1),
+        next_server_request: AtomicU64::new(1),
+        pending: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        approvals: Mutex::new(HashMap::new()),
+        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+        accept_waiters: Mutex::new(HashMap::new()),
+        upstream: Mutex::new(None),
+        next_forward: AtomicU64::new(1),
+        hub: hub.clone(),
+        client,
+        observer,
+    });
+
+    let control = conn.open_link().await.context("engine unavailable")?;
+    *conn.control.lock().await = Some(control);
+
+    let mut create_params = json!({ "cwd": cwd });
+    if let Some(title) = title {
+        create_params["title"] = json!(title);
+    }
+    let created = conn.dispatch("session.create", &create_params).await.map_err(|e| anyhow!(e.message))?;
+    let session_id = created["session_id"].as_str().unwrap_or_default().to_string();
+    if session_id.is_empty() {
+        bail!("engine did not return a session id");
+    }
+
+    // Every approval on this session is denied outright, before it can ever
+    // reach a desktop prompt (see the two `Out::Approval`/`decide` gates).
+    hub.mark_headless(&session_id).await;
+
+    let outcome = tokio::time::timeout(timeout, async {
+        conn.dispatch("prompt.submit", &json!({ "session_id": session_id, "text": prompt })).await.map_err(|e| anyhow!(e.message))?;
+        while let Some(msg) = ws_out.recv().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+            if frame["method"] != "event" || frame["params"]["session_id"] != session_id.as_str() {
+                continue;
+            }
+            if frame["params"]["type"] == "message.complete" {
+                let payload = frame["params"]["payload"].clone();
+                return Ok(payload);
+            }
+        }
+        bail!("engine connection closed before the turn finished")
+    })
+    .await;
+
+    hub.unmark_headless(&session_id).await;
+    // Only now is the session guaranteed persisted (jcode does not write a
+    // session record until its first turn), so hide it from session.list
+    // here rather than before the turn — the same mechanism a user's own
+    // archived chats use. Best-effort: a session that never got this far
+    // (e.g. jcode was unreachable) has nothing to hide.
+    let _ = conn.dispatch("session.set_hidden", &json!({ "session_id": session_id, "hidden": true })).await;
+    for task in conn.link_tasks.lock().await.drain(..) {
+        task.abort();
+    }
+
+    let usage = |payload: &Value| -> Value {
+        let u = &payload["usage"];
+        if u.is_null() { Value::Null } else { json!({ "input_tokens": u["input"], "output_tokens": u["output"], "cached_tokens": u["cache_read"] }) }
+    };
+    Ok(match outcome {
+        Ok(Ok(payload)) => {
+            let ok = payload["status"] == "complete";
+            let text = payload["text"].as_str().unwrap_or_default().to_string();
+            json!({
+                "ok": ok,
+                "text": text,
+                "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({})", payload["status"].as_str().unwrap_or("unknown"))) },
+                "session_id": session_id,
+                "usage": usage(&payload),
+            })
+        }
+        Ok(Err(err)) => json!({ "ok": false, "text": "", "error": err.to_string(), "session_id": session_id }),
+        Err(_) => {
+            let _ = conn.dispatch("session.interrupt", &json!({ "session_id": session_id })).await;
+            json!({ "ok": false, "text": "", "error": "timed out waiting for the turn to finish", "session_id": session_id })
+        }
+    })
 }
 
 pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>) -> Result<()> {

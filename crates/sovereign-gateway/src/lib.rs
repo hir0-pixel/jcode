@@ -443,6 +443,28 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             respond(&mut stream, "200 OK", &body).await
         }
         _ if !token_ok => respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await,
+        ("POST", "/api/agent/run") => {
+            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let Some(prompt) = body["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail": "prompt is required"})).await;
+            };
+            let timeout_s = body["timeout_s"].as_u64().unwrap_or(600).clamp(1, 3600);
+            let result = rpc::agent_run(
+                config.clone(),
+                hub.clone(),
+                observer.clone(),
+                prompt,
+                body["cwd"].as_str(),
+                body["title"].as_str(),
+                Duration::from_secs(timeout_s),
+            )
+            .await;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"ok": false, "error": err.to_string()})).await,
+            }
+        }
         ("GET", "/api/model/info") => {
             let body = json!({"model": config.model, "provider": config.provider, "capabilities": {}});
             respond(&mut stream, "200 OK", &body).await
