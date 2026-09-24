@@ -227,6 +227,9 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<(
 /// backend. The client's credential is replaced by the backend's private
 /// token; bytes then flow both ways untouched.
 async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::Features, upgrade: bool) -> Result<()> {
+    if std::env::var_os("SOVEREIGN_TRACE_FORWARD").is_some() {
+        eprintln!("sovereign: forward HTTP {} {}", req.method, req.path);
+    }
     let port = features.port().await?;
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await?;
     let query: Vec<&str> = req
@@ -264,6 +267,19 @@ async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::F
 
 fn query_u64(req: &Request, key: &str) -> Option<u64> {
     auth::query_param(req.query.as_deref()?, key)?.parse().ok()
+}
+
+fn bundled_startup_request(req: &Request) -> bool {
+    std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_some()
+        && auth::query_param(req.query.as_deref().unwrap_or_default(), "feature").as_deref() != Some("1")
+}
+
+fn bundled_defaults() -> Value {
+    std::env::var("SOVEREIGN_HERMES_DEFAULTS")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
 }
 
 /// One request/reply against the engine over a short-lived in-process bridge,
@@ -397,6 +413,32 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let body = json!({"model": config.model, "provider": config.provider, "capabilities": {}});
             respond(&mut stream, "200 OK", &body).await
         }
+        ("GET", "/api/config" | "/api/config/defaults") if bundled_startup_request(&req) => {
+            let body = if auth::query_param(req.query.as_deref().unwrap_or_default(), "include_defaults").as_deref() == Some("false") {
+                json!({})
+            } else {
+                bundled_defaults()
+            };
+            respond(&mut stream, "200 OK", &body).await
+        }
+        ("GET", "/api/local-models/status") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({
+                "enabled": false, "runtime_installed": false, "server_running": false,
+                "update_available": false, "loaded_models": {}, "loading": {}, "models": []
+            })).await
+        }
+        ("GET", "/api/local-models/jobs") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({"jobs": []})).await
+        }
+        ("GET", "/api/tools/terminal/backends") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({"active": "local", "backends": [{
+                "name": "local", "label": "Local", "description": "Run on this computer",
+                "active": true, "status": "ready", "detail": null
+            }]})).await
+        }
+        ("POST", "/api/sessions/owner-backfill") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({"ok": true, "stamped": 0, "profile": "default"})).await
+        }
         ("GET", "/api/profiles") => {
             let body = json!({"profiles": [{
                 "name": "default", "display_name": "Default", "path": config.home, "is_default": true,
@@ -441,7 +483,7 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         ("GET", "/api/fs/default-cwd") => {
             respond(&mut stream, "200 OK", &json!({"cwd": config.default_cwd, "branch": null})).await
         }
-        ("GET", "/api/cron/jobs") => respond(&mut stream, "200 OK", &json!([])).await,
+        ("GET", "/api/cron/jobs") if bundled_startup_request(&req) => respond(&mut stream, "200 OK", &json!([])).await,
         ("GET", "/api/host/identity") => {
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await

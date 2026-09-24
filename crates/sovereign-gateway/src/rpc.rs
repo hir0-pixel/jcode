@@ -643,6 +643,9 @@ impl Conn {
 
     /// Forward a method the Rust harness does not own to Hermes's backend.
     async fn forward(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value, RpcError> {
+        if std::env::var_os("SOVEREIGN_TRACE_FORWARD").is_some() {
+            eprintln!("sovereign: forward RPC {method}");
+        }
         // Only methods Hermes actually defines may wake the Python backend;
         // anything else is answered here without starting it.
         if !crate::contract_methods().contains(method) {
