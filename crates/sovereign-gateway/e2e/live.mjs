@@ -204,6 +204,9 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
     check(seqs.every((s, i) => i === 0 || s > seqs[i - 1]), 'per-session seq is monotonic')
     check(events.some(e => e.type === 'message.start'), 'message.start emitted')
   }
+  f = await rpc('session.list', { limit: 20 })
+  console.log('     listed row:', JSON.stringify(f.result?.sessions?.find(x => x.id === sid)))
+  check(f.result?.sessions?.find(x => x.id === sid)?.title?.startsWith('Reply with exactly the word PONG'), 'a session is titled from its first prompt')
   f = await rpc('session.history', { session_id: sid })
   if (!f.error) validate('result', 'session.history', results['session.history'], f.result)
   check((f.result?.count ?? 0) >= 2, 'history holds the exchange')

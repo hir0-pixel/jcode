@@ -444,6 +444,20 @@ impl Conn {
                     return Err(RpcError::params("text is required"));
                 }
                 let busy = self.sessions.lock().await.get(&id).is_some_and(SessionState::turn_active);
+                self.ensure_attached(&id).await.map_err(RpcError::internal)?;
+                // jcode does not auto-title sessions; Hermes titles from the first
+                // prompt. Rename before sending: jcode refuses renames mid-turn.
+                let untitled = {
+                    let known = self.known.lock().await;
+                    known.get(&id).is_none_or(|info| info["title"].as_str().is_none_or(str::is_empty))
+                };
+                if untitled && !busy && let Some(title) = map::derive_title(p["title_preview"].as_str(), &text) {
+                    if self.call(json!({ "req": "rename_session", "session_id": id, "title": title })).await.is_ok() {
+                        if let Some(info) = self.known.lock().await.get_mut(&id) {
+                            info["title"] = json!(title);
+                        }
+                    }
+                }
                 self.submit(&id, &text).await.map_err(RpcError::internal)?;
                 Ok(json!({ "status": if busy { "queued" } else { "streaming" } }))
             }

@@ -378,6 +378,20 @@ pub fn complete_path(word: &str, cwd: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Title for an untitled session from its first prompt: the desktop's
+/// `title_preview` when given, else the first non-empty line, capped at 60
+/// characters on a word boundary. No model call.
+pub fn derive_title(preview: Option<&str>, text: &str) -> Option<String> {
+    let source = preview.filter(|p| !p.trim().is_empty()).unwrap_or(text);
+    let line = source.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if line.chars().count() <= 60 {
+        return Some(line.to_string());
+    }
+    let cut: String = line.chars().take(60).collect();
+    let trimmed = cut.rsplit_once(' ').map(|(head, _)| head).filter(|h| h.len() >= 20).unwrap_or(&cut);
+    Some(format!("{}…", trimmed.trim_end()))
+}
+
 /// Text of a `prompt.submit` `text` field, which may be a string or a list of
 /// content parts.
 pub fn prompt_text(text: &Value) -> String {
@@ -509,6 +523,15 @@ mod tests {
     #[test]
     fn events_without_a_session_are_ignored() {
         assert!(run(&[json!({"ev":"text_delta","text":"x"})]).is_empty());
+    }
+
+    #[test]
+    fn titles_come_from_the_first_prompt() {
+        assert_eq!(derive_title(None, "\n  Fix the login bug\nmore").as_deref(), Some("Fix the login bug"));
+        assert_eq!(derive_title(Some("Preview title"), "ignored").as_deref(), Some("Preview title"));
+        let long = derive_title(None, &"word ".repeat(40)).unwrap();
+        assert!(long.ends_with('…') && long.chars().count() <= 61);
+        assert_eq!(derive_title(None, "   "), None);
     }
 
     #[test]
