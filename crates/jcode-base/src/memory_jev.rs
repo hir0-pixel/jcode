@@ -58,7 +58,87 @@ pub async fn recall(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
+    if local_mode() {
+        return Ok(select_local(query, entries, limit));
+    }
     select(&JevClient::new()?, query, entries, limit).await
+}
+
+/// Sovereign engine: recall runs locally and never sends memories anywhere.
+pub fn local_mode() -> bool {
+    std::env::var_os("SOVEREIGN_LOCAL_MEMORY").is_some()
+}
+
+fn local_terms(text: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "are", "but", "not", "you", "your", "with", "this", "that", "from", "have",
+        "has", "was", "were", "will", "would", "can", "could", "should", "what", "when", "where", "which",
+        "who", "how", "why", "into", "about", "there", "their", "they", "them", "then", "than", "also",
+        "just", "like", "use", "using", "used", "please", "want", "need", "make", "does", "did", "our",
+    ];
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOP.contains(w))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Local relevance: BM25-style scoring over content, tags and category.
+/// Returns at most `limit` entries and nothing when nothing clearly matches
+/// (never pads), so irrelevant memories do not cost prompt tokens.
+pub fn select_local(query: &str, entries: Vec<MemoryEntry>, limit: usize) -> Vec<(MemoryEntry, f32)> {
+    use std::collections::{HashMap, HashSet};
+    let query_terms: HashSet<String> = local_terms(query).into_iter().collect();
+    if query_terms.is_empty() || entries.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let docs: Vec<Vec<String>> = entries
+        .iter()
+        .map(|e| local_terms(&format!("{} {} {:?}", e.content, e.tags.join(" "), e.category)))
+        .collect();
+    let n = docs.len() as f32;
+    let avg_len = docs.iter().map(Vec::len).sum::<usize>().max(1) as f32 / n;
+    let mut df: HashMap<&str, f32> = HashMap::new();
+    for doc in &docs {
+        for term in doc.iter().collect::<HashSet<_>>() {
+            *df.entry(term.as_str()).or_default() += 1.0;
+        }
+    }
+    let needed = if query_terms.len() <= 2 { 1 } else { 2 };
+    let (k1, b) = (1.2f32, 0.75f32);
+    let mut scored: Vec<(usize, f32)> = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, doc)| {
+            let mut tf: HashMap<&str, f32> = HashMap::new();
+            for term in doc {
+                *tf.entry(term.as_str()).or_default() += 1.0;
+            }
+            let matched = query_terms.iter().filter(|q| tf.contains_key(q.as_str())).count();
+            if matched < needed {
+                return None;
+            }
+            let len_norm = 1.0 - b + b * doc.len() as f32 / avg_len;
+            let score: f32 = query_terms
+                .iter()
+                .filter_map(|q| {
+                    let f = *tf.get(q.as_str())?;
+                    let d = df.get(q.as_str()).copied().unwrap_or(1.0);
+                    let idf = (1.0 + (n - d + 0.5) / (d + 0.5)).ln();
+                    Some(idf * f * (k1 + 1.0) / (f + k1 * len_norm))
+                })
+                .sum();
+            Some((i, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(limit);
+    let top = scored.first().map(|s| s.1).unwrap_or(1.0).max(f32::EPSILON);
+    let mut entries: Vec<Option<MemoryEntry>> = entries.into_iter().map(Some).collect();
+    scored
+        .into_iter()
+        .filter_map(|(i, score)| entries[i].take().map(|e| (e, (score / top).clamp(0.0, 1.0))))
+        .collect()
 }
 
 pub async fn select(
@@ -263,3 +343,33 @@ pub async fn select_with_transport<T: RelevanceTransport + ?Sized>(
 #[cfg(test)]
 #[path = "memory_jev_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod local_tests {
+    use super::{MemoryEntry, select_local};
+    use jcode_memory_types::MemoryCategory;
+
+    fn entries() -> Vec<MemoryEntry> {
+        vec![
+            MemoryEntry::new(MemoryCategory::Preference, "The user prefers pnpm over npm for package installs"),
+            MemoryEntry::new(MemoryCategory::Preference, "Deploys go through the staging cluster first"),
+            MemoryEntry::new(MemoryCategory::Preference, "The user's cat is named Miso"),
+        ]
+    }
+
+    #[test]
+    fn picks_relevant_memories_and_never_pads() {
+        let hits = select_local("install the package dependencies with pnpm", entries(), 5);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.content.contains("pnpm"));
+        assert!(select_local("what is the weather in Lahore today", entries(), 5).is_empty());
+        assert!(select_local("", entries(), 5).is_empty());
+    }
+
+    #[test]
+    fn respects_the_limit_and_ranks_best_first() {
+        let hits = select_local("staging deploys cluster pnpm package", entries(), 1);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].1 - 1.0).abs() < f32::EPSILON);
+    }
+}

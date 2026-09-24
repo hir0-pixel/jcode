@@ -288,6 +288,32 @@ if (process.env.E2E_SKIP_CHAT !== '1') {
   check(/learned instructions/i.test(f.result?.output || ''), '/harness shows the learned instructions')
 }
 
+// Local memory (E2E_MEMORY=1): saved through the memory tool, recalled locally.
+if (process.env.E2E_MEMORY === '1') {
+  const turn = async (s, text) => {
+    const before = events.filter(e => e.type === 'message.complete' && e.session_id === s).length
+    await rpc('prompt.submit', { session_id: s, text })
+    const t0 = Date.now()
+    while (Date.now() - t0 < 600_000) {
+      const done = events.filter(e => e.type === 'message.complete' && e.session_id === s)
+      if (done.length > before) return done[done.length - 1]
+      await new Promise(r => setTimeout(r, 200))
+    }
+  }
+  f = await rpc('session.create', { cwd: home })
+  const m1 = f.result.session_id
+  await turn(m1, 'Use the memory tool to remember, globally, this fact about me: my favourite colour is teal.')
+  const saved = events.filter(e => e.session_id === m1 && e.type === 'tool.start').map(e => e.payload.name)
+  console.log('     memory tools used:', saved.join(', '))
+  check(saved.includes('memory'), 'model saved the fact with the memory tool')
+  f = await rpc('session.create', { cwd: home })
+  const m2 = f.result.session_id
+  await turn(m2, 'I will ask you about my favourite colour next.')
+  const a = await turn(m2, 'What is my favourite colour? Answer with one word, or UNKNOWN.')
+  console.log('     recall answer:', JSON.stringify(a?.payload.text).slice(0, 80))
+  check(/teal/i.test(a?.payload.text || ''), 'a new session recalled the memory locally')
+}
+
 f = await rpc('session.interrupt', { session_id: sid })
 if (!f.error) validate('result', 'session.interrupt', results['session.interrupt'], f.result)
 check(!f.error, 'session.interrupt answers when idle')

@@ -51,6 +51,9 @@ fn main() -> Result<()> {
     // anonymous usage telemetry is disabled unconditionally.
     // SAFETY: single-threaded here, before the runtime starts.
     unsafe { std::env::set_var("JCODE_NO_TELEMETRY", "1") };
+    // Memory recall is local; remote Jev relevance calls are disabled.
+    // SAFETY: as above.
+    unsafe { std::env::set_var("SOVEREIGN_LOCAL_MEMORY", "1") };
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let argv = translate(std::env::args().skip(1).collect());
     tokio::runtime::Builder::new_multi_thread()

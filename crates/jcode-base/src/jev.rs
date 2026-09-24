@@ -179,6 +179,11 @@ impl JevClient {
     }
 
     fn for_purpose(purpose: JevPurpose) -> Result<Self> {
+        // Sovereign engine: remote relevance decisions would send local data
+        // (memories, page content) to a third party. Hard off.
+        if std::env::var_os("SOVEREIGN_LOCAL_MEMORY").is_some() {
+            anyhow::bail!("remote Jev decisions are disabled in the sovereign engine (local-only)");
+        }
         let (provider, api_key, endpoint, me_endpoint) = Self::resolve(purpose)?;
         let build = || {
             client_builder()

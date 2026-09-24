@@ -1158,6 +1158,9 @@ impl MemoryManager {
             if entries.is_empty() {
                 return Ok(Vec::new());
             }
+            if crate::memory_jev::local_mode() {
+                return Ok(crate::memory_jev::select_local(query, entries, 5));
+            }
             let client = crate::jev::JevClient::new()?;
             crate::memory_jev::select(&client, query, entries, 5).await
         }
