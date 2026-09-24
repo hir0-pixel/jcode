@@ -123,24 +123,6 @@ fn memory_overlap_ratio(left: &HashSet<String>, right: &HashSet<String>) -> f32 
 /// Read the actual graph file, not the mtime cache, and never migrate/write or
 /// run inference from the foreground pending-consumption path. Retrieval has
 /// already migrated any legacy entries before they can become scoped pending.
-fn read_validation_graph(
-    path: &std::path::Path,
-) -> anyhow::Result<crate::memory_graph::MemoryGraph> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(crate::memory_graph::MemoryGraph::new());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let graph: crate::memory_graph::MemoryGraph = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(
-        graph.graph_version == super::GRAPH_VERSION,
-        "unsupported memory graph"
-    );
-    Ok(graph)
-}
-
 fn semantic_signature(entry: &super::MemoryEntry) -> anyhow::Result<String> {
     // Include everything sent to Jev plus semantic/rendering metadata. Access
     // counters and embeddings do not change the fact that was judged.
@@ -163,13 +145,10 @@ fn snapshot_selected_memories(
         Some(project) => super::MemoryManager::new().with_project_dir(project),
         None => super::MemoryManager::new(),
     };
-    let project = match manager.project_memory_path()? {
-        Some(path) => read_validation_graph(&path)?,
-        None => crate::memory_graph::MemoryGraph::new(),
-    };
     // Do not swallow a corrupt/unreadable store, even if the other store has
     // matching IDs. Ambiguous duplicate IDs are likewise rejected below.
-    let global = read_validation_graph(&manager.global_memory_path()?)?;
+    let project = manager.load_project_graph()?;
+    let global = manager.load_global_graph()?;
     let mut snapshots = HashMap::new();
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
@@ -865,28 +844,21 @@ mod scoped_tests {
     }
 
     #[test]
-    fn updated_fact_is_rejected_even_when_disk_mtime_matches_cache() {
+    fn updated_fact_is_rejected_when_another_writer_changes_it() {
         fixture(|| {
             let mut entry = fact("Database port is 5432");
             save(Some("/project/a"), false, std::slice::from_ref(&entry));
             publish("updated", Some("/project/a"), std::slice::from_ref(&entry));
-            let path = manager(Some("/project/a"))
-                .project_memory_path()
-                .unwrap()
-                .unwrap();
-            let old_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            // Rewrite through a second connection, outside MemoryManager, so this
+            // process's cached graph still shows the old content. Scoped
+            // validation must notice (data_version) and not use it.
             entry.content = "Database port is 6432".into();
-            let mut graph = MemoryGraph::new();
-            graph.add_memory(entry.clone());
-            // Rewrite outside MemoryManager, preserving mtime, so a cached graph
-            // would still show the old content. Scoped validation must not use it.
-            std::fs::write(&path, serde_json::to_vec(&graph).unwrap()).unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(old_mtime))
-                .unwrap();
+            let db = rusqlite::Connection::open(manager(Some("/project/a")).db_path().unwrap()).unwrap();
+            db.execute(
+                "UPDATE memories SET content=?1, entry=?2 WHERE id=?3",
+                (&entry.content, serde_json::to_string(&entry).unwrap(), &entry.id),
+            )
+            .unwrap();
             assert!(take_pending_memory_for_project("updated", Some("/project/a")).is_none());
             assert!(!is_memory_injected("updated", &entry.id));
             publish("updated", Some("/project/a"), std::slice::from_ref(&entry));
@@ -991,11 +963,9 @@ mod scoped_tests {
             save(None, true, std::slice::from_ref(&entry));
             save(Some("/project/a"), false, &[]);
             publish("corrupt", Some("/project/a"), std::slice::from_ref(&entry));
-            let path = manager(Some("/project/a"))
-                .project_memory_path()
-                .unwrap()
+            let db = rusqlite::Connection::open(manager(Some("/project/a")).db_path().unwrap()).unwrap();
+            db.execute("UPDATE memory_graphs SET graph='not a memory graph' WHERE scope LIKE 'project:%'", [])
                 .unwrap();
-            std::fs::write(path, b"not a memory graph").unwrap();
             assert!(take_pending_memory_for_project("corrupt", Some("/project/a")).is_none());
             assert!(!is_memory_injected("corrupt", &entry.id));
             publish(

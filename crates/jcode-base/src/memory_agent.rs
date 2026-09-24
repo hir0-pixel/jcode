@@ -324,17 +324,9 @@ pub fn recall_local_now(
         return;
     }
     let manager = manager_for_working_dir(working_dir);
-    let Ok(entries) = crate::memory_jev::collect_scoped(&manager, memory::MemoryScope::All) else {
+    let Ok(relevant) = manager.recall_local(Some(session_id), query, 5, memory::MemoryScope::All) else {
         return;
     };
-    let entries: Vec<_> = entries
-        .into_iter()
-        .filter(|entry| entry.active && !memory::is_memory_injected(session_id, &entry.id))
-        .collect();
-    let relevant: Vec<memory::MemoryEntry> = crate::memory_jev::select_local(query, entries, 5)
-        .into_iter()
-        .map(|(entry, _)| entry)
-        .collect();
     let Some(prompt) = memory::format_relevant_prompt(&relevant, 5) else {
         return;
     };

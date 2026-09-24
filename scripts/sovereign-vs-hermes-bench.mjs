@@ -372,8 +372,9 @@ function listMemory(home) {
     for (const e of fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : []) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) walk(p)
-      else if (/memor|USER\.md/i.test(p)) {
-        const text = fs.readFileSync(p, 'utf8')
+      // Hermes: MEMORY.md / USER.md; Sovereign: sovereign.db (+ its WAL).
+      else if (/memor|USER\.md|sovereign\.db/i.test(p)) {
+        const text = fs.readFileSync(p).toString('latin1')
         found.push({ file: path.relative(home, p), mentions_nim: /\bnim\b/i.test(text), bytes: text.length })
       }
     }

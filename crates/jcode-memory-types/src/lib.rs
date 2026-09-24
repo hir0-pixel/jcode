@@ -221,7 +221,7 @@ pub enum TrustLevel {
 }
 
 /// A reinforcement breadcrumb tracking when/where a memory was reinforced
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Reinforcement {
     pub session_id: String,
     pub message_index: usize,
@@ -229,7 +229,7 @@ pub struct Reinforcement {
 }
 
 /// A single memory entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
     pub category: MemoryCategory,

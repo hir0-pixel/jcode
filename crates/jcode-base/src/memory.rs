@@ -42,7 +42,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-use cache::{cache_graph, cached_graph};
+use cache::{cache_graph, cached_graph, with_cached};
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
@@ -231,6 +231,7 @@ impl MemoryManager {
         }
 
         let test_dir = storage::jcode_dir()?.join("memory").join("test");
+        crate::memory_store::close(&self.db_path()?);
         if test_dir.exists() {
             std::fs::remove_dir_all(&test_dir)?;
             crate::logging::info("Cleared test memory storage");
@@ -242,29 +243,26 @@ impl MemoryManager {
         self.project_dir.clone()
     }
 
-    fn project_memory_path(&self) -> Result<Option<PathBuf>> {
-        // In test mode, use test directory
+    /// The engine's memory database (`sovereign.db`), or a throwaway one in tests.
+    fn db_path(&self) -> Result<PathBuf> {
+        Ok(if self.test_mode {
+            storage::jcode_dir()?.join("memory").join("test").join("memory.db")
+        } else {
+            storage::jcode_dir()?.join("sovereign.db")
+        })
+    }
+
+    /// `project:<hash of the project dir>` (the old JSON file's name), if any.
+    fn project_scope(&self) -> Option<String> {
         if self.test_mode {
-            let test_dir = storage::jcode_dir()?.join("memory").join("test");
-            std::fs::create_dir_all(&test_dir)?;
-            return Ok(Some(test_dir.join("test_project.json")));
+            return Some("project:test".to_string());
         }
-
-        let project_dir = match self.get_project_dir() {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        let project_hash = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            project_dir.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
-
-        let memory_dir = storage::jcode_dir()?.join("memory").join("projects");
-        Ok(Some(memory_dir.join(format!("{}.json", project_hash))))
+        let project_dir = self.get_project_dir()?;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        project_dir.hash(&mut hasher);
+        Some(format!("project:{:016x}", hasher.finish()))
     }
 
     fn legacy_notes_path(&self) -> Result<Option<PathBuf>> {
@@ -343,49 +341,11 @@ impl MemoryManager {
         Ok(changed)
     }
 
-    fn global_memory_path(&self) -> Result<PathBuf> {
-        if self.test_mode {
-            let test_dir = storage::jcode_dir()?.join("memory").join("test");
-            std::fs::create_dir_all(&test_dir)?;
-            Ok(test_dir.join("test_global.json"))
-        } else {
-            Ok(storage::jcode_dir()?.join("memory").join("global.json"))
-        }
-    }
-
-    pub fn load_project(&self) -> Result<MemoryStore> {
-        match self.project_memory_path()? {
-            Some(path) if path.exists() => storage::read_json(&path),
-            _ => Ok(MemoryStore::new()),
-        }
-    }
-
-    pub fn load_global(&self) -> Result<MemoryStore> {
-        let path = self.global_memory_path()?;
-        if path.exists() {
-            storage::read_json(&path)
-        } else {
-            Ok(MemoryStore::new())
-        }
-    }
-
-    pub fn save_project(&self, store: &MemoryStore) -> Result<()> {
-        if let Some(path) = self.project_memory_path()? {
-            storage::write_json(&path, store)?;
-        }
-        Ok(())
-    }
-
-    pub fn save_global(&self, store: &MemoryStore) -> Result<()> {
-        let path = self.global_memory_path()?;
-        storage::write_json(&path, store)
-    }
-
     /// Store without embedding inference. Exact duplicates reinforce an existing
     /// entry only within the requested scope, never mutate a different project.
     pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
         anyhow::ensure!(
-            self.project_memory_path()?.is_some(),
+            self.project_scope().is_some(),
             "Project memory requires a working directory; use global scope explicitly"
         );
         let mut graph = self.load_project_graph()?;
@@ -1123,7 +1083,11 @@ impl MemoryManager {
             return Ok(MemoryRelevanceResult::default());
         }
         pipeline_start();
-        let entries = match crate::memory_jev::collect_scoped(self, MemoryScope::All) {
+        let local = crate::memory_jev::local_mode();
+        // Local recall queries the index directly; loading every memory is only
+        // needed to hand them to the remote relevance service.
+        let loaded = if local { Ok(Vec::new()) } else { crate::memory_jev::collect_scoped(self, MemoryScope::All) };
+        let entries = match loaded {
             Ok(entries) => entries,
             Err(error) => {
                 clear_pending_memory(session_id);
@@ -1156,11 +1120,11 @@ impl MemoryManager {
         emit_memory_activity(event_tx.as_ref());
         let started = Instant::now();
         let result = async {
+            if local {
+                return Ok(self.recall_local(Some(session_id), query, 5, MemoryScope::All)?.into_iter().map(|e| (e, 1.0)).collect());
+            }
             if entries.is_empty() {
                 return Ok(Vec::new());
-            }
-            if crate::memory_jev::local_mode() {
-                return Ok(crate::memory_jev::select_local(query, entries, 5));
             }
             let client = crate::jev::JevClient::new()?;
             crate::memory_jev::select(&client, query, entries, 5).await
@@ -1207,145 +1171,120 @@ impl MemoryManager {
         })
     }
 
+    /// Local recall (sovereign): an indexed full-text query over the stored
+    /// memories instead of loading and scanning all of them. Skips memories
+    /// already injected into `session_id`, applies the never-pad floor
+    /// (`memory_jev::meets_term_floor`) and returns at most `limit`, best first.
+    pub fn recall_local(&self, session_id: Option<&str>, query: &str, limit: usize, scope: MemoryScope) -> Result<Vec<MemoryEntry>> {
+        let mut terms = crate::memory_jev::local_terms(query);
+        terms.sort();
+        terms.dedup();
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut scopes = Vec::new();
+        if scope.includes_global() {
+            scopes.push("global".to_string());
+        }
+        if scope.includes_project()
+            && let Some(project) = self.project_scope()
+        {
+            scopes.push(project);
+        }
+        let db = self.db_path()?;
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        // A few extra candidates so the injected/floor filters rarely starve the result.
+        let candidates = crate::memory_store::search(&db, &scopes, &terms, limit * 4)?;
+        Ok(candidates
+            .into_iter()
+            .filter(|e| session_id.is_none_or(|s| !is_memory_injected(s, &e.id)))
+            .filter(|e| crate::memory_jev::meets_term_floor(&terms, e))
+            .take(limit)
+            .collect())
+    }
+
     /// Load the existing project graph without generating embeddings.
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
-        let Some(path) = self.project_memory_path()? else {
-            return Ok(MemoryGraph::new());
-        };
-
-        if !self.test_mode
-            && let Some(mut graph) = cached_graph(&path)
-        {
-            if Self::normalize_graph_search_text(&mut graph) {
-                cache_graph(path.clone(), &graph);
-            }
-            return Ok(graph);
-        }
-
-        if path.exists() {
-            // Try loading as MemoryGraph first
-            if let Ok(graph) = storage::read_json::<MemoryGraph>(&path)
-                && graph.graph_version == GRAPH_VERSION
-            {
-                let mut graph = graph;
-                let normalized = Self::normalize_graph_search_text(&mut graph);
-                if self.import_legacy_notes_into_graph(&mut graph)? {
-                    self.save_project_graph(&graph)?;
-                } else if normalized {
-                    storage::write_json(&path, &graph)?;
-                }
-                if !self.test_mode {
-                    cache_graph(path, &graph);
-                }
-                return Ok(graph);
-            }
-
-            // Fall back to legacy MemoryStore and migrate
-            let store: MemoryStore = storage::read_json(&path)?;
-            let mut graph = MemoryGraph::from_legacy_store(store);
-            let _ = self.import_legacy_notes_into_graph(&mut graph)?;
-
-            // Save migrated format (create backup first)
-            let backup_path = path.with_extension("json.bak");
-            if !backup_path.exists() {
-                let _ = std::fs::copy(&path, &backup_path);
-            }
-            storage::write_json(&path, &graph)?;
-
-            crate::logging::info(&format!(
-                "Migrated memory store to graph format: {}",
-                path.display()
-            ));
-            if !self.test_mode {
-                cache_graph(path, &graph);
-            }
-            Ok(graph)
-        } else {
-            let mut graph = MemoryGraph::new();
-            if self.import_legacy_notes_into_graph(&mut graph)? {
-                self.save_project_graph(&graph)?;
-            }
-            if !self.test_mode {
-                cache_graph(path, &graph);
-            }
-            Ok(graph)
+        match self.project_scope() {
+            Some(scope) => self.load_scope_graph(&scope, true),
+            None => Ok(MemoryGraph::new()),
         }
     }
 
-    /// Load global memories as a MemoryGraph with automatic migration
+    /// Load global memories as a MemoryGraph
     pub fn load_global_graph(&self) -> Result<MemoryGraph> {
-        let path = self.global_memory_path()?;
+        self.load_scope_graph("global", false)
+    }
+
+    fn load_scope_graph(&self, scope: &str, import_notes: bool) -> Result<MemoryGraph> {
+        let db = self.db_path()?;
+        let key = format!("{}#{scope}", db.display());
+        let version = crate::memory_store::data_version(&db)?;
         if !self.test_mode
-            && let Some(mut graph) = cached_graph(&path)
+            && let Some(graph) = cached_graph(&key, version)
         {
-            if Self::normalize_graph_search_text(&mut graph) {
-                cache_graph(path.clone(), &graph);
-            }
             return Ok(graph);
         }
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        let mut graph = crate::memory_store::load_graph(&db, scope)?.unwrap_or_default();
+        let mut changed = Self::normalize_graph_search_text(&mut graph);
+        if import_notes {
+            changed |= self.import_legacy_notes_into_graph(&mut graph)?;
+        }
+        if changed {
+            crate::memory_store::save_graph(&db, scope, &graph, None)?;
+        }
+        if !self.test_mode {
+            cache_graph(key, crate::memory_store::data_version(&db)?, &graph);
+        }
+        Ok(graph)
+    }
 
-        if path.exists() {
-            // Try loading as MemoryGraph first
-            if let Ok(graph) = storage::read_json::<MemoryGraph>(&path)
+    fn save_scope_graph(&self, scope: &str, graph: &MemoryGraph) -> Result<()> {
+        let db = self.db_path()?;
+        if self.test_mode {
+            return crate::memory_store::save_graph(&db, scope, graph, None);
+        }
+        let key = format!("{}#{scope}", db.display());
+        let version = crate::memory_store::data_version(&db)?;
+        // Diff against the graph as last loaded: only changed rows are written.
+        with_cached(&key, version, |previous| crate::memory_store::save_graph(&db, scope, graph, previous))?;
+        cache_graph(key, crate::memory_store::data_version(&db)?, graph);
+        Ok(())
+    }
+
+    /// First use after the SQLite move: pull in the old JSON graphs once.
+    fn import_json_once(&self, db: &std::path::Path) -> Result<()> {
+        let memory_dir = storage::jcode_dir()?.join("memory");
+        let imported = crate::memory_store::import_json_once(db, &memory_dir, |path| {
+            if let Ok(graph) = storage::read_json::<MemoryGraph>(path)
                 && graph.graph_version == GRAPH_VERSION
             {
-                let mut graph = graph;
-                if Self::normalize_graph_search_text(&mut graph) {
-                    storage::write_json(&path, &graph)?;
-                }
-                if !self.test_mode {
-                    cache_graph(path, &graph);
-                }
                 return Ok(graph);
             }
-
-            // Fall back to legacy MemoryStore and migrate
-            let store: MemoryStore = storage::read_json(&path)?;
-            let graph = MemoryGraph::from_legacy_store(store);
-
-            // Save migrated format (create backup first)
-            let backup_path = path.with_extension("json.bak");
-            if !backup_path.exists() {
-                let _ = std::fs::copy(&path, &backup_path);
-            }
-            storage::write_json(&path, &graph)?;
-
-            crate::logging::info(&format!(
-                "Migrated global memory store to graph format: {}",
-                path.display()
-            ));
-            if !self.test_mode {
-                cache_graph(path, &graph);
-            }
-            Ok(graph)
-        } else {
-            let graph = MemoryGraph::new();
-            if !self.test_mode {
-                cache_graph(path, &graph);
-            }
-            Ok(graph)
+            Ok(MemoryGraph::from_legacy_store(storage::read_json::<MemoryStore>(path)?))
+        })?;
+        if imported > 0 {
+            crate::logging::info(&format!("Imported {imported} memories from JSON into {}", db.display()));
         }
+        Ok(())
     }
 
     /// Save project memories as a MemoryGraph
     pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
-        if let Some(path) = self.project_memory_path()? {
-            storage::write_json(&path, graph)?;
-            if !self.test_mode {
-                cache_graph(path, graph);
-            }
+        match self.project_scope() {
+            Some(scope) => self.save_scope_graph(&scope, graph),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Save global memories as a MemoryGraph
     pub fn save_global_graph(&self, graph: &MemoryGraph) -> Result<()> {
-        let path = self.global_memory_path()?;
-        storage::write_json(&path, graph)?;
-        if !self.test_mode {
-            cache_graph(path, graph);
-        }
-        Ok(())
+        self.save_scope_graph("global", graph)
     }
 
     /// Add a tag to a memory

@@ -1,58 +1,37 @@
 use crate::memory_graph::MemoryGraph;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
 
 // === Graph Cache ===
+//
+// Keyed by "<db path>#<scope>". An entry is valid while the database's
+// `data_version` is unchanged, i.e. no other connection has committed since;
+// this process's own writes refresh the entry directly.
 
 struct GraphCacheEntry {
     graph: MemoryGraph,
-    modified: Option<SystemTime>,
+    version: i64,
 }
 
-struct GraphCache {
-    entries: HashMap<PathBuf, GraphCacheEntry>,
+static GRAPH_CACHE: OnceLock<Mutex<HashMap<String, GraphCacheEntry>>> = OnceLock::new();
+
+fn graph_cache() -> &'static Mutex<HashMap<String, GraphCacheEntry>> {
+    GRAPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-impl GraphCache {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
+pub(super) fn cached_graph(key: &str, version: i64) -> Option<MemoryGraph> {
+    with_cached(key, version, |graph| graph.cloned())
 }
 
-static GRAPH_CACHE: OnceLock<Mutex<GraphCache>> = OnceLock::new();
-
-fn graph_cache() -> &'static Mutex<GraphCache> {
-    GRAPH_CACHE.get_or_init(|| Mutex::new(GraphCache::new()))
+/// Borrow the cached graph (if still valid) without cloning it.
+pub(super) fn with_cached<R>(key: &str, version: i64, f: impl FnOnce(Option<&MemoryGraph>) -> R) -> R {
+    let cache = graph_cache().lock().ok();
+    let entry = cache.as_ref().and_then(|cache| cache.get(key)).filter(|e| e.version == version);
+    f(entry.map(|e| &e.graph))
 }
 
-fn graph_mtime(path: &PathBuf) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
-pub(super) fn cached_graph(path: &PathBuf) -> Option<MemoryGraph> {
-    let modified = graph_mtime(path);
-    let cache = graph_cache().lock().ok()?;
-    let entry = cache.entries.get(path)?;
-    if entry.modified == modified {
-        Some(entry.graph.clone())
-    } else {
-        None
-    }
-}
-
-pub(super) fn cache_graph(path: PathBuf, graph: &MemoryGraph) {
-    let modified = graph_mtime(&path);
+pub(super) fn cache_graph(key: String, version: i64, graph: &MemoryGraph) {
     if let Ok(mut cache) = graph_cache().lock() {
-        cache.entries.insert(
-            path,
-            GraphCacheEntry {
-                graph: graph.clone(),
-                modified,
-            },
-        );
+        cache.insert(key, GraphCacheEntry { graph: graph.clone(), version });
     }
 }

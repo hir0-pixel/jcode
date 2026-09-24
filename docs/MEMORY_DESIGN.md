@@ -1,6 +1,21 @@
 # Sovereign memory and storage: design and build plan
 
-Status: proposal (2026-09-24). Nothing here is built yet.
+Status (2026-09-24): M1 built, M2 in progress. Where the build departed from this proposal:
+
+- **Chats stay in jcode's session store** (snapshot + append-only journal), not Hermes's
+  `state.db`: about 30 jcode modules read those files directly (crash recovery, replay,
+  search), so moving them would be a large rewrite for no user-visible gain. The single-store
+  goal is met differently: the engine answers every chat-bound RPC and REST method itself and
+  never forwards one to Python, so Python never holds chat data (M1, commits 343029d,
+  f817151, a52650f).
+- **Memory lives in the engine's own `sovereign.db`** (jcode home, WAL), not `state.db`:
+  memories are rows with an FTS5 index (Porter stemming) kept in sync by triggers; per-turn
+  recall is an indexed query; writes touch only changed rows (M2). Measured on a worst-case
+  corpus: recall 57 -> 16 ms and saving one memory 90 ms -> 7 ms at 10k memories
+  (`memory_store::tests::scaling`). jcode's behaviours are unchanged: recalled memory is
+  appended at the end of the prompt, each memory at most once per session, nothing when
+  nothing matches, at most 5.
+
 
 Goal: one app with jcode-level token and RAM efficiency, Prime-style self-improvement and
 Evestack-style observability, all on ONE store and ONE agent loop. Cheaper than stock Hermes

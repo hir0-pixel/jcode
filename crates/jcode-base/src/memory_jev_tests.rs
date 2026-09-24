@@ -337,7 +337,10 @@ fn manager_scope_active_filter_and_storage_failures() {
             ["global"]
         );
         assert_eq!(collect_scoped(&manager, MemoryScope::All).unwrap().len(), 2);
-        std::fs::write(home.path().join("memory/test/test_global.json"), "not json").unwrap();
+        rusqlite::Connection::open(home.path().join("memory/test/memory.db"))
+            .unwrap()
+            .execute("UPDATE memory_graphs SET graph='not json' WHERE scope='global'", [])
+            .unwrap();
         assert!(collect_scoped(&manager, MemoryScope::Global).is_err());
         assert!(collect_scoped(&manager, MemoryScope::All).is_err());
         assert!(collect_scoped(&manager, MemoryScope::Project).is_ok());
