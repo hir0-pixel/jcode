@@ -2,8 +2,53 @@ use super::*;
 use crate::provider::{EventStream, Provider};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 struct MockSummaryProvider;
+
+struct BlockingSummaryProvider {
+    started: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl Provider for BlockingSummaryProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    fn name(&self) -> &str {
+        "blocking-summary"
+    }
+
+    fn model(&self) -> String {
+        "blocking-summary-model".into()
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            started: self.started.clone(),
+        })
+    }
+
+    async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
+        std::future::pending().await
+    }
+
+    async fn complete_simple_with_usage(
+        &self,
+        _prompt: &str,
+        _system: &str,
+    ) -> Result<jcode_provider_core::SimpleCompletion> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
 
 #[async_trait::async_trait]
 impl Provider for MockSummaryProvider {
@@ -228,6 +273,46 @@ async fn test_force_compact_applies_summary() {
         }
         _ => panic!("expected text summary block"),
     }
+}
+
+#[tokio::test]
+async fn test_aborted_compaction_keeps_unknown_usage_model_call() {
+    let mut manager = CompactionManager::new().with_budget(1_000);
+    let mut messages = Vec::new();
+    for i in 0..30 {
+        messages.push(make_text_message(
+            Role::User,
+            &format!("Turn {} {}", i, "x".repeat(120)),
+        ));
+        manager.notify_message_added();
+    }
+
+    let blocking = Arc::new(BlockingSummaryProvider {
+        started: Arc::new(Notify::new()),
+    });
+    let started_notify = blocking.started.clone();
+    let started = started_notify.notified();
+    let provider: Arc<dyn Provider> = blocking.clone();
+    manager
+        .force_compact_with(&messages, provider)
+        .expect("manual compaction should start");
+    started.await;
+
+    manager
+        .hard_compact_with(&messages)
+        .expect("hard compaction should supersede the pending summary");
+    let calls = manager.take_model_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].provider, "blocking-summary");
+    assert_eq!(calls[0].model, "blocking-summary-model");
+    assert!(calls[0].usage.is_none());
+    assert!(
+        calls[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("usage unavailable")
+    );
 }
 
 // ── ensure_context_fits tests ──────────────────────────────

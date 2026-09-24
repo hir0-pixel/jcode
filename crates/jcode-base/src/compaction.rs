@@ -23,7 +23,7 @@ use crate::provider::openai_request::{
 use anyhow::Result;
 use jcode_provider_core::SimpleUsage;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -56,6 +56,44 @@ struct CompactionResult {
 struct GeneratedCompaction {
     result: Result<CompactionResult>,
     model_calls: Vec<CompactionModelCall>,
+}
+
+type PendingModelCalls = Arc<Mutex<Vec<CompactionModelCall>>>;
+
+fn begin_model_call(
+    pending: &PendingModelCalls,
+    provider: String,
+    model: String,
+    started_ms: i64,
+) -> usize {
+    let mut calls = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = calls.len();
+    calls.push(CompactionModelCall {
+        provider,
+        model,
+        started_ms,
+        usage: None,
+        error: Some("Compaction interrupted; token usage unavailable".into()),
+    });
+    index
+}
+
+fn finish_model_call(
+    pending: &PendingModelCalls,
+    index: usize,
+    usage: Option<SimpleUsage>,
+    error: Option<String>,
+) {
+    if let Some(call) = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(index)
+    {
+        call.usage = usage;
+        call.error = error;
+    }
 }
 
 /// Usage for a model request made while compacting one session.
@@ -196,6 +234,9 @@ pub struct CompactionManager {
     /// Model requests from the latest completed compaction, including failures.
     last_model_calls: Vec<CompactionModelCall>,
 
+    /// In-flight calls survive task aborts so they can be reported with unknown usage.
+    pending_model_calls: Option<PendingModelCalls>,
+
     // ── Mode & strategy ────────────────────────────────────────────────────
     /// Active compaction mode (set from config at construction)
     mode: crate::config::CompactionMode,
@@ -245,6 +286,7 @@ impl CompactionManager {
             observed_input_tokens: None,
             last_compaction: None,
             last_model_calls: Vec::new(),
+            pending_model_calls: None,
             mode,
             compaction_config: cfg,
             token_history: VecDeque::with_capacity(TOKEN_HISTORY_WINDOW + 1),
@@ -943,13 +985,19 @@ impl CompactionManager {
 
         self.pending_cutoff = cutoff;
         self.pending_trigger = Some(mode_label.clone());
+        let pending_model_calls = Arc::new(Mutex::new(Vec::new()));
+        self.pending_model_calls = Some(pending_model_calls.clone());
 
         // Spawn background task that notifies via Bus when done
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let mut generated =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let mut generated = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                pending_model_calls,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction ({}) finished in {:.2}s ({} messages summarized)",
@@ -1158,12 +1206,18 @@ impl CompactionManager {
 
         self.pending_cutoff = cutoff;
         self.pending_trigger = Some("manual".to_string());
+        let pending_model_calls = Arc::new(Mutex::new(Vec::new()));
+        self.pending_model_calls = Some(pending_model_calls.clone());
 
         self.pending_task = Some(tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let mut generated =
-                generate_compaction_artifact(provider, messages_to_summarize, existing_summary)
-                    .await;
+            let mut generated = generate_compaction_artifact(
+                provider,
+                messages_to_summarize,
+                existing_summary,
+                pending_model_calls,
+            )
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             crate::logging::info(&format!(
                 "Compaction finished in {:.2}s ({} messages summarized)",
@@ -1200,6 +1254,7 @@ impl CompactionManager {
         // Get result
         match futures::executor::block_on(task) {
             Ok(generated) => {
+                self.pending_model_calls = None;
                 self.last_model_calls = generated.model_calls;
                 match generated.result {
                     Ok(result) => {
@@ -1322,6 +1377,17 @@ impl CompactionManager {
                 }
             }
             Err(e) => {
+                self.last_model_calls = self
+                    .pending_model_calls
+                    .take()
+                    .map(|calls| {
+                        std::mem::take(
+                            &mut *calls
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        )
+                    })
+                    .unwrap_or_default();
                 crate::logging::error(&format!("[compaction] Task panicked: {}", e));
                 self.pending_trigger = None;
                 self.pending_cutoff = 0;
@@ -1557,6 +1623,13 @@ impl CompactionManager {
         // we're committed to the hard compact.
         if let Some(task) = self.pending_task.take() {
             task.abort();
+            if let Some(calls) = self.pending_model_calls.take() {
+                self.last_model_calls.extend(std::mem::take(
+                    &mut *calls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                ));
+            }
             crate::logging::warn(&format!(
                 "[compaction] Aborting in-flight background compaction (pending_cutoff={}, trigger={:?}) — superseded by hard compact",
                 self.pending_cutoff, self.pending_trigger,
@@ -1733,6 +1806,7 @@ async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
+    pending_model_calls: PendingModelCalls,
 ) -> GeneratedCompaction {
     let start = Instant::now();
     let mut model_calls = Vec::new();
@@ -1765,6 +1839,14 @@ async fn generate_compaction_artifact(
     let native_provider = provider.name().to_string();
     let native_model = provider.model();
     let trace_native_error = provider.native_compaction_mode().as_deref() == Some("explicit");
+    let native_call_index = trace_native_error.then(|| {
+        begin_model_call(
+            &pending_model_calls,
+            native_provider.clone(),
+            native_model.clone(),
+            native_started_ms,
+        )
+    });
     match provider
         .native_compact(
             &messages,
@@ -1778,6 +1860,9 @@ async fn generate_compaction_artifact(
         .await
     {
         Ok(native) => {
+            if let Some(index) = native_call_index {
+                finish_model_call(&pending_model_calls, index, native.usage, None);
+            }
             model_calls.push(CompactionModelCall {
                 provider: native_provider,
                 model: native_model,
@@ -1806,6 +1891,9 @@ async fn generate_compaction_artifact(
             }
         }
         Err(error) if trace_native_error => {
+            if let Some(index) = native_call_index {
+                finish_model_call(&pending_model_calls, index, None, Some(error.to_string()));
+            }
             model_calls.push(CompactionModelCall {
                 provider: native_provider,
                 model: native_model,
@@ -1827,6 +1915,12 @@ async fn generate_compaction_artifact(
         .as_millis() as i64;
     let provider_name = provider.name().to_string();
     let model = provider.model();
+    let call_index = begin_model_call(
+        &pending_model_calls,
+        provider_name.clone(),
+        model.clone(),
+        started_ms,
+    );
     let summary = provider
         .complete_simple_with_usage(
             &prompt,
@@ -1835,6 +1929,7 @@ async fn generate_compaction_artifact(
         .await;
     match summary {
         Ok(summary) => {
+            finish_model_call(&pending_model_calls, call_index, summary.usage, None);
             model_calls.push(CompactionModelCall {
                 provider: provider_name,
                 model,
@@ -1854,6 +1949,12 @@ async fn generate_compaction_artifact(
             }
         }
         Err(error) => {
+            finish_model_call(
+                &pending_model_calls,
+                call_index,
+                None,
+                Some(error.to_string()),
+            );
             model_calls.push(CompactionModelCall {
                 provider: provider_name,
                 model,
@@ -1902,8 +2003,13 @@ pub async fn build_transfer_compaction_state_with_model_calls(
         .as_ref()
         .map(|state| state.original_turn_count.max(state.covers_up_to_turn))
         .unwrap_or(0);
-    let generated =
-        generate_compaction_artifact(provider, messages.clone(), existing_summary).await;
+    let generated = generate_compaction_artifact(
+        provider,
+        messages.clone(),
+        existing_summary,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
     for call in generated.model_calls {
         on_model_call(call);
     }
