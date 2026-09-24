@@ -532,6 +532,77 @@ impl Observer {
         )
     }
 
+    /// Hermes's `/api/analytics/usage` shape, from the ledger: runs are turns,
+    /// `chat` spans are model calls, `execute_tool` spans are tool calls.
+    pub fn analytics(&self, days: u64) -> rusqlite::Result<Value> {
+        let db = Connection::open(&self.path)?;
+        let since = now() - days as i64 * 86_400_000;
+        let mut daily = db.prepare(
+            // Driven from runs_recent, counting each run's model calls through
+            // spans_run: cost follows the requested window, not total history
+            // (a CTE over spans scanned the whole table; measured 12-16x slower).
+            "SELECT date(r.started_at_ms/1000,'unixepoch','localtime') AS day, COUNT(DISTINCT r.session_id),
+                    SUM(r.input_tokens), SUM(r.output_tokens), SUM(r.cache_read_tokens), COALESCE(SUM(r.cost_usd),0),
+                    SUM((SELECT COUNT(*) FROM spans s WHERE s.run_id=r.id AND s.kind='chat'))
+             FROM runs r WHERE r.started_at_ms>=?1 GROUP BY day ORDER BY day",
+        )?;
+        let daily = daily
+            .query_map([since], |r| {
+                let cost: f64 = r.get(5)?;
+                Ok(json!({"day": r.get::<_, String>(0)?, "sessions": r.get::<_, i64>(1)?, "input_tokens": r.get::<_, i64>(2)?,
+                    "output_tokens": r.get::<_, i64>(3)?, "cache_read_tokens": r.get::<_, i64>(4)?, "reasoning_tokens": 0,
+                    "estimated_cost": cost, "actual_cost": cost, "api_calls": r.get::<_, i64>(6)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut by_model = db.prepare(
+            "SELECT r.model, COUNT(DISTINCT r.session_id), SUM(r.input_tokens), SUM(r.output_tokens), COALESCE(SUM(r.cost_usd),0),
+                    SUM((SELECT COUNT(*) FROM spans s WHERE s.run_id=r.id AND s.kind='chat'))
+             FROM runs r WHERE r.started_at_ms>=?1 GROUP BY r.model ORDER BY SUM(r.input_tokens) DESC",
+        )?;
+        let by_model = by_model
+            .query_map([since], |r| {
+                Ok(json!({"model": r.get::<_, String>(0)?, "sessions": r.get::<_, i64>(1)?, "input_tokens": r.get::<_, i64>(2)?,
+                    "output_tokens": r.get::<_, i64>(3)?, "estimated_cost": r.get::<_, f64>(4)?, "api_calls": r.get::<_, i64>(5)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut tools = db.prepare(
+            "SELECT s.name, COUNT(*) FROM runs r JOIN spans s ON s.run_id=r.id
+             WHERE r.started_at_ms>=?1 AND s.kind='execute_tool' GROUP BY s.name ORDER BY COUNT(*) DESC",
+        )?;
+        let tools: Vec<(String, i64)> = tools.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let tool_total = tools.iter().map(|(_, n)| n).sum::<i64>().max(1) as f64;
+        let tools: Vec<Value> = tools
+            .into_iter()
+            .map(|(tool, count)| json!({"tool": tool, "count": count, "percentage": count as f64 * 100.0 / tool_total}))
+            .collect();
+        let sum = |key: &str| daily.iter().map(|d| d[key].as_i64().unwrap_or(0)).sum::<i64>();
+        let cost: f64 = daily.iter().map(|d| d["estimated_cost"].as_f64().unwrap_or(0.0)).sum();
+        let sessions: i64 = db.query_row("SELECT COUNT(DISTINCT session_id) FROM runs WHERE started_at_ms>=?1", [since], |r| r.get(0))?;
+        Ok(json!({
+            "period_days": days,
+            "daily": daily,
+            "by_model": by_model,
+            "tools": tools,
+            "skills": {"summary": {"distinct_skills_used": 0, "total_skill_actions": 0}, "top_skills": []},
+            "totals": {"total_sessions": sessions, "total_input": sum("input_tokens"), "total_output": sum("output_tokens"),
+                "total_cache_read": sum("cache_read_tokens"), "total_reasoning": 0, "total_api_calls": sum("api_calls"),
+                "total_estimated_cost": cost, "total_actual_cost": cost},
+        }))
+    }
+
+    /// Hermes's `insights.get`: sessions and messages over the last `days`.
+    /// A top-level run is one user turn and its reply, i.e. two messages.
+    pub fn insights(&self, days: u64) -> rusqlite::Result<Value> {
+        let db = Connection::open(&self.path)?;
+        let since = now() - days as i64 * 86_400_000;
+        let (sessions, turns): (i64, i64) = db.query_row(
+            "SELECT COUNT(DISTINCT session_id), COUNT(*) FROM runs WHERE parent_id IS NULL AND started_at_ms>=?1",
+            [since],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(json!({"days": days, "sessions": sessions, "messages": turns * 2}))
+    }
+
     pub fn detail(&self, id: &str) -> rusqlite::Result<Value> {
         let db = Connection::open(&self.path)?;
         let mut stmt = db.prepare("SELECT id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error FROM runs WHERE id=?1")?;

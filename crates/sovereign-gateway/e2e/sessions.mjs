@@ -119,6 +119,15 @@ try {
   check(!(await listIds()).includes(c), 'deleted session is gone from the list')
   check(!fs.existsSync(path.join(jcodeHome, 'sessions', `${c}.json`)), 'deleted session file is removed from disk')
 
+  // Undo after a tool turn: history carries tool rows that jcode's rewind
+  // does not count, so positions must be taken among user/assistant only.
+  const t = (await rpc('session.create', { cwd: home })).result.session_id
+  await turn(t, 'Use the bash tool to run exactly: echo tool-ran . Then reply with exactly the word DONE.')
+  await turn(t, 'Reply with exactly the word FOUR.')
+  const tu = (await rpc('session.undo', { session_id: t })).result
+  const th = await history(t)
+  check(!JSON.stringify(th).includes('FOUR') && th.filter(m => m.role === 'user').length === 1, `undo after a tool turn removes only the last turn (removed ${tu?.removed}, ${th.length} left)`)
+
   // REST surface the desktop sidebar uses (/api/sessions/*).
   const http = (method, p, body) =>
     fetch(`http://127.0.0.1:${port}${p}`, {
@@ -143,10 +152,18 @@ try {
   check((await listIds()).includes(a), 'REST unarchive restores it')
   const gone = await http('DELETE', `/api/sessions/${a}`)
   check(gone.status === 200 && !(await listIds()).includes(a), 'REST delete removes the session')
+  const usage = await http('GET', `/api/analytics/usage?days=7`)
+  check(usage.status === 200 && usage.body?.totals?.total_sessions >= 1 && usage.body?.totals?.total_api_calls >= 1, `usage chart comes from the engine ledger (${usage.body?.totals?.total_api_calls} calls)`)
+  const insights = (await rpc('insights.get', { days: 7 })).result
+  check(insights?.sessions >= 1 && insights?.messages >= 2, `insights.get counts engine chats (${insights?.sessions} sessions, ${insights?.messages} messages)`)
+  const bars = (await rpc('usage.bars', {})).result
+  check(bars?.available === false, 'usage.bars answers unavailable without Python')
+  const handoff = await rpc('handoff.request', { session_id: a, platform: 'telegram' })
+  check(Boolean(handoff.error), 'handoff is refused until messaging runs on the engine')
   const other = await http('POST', `/api/sessions/bulk-delete`, { ids: [] })
   check(other.status === 404 && other.body?.reason === 'not_supported_by_engine', 'unbuilt /api/sessions routes are refused, not proxied')
 
-  check(!/forward RPC session\./.test(stderr), 'no session method was forwarded to Python')
+  check(!/forward RPC (session|insights|usage|handoff)\./.test(stderr), 'no chat-bound method was forwarded to Python')
 } catch (err) {
   failures++
   console.error('FAIL', err.message)

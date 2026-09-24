@@ -2,7 +2,7 @@
 
 Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; every other Hermes method and route is forwarded to Hermes's own Python backend, which starts only when one of them is first used and stops after 10 idle minutes.
 
-**JSON-RPC methods (235):** 33 working, 18 placeholder, 184 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
+**JSON-RPC methods (235):** 34 working, 22 placeholder, 179 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
 
 | Namespace | Rust (working) | Rust (placeholder) | Forwarded to Hermes (Python) |
 |---|---|---|---|
@@ -29,10 +29,10 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | free_tier | – | `free_tier.status` | `free_tier.ack_notice`, `free_tier.provision` |
 | gateway | `gateway.capabilities` | – | – |
 | groups | – | – | `groups.approve`, `groups.capabilities`, `groups.create`, `groups.demote`, `groups.disband`, `groups.list`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
-| handoff | – | – | `handoff.fail`, `handoff.request`, `handoff.state` |
+| handoff | – | `handoff.fail`, `handoff.request`, `handoff.state` | – |
 | image | – | – | `image.attach`, `image.attach_bytes`, `image.detach`, `image.generate` |
 | input | – | – | `input.detect_drop` |
-| insights | – | – | `insights.get` |
+| insights | `insights.get` | – | – |
 | learning | – | – | `learning.delete`, `learning.detail`, `learning.edit`, `learning.frames` |
 | llm | – | – | `llm.oneshot` |
 | mcp | – | – | `mcp.catalog`, `mcp.servers.add`, `mcp.servers.list`, `mcp.servers.oauth.callback`, `mcp.servers.oauth.cancel`, `mcp.servers.oauth.poll`, `mcp.servers.oauth.start`, `mcp.servers.remove`, `mcp.servers.set_api_key`, `mcp.servers.status`, `mcp.servers.test` |
@@ -65,18 +65,18 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | terminal | – | – | `terminal.resize` |
 | tools | – | – | `tools.configure`, `tools.list`, `tools.show` |
 | toolsets | – | – | `toolsets.list` |
-| usage | – | – | `usage.bars` |
+| usage | – | `usage.bars` | – |
 | vault | – | – | `vault.add`, `vault.list`, `vault.lock`, `vault.remove`, `vault.source.set`, `vault.sources`, `vault.unlock` |
 | verification | – | – | `verification.status` |
 | voice | – | – | `voice.record`, `voice.toggle`, `voice.tts` |
 | wake | – | `wake.status` | `wake.feed`, `wake.pause`, `wake.resume`, `wake.start`, `wake.stop` |
 
-**HTTP routes in Hermes (267):** 24 served by the Rust engine, 8 chat-bound routes refused by the engine (not built yet; never proxied, since chats are not in Python's database); the rest are reverse-proxied to Hermes's Python backend.
+**HTTP routes in Hermes (267):** 25 served by the Rust engine, 8 chat-bound routes refused by the engine (not built yet; never proxied, since chats are not in Python's database); the rest are reverse-proxied to Hermes's Python backend.
 
 | Router | Rust | Refused by engine | Forwarded |
 |---|---|---|---|
 | actions | `GET /api/hermes/update/check` | – | `POST /api/gateway/restart`, `GET /api/gateway/migrate/plan`, `POST /api/gateway/migrate`, `POST /api/gateway/drain`, `POST /api/hermes/update`, `GET /api/actions/{name}/status`, `GET /api/hermes/update/receipt` |
-| analytics | – | – | `GET /api/config/raw`, `PUT /api/config/raw`, `GET /api/analytics/usage`, `GET /api/analytics/models` |
+| analytics | `GET /api/analytics/usage` | – | `GET /api/config/raw`, `PUT /api/config/raw`, `GET /api/analytics/models` |
 | audio | – | – | `POST /api/audio/transcribe`, `GET /api/audio/voice-config`, `GET /api/audio/voice-live/status`, `POST /api/audio/voice-live/session`, `GET /api/audio/elevenlabs/voices`, `POST /api/audio/speak`, `POST /api/audio/tts-lease` |
 | chat_workspaces | – | – | `GET /api/chat/workspaces` |
 | config_env | – | – | `GET /api/config`, `GET /api/config/defaults`, `GET /api/config/schema`, `GET /api/egress/status`, `PUT /api/config`, `GET /api/env`, `PUT /api/env`, `GET /api/providers/custom-endpoints`, `POST /api/providers/custom-endpoints`, `POST /api/providers/custom-endpoints/{endpoint_id}/activate`, `DELETE /api/providers/custom-endpoints/{endpoint_id}`, `POST /api/providers/custom-endpoints/validate`, `POST /api/providers/validate`, `DELETE /api/env`, `POST /api/env/reveal` |

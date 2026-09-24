@@ -544,7 +544,12 @@ impl Conn {
                 }
                 self.ensure_attached(id).await.map_err(RpcError::internal)?;
                 let history = call(json!({ "req": "get_history", "session_id": id })).await?;
-                let messages = history["messages"].as_array().cloned().unwrap_or_default();
+                // jcode's rewind indexes only user and assistant messages, so
+                // positions must be counted among those (tool rows excluded).
+                let messages: Vec<Value> = history["messages"]
+                    .as_array()
+                    .map(|all| all.iter().filter(|m| m["role"] == "user" || m["role"] == "assistant").cloned().collect())
+                    .unwrap_or_default();
                 let Some(last_user) = messages.iter().rposition(|m| m["role"] == "user") else {
                     return Ok(json!({ "removed": 0 }));
                 };
@@ -597,6 +602,22 @@ impl Conn {
             "session.events.stats" => Ok(json!({
                 "sessions": 0, "events": 0, "bytes": 0, "max_per_session": 0, "max_bytes_per_session": 0, "max_bytes_process": 0,
             })),
+            "insights.get" => {
+                let days = p["days"].as_u64().unwrap_or(30).clamp(1, 3650);
+                let observer = self.observer.clone();
+                tokio::task::spawn_blocking(move || observer.insights(days))
+                    .await
+                    .map_err(|e| RpcError::internal(anyhow!(e)))?
+                    .map_err(|e| RpcError::internal(anyhow!(e)))
+            }
+            // Hermes's hosted-subscription dollar bars; nothing to show here.
+            "usage.bars" => Ok(json!({ "ok": true, "available": false, "status": "not_applicable" })),
+            // Handoff hands a chat to Hermes's messaging gateway, which looks it up
+            // in Python's database; it arrives with messaging on the engine (M4).
+            "handoff.request" | "handoff.state" | "handoff.fail" => {
+                crate::note_unsupported("rpc", method);
+                Err(RpcError::unsupported(method))
+            }
             "session.cwd.set" | "session.control" | "session.workspace.move" | "session.context_breakdown" | "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
                 crate::note_unsupported("rpc", method);
                 Err(RpcError::unsupported(method))

@@ -541,6 +541,13 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
         }
+        ("GET", "/api/analytics/usage") => {
+            let days = query_u64(&req, "days").unwrap_or(30).clamp(1, 3650);
+            match tokio::task::spawn_blocking(move || observer.analytics(days)).await? {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+            }
+        }
         ("GET", "/api/sovereign/observability/runs") => {
             let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
             let result = tokio::task::spawn_blocking(move || observer.list(limit)).await?;

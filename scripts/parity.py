@@ -30,6 +30,8 @@ PLACEHOLDER = {
     "session.events.since", "session.events.stats", "session.cwd.set", "session.control",
     "session.workspace.move", "session.context_breakdown", "session.foreign.import",
     "session.foreign.list", "session.foreign.preview",
+    # Hosted-subscription bars (not applicable) and messaging handoff (M4).
+    "usage.bars", "handoff.request", "handoff.state", "handoff.fail",
 }
 # Where each missing namespace gets built (docs/SOVEREIGN_PLAN.md modules).
 PLAN = {
