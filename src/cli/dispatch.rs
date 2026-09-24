@@ -1348,8 +1348,11 @@ async fn run_gateway(
     let socket = crate::storage::runtime_dir().join(format!("sovereign-{}.sock", std::process::id()));
     server::set_socket_path(&socket.to_string_lossy());
 
-    let token = match std::env::var("HERMES_DASHBOARD_SESSION_TOKEN") {
-        Ok(token) if token.len() >= 32 => token,
+    let launch = sovereign_gateway::auth::launch_token()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HERMES_DASHBOARD_SESSION_TOKEN").ok());
+    let token = match launch {
+        Some(token) if token.len() >= 32 => token,
         _ => {
             let token = sovereign_gateway::auth::generate_token();
             let path = crate::storage::jcode_dir()?.join("sovereign-gateway.token");
@@ -1363,6 +1366,7 @@ async fn run_gateway(
         .or_else(|_| format!("[{host}]:{port}").parse())
         .map_err(|_| anyhow::anyhow!("invalid --host {host}"))?;
 
+    let approval_secret = sovereign_gateway::auth::generate_token();
     let provider = provider_init::init_provider_for_serve(provider_choice, model).await?;
     let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
     let refine_provider = provider.clone();
@@ -1391,9 +1395,13 @@ async fn run_gateway(
             model: provider_model,
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
             complete: Some(complete),
+            approval_secret: approval_secret.clone(),
         })
         .await?;
         let port = gateway.local_addr().port();
+        // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval.
+        let approval = serde_json::json!({ "addr": gateway.local_addr().to_string(), "secret": approval_secret });
+        write_private_file(&crate::storage::jcode_dir()?.join("sovereign-approval.json"), &approval.to_string())?;
         if let Ok(ready_file) = std::env::var("HERMES_DESKTOP_READY_FILE") {
             write_private_file(std::path::Path::new(&ready_file), &format!("{{\"port\":{port}}}"))?;
         }

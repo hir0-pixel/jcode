@@ -6,6 +6,19 @@
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 
+/// Launch token handed over by the binary's `main` after it removed the
+/// variable from the process environment (so tool subprocesses such as the
+/// model's shell commands never inherit it).
+static LAUNCH_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_launch_token(token: String) {
+    let _ = LAUNCH_TOKEN.set(token);
+}
+
+pub fn launch_token() -> Option<&'static str> {
+    LAUNCH_TOKEN.get().map(String::as_str)
+}
+
 /// 256-bit random token, hex encoded.
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];

@@ -111,6 +111,9 @@ check((await closeCode(openWs(`?token=${token}`, { origin: 'https://evil.example
 // Authenticated client
 const ws = openWs(`?token=${token}`, { origin: 'file://' })
 const events = []
+const approvals = []
+let approvalChoice = 'deny'
+const approvalSchema = contract['x-server-requests'].find(r => r.name === 'approval').params[0].schema
 const pending = new Map()
 let nextId = 1
 ws.on('message', data => {
@@ -124,7 +127,9 @@ ws.on('message', data => {
     pending.get(frame.id)(frame)
     pending.delete(frame.id)
   } else if (frame.method === 'approval') {
-    ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { choice: 'deny' } }))
+    approvals.push(frame.params)
+    validate('server-request', 'approval', approvalSchema, frame.params)
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { choice: approvalChoice } }))
   }
 })
 await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject) })
@@ -313,6 +318,52 @@ if (process.env.E2E_MEMORY === '1') {
   const a = await turn(m2, 'What is my favourite colour? Answer with one word, or UNKNOWN.')
   console.log('     recall answer:', JSON.stringify(a?.payload.text).slice(0, 80))
   check(/teal/i.test(a?.payload.text || ''), 'a new session recalled the memory locally')
+}
+
+// Human approval for risky shell commands (the pre_tool gate).
+if (process.env.E2E_SKIP_CHAT !== '1') {
+  const victim = path.join(home, 'scratch-dir')
+  const ask = async (s, text) => {
+    const before = events.filter(e => e.type === 'message.complete' && e.session_id === s).length
+    await rpc('prompt.submit', { session_id: s, text })
+    const t0 = Date.now()
+    while (Date.now() - t0 < 600_000) {
+      if (events.filter(e => e.type === 'message.complete' && e.session_id === s).length > before) return
+      await new Promise(r => setTimeout(r, 200))
+    }
+  }
+  fs.mkdirSync(victim, { recursive: true }); fs.writeFileSync(path.join(victim, 'f.txt'), 'x')
+  f = await rpc('session.create', { cwd: home })
+  const asid = f.result.session_id
+  // Did the model issue a bash call containing `needle` since event index `from`?
+  const ranBash = (from, needle) => events.slice(from).some(e => e.session_id === asid && e.type === 'tool.start' && e.payload.name === 'bash' && String(e.payload.args?.command || '').includes(needle))
+  approvalChoice = 'deny'
+  let n0 = approvals.length, e0 = events.length
+  await ask(asid, 'Run exactly this shell command with the bash tool: rm -rf ./scratch-dir')
+  if (ranBash(e0, 'rm -rf')) {
+    check(approvals.length > n0, 'a risky command raised a desktop approval prompt')
+    check(fs.existsSync(victim), 'a denied command did not run')
+  } else console.log('     skipped: the model did not issue rm -rf (deny case)')
+  approvalChoice = 'once'
+  n0 = approvals.length; e0 = events.length
+  await ask(asid, 'I approve it now. Run exactly this shell command with the bash tool: rm -rf ./scratch-dir')
+  if (ranBash(e0, 'rm -rf')) check(approvals.length > n0 && !fs.existsSync(victim), 'an approved command ran')
+  else console.log('     skipped: the model did not issue rm -rf (approve case)')
+  const n2 = approvals.length
+  await ask(asid, 'Run exactly this shell command with the bash tool and show me its output: echo TOKEN=[$HERMES_DASHBOARD_SESSION_TOKEN]')
+  const leaked = events.some(e => e.session_id === asid && JSON.stringify(e.payload || {}).includes(token))
+  const echoed = events.filter(e => e.session_id === asid && e.type === 'tool.complete').map(e => e.payload.result_text || '').filter(t => t.includes('TOKEN=')).pop() || ''
+  console.log('     token probe:', JSON.stringify(echoed).slice(0, 200), 'leaked=' + leaked)
+  const lastTools = events.filter(e => e.session_id === asid && (e.type === 'tool.start' || e.type === 'tool.complete')).slice(-2).map(e => e.type + ':' + JSON.stringify(e.payload).slice(0, 160))
+  const lastReply = events.filter(e => e.session_id === asid && e.type === 'message.complete').pop()
+  console.log('     last tools:', lastTools.join(' | '), '\n     last reply:', JSON.stringify(lastReply?.payload.text).slice(0, 200))
+  check(!leaked, 'the desktop token never appears in any session event')
+  if (echoed) check(/TOKEN=\[\]/.test(echoed), "the model's shell sees an empty desktop token")
+  else console.log("     skipped: the model did not run the token probe")
+  const approvalFile = path.join(home, 'sovereign-approval.json')
+  check(fs.existsSync(approvalFile) && (fs.statSync(approvalFile).mode & 0o077) === 0, 'approval endpoint file is owner-only')
+  await ask(asid, 'Run exactly this shell command with the bash tool: echo safe-command')
+  check(approvals.length === n2, 'safe commands ran without a prompt')
 }
 
 f = await rpc('session.interrupt', { session_id: sid })

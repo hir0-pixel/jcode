@@ -7753,6 +7753,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "httparse",
+ "jcode-command-risk",
  "jcode-harness-api-server",
  "jsonschema",
  "rand 0.8.6",

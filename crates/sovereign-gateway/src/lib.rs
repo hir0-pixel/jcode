@@ -7,6 +7,7 @@
 //! Contract: hermes-agent `apps/shared/src/gateway-contract.openrpc.json`
 //! (vendored under `contract/`).
 
+pub mod approvals;
 pub mod auth;
 pub mod map;
 mod rpc;
@@ -56,6 +57,8 @@ pub struct Config {
     pub home: String,
     /// One-shot model call `(system, user) -> text`, used by `/refine`.
     pub complete: Option<Complete>,
+    /// Lets the `pre_tool` hook create approval prompts (never answer them).
+    pub approval_secret: String,
 }
 
 pub type Complete = std::sync::Arc<
@@ -66,6 +69,7 @@ pub struct Gateway {
     listener: TcpListener,
     local: SocketAddr,
     config: Arc<Config>,
+    hub: Arc<approvals::Hub>,
 }
 
 impl Gateway {
@@ -78,7 +82,7 @@ impl Gateway {
         }
         let listener = TcpListener::bind(config.bind).await.context("binding gateway")?;
         let local = listener.local_addr()?;
-        Ok(Self { listener, local, config: Arc::new(config) })
+        Ok(Self { listener, local, config: Arc::new(config), hub: Arc::default() })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -94,10 +98,11 @@ impl Gateway {
                 continue;
             };
             let config = self.config.clone();
+            let hub = self.hub.clone();
             let local = self.local;
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle(stream, local, config).await;
+                let _ = handle(stream, local, config, hub).await;
             });
         }
     }
@@ -108,6 +113,8 @@ struct Request {
     path: String,
     query: Option<String>,
     headers: Vec<(String, String)>,
+    /// Body bytes read along with the headers.
+    body_prefix: Vec<u8>,
 }
 
 impl Request {
@@ -134,7 +141,10 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
     }
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
-    req.parse(&buf)?;
+    let header_len = match req.parse(&buf)? {
+        httparse::Status::Complete(n) => n,
+        httparse::Status::Partial => bail!("incomplete request"),
+    };
     let target = req.path.unwrap_or("/");
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), Some(q.to_string())),
@@ -149,7 +159,28 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
             .iter()
             .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned()))
             .collect(),
+        body_prefix: buf[header_len..].to_vec(),
     })
+}
+
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
+async fn read_body(stream: &mut TcpStream, req: &Request) -> Result<Vec<u8>> {
+    let len: usize = req.header("content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    if len > MAX_BODY_BYTES {
+        bail!("body too large");
+    }
+    let mut body = req.body_prefix.clone();
+    body.truncate(len);
+    while body.len() < len {
+        let mut chunk = vec![0u8; len - body.len()];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("connection closed mid-body");
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<()> {
@@ -222,7 +253,7 @@ async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> R
         .unwrap_or_default())
 }
 
-async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -> Result<()> {
+async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, hub: Arc<approvals::Hub>) -> Result<()> {
     let req = tokio::time::timeout(HEADER_TIMEOUT, read_request(&mut stream)).await??;
     let bound_ip = local.ip().to_string();
     let host_reason = auth::host_origin_reason(req.header("host"), req.header("origin"), local.port(), &bound_ip);
@@ -254,11 +285,23 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -
         if !token_ok {
             return rpc::close(ws, 4401, "unauthorized").await;
         }
-        return rpc::run(ws, config).await;
+        return rpc::run(ws, config, hub).await;
     }
 
     if host_reason.is_some() {
         return respond(&mut stream, "403 Forbidden", &json!({"detail": "host not allowed"})).await;
+    }
+    if req.method == "POST" && req.path == "/api/sovereign/approve" {
+        let secret_ok = auth::token_matches(&config.approval_secret, req.header("x-sovereign-approval-secret"));
+        if !secret_ok {
+            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+        }
+        let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+        let Some((session, tool, command, reason)) = approvals::parse_request(&body) else {
+            return respond(&mut stream, "400 Bad Request", &json!({"detail": "bad approval request"})).await;
+        };
+        let choice = hub.decide(&session, &tool, &command, &reason).await;
+        return respond(&mut stream, "200 OK", &json!({"choice": choice})).await;
     }
     let public = json!({"ok": true, "version": config.version, "auth_required": false});
     match (req.method.as_str(), req.path.as_str()) {

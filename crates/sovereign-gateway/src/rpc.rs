@@ -1,6 +1,7 @@
 //! One WebSocket client: JSON-RPC 2.0 in, harness API calls out, harness
 //! events translated back into Hermes `event` notifications.
 
+use crate::approvals::{Client, Hub};
 use crate::map::{self, Out, SessionState};
 use crate::{Config, MAX_FRAME_BYTES};
 use anyhow::{Result, anyhow};
@@ -79,6 +80,9 @@ struct Conn {
     in_flight: Arc<tokio::sync::Semaphore>,
     /// `prompt.submit` callers waiting for jcode's `message_accepted`.
     accept_waiters: Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>,
+    hub: Arc<Hub>,
+    /// This connection as seen by the approval hub.
+    client: Arc<Client>,
 }
 
 impl Conn {
@@ -166,6 +170,7 @@ impl Conn {
         match self.call_on(&link, json!({ "req": "attach_session", "session_id": session_id })).await {
             Ok(reply) => {
                 self.links.lock().await.insert(session_id.to_string(), link);
+                self.client.sessions.lock().await.insert(session_id.to_string());
                 if reply["session"].is_object() {
                     self.known.lock().await.insert(session_id.to_string(), reply["session"].clone());
                 }
@@ -207,6 +212,9 @@ impl Conn {
     }
 
     async fn on_harness_frame(&self, frame: Value) {
+        if std::env::var_os("SOVEREIGN_GATEWAY_TRACE").is_some() {
+            eprintln!("sovereign-gateway: harness {}", frame.to_string().chars().take(300).collect::<String>());
+        }
         if frame["ev"] == "message_accepted" {
             if let Some(sid) = frame["session_id"].as_str() {
                 for waiter in self.accept_waiters.lock().await.remove(sid).unwrap_or_default() {
@@ -370,6 +378,7 @@ impl Conn {
                     .map_err(RpcError::internal)?;
                 let id = reply["session"]["session_id"].as_str().unwrap_or_default().to_string();
                 self.links.lock().await.insert(id.clone(), link);
+                self.client.sessions.lock().await.insert(id.clone());
                 self.known.lock().await.insert(id.clone(), reply["session"].clone());
                 if let Some(title) = p["title"].as_str().filter(|t| !t.is_empty()) {
                     let _ = self.call(json!({ "req": "rename_session", "session_id": id, "title": title })).await;
@@ -487,7 +496,8 @@ impl Conn {
                         .collect();
                     keys.into_iter().filter_map(|k| approvals.remove(&k)).collect()
                 };
-                let resolved = matching.len();
+                let mut resolved = matching.len();
+                resolved += self.hub.answer_session(&id, wanted.as_deref(), &choice).await;
                 for (session, request) in matching {
                     self.resolve_approval(&session, &request, &choice).await.map_err(RpcError::internal)?;
                 }
@@ -564,8 +574,11 @@ impl Conn {
     /// A reply to one of our server requests (currently only `approval`).
     async fn on_client_reply(&self, frame: &Value) {
         let Some(id) = frame["id"].as_str() else { return };
-        let Some((session, request)) = self.approvals.lock().await.remove(id) else { return };
         let choice = frame["result"]["choice"].as_str().unwrap_or("deny");
+        if self.hub.answer(id, choice).await {
+            return;
+        }
+        let Some((session, request)) = self.approvals.lock().await.remove(id) else { return };
         let _ = self.resolve_approval(&session, &request, choice).await;
     }
 }
@@ -585,9 +598,11 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
-pub async fn run(ws: Ws, config: Arc<Config>) -> Result<()> {
+pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
+    let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
+    hub.add(client.clone()).await;
     let conn = Arc::new(Conn {
         config,
         to_ws,
@@ -602,6 +617,8 @@ pub async fn run(ws: Ws, config: Arc<Config>) -> Result<()> {
         approvals: Mutex::new(HashMap::new()),
         in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
         accept_waiters: Mutex::new(HashMap::new()),
+        hub: hub.clone(),
+        client: client.clone(),
     });
 
     // Control link first: if the engine is unreachable, refuse the client.
@@ -670,6 +687,7 @@ pub async fn run(ws: Ws, config: Arc<Config>) -> Result<()> {
     }
 
     writer.abort();
+    hub.remove(client.id).await;
     for task in conn.link_tasks.lock().await.drain(..) {
         task.abort();
     }

@@ -50,9 +50,34 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("__repl-worker") {
         return Ok(sovereign_prime::worker::run(sovereign_prime::worker::Limits::default())?);
     }
+    // pre_tool gate (spawned by jcode before each tool call): ask a human
+    // before risky shell commands. Exit 0 allows, 2 blocks.
+    if std::env::args().nth(1).as_deref() == Some("__pre-tool") {
+        let file = jcode::storage::jcode_dir().map(|d| d.join("sovereign-approval.json")).unwrap_or_default();
+        std::process::exit(sovereign_gateway::approvals::hook::run(&file));
+    }
+    // Keep the desktop's session token out of the environment that tool
+    // subprocesses (including the model's shell commands) inherit.
+    if let Ok(token) = std::env::var("HERMES_DASHBOARD_SESSION_TOKEN") {
+        // SAFETY: single-threaded here, before the runtime starts.
+        unsafe { std::env::remove_var("HERMES_DASHBOARD_SESSION_TOKEN") };
+        sovereign_gateway::auth::set_launch_token(token);
+    }
     if let Ok(exe) = std::env::current_exe() {
         // SAFETY: single-threaded here, before the runtime starts.
-        unsafe { std::env::set_var("SOVEREIGN_REPL_WORKER", exe) };
+        unsafe { std::env::set_var("SOVEREIGN_REPL_WORKER", &exe) };
+        // Human approval gate for risky shell commands, unless the user
+        // configured their own pre_tool hook. The long timeout keeps jcode
+        // from failing open while a person decides; the hook gives up (deny)
+        // first.
+        if std::env::var_os("JCODE_HOOK_PRE_TOOL").is_none() {
+            let hook = format!("\"{}\" __pre-tool", exe.display());
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var("JCODE_HOOK_PRE_TOOL", hook);
+                std::env::set_var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS", "600000");
+            }
+        }
     }
     // Sovereign: nothing leaves the machine except model calls. jcode's
     // anonymous usage telemetry is disabled unconditionally.
