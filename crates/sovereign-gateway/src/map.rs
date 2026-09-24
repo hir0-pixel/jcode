@@ -256,6 +256,32 @@ pub fn session_row(info: &Value) -> Value {
     })
 }
 
+/// jcode `SessionInfo` → desktop REST `SessionInfo` (`types/hermes.ts`).
+pub fn session_info(info: &Value) -> Value {
+    let row = session_row(info);
+    let secs = row["started_at"].clone();
+    json!({
+        "id": row["id"],
+        "title": row["title"],
+        "preview": "",
+        "source": "desktop",
+        "started_at": secs,
+        "last_active": secs,
+        "ended_at": null,
+        "is_active": info["status"] == "running",
+        "message_count": 0,
+        "tool_call_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "model": null,
+        "cwd": info["working_dir"],
+        "parent_session_id": info["parent_session_id"],
+        "archived": info["archived"].as_bool().unwrap_or(false),
+        "profile": "default",
+        "is_default_profile": true,
+    })
+}
+
 /// jcode history message → Hermes `TranscriptMessage`.
 pub fn transcript(messages: &Value) -> Vec<Value> {
     messages

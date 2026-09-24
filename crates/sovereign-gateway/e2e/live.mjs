@@ -170,6 +170,15 @@ check(!f.error, 'session.create succeeds')
 if (!f.error) validate('result', 'session.create', results['session.create'], f.result)
 const sid = f.result?.session_id
 
+const auth = { 'x-hermes-session-token': token }
+r = await get('/api/profiles/sessions?limit=20&offset=0&min_messages=0&archived=false&order=recent&profile=all')
+check(r.status === 401, 'session REST route refuses a missing token')
+for (const route of ['/api/model/info', '/api/profiles', '/api/profiles/active', '/api/hermes/update/check', '/api/fs/default-cwd', '/api/cron/jobs']) {
+  r = await get(route, auth)
+  check(r.status === 200, `${route} answers`)
+}
+r = await get('/api/hermes/update/check', auth)
+check((await r.json()).update_available === false, 'update check never offers the Hermes updater')
 f = await rpc('session.list', { limit: 20 })
 if (!f.error) validate('result', 'session.list', results['session.list'], f.result)
 check(f.result?.sessions?.some(s => s.id === sid), 'session.list includes the new session')
@@ -182,6 +191,8 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
   const done = await waitFor(e => e.type === 'message.complete' && e.session_id === sid, 600_000).catch(e => fail(e.message))
   if (done) {
     console.log('     reply:', JSON.stringify(done.payload.text).slice(0, 200), `(${((Date.now() - t0) / 1000).toFixed(1)}s)`)
+    const u = done.payload.usage || {}
+    console.log(`     usage: input ${u.input} tokens, output ${u.output}, calls ${u.calls}, cache_read ${u.cache_read}`)
     check(done.payload.status === 'complete', 'turn completed')
     check(/PONG/i.test(done.payload.text), 'reply streamed back through the gateway')
     const seqs = events.filter(e => e.session_id === sid).map(e => e.seq)
@@ -192,6 +203,13 @@ if (process.env.E2E_SKIP_CHAT !== '1' && sid) {
   if (!f.error) validate('result', 'session.history', results['session.history'], f.result)
   check((f.result?.count ?? 0) >= 2, 'history holds the exchange')
 
+  // jcode persists a session once it holds a message; REST lists stored sessions
+r = await get('/api/profiles/sessions?limit=20&offset=0&min_messages=0&archived=false&order=recent&profile=all', auth)
+  const paged = await r.json(); if (process.env.E2E_DEBUG) console.log('PAGED', JSON.stringify(paged).slice(0, 600))
+  check(r.status === 200 && paged.sessions.some(x => x.id === sid) && paged.total >= 1, '/api/profiles/sessions lists the session')
+  r = await get('/api/profiles/sessions/sidebar?recents_profile=default&recents_limit=10&cron_limit=5&messaging_limit=5', auth)
+  const side = await r.json()
+  check(r.status === 200 && side.recents.sessions.some(x => x.id === sid) && Array.isArray(side.cron.sessions), 'sidebar batch lists the session')
   // resume returns the same transcript
   f = await rpc('session.resume', { session_id: sid })
   if (!f.error) validate('result', 'session.resume', results['session.resume'], f.result)

@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_tungstenite::WebSocketStream;
@@ -158,6 +158,64 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<(
     Ok(())
 }
 
+fn query_u64(req: &Request, key: &str) -> Option<u64> {
+    auth::query_param(req.query.as_deref()?, key)?.parse().ok()
+}
+
+/// One request/reply against the engine over a short-lived in-process bridge,
+/// for HTTP routes that have no WebSocket connection to ride on.
+async fn harness_request(legacy_socket: &std::path::Path, request: Value) -> Result<Value> {
+    let (ours, theirs) = tokio::io::duplex(MAX_FRAME_BYTES);
+    let (their_read, their_write) = tokio::io::split(theirs);
+    let bridge = tokio::spawn(jcode_harness_api_server::run_bridge_stream(
+        their_read,
+        their_write,
+        legacy_socket.to_path_buf(),
+    ));
+    let (our_read, mut our_write) = tokio::io::split(ours);
+    let mut lines = BufReader::new(our_read).lines();
+    let result = async {
+        let hello = json!({"v": 1, "id": 0, "req": "hello", "min_version": 1, "max_version": 1, "client": "sovereign-gateway-http"});
+        our_write.write_all(format!("{hello}\n").as_bytes()).await?;
+        lines.next_line().await?.context("engine closed")?;
+        let mut frame = request;
+        frame["v"] = json!(1);
+        frame["id"] = json!(1);
+        our_write.write_all(format!("{frame}\n").as_bytes()).await?;
+        loop {
+            let line = lines.next_line().await?.context("engine closed")?;
+            let reply: Value = serde_json::from_str(&line)?;
+            if reply["reply_to"] == 1 {
+                if reply["ev"] == "error" {
+                    bail!("{}", reply["message"].as_str().unwrap_or("engine error"));
+                }
+                return Ok(reply);
+            }
+        }
+    };
+    let result = tokio::time::timeout(Duration::from_secs(20), result).await.context("engine timed out")?;
+    bridge.abort();
+    result
+}
+
+async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> Result<Vec<Value>> {
+    let reply = harness_request(
+        &config.legacy_socket,
+        json!({"req": "list_sessions", "limit": limit, "include_archived": include_archived}),
+    )
+    .await?;
+    Ok(reply["sessions"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|s| s["parent_session_id"].is_null())
+                .filter(|s| include_archived || s["archived"] != true)
+                .map(map::session_info)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -> Result<()> {
     let req = tokio::time::timeout(HEADER_TIMEOUT, read_request(&mut stream)).await??;
     let bound_ip = local.ip().to_string();
@@ -210,6 +268,55 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>) -
             respond(&mut stream, "200 OK", &body).await
         }
         _ if !token_ok => respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await,
+        ("GET", "/api/model/info") => {
+            let body = json!({"model": config.model, "provider": config.provider, "capabilities": {}});
+            respond(&mut stream, "200 OK", &body).await
+        }
+        ("GET", "/api/profiles") => {
+            let body = json!({"profiles": [{
+                "name": "default", "display_name": "Default", "path": config.home, "is_default": true,
+                "has_env": false, "model": config.model, "provider": config.provider, "skill_count": 0,
+            }]});
+            respond(&mut stream, "200 OK", &body).await
+        }
+        ("GET", "/api/profiles/active") => {
+            respond(&mut stream, "200 OK", &json!({"active": "default", "default": "default"})).await
+        }
+        ("GET", "/api/profiles/sessions") => {
+            let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 1000);
+            let archived = auth::query_param(req.query.as_deref().unwrap_or_default(), "archived").as_deref() == Some("true");
+            match session_infos(&config, limit, archived).await {
+                Ok(sessions) => {
+                    let total = sessions.len();
+                    let body = json!({"sessions": sessions, "total": total, "limit": limit, "offset": 0});
+                    respond(&mut stream, "200 OK", &body).await
+                }
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/profiles/sessions/sidebar") => {
+            let limit = query_u64(&req, "recents_limit").unwrap_or(50).clamp(1, 1000);
+            match session_infos(&config, limit, false).await {
+                Ok(sessions) => {
+                    let empty = json!({"sessions": []});
+                    let body = json!({"recents": {"sessions": sessions}, "cron": empty, "messaging": empty});
+                    respond(&mut stream, "200 OK", &body).await
+                }
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/hermes/update/check") => {
+            let body = json!({
+                "install_method": "sovereign-engine", "current_version": config.version, "behind": 0,
+                "update_available": false, "can_apply": false, "update_command": null,
+                "message": "The engine is updated with its own release, not the Hermes updater.",
+            });
+            respond(&mut stream, "200 OK", &body).await
+        }
+        ("GET", "/api/fs/default-cwd") => {
+            respond(&mut stream, "200 OK", &json!({"cwd": config.default_cwd, "branch": null})).await
+        }
+        ("GET", "/api/cron/jobs") => respond(&mut stream, "200 OK", &json!([])).await,
         ("GET", "/api/host/identity") => {
             let body = json!({"ok": true, "protocolVersion": 1, "pid": std::process::id(), "role": "serve"});
             respond(&mut stream, "200 OK", &body).await
