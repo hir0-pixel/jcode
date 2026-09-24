@@ -56,6 +56,16 @@ fn main() -> Result<()> {
         let file = jcode::storage::jcode_dir().map(|d| d.join("sovereign-approval.json")).unwrap_or_default();
         std::process::exit(sovereign_gateway::approvals::hook::run(&file));
     }
+    #[cfg(unix)]
+    if let Some(parent) = std::env::var("HERMES_PARENT_PID").ok().and_then(|pid| pid.parse::<libc::pid_t>().ok()) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // A direct Electron child is reparented when the app is force-killed.
+            if unsafe { libc::getppid() } != parent {
+                std::process::exit(0);
+            }
+        });
+    }
     // Keep the desktop's session token out of the environment that tool
     // subprocesses (including the model's shell commands) inherit.
     if let Ok(token) = std::env::var("HERMES_DASHBOARD_SESSION_TOKEN") {
