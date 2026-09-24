@@ -6,7 +6,7 @@ use crate::{Config, MAX_FRAME_BYTES};
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -61,7 +61,15 @@ impl RpcError {
 struct Conn {
     config: Arc<Config>,
     to_ws: mpsc::Sender<Message>,
-    to_harness: mpsc::Sender<String>,
+    /// Control link: session-less requests (list, ping).
+    control: Mutex<Option<mpsc::Sender<String>>>,
+    /// One bridge link per session: jcode's API bridge attaches exactly one
+    /// session per connection, while the desktop multiplexes many.
+    links: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    link_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// jcode `SessionInfo` for sessions this client created or attached, so a
+    /// new, still-empty session (not yet persisted) appears in `session.list`.
+    known: Mutex<HashMap<String, Value>>,
     next_id: AtomicU64,
     next_server_request: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
@@ -69,9 +77,6 @@ struct Conn {
     /// Hermes server-request id → (session, jcode permission request id).
     approvals: Mutex<HashMap<String, (String, String)>>,
     in_flight: Arc<tokio::sync::Semaphore>,
-    /// Sessions this connection is attached to; jcode only accepts
-    /// session-scoped requests on an attached connection.
-    attached: Mutex<HashSet<String>>,
     /// `prompt.submit` callers waiting for jcode's `message_accepted`.
     accept_waiters: Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>,
 }
@@ -79,7 +84,12 @@ struct Conn {
 impl Conn {
     /// Send one harness request and await its direct reply.
     async fn call(&self, request: Value) -> Result<Value> {
-        let rx = self.send_request(request).await?;
+        let link = self.route(&request).await?;
+        self.call_on(&link, request).await
+    }
+
+    async fn call_on(&self, link: &mpsc::Sender<String>, request: Value) -> Result<Value> {
+        let rx = self.send_on(link, request).await?;
         let reply = tokio::time::timeout(HARNESS_CALL_TIMEOUT, rx)
             .await
             .map_err(|_| anyhow!("engine did not reply in time"))?
@@ -87,33 +97,91 @@ impl Conn {
         check_reply(reply)
     }
 
-    async fn send_request(&self, request: Value) -> Result<oneshot::Receiver<Value>> {
+    /// The link a request belongs on: its session's link, else the control link.
+    async fn route(&self, request: &Value) -> Result<mpsc::Sender<String>> {
+        if let Some(sid) = request["session_id"].as_str() {
+            if let Some(link) = self.links.lock().await.get(sid) {
+                return Ok(link.clone());
+            }
+        }
+        self.control.lock().await.clone().ok_or_else(|| anyhow!("engine connection closed"))
+    }
+
+    async fn send_on(&self, link: &mpsc::Sender<String>, request: Value) -> Result<oneshot::Receiver<Value>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         let mut frame = request;
         frame["v"] = json!(1);
         frame["id"] = json!(id);
-        self.to_harness.send(frame.to_string()).await.map_err(|_| anyhow!("engine connection closed"))?;
+        link.send(frame.to_string()).await.map_err(|_| anyhow!("engine connection closed"))?;
         Ok(rx)
     }
 
+    /// Open a new in-process bridge link and start pumping its frames.
+    async fn open_link(self: &Arc<Self>) -> Result<mpsc::Sender<String>> {
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME_BYTES);
+        let (their_read, their_write) = tokio::io::split(theirs);
+        let bridge = tokio::spawn(jcode_harness_api_server::run_bridge_stream(
+            their_read,
+            their_write,
+            self.config.legacy_socket.clone(),
+        ));
+        let (our_read, mut our_write) = tokio::io::split(ours);
+        let hello = json!({"v": 1, "id": 0, "req": "hello", "min_version": 1, "max_version": 1, "client": "sovereign-gateway"});
+        our_write.write_all(format!("{hello}\n").as_bytes()).await?;
+        let mut lines = BufReader::new(our_read).lines();
+        let hello_ok: Value = serde_json::from_str(&lines.next_line().await?.ok_or_else(|| anyhow!("engine closed"))?)?;
+        if hello_ok["ev"] != "hello_ok" {
+            bridge.abort();
+            return Err(anyhow!("engine unavailable"));
+        }
+        let (tx, mut rx) = mpsc::channel::<String>(256);
+        let writer = tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                if our_write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let weak = Arc::downgrade(self);
+        let reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Some(conn) = weak.upgrade() else { break };
+                if let Ok(frame) = serde_json::from_str::<Value>(&line) {
+                    conn.on_harness_frame(frame).await;
+                }
+            }
+        });
+        self.link_tasks.lock().await.extend([bridge.abort_handle(), writer.abort_handle(), reader.abort_handle()]);
+        Ok(tx)
+    }
+
     /// Attach this connection to `session_id` once.
-    async fn ensure_attached(&self, session_id: &str) -> Result<Value> {
-        if self.attached.lock().await.contains(session_id) {
+    async fn ensure_attached(self: &Arc<Self>, session_id: &str) -> Result<Value> {
+        if self.links.lock().await.contains_key(session_id) {
             return Ok(Value::Null);
         }
-        let reply = self.call(json!({ "req": "attach_session", "session_id": session_id })).await?;
-        self.attached.lock().await.insert(session_id.to_string());
-        Ok(reply)
+        let link = self.open_link().await?;
+        match self.call_on(&link, json!({ "req": "attach_session", "session_id": session_id })).await {
+            Ok(reply) => {
+                self.links.lock().await.insert(session_id.to_string(), link);
+                if reply["session"].is_object() {
+                    self.known.lock().await.insert(session_id.to_string(), reply["session"].clone());
+                }
+                Ok(reply)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Send a message and wait until jcode acknowledges it (or rejects it).
-    async fn submit(&self, session_id: &str, text: &str) -> Result<()> {
+    async fn submit(self: &Arc<Self>, session_id: &str, text: &str) -> Result<()> {
         self.ensure_attached(session_id).await?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.accept_waiters.lock().await.entry(session_id.to_string()).or_default().push(accepted_tx);
-        let reply = self.send_request(json!({ "req": "send_message", "session_id": session_id, "content": text })).await?;
+        let link = self.route(&json!({ "session_id": session_id })).await?;
+        let reply = self.send_on(&link, json!({ "req": "send_message", "session_id": session_id, "content": text })).await?;
         tokio::select! {
             _ = accepted_rx => Ok(()),
             reply = reply => match reply {
@@ -191,7 +259,7 @@ impl Conn {
         Ok(())
     }
 
-    async fn dispatch(&self, method: &str, p: &Value) -> Result<Value, RpcError> {
+    async fn dispatch(self: &Arc<Self>, method: &str, p: &Value) -> Result<Value, RpcError> {
         let sid = || p["session_id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError::params("session_id is required"));
         let call = |req: Value| async move { self.call(req).await.map_err(RpcError::internal) };
         match method {
@@ -283,9 +351,14 @@ impl Conn {
             "client.capabilities" => Ok(json!({ "server_requests": ["approval"] })),
             "session.create" => {
                 let cwd = p["cwd"].as_str().unwrap_or(&self.config.default_cwd).to_string();
-                let reply = call(json!({ "req": "create_session", "working_dir": cwd })).await?;
+                let link = self.open_link().await.map_err(RpcError::internal)?;
+                let reply = self
+                    .call_on(&link, json!({ "req": "create_session", "working_dir": cwd }))
+                    .await
+                    .map_err(RpcError::internal)?;
                 let id = reply["session"]["session_id"].as_str().unwrap_or_default().to_string();
-                self.attached.lock().await.insert(id.clone());
+                self.links.lock().await.insert(id.clone(), link);
+                self.known.lock().await.insert(id.clone(), reply["session"].clone());
                 if let Some(title) = p["title"].as_str().filter(|t| !t.is_empty()) {
                     let _ = self.call(json!({ "req": "rename_session", "session_id": id, "title": title })).await;
                 }
@@ -300,8 +373,7 @@ impl Conn {
             }
             "session.resume" => {
                 let id = sid()?.to_string();
-                let attached = call(json!({ "req": "attach_session", "session_id": id })).await?;
-                self.attached.lock().await.insert(id.clone());
+                let attached = self.ensure_attached(&id).await.map_err(RpcError::internal)?;
                 let cwd = attached["session"]["working_dir"].as_str().unwrap_or(&self.config.default_cwd).to_string();
                 let messages = if p["omit_messages"].as_bool() == Some(true) {
                     Vec::new()
@@ -333,10 +405,15 @@ impl Conn {
                     req["limit"] = json!(limit.min(1000));
                 }
                 let reply = call(req).await?;
-                let rows: Vec<Value> = reply["sessions"]
+                let mut rows: Vec<Value> = reply["sessions"]
                     .as_array()
                     .map(|list| list.iter().filter(|s| s["parent_session_id"].is_null()).map(map::session_row).collect())
                     .unwrap_or_default();
+                for (id, info) in self.known.lock().await.iter() {
+                    if info["parent_session_id"].is_null() && !rows.iter().any(|r| r["id"] == id.as_str()) {
+                        rows.insert(0, map::session_row(info));
+                    }
+                }
                 Ok(json!({ "sessions": rows }))
             }
             "prompt.submit" => {
@@ -438,62 +515,35 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
 pub async fn run(ws: Ws, config: Arc<Config>) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
-    let (to_harness, mut harness_out) = mpsc::channel::<String>(256);
-
-    // In-process harness bridge over an in-memory duplex.
-    let (ours, theirs) = tokio::io::duplex(MAX_FRAME_BYTES);
-    let (their_read, their_write) = tokio::io::split(theirs);
-    let bridge = tokio::spawn(jcode_harness_api_server::run_bridge_stream(
-        their_read,
-        their_write,
-        config.legacy_socket.clone(),
-    ));
-    let (our_read, mut our_write) = tokio::io::split(ours);
-
     let conn = Arc::new(Conn {
         config,
         to_ws,
-        to_harness,
+        control: Mutex::new(None),
+        links: Mutex::new(HashMap::new()),
+        link_tasks: Mutex::new(Vec::new()),
+        known: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
         in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
-        attached: Mutex::new(HashSet::new()),
         accept_waiters: Mutex::new(HashMap::new()),
     });
 
-    // Handshake with the bridge before accepting client traffic.
-    let hello = json!({"v": 1, "id": 0, "req": "hello", "min_version": 1, "max_version": 1, "client": "sovereign-gateway"});
-    our_write.write_all(format!("{hello}\n").as_bytes()).await?;
-    let mut lines = BufReader::new(our_read).lines();
-    let hello_ok: Value = serde_json::from_str(&lines.next_line().await?.ok_or_else(|| anyhow!("engine closed"))?)?;
-    if hello_ok["ev"] != "hello_ok" {
-        let _ = ws_tx.send(Message::Close(Some(CloseFrame { code: CloseCode::from(1011), reason: "engine unavailable".into() }))).await;
-        bridge.abort();
-        return Ok(());
+    // Control link first: if the engine is unreachable, refuse the client.
+    match conn.open_link().await {
+        Ok(control) => *conn.control.lock().await = Some(control),
+        Err(_) => {
+            let _ = ws_tx.send(Message::Close(Some(CloseFrame { code: CloseCode::from(1011), reason: "engine unavailable".into() }))).await;
+            return Ok(());
+        }
     }
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = ws_out.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
-            }
-        }
-    });
-    let harness_writer = tokio::spawn(async move {
-        while let Some(line) = harness_out.recv().await {
-            if our_write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
-                break;
-            }
-        }
-    });
-    let reader_conn = conn.clone();
-    let harness_reader = tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(frame) = serde_json::from_str::<Value>(&line) {
-                reader_conn.on_harness_frame(frame).await;
             }
         }
     });
@@ -547,8 +597,8 @@ pub async fn run(ws: Ws, config: Arc<Config>) -> Result<()> {
     }
 
     writer.abort();
-    harness_writer.abort();
-    harness_reader.abort();
-    bridge.abort();
+    for task in conn.link_tasks.lock().await.drain(..) {
+        task.abort();
+    }
     Ok(())
 }
