@@ -9,6 +9,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod features;
 pub mod map;
 mod rpc;
 
