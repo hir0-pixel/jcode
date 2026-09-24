@@ -1271,49 +1271,7 @@ impl MemoryManager {
         if imported > 0 {
             crate::logging::info(&format!("Imported {imported} memories from JSON into {}", db.display()));
         }
-        let hermes = crate::memory_store::once(db, "hermes_imported", || self.import_hermes_memories())?;
-        if hermes > 0 {
-            crate::logging::info(&format!("Imported {hermes} Hermes memories (MEMORY.md / USER.md)"));
-        }
         Ok(())
-    }
-
-    /// Moving from Hermes: its MEMORY.md (facts) and USER.md (about the user)
-    /// become user-stated global memories, deduplicated. Hermes's files are
-    /// only read, never changed.
-    fn import_hermes_memories(&self) -> Result<usize> {
-        let home = match std::env::var_os("HERMES_HOME") {
-            Some(home) => PathBuf::from(home),
-            None => match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(".hermes"),
-                None => return Ok(0),
-            },
-        };
-        let mut graph = self.load_global_graph_uncached()?;
-        let mut added = 0;
-        for (file, category) in [("MEMORY.md", MemoryCategory::Fact), ("USER.md", MemoryCategory::Preference)] {
-            let Ok(raw) = std::fs::read_to_string(home.join("memories").join(file)) else {
-                continue;
-            };
-            for text in crate::memory_store::hermes_entries(&raw) {
-                let mut entry = MemoryEntry::new(category.clone(), text);
-                entry.trust = TrustLevel::High;
-                entry.source = Some(format!("hermes:{file}"));
-                let before = graph.memories.len();
-                Self::remember_in_graph(&mut graph, entry);
-                added += graph.memories.len() - before;
-            }
-        }
-        if added > 0 {
-            crate::memory_store::save_graph(&self.db_path()?, "global", &graph, None)?;
-        }
-        Ok(added)
-    }
-
-    /// The stored global graph, straight from the database (used while the
-    /// one-time imports run, before anything is cached).
-    fn load_global_graph_uncached(&self) -> Result<MemoryGraph> {
-        Ok(crate::memory_store::load_graph(&self.db_path()?, "global")?.unwrap_or_default())
     }
 
     /// Save project memories as a MemoryGraph

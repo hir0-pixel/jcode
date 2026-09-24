@@ -323,15 +323,6 @@ pub(crate) fn import_json_once(db_path: &Path, memory_dir: &Path, load: impl Fn(
     })
 }
 
-/// Entries of a Hermes memory file (`MEMORY.md` / `USER.md`): split on the
-/// full `\n§\n` delimiter; entries Hermes blocked as injected content skipped.
-pub(crate) fn hermes_entries(raw: &str) -> Vec<String> {
-    raw.split("\n§\n")
-        .map(str::trim)
-        .filter(|e| !e.is_empty() && !e.starts_with("[BLOCKED:"))
-        .map(str::to_string)
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {

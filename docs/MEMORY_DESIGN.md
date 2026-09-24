@@ -21,9 +21,6 @@ Status (2026-09-24): M1 built, M2 in progress. Where the build departed from thi
 - **No `memory_injections` table:** jcode already records each injection in the session
   (persisted) and restores the inject-once set when a session is resumed; a table would
   store the same fact twice.
-- **Hermes import:** on first run, `$HERMES_HOME/memories/MEMORY.md` (facts) and `USER.md`
-  (about the user) are imported once as user-stated memories, deduplicated; entries Hermes
-  blocked as injected content are skipped; Hermes's files are only read.
 
 
 Goal: one app with jcode-level token and RAM efficiency, Prime-style self-improvement and
