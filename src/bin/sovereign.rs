@@ -10,7 +10,9 @@ use anyhow::Result;
 
 // Counts allocations so a REPL worker (this binary with `__repl-worker`) can
 // enforce a hard memory ceiling. The engine process never arms a limit, so
-// for it this is the system allocator plus one counter.
+// for it this is the system allocator plus one counter. monty-alloc is
+// Unix-only in this workspace today.
+#[cfg(unix)]
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 

@@ -1,6 +1,7 @@
 //! Standalone REPL worker (tests and diagnostics). The sovereign binary runs
 //! the same worker for `sovereign __repl-worker`.
 
+#[cfg(unix)]
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
