@@ -11,8 +11,10 @@ jcode-storage = { path = "../jcode-storage" }
 monty = "0.0.23"
 monty-alloc = "0.0.23"
 monty-types = "0.0.23"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "process", "io-util", "sync", "time", "rt", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt-multi-thread", "macros"] }

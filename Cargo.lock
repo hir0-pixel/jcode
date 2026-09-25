@@ -7758,8 +7758,10 @@ dependencies = [
  "monty",
  "monty-alloc",
  "monty-types",
+ "rusqlite",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
