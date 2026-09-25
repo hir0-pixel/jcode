@@ -489,7 +489,11 @@ impl Conn {
                 return None;
             }
             let sid = s["session_id"].as_str()?;
-            if sid == subagent_id || s["agent_label"].as_str() == Some(subagent_id) {
+            if sid == subagent_id
+                || s["agent_label"].as_str() == Some(subagent_id)
+                || s["title"].as_str() == Some(subagent_id)
+                || s["friendly_name"].as_str() == Some(subagent_id)
+            {
                 Some(sid.to_string())
             } else {
                 None
@@ -655,8 +659,9 @@ impl Conn {
                 let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
                     return Ok(json!({ "found": false, "subagent_id": subagent_id }));
                 };
-                call(json!({ "req": "cancel", "session_id": child })).await?;
-                Ok(json!({ "found": true, "subagent_id": subagent_id }))
+                // Best-effort: a finished child may reject cancel.
+                let cancelled = call(json!({ "req": "cancel", "session_id": child })).await.is_ok();
+                Ok(json!({ "found": true, "subagent_id": subagent_id, "child_session_id": child, "cancelled": cancelled }))
             }
             "subagent.steer" => {
                 let parent = sid()?;

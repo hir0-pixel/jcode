@@ -585,17 +585,23 @@ pub struct Heartbeat {
 impl Heartbeat {
     pub fn new(session_id: impl Into<String>, prompt: impl Into<String>, interval_seconds: i64) -> Self {
         let now = now_ms();
+        let floor = std::env::var("SOVEREIGN_HEARTBEAT_MIN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60i64)
+            .max(1);
+        let interval = interval_seconds.max(floor);
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.into(),
             source: "user".to_string(),
             prompt: prompt.into(),
             status: HeartbeatStatus::Active,
-            interval_seconds: interval_seconds.max(60),
+            interval_seconds: interval,
             created_at_ms: now,
-            // Due immediately on first poll after set (Prime/Hermes: first fire after interval;
-            // for tests we allow due when last_fired is 0 and age >= interval from created).
-            last_fired_at_ms: now,
+            // In test floors (<60s), make the first tick due immediately so e2e
+            // can observe a fire without waiting a full minute.
+            last_fired_at_ms: if floor < 60 { now - interval * 1000 } else { now },
             fire_count: 0,
         }
     }
