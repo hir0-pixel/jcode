@@ -33,6 +33,9 @@ mod panel;
 mod patch;
 mod read;
 mod refine;
+mod session_goal;
+mod session_heartbeat;
+mod delegate;
 mod repl;
 mod replace;
 pub(crate) mod sdk;
@@ -587,6 +590,9 @@ impl Registry {
         // same gate as the REPL (both are sovereign-prime features).
         if is_sovereign_engine {
             Self::insert_tool(&mut tools_map, "refine", refine::RefineTool);
+            Self::insert_tool(&mut tools_map, "session_goal", session_goal::SessionGoalTool);
+            Self::insert_tool(&mut tools_map, "heartbeat", session_heartbeat::SessionHeartbeatTool);
+            Self::insert_tool(&mut tools_map, "delegate", delegate::DelegateTool::new());
         }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 

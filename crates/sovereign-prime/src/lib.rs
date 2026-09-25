@@ -7,6 +7,8 @@
 //! memory-capped worker process so a runaway snippet cannot take the engine
 //! down.
 
+pub mod agent_loop;
+pub mod agent_loop_host;
 pub mod entries;
 pub mod harness;
 pub mod learning;

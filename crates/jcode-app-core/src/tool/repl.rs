@@ -102,6 +102,24 @@ impl Tool for ReplTool {
             })
         });
         let session_id = ctx.session_id.clone();
+        let session_for_host = ctx.session_id.clone();
+        let goal: sovereign_prime::host::HostFn = Arc::new(move |op_json: String| {
+            let session_id = session_for_host.clone();
+            Box::pin(async move {
+                let home = jcode_base::storage::jcode_dir()?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(&home)?;
+                sovereign_prime::agent_loop_host::goal_host(&store, &session_id, &op_json)
+            })
+        });
+        let session_for_hb = ctx.session_id.clone();
+        let heartbeat: sovereign_prime::host::HostFn = Arc::new(move |op_json: String| {
+            let session_id = session_for_hb.clone();
+            Box::pin(async move {
+                let home = jcode_base::storage::jcode_dir()?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(&home)?;
+                sovereign_prime::agent_loop_host::heartbeat_host(&store, &session_id, &op_json)
+            })
+        });
         let refine: sovereign_prime::host::Refine = Arc::new(move |op_json: String| {
             let session_id = session_id.clone();
             Box::pin(async move {
@@ -117,9 +135,14 @@ impl Tool for ReplTool {
                 }
             })
         });
+        let extra = sovereign_prime::host::ExtraHostFns {
+            goal,
+            heartbeat,
+            ..sovereign_prime::host::ExtraHostFns::default()
+        };
         let out = self
             .host
-            .run(&ctx.session_id, code, ctx.working_dir.as_deref(), llm_query, refine)
+            .run(&ctx.session_id, code, ctx.working_dir.as_deref(), llm_query, refine, extra)
             .await?;
         let mut text = String::new();
         if out.fresh_state {

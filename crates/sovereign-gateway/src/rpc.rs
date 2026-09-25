@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -269,9 +270,11 @@ impl Conn {
                 Out::Event { ty, session_id, payload } => {
                     self.observer.event(&session_id, ty, &payload);
                     let completed = ty == "message.complete";
+                    let payload_for_loop = completed.then(|| payload.clone());
                     self.emit(ty, Some(&session_id), payload).await;
-                    if completed {
-                        self.schedule_learning(session_id);
+                    if let Some(loop_payload) = payload_for_loop {
+                        self.schedule_learning(session_id.clone());
+                        self.schedule_agent_loop(session_id, loop_payload);
                     }
                 }
                 Out::Approval { session_id, request_id, tool_name, description } => {
@@ -357,6 +360,143 @@ impl Conn {
         });
     }
 
+    /// After a completed turn, maybe inject goal/autonomous/heartbeat continuation.
+    fn schedule_agent_loop(self: &Arc<Self>, session_id: String, payload: Value) {
+        let conn = self.clone();
+        tokio::spawn(async move {
+            let home = Path::new(&conn.config.home);
+            let store = match sovereign_prime::agent_loop::ControlStore::open_cached(home) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!("sovereign: agent loop store for {session_id}: {err:#}");
+                    return;
+                }
+            };
+            let usage = payload.get("usage").cloned().unwrap_or(json!({}));
+            let tokens = usage["total"]
+                .as_u64()
+                .or_else(|| {
+                    let input = usage["input"].as_u64().unwrap_or(0);
+                    let output = usage["output"].as_u64().unwrap_or(0);
+                    (input + output > 0).then_some(input + output)
+                })
+                .unwrap_or(0) as i64;
+            let interrupted = payload["status"].as_str() == Some("interrupted");
+            let subagents_running = conn.child_sessions_running(&session_id).await;
+            let continuation = match sovereign_prime::agent_loop::after_turn(
+                &store,
+                &session_id,
+                tokens,
+                subagents_running,
+                interrupted,
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("sovereign: after_turn for {session_id}: {err:#}");
+                    return;
+                }
+            };
+            let continuation = match continuation {
+                Some(c) => Some(c),
+                None if !interrupted && !conn.sessions.lock().await.get(&session_id).is_some_and(SessionState::turn_active) => {
+                    sovereign_prime::agent_loop::due_heartbeat(&store, &session_id).ok().flatten()
+                }
+                None => None,
+            };
+            let Some(cont) = continuation else { return };
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if conn.sessions.lock().await.get(&session_id).is_some_and(SessionState::turn_active) {
+                return;
+            }
+            let prompt = match cont {
+                sovereign_prime::agent_loop::Continuation::Goal(p) | sovereign_prime::agent_loop::Continuation::Autonomous(p) => p,
+                sovereign_prime::agent_loop::Continuation::Heartbeat { prompt, .. } => prompt,
+            };
+            if let Err(err) = conn.submit(&session_id, &prompt).await {
+                eprintln!("sovereign: agent loop submit for {session_id}: {err:#}");
+            }
+        });
+    }
+
+    async fn child_sessions_running(self: &Arc<Self>, parent_id: &str) -> bool {
+        let Ok(reply) = self.call(json!({ "req": "list_sessions" })).await else {
+            return false;
+        };
+        let sessions = self.sessions.lock().await;
+        reply["sessions"].as_array().is_some_and(|list| {
+            list.iter().any(|s| {
+                s["parent_session_id"].as_str() == Some(parent_id)
+                    && s["session_id"]
+                        .as_str()
+                        .is_some_and(|id| sessions.get(id).is_some_and(SessionState::turn_active))
+            })
+        })
+    }
+
+    async fn list_owned_children(self: &Arc<Self>, parent_id: &str) -> Result<Vec<Value>> {
+        let reply = self.call(json!({ "req": "list_sessions" })).await?;
+        let sessions = self.sessions.lock().await;
+        Ok(reply["sessions"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter(|s| s["parent_session_id"].as_str() == Some(parent_id))
+                    .map(|s| Self::subagent_snapshot(s, parent_id, &sessions))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn subagent_snapshot(info: &Value, parent_id: &str, sessions: &HashMap<String, SessionState>) -> Value {
+        let child_id = info["session_id"].as_str().unwrap_or_default();
+        let subagent_id = info["agent_label"].as_str().unwrap_or(child_id);
+        let started_ms = info["last_active_at_ms"].as_i64().or(info["updated_at_ms"].as_i64()).unwrap_or(0);
+        json!({
+            "subagent_id": subagent_id,
+            "parent_id": parent_id,
+            "goal": info["title"].as_str().or(info["agent_label"].as_str()),
+            "child_session_id": child_id,
+            "status": Self::map_subagent_status(info, sessions),
+            "model": info["model"],
+            "started_at": started_ms as f64 / 1000.0,
+            "task_index": 0,
+            "task_count": 1,
+            "accepting_steer": true,
+        })
+    }
+
+    fn map_subagent_status(info: &Value, sessions: &HashMap<String, SessionState>) -> Value {
+        let child_id = info["session_id"].as_str().unwrap_or_default();
+        if sessions.get(child_id).is_some_and(SessionState::turn_active) {
+            return json!("running");
+        }
+        let status = info["swarm_status"].as_str().or(info["status"].as_str()).unwrap_or("ready");
+        let mapped = match status {
+            "running" | "processing" => "running",
+            "ready" | "idle" => "ready",
+            "completed" => "completed",
+            "failed" | "error" => "failed",
+            "stopped" | "interrupted" => "stopped",
+            other => other,
+        };
+        json!(mapped)
+    }
+
+    async fn resolve_child_session(self: &Arc<Self>, parent_id: &str, subagent_id: &str) -> Option<String> {
+        let reply = self.call(json!({ "req": "list_sessions" })).await.ok()?;
+        reply["sessions"].as_array()?.iter().find_map(|s| {
+            if s["parent_session_id"].as_str() != Some(parent_id) {
+                return None;
+            }
+            let sid = s["session_id"].as_str()?;
+            if sid == subagent_id || s["agent_label"].as_str() == Some(subagent_id) {
+                Some(sid.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
     async fn resolve_approval(&self, session_id: &str, request_id: &str, choice: &str) -> Result<()> {
         self.call(json!({
             "req": "permission_response",
@@ -431,6 +571,10 @@ impl Conn {
                     ["/refine rollback", "Undo the last /refine (or a specific changeset id)"],
                     ["/refine status", "Show current harness entries and recent refinements"],
                     ["/harness", "Show the learned instructions"],
+                    ["/goal", "Set or manage the unattended session goal"],
+                    ["/autonomous", "Run self-paced work with optional quality gates"],
+                    ["/loop", "Alias for /autonomous"],
+                    ["/heartbeat", "Schedule idle heartbeats for this session"],
                 ]);
                 Ok(json!({
                     "pairs": pairs, "sub": {}, "canon": {}, "commands": {},
@@ -500,11 +644,102 @@ impl Conn {
                 "bot_mode_protocol": false,
             })),
             "pet.info" => Ok(json!({ "enabled": false })),
-            "subagent.list" => Ok(json!({ "subagents": [], "delegations": [] })),
+            "subagent.list" => {
+                let id = sid()?;
+                let subagents = self.list_owned_children(id).await.map_err(RpcError::internal)?;
+                Ok(json!({ "subagents": subagents, "delegations": [] }))
+            }
+            "subagent.interrupt" => {
+                let parent = sid()?;
+                let subagent_id = p["subagent_id"].as_str().ok_or_else(|| RpcError::params("subagent_id is required"))?;
+                let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
+                    return Ok(json!({ "found": false, "subagent_id": subagent_id }));
+                };
+                call(json!({ "req": "cancel", "session_id": child })).await?;
+                Ok(json!({ "found": true, "subagent_id": subagent_id }))
+            }
+            "subagent.steer" => {
+                let parent = sid()?;
+                let subagent_id = p["subagent_id"].as_str().ok_or_else(|| RpcError::params("subagent_id is required"))?;
+                let content = p["content"].as_str().or(p["text"].as_str()).unwrap_or_default();
+                let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
+                    return Err(RpcError::params("subagent not found"));
+                };
+                call(json!({ "req": "soft_interrupt", "session_id": child, "content": content })).await?;
+                Ok(json!({ "subagent_id": subagent_id, "steered": true }))
+            }
+            "subagent.tail" => {
+                let parent = sid()?;
+                let subagent_id = p["subagent_id"].as_str().ok_or_else(|| RpcError::params("subagent_id is required"))?;
+                let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
+                    return Ok(json!({ "subagent_id": subagent_id, "available": false, "entries": [] }));
+                };
+                self.ensure_attached(&child).await.map_err(RpcError::internal)?;
+                let history = call(json!({ "req": "get_history", "session_id": child })).await?;
+                let entries: Vec<Value> = history["messages"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .rev()
+                            .filter(|m| {
+                                let role = m["role"].as_str().unwrap_or_default();
+                                role == "assistant" || role == "tool" || m.get("tool_name").is_some()
+                            })
+                            .take(20)
+                            .map(|m| {
+                                let tool = m["tool_name"].as_str().or(m["name"].as_str()).unwrap_or("assistant").to_string();
+                                let preview = m["content"].as_str().unwrap_or("").chars().take(240).collect::<String>();
+                                let is_error = m["is_error"].as_bool().unwrap_or(false)
+                                    || preview.starts_with("Error:");
+                                json!({ "tool": tool, "preview": preview, "is_error": is_error })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(json!({ "subagent_id": subagent_id, "available": !entries.is_empty(), "entries": entries }))
+            }
+            "spawn_tree.list" => Ok(json!({ "entries": [] })),
+            "spawn_tree.save" => Ok(json!({ "ok": true, "path": p["path"].as_str().unwrap_or("") })),
+            "spawn_tree.load" => Ok(json!({ "session_id": null, "entries": [] })),
+            "delegation.pause" => Ok(json!({ "paused": p["paused"].as_bool().unwrap_or(true) })),
+            "delegation.status" => {
+                let id = sid()?;
+                let children = self.list_owned_children(id).await.map_err(RpcError::internal)?;
+                let active: Vec<Value> = children
+                    .into_iter()
+                    .filter(|c| c["status"] == "running" || c["status"] == "ready")
+                    .collect();
+                Ok(json!({
+                    "active": active,
+                    "paused": false,
+                    "max_spawn_depth": 4,
+                    "max_concurrent_children": 8,
+                }))
+            }
+            "groups.list" => Ok(json!({ "rooms": [], "next_offset": null })),
+            "groups.capabilities" => Ok(json!({
+                "protocol_version": 1,
+                "driver": false,
+                "persistent_process": false,
+                "authority_gateway_id": "",
+                "room_link": { "linked": false, "room_id": null, "gateway_id": null },
+                "features": [],
+                "methods": [],
+                "max_log_limit": 0,
+            })),
             "process.list" => Ok(json!({ "processes": [] })),
             "session.control.read" => {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                Ok(json!({ "control": { "goal": null, "loop": null, "heartbeat": null, "revision": "0", "updated_at": now } }))
+                let id = sid()?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                Ok(json!({ "control": store.control_snapshot(id).map_err(RpcError::internal)? }))
+            }
+            "session.control" => {
+                let id = sid()?;
+                let action = p["action"].as_str().ok_or_else(|| RpcError::params("action is required"))?;
+                let args = p.get("args").cloned().unwrap_or(json!({}));
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                let (control, dispatch) = sovereign_prime::agent_loop::control_action(&store, id, action, &args).map_err(RpcError::internal)?;
+                Ok(json!({ "control": control, "dispatch": dispatch }))
             }
             "complete.path" => {
                 let word = p["word"].as_str().unwrap_or_default().to_string();
@@ -742,7 +977,7 @@ impl Conn {
                 crate::note_unsupported("rpc", method);
                 Err(RpcError::unsupported(method))
             }
-            "session.cwd.set" | "session.control" | "session.workspace.move" | "session.context_breakdown" | "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
+            "session.cwd.set" | "session.workspace.move" | "session.context_breakdown" | "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
                 crate::note_unsupported("rpc", method);
                 Err(RpcError::unsupported(method))
             }
@@ -895,6 +1130,21 @@ impl Conn {
                 let id = rest.iter().find(|w| **w != "--global").copied();
                 let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
                 sovereign_prime::refine::rollback(&store, sid, id)
+            })(),
+            ["goal", rest @ ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/goal needs an open session"))?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(std::path::Path::new(&self.config.home))?;
+                sovereign_prime::agent_loop::handle_goal_command(&store, sid, &rest.join(" "))
+            })(),
+            ["autonomous" | "loop", rest @ ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/autonomous needs an open session"))?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(std::path::Path::new(&self.config.home))?;
+                sovereign_prime::agent_loop::handle_autonomous_command(&store, sid, &rest.join(" "))
+            })(),
+            ["heartbeat", rest @ ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/heartbeat needs an open session"))?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(std::path::Path::new(&self.config.home))?;
+                sovereign_prime::agent_loop::handle_heartbeat_command(&store, sid, &rest.join(" "))
             })(),
             ["refine", rest @ ..] => async {
                 let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/refine needs an open session"))?;

@@ -30,6 +30,34 @@ pub type LlmQuery = Arc<dyn Fn(String) -> BoxFuture<Result<String>> + Send + Syn
 /// the model-callable `refine` tool, this only *schedules* a refinement
 /// (applied at turn end, never mid-turn) or reports whether one is pending.
 pub type Refine = Arc<dyn Fn(String) -> BoxFuture<Result<String>> + Send + Sync>;
+/// Generic host callback (`goal`, `heartbeat`, `spawn_subagent`, `agent_message`).
+pub type HostFn = Arc<dyn Fn(String) -> BoxFuture<Result<String>> + Send + Sync>;
+
+/// Optional REPL host hooks beyond `llm_query` / `refine`.
+#[derive(Clone)]
+pub struct ExtraHostFns {
+    pub goal: HostFn,
+    pub heartbeat: HostFn,
+    pub spawn_subagent: HostFn,
+    pub agent_message: HostFn,
+}
+
+impl Default for ExtraHostFns {
+    fn default() -> Self {
+        fn unavailable(name: &'static str) -> HostFn {
+            Arc::new(move |_| {
+                let name = name.to_string();
+                Box::pin(async move { Err(anyhow!("{name} is not available")) })
+            })
+        }
+        Self {
+            goal: unavailable("goal"),
+            heartbeat: unavailable("heartbeat"),
+            spawn_subagent: unavailable("spawn_subagent"),
+            agent_message: unavailable("agent_message"),
+        }
+    }
+}
 
 pub struct RunOutput {
     pub stdout: String,
@@ -114,7 +142,15 @@ impl ReplHost {
         Ok(Worker { child, stdin, stdout, last_used: Instant::now() })
     }
 
-    pub async fn run(&self, session: &str, code: &str, workdir: Option<&Path>, llm_query: LlmQuery, refine: Refine) -> Result<RunOutput> {
+    pub async fn run(
+        &self,
+        session: &str,
+        code: &str,
+        workdir: Option<&Path>,
+        llm_query: LlmQuery,
+        refine: Refine,
+        extra: ExtraHostFns,
+    ) -> Result<RunOutput> {
         let slot = self.workers.lock().await.entry(session.to_string()).or_default().clone();
         let mut guard = slot.lock().await;
         let fresh_state = guard.is_none();
@@ -122,7 +158,7 @@ impl ReplHost {
             *guard = Some(self.spawn().await?);
         }
         let worker = guard.as_mut().expect("worker present");
-        let result = tokio::time::timeout(RUN_TIMEOUT, drive(worker, code, workdir, &llm_query, &refine)).await;
+        let result = tokio::time::timeout(RUN_TIMEOUT, drive(worker, code, workdir, &llm_query, &refine, &extra)).await;
         match result {
             Ok(Ok((stdout, value, error, host_calls))) => {
                 worker.last_used = Instant::now();
@@ -156,6 +192,7 @@ async fn drive(
     workdir: Option<&Path>,
     llm_query: &LlmQuery,
     refine: &Refine,
+    extra: &ExtraHostFns,
 ) -> Result<(String, Option<String>, Option<String>, usize)> {
     send(worker, json!({"op": "run", "code": code})).await?;
     let mut host_calls = 0;
@@ -171,9 +208,13 @@ async fn drive(
                 host_calls += 1;
                 let arg = msg["args"][0].as_str().unwrap_or_default().to_string();
                 let reply = match msg["fn"].as_str() {
-                    Some("llm_query") => llm_query(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("llm_query") => llm_query(truncate(arg.clone(), MAX_QUERY_CHARS)).await,
                     Some("load") => load(workdir, &arg).await,
                     Some("refine") => refine(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("goal") => (extra.goal)(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("heartbeat") => (extra.heartbeat)(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("spawn_subagent") => (extra.spawn_subagent)(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("agent_message") => (extra.agent_message)(truncate(arg, MAX_QUERY_CHARS)).await,
                     _ => Err(anyhow!("unknown host function")),
                 };
                 let reply = match reply {
