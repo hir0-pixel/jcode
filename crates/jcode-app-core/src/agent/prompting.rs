@@ -149,6 +149,7 @@ impl Agent {
             self.agents_md_snapshot.clone(),
         );
 
+        self.append_continual_harness_addenda(&mut split);
         self.append_current_turn_system_reminder(&mut split);
         crate::prompt::append_swarm_effort_directive(
             &mut split,
@@ -156,6 +157,31 @@ impl Agent {
         );
 
         split
+    }
+
+    /// Prime's Continual Harness `prompt`-kind entries, rendered into the
+    /// *static* (cached) part so provider prompt caching still applies: a
+    /// running session's cache stays valid because this only changes when a
+    /// brand-new session builds its first prompt, matching M9's "applied to
+    /// new sessions" contract for `/refine`. Sovereign engine only (gated on
+    /// the same env var as the REPL and `refine` tool), and best-effort: any
+    /// storage error here must never break prompt building.
+    fn append_continual_harness_addenda(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        if std::env::var_os("SOVEREIGN_REPL_WORKER").is_none() {
+            return;
+        }
+        let Ok(home) = jcode_base::storage::jcode_dir() else { return };
+        let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(&home) else { return };
+        let Ok(addenda) = store.render_prompt(&self.session.id) else { return };
+        let addenda = addenda.trim();
+        if addenda.is_empty() {
+            return;
+        }
+        if !split.static_part.is_empty() {
+            split.static_part.push_str("\n\n");
+        }
+        split.static_part.push_str("# Continual Harness\n\n");
+        split.static_part.push_str(addenda);
     }
 
     /// Non-blocking memory prompt - takes pending result and spawns check for next turn

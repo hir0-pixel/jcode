@@ -649,6 +649,16 @@ impl EntryStore {
         self.changeset(&rollback_id)?.context("just-recorded changeset vanished")
     }
 
+    /// Resolve a stored `subagent` entry by name (case-insensitive title
+    /// match, local overriding global as usual) for `session`. M10b's swarm
+    /// wiring can call this to turn a spawn request naming `spec: <name>`
+    /// into that entry's `content` (instructions), `reference` (allowed
+    /// tools) and `arguments` (a model hint) — not wired to the swarm here.
+    pub fn resolve_subagent_spec(&self, session: &str, name: &str) -> Result<Option<HarnessEntry>> {
+        let entries = self.list_visible(session, Some(EntryKind::Subagent))?;
+        Ok(entries.into_iter().find(|e| e.title.eq_ignore_ascii_case(name)))
+    }
+
     /// `refine.run(instructions)` (the model-callable tool and the REPL host
     /// function): schedule a refinement for `session`, applied at turn end,
     /// never mid-turn. A later call before turn end just updates the pending
@@ -818,6 +828,18 @@ mod tests {
         assert!(global);
         assert!(store.take_pending_refine("s1").unwrap().is_none(), "taken exactly once");
         assert!(!store.refine_pending("s1").unwrap());
+    }
+
+    #[test]
+    fn resolves_a_subagent_spec_by_name_case_insensitively() {
+        let store = EntryStore::memory().unwrap();
+        let mut e = entry(EntryKind::Subagent, Scope::Global, None);
+        e.title = "Code Reviewer".into();
+        e.content = "Review diffs for correctness bugs.".into();
+        store.create(e).unwrap();
+        let resolved = store.resolve_subagent_spec("s1", "code reviewer").unwrap();
+        assert_eq!(resolved.unwrap().content, "Review diffs for correctness bugs.");
+        assert!(store.resolve_subagent_spec("s1", "nope").unwrap().is_none());
     }
 
     #[test]
