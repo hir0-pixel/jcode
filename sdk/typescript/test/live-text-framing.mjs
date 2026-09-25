@@ -20,7 +20,6 @@ const client = await JcodeClient.launch({
   inheritStderr: true,
   wakeMode: "external",
   env: {
-    JCODE_NO_TELEMETRY: "1",
     JCODE_MEMORY_ENABLED: "0",
     JCODE_MEMORY_SIDECAR_ENABLED: "0",
     JCODE_ACTIVE_PROVIDER: "",

@@ -34,7 +34,7 @@ SOVEREIGN_PROVIDER=openai scripts/sovereign-desktop.sh
   improvement from the current session; `/refine rollback` undoes it;
   `/harness` shows what has been learned. Applies to new sessions.
 - **Local memory:** recall is local keyword relevance; the remote Jev service
-  and jcode's usage telemetry are disabled.
+  is disabled.
 
 ## Not yet supported
 

@@ -245,7 +245,6 @@ if [[ "$SYNC_SOURCE" -eq 1 ]]; then
         --exclude '.jcode/' \
         --exclude '.tmp/' \
         --exclude '.wrangler/' \
-        --exclude 'telemetry-worker/backups/' \
         --exclude 'tmp/' \
         --exclude 'node_modules/' \
         --exclude 'assets/demos/' \

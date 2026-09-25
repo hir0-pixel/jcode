@@ -425,10 +425,17 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
     }
     let public = json!({"ok": true, "version": config.version, "auth_required": false});
     // Chats live only in the engine's store; never proxy these to Python.
-    if req.path != "/api/sessions/owner-backfill"
-        && let Some(result) = sessions_rest::route(&mut stream, &req, &config).await
-    {
-        return result;
+    // Session data (transcripts, search, delete, rename) is sensitive, so this
+    // early-dispatch path must carry its own token check: it runs before the
+    // `!token_ok` catch-all below, which only guards the arms of the match
+    // that follows.
+    if req.path != "/api/sessions/owner-backfill" && req.path.starts_with("/api/sessions") {
+        if !token_ok {
+            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+        }
+        if let Some(result) = sessions_rest::route(&mut stream, &req, &config).await {
+            return result;
+        }
     }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/health") => respond(&mut stream, "200 OK", &public).await,

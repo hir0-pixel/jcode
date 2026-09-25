@@ -119,43 +119,6 @@ impl ExternalAuthReviewCandidate {
     }
 }
 
-impl ExternalAuthReviewCandidate {
-    /// Coarse telemetry `(provider, method)` labels for the providers this
-    /// candidate activates on a successful import. Used by the onboarding flow
-    /// to record `auth_success` so auto-imported logins show up in the
-    /// activation funnel (they previously did not, because auto-import never
-    /// flows through the manual `pending_login` telemetry path).
-    ///
-    /// The method is reported as `"import"` so import-driven activation can be
-    /// distinguished from manual login in the funnel.
-    pub fn telemetry_auth_labels(&self) -> Vec<(&'static str, &'static str)> {
-        const METHOD: &str = "import";
-        match &self.action {
-            ExternalAuthReviewAction::CodexLegacy => vec![("openai", METHOD)],
-            ExternalAuthReviewAction::ClaudeCode => vec![("claude", METHOD)],
-            ExternalAuthReviewAction::ClaudeCodeNative => vec![("claude", METHOD)],
-            ExternalAuthReviewAction::GeminiCli => vec![("gemini", METHOD)],
-            ExternalAuthReviewAction::Copilot(_) => vec![("copilot", METHOD)],
-            ExternalAuthReviewAction::Cursor(_) => vec![("cursor", METHOD)],
-            ExternalAuthReviewAction::SharedExternal(source) => {
-                auth::external::source_provider_labels(*source)
-                    .into_iter()
-                    .filter_map(|label| {
-                        telemetry_provider_id_for_label(label).map(|id| (id, METHOD))
-                    })
-                    .collect()
-            }
-        }
-    }
-}
-
-/// Map a human-facing provider label (as produced by
-/// [`auth::external::source_provider_labels`]) to the canonical telemetry
-/// provider id used by the activation funnel.
-fn telemetry_provider_id_for_label(label: &str) -> Option<&'static str> {
-    provider_id_for_label(label).filter(|id| *id != "cursor")
-}
-
 fn provider_id_for_label(label: &str) -> Option<&'static str> {
     match label {
         "Cursor" => Some("cursor"),
@@ -173,11 +136,8 @@ fn provider_id_for_label(label: &str) -> Option<&'static str> {
 pub struct ExternalAuthAutoImportOutcome {
     pub imported: usize,
     pub messages: Vec<String>,
-    /// Coarse `(provider, method)` telemetry labels for each provider that was
-    /// successfully imported, so callers can record `auth_success` for the
-    /// activation funnel. May contain more entries than `imported` when a
-    /// single source carries multiple providers.
-    pub imported_auth_labels: Vec<(&'static str, &'static str)>,
+    /// Provider IDs successfully imported. A source may carry multiple providers.
+    pub imported_provider_ids: Vec<&'static str>,
 }
 
 impl ExternalAuthAutoImportOutcome {
@@ -196,9 +156,7 @@ impl ExternalAuthAutoImportOutcome {
             "openrouter",
         ];
         ORDER.iter().copied().find(|provider| {
-            self.imported_auth_labels
-                .iter()
-                .any(|(imported, _)| imported == provider)
+            self.imported_provider_ids.iter().any(|imported| imported == provider)
         })
     }
 
@@ -665,7 +623,7 @@ pub async fn run_external_auth_auto_import_candidates(
     let mut outcome = ExternalAuthAutoImportOutcome {
         imported: 0,
         messages: Vec::new(),
-        imported_auth_labels: Vec::new(),
+        imported_provider_ids: Vec::new(),
     };
 
     for &index in selected {
@@ -677,8 +635,8 @@ pub async fn run_external_auth_auto_import_candidates(
             Ok(detail) => {
                 outcome.imported += 1;
                 outcome
-                    .imported_auth_labels
-                    .extend(candidate.telemetry_auth_labels());
+                    .imported_provider_ids
+                    .extend(candidate.provider_ids());
                 outcome.messages.push(format!(
                     "✓ {} (from {}): {}",
                     candidate.provider_summary, candidate.source_name, detail
@@ -758,7 +716,7 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 0,
             messages: Vec::new(),
-            imported_auth_labels: Vec::new(),
+            imported_provider_ids: Vec::new(),
         };
         assert_eq!(
             outcome.render_markdown(),
@@ -776,7 +734,7 @@ mod render_markdown_tests {
                 "✓ Claude (from Claude Code): Loaded Claude credentials.".to_string(),
                 "✕ Cursor (from Cursor native): no usable auth token.".to_string(),
             ],
-            imported_auth_labels: vec![("openai", "import"), ("claude", "import")],
+            imported_provider_ids: vec!["openai", "claude"],
         };
         let md = outcome.render_markdown();
         assert!(md.starts_with("**Logins imported**"), "got: {md}");
@@ -800,7 +758,7 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 1,
             messages: vec!["✓ Gemini (from Gemini CLI): Loaded Gemini credentials.".to_string()],
-            imported_auth_labels: vec![("gemini", "import")],
+            imported_provider_ids: vec!["gemini"],
         };
         let md = outcome.render_markdown();
         assert!(md.contains("Reusing 1 existing login:"), "got: {md}");
@@ -811,18 +769,14 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 3,
             messages: Vec::new(),
-            imported_auth_labels: vec![
-                ("gemini", "import"),
-                ("claude", "import"),
-                ("openai", "import"),
-            ],
+            imported_provider_ids: vec!["gemini", "claude", "openai"],
         };
         assert_eq!(outcome.preferred_activation_provider(), Some("claude"));
 
         let anthropic_only = ExternalAuthAutoImportOutcome {
             imported: 1,
             messages: Vec::new(),
-            imported_auth_labels: vec![("claude", "import")],
+            imported_provider_ids: vec!["claude"],
         };
         assert_eq!(
             anthropic_only.preferred_activation_provider(),
@@ -831,13 +785,13 @@ mod render_markdown_tests {
     }
 
     #[test]
-    fn fixture_candidate_reports_import_auth_labels() {
+    fn fixture_candidate_reports_provider_ids() {
         use super::ExternalAuthReviewCandidate;
         // The fixture points at the legacy Codex action -> OpenAI provider.
         let candidate = ExternalAuthReviewCandidate::fixture("OpenAI/Codex", "Codex auth.json");
         assert_eq!(
-            candidate.telemetry_auth_labels(),
-            vec![("openai", "import")]
+            candidate.provider_ids(),
+            vec!["openai"]
         );
     }
 

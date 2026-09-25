@@ -2109,11 +2109,6 @@ fn format_event_for_expanded(
             truncate_with_ellipsis(&format!("{} hits ({}ms)", hits, latency_ms), max_width),
             rgb(140, 180, 255),
         ),
-        MemoryEventKind::SidecarRelevant { memory_preview } => (
-            "✓",
-            truncate_with_ellipsis(memory_preview, max_width),
-            rgb(100, 200, 100),
-        ),
         MemoryEventKind::MemorySurfaced { memory_preview } => (
             "★",
             truncate_with_ellipsis(memory_preview, max_width),

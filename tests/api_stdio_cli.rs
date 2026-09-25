@@ -32,7 +32,6 @@ fn exercise_stdio(close_daemon_first: bool) {
             .env("JCODE_HOME", &home)
             .env("JCODE_RUNTIME_DIR", &runtime)
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("JCODE_NO_TELEMETRY", "1")
             .env("JCODE_SOCKET", &socket)
             .env("JCODE_API_SOCKET", runtime.join("unused-api.sock"))
             .env("XDG_CONFIG_HOME", root.path().join("config"))

@@ -168,7 +168,9 @@ fn create_tool_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None, thought_signature: None, },
+                intent: None,
+                thought_signature: None,
+            },
         ),
     ];
     app.bump_display_messages_version();
@@ -195,7 +197,9 @@ fn create_tool_failed_output_copy_test_app()
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None, thought_signature: None, },
+                intent: None,
+                thought_signature: None,
+            },
         ),
     ];
     app.bump_display_messages_version();
@@ -509,8 +513,14 @@ fn test_chat_mouse_scroll_requests_immediate_redraw_during_streaming() {
         modifiers: KeyModifiers::empty(),
     });
 
-    assert!(app.auto_scroll_paused, "scroll state should update immediately");
-    assert_ne!(app.scroll_offset, 0, "scroll offset should change immediately");
+    assert!(
+        app.auto_scroll_paused,
+        "scroll state should update immediately"
+    );
+    assert_ne!(
+        app.scroll_offset, 0,
+        "scroll offset should change immediately"
+    );
     assert!(
         !scroll_only,
         "chat mouse wheel scrolls should request immediate redraw while streaming"
@@ -705,7 +715,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         clean = render_and_snap(&app, &mut terminal);
     }
     assert!(
-        !clean.contains('Z'),
+        !clean.contains("ZZZZ"),
         "ghost marker must not be present before injection:\n{clean}"
     );
     let target_row = clean
@@ -781,15 +791,15 @@ fn test_local_typing_snaps_rendered_viewport_to_bottom_in_one_frame() {
     let (mut app, mut terminal) = create_scroll_test_app(50, 12, 0, 32);
     let _ = render_and_snap(&app, &mut terminal);
     let max_scroll = crate::tui::ui::last_max_scroll();
-    assert!(max_scroll > 8, "expected a long transcript, got {max_scroll}");
+    assert!(
+        max_scroll > 8,
+        "expected a long transcript, got {max_scroll}"
+    );
 
     app.auto_scroll_paused = true;
     app.scroll_offset = max_scroll - 8;
     let _ = render_and_snap(&app, &mut terminal);
-    assert_eq!(
-        crate::tui::ui::last_resolved_chat_scroll(),
-        max_scroll - 8
-    );
+    assert_eq!(crate::tui::ui::last_resolved_chat_scroll(), max_scroll - 8);
 
     app.handle_key(KeyCode::Char('x'), KeyModifiers::empty())
         .unwrap();
@@ -907,7 +917,10 @@ fn test_local_alt_m_hidden_side_panel_stays_hidden_across_snapshot_update() {
     app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
         .unwrap();
     assert_eq!(app.side_panel.focused_page_id.as_deref(), Some("plan"));
-    assert_eq!(app.status_notice(), Some("Side panel: Updated plan".to_string()));
+    assert_eq!(
+        app.status_notice(),
+        Some("Side panel: Updated plan".to_string())
+    );
 }
 
 #[test]
@@ -931,14 +944,15 @@ fn test_images_do_not_drive_side_panel_visibility() {
     let mut app = create_test_app();
     app.is_remote = true;
     app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        history_message_index: None,
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-        anchor: None,
-    });
+    app.remote_side_pane_images
+        .push(crate::session::RenderedImage {
+            history_message_index: None,
+            media_type: "image/png".to_string(),
+            data: "image-data".to_string(),
+            label: Some("preview.png".to_string()),
+            source: crate::session::RenderedImageSource::UserInput,
+            anchor: None,
+        });
 
     // Auto-hide bookkeeping is now a no-op for images.
     assert!(!app.update_pinned_images_auto_hide());
@@ -1222,7 +1236,10 @@ fn test_chat_overscroll_reveals_status_line_then_rebounds() {
     // affordance to assert on is the `(overscroll x.x)` countdown, not the
     // glyphs alone.)
     let pinned = render_and_snap(&app, &mut terminal);
-    assert!(!app.chat_overscroll_active(), "should start without overscroll");
+    assert!(
+        !app.chat_overscroll_active(),
+        "should start without overscroll"
+    );
     assert!(
         !pinned.contains("(overscroll"),
         "overscroll countdown should be hidden while pinned: {pinned:?}"

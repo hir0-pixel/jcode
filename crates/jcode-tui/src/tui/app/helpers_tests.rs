@@ -467,7 +467,6 @@ fn gather_ambient_info_filters_to_session_reminders_when_ambient_disabled() {
             additional_context: None,
         })
         .expect("schedule second reminder");
-
     // This test exercises queue filtering, not the stale-while-revalidate cache.
     // Read synchronously while the temporary JCODE_HOME and its files are pinned:
     // an unrelated in-flight cache refresh can otherwise overwrite the cleared

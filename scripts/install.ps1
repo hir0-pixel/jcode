@@ -691,9 +691,8 @@ function ConvertFrom-JcodeVersionOutput([string]$Output) {
         return $null
     }
 
-    # A genuinely fresh profile may print the one-time telemetry notice before
-    # the version. When output is captured by PowerShell, terminal control
-    # sequences can also leave the final `jcode v...` on the same logical line.
+    # Terminal control sequences can leave the final `jcode v...` on the
+    # same logical line when PowerShell captures output.
     if ($Output -match '(?i)\bjcode\s+v?([0-9][0-9A-Za-z.+-]*)') {
         return "v$($Matches[1])"
     }
@@ -708,11 +707,7 @@ function Get-JcodeVersionFromBinary([string]$BinaryPath) {
 
     $previousErrorActionPreference = $ErrorActionPreference
     try {
-        # Fresh profiles emit the one-time telemetry notice on stderr. Under
-        # Windows PowerShell with ErrorActionPreference=Stop, native stderr is
-        # promoted to a terminating NativeCommandError even when the process
-        # succeeds. Capture both streams without letting that notice abort the
-        # version probe.
+        # Capture native stderr without aborting a successful version probe.
         $ErrorActionPreference = 'Continue'
         $output = (& $BinaryPath --version 2>&1 | Out-String).Trim()
         $exitCode = $LASTEXITCODE

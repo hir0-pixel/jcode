@@ -75,6 +75,14 @@ fn test_prompt_entry_bg_color_pulses_then_fades() {
 
 #[test]
 fn test_prompt_entry_shimmer_color_moves_across_positions() {
+    // Blend distances here are fine-grained; on a 256-color fallback (no
+    // COLORTERM, as under a headless test runner) several of them quantize
+    // to the same nearest xterm index, collapsing colors that are genuinely
+    // different in the underlying RGB math. Pin truecolor so this measures
+    // the shimmer function itself, not terminal-capability quantization.
+    // Scoped (not the permanent `pin_truecolor_for_tests`) so it cannot leak
+    // into unrelated rendering-snapshot tests elsewhere in the binary.
+    let _truecolor = jcode_tui_style::color::TruecolorTestGuard::pin();
     let base = user_text();
     let left_early = prompt_entry_shimmer_color(base, 0.1, 0.1);
     let right_early = prompt_entry_shimmer_color(base, 0.9, 0.1);

@@ -5,7 +5,6 @@ use super::*;
 pub enum MemoryStateSnapshot {
     Idle,
     Embedding,
-    SidecarChecking { count: usize },
     FoundRelevant { count: usize },
     Extracting { reason: String },
     Maintaining { phase: String },

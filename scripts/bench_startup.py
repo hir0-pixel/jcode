@@ -108,7 +108,6 @@ def isolated_env(root: str) -> dict[str, str]:
     env["JCODE_HOME"] = os.path.join(root, "home")
     env["JCODE_RUNTIME_DIR"] = os.path.join(root, "run")
     env["JCODE_SOCKET"] = os.path.join(env["JCODE_RUNTIME_DIR"], "jcode.sock")
-    env["JCODE_NO_TELEMETRY"] = "1"
     os.makedirs(env["JCODE_HOME"], exist_ok=True)
     os.makedirs(env["JCODE_RUNTIME_DIR"], exist_ok=True)
     return env

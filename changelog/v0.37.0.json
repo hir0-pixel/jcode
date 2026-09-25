@@ -1,9 +1,8 @@
 {
   "version": "0.37.0",
   "date": "2026-07-07",
-  "title": "Sponsored tool discovery, inline todo card, and cache-aware notices",
+  "title": "Inline todo card and cache-aware notices",
   "highlights": [
-    "New discover_tools capability lets the agent browse and select sponsored third-party tools in two phases (browse a category, then fetch setup instructions), with clear (sponsored discovery) provenance tags, substantive selection reasons, and an opt-out config",
     "A live todo card can be pinned inline in chat via /todos or Alt+P, and todos now track confidence history with a spike-aware validation gate",
     "Claude Sonnet 5 supports reasoning effort selection and is classified as a native 1M-context model"
   ],

@@ -11,7 +11,7 @@ pub use jcode_config_types::{
     MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
     NamedProviderType, NativeScrollbarConfig, NotificationsConfig, OverscrollStatusMode,
     PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig, SessionPickerResumeAction,
-    SponsorsConfig, SwarmSpawnMode, SwarmStripLayout, TerminalConfig, UpdateChannel,
+    SwarmSpawnMode, SwarmStripLayout, TerminalConfig, UpdateChannel,
     WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DISABLE_BASE_TOOLS",
     "JCODE_DISABLED_ANIMATIONS",
     "JCODE_DISABLED_TOOLS",
-    "JCODE_SPONSORS_ENABLED",
     "JCODE_DISCORD_BOT_TOKEN",
     "JCODE_DISCORD_BOT_USER_ID",
     "JCODE_DISCORD_CHANNEL_ID",
@@ -311,7 +310,7 @@ pub fn config() -> &'static Config {
     if let Some(reason) = reload_reason {
         crate::logging::info(&format!("CONFIG_RELOAD {}", reason));
         // A config reload can change config-derived system prompt sections
-        // (feature toggles, sponsors, ...), which legitimately invalidates the
+        // (feature toggles, ...), which legitimately invalidates the
         // KV cache prefix of warm sessions. Document it so a subsequent
         // harness-attributed cache miss is surfaced with this cause instead of
         // as an unexplained prompt mutation.
@@ -546,12 +545,6 @@ pub struct Config {
 
     /// Auto-judge configuration
     pub autojudge: AutoJudgeConfig,
-
-    /// Partner discovery configuration. Skipped when it matches the shipped
-    /// default so saving config never bakes today's default into the file (see
-    /// [`sponsors_is_default`]).
-    #[serde(skip_serializing_if = "sponsors_is_default")]
-    pub sponsors: SponsorsConfig,
 
     /// Global "launch a new jcode" hotkeys (macOS). Baked once by auto-import.
     pub launch_hotkeys: LaunchHotkeysConfig,
@@ -839,22 +832,3 @@ mod tests;
 #[cfg(test)]
 #[path = "config_color_tests.rs"]
 mod color_tests;
-
-/// Whether integration discovery settings carry no information beyond the shipped
-/// default, so `[sponsors]` can be left out of written config files.
-///
-/// Discovery originally shipped opt-in with `enabled = false`, and because
-/// config saves serialize the whole struct, any save during that window froze
-/// the old default into the user's file and permanently disabled discovery even
-/// after the default flipped. Omitting default sections prevents a repeat.
-fn sponsors_is_default(sponsors: &SponsorsConfig) -> bool {
-    sponsors.enabled && is_default_discovery_endpoint(&sponsors.endpoint)
-}
-
-/// Endpoints used by shipped defaults. These may also be explicit user choices.
-fn is_default_discovery_endpoint(endpoint: &str) -> bool {
-    matches!(
-        endpoint.trim_end_matches('/'),
-        "https://api.jcode.sh/v1/discovery" | "https://api.solosystems.dev/v1/discovery"
-    )
-}

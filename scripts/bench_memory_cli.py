@@ -95,14 +95,14 @@ def build_specs() -> dict[str, ToolSpec]:
             name="jcode_memory_off",
             argv=[jcode, "--no-update", "--no-selfdev"],
             version_argv=[jcode, "version"],
-            env={"JCODE_NO_TELEMETRY": "1", "JCODE_MEMORY_ENABLED": "0"},
+            env={"JCODE_MEMORY_ENABLED": "0"},
             jcode=True,
         ),
         "jcode_memory_on": ToolSpec(
             name="jcode_memory_on",
             argv=[jcode, "--no-update", "--no-selfdev"],
             version_argv=[jcode, "version"],
-            env={"JCODE_NO_TELEMETRY": "1", "JCODE_MEMORY_ENABLED": "1"},
+            env={"JCODE_MEMORY_ENABLED": "1"},
             jcode=True,
         ),
         "pi": ToolSpec(

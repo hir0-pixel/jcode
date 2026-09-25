@@ -785,7 +785,6 @@ impl Agent {
                         }
                     }
                     StreamEvent::ConnectionType { connection } => {
-                        crate::telemetry::record_connection_type(&connection);
                         self.last_connection_type = Some(connection.clone());
                         let _ = event_tx.send(ServerEvent::ConnectionType { connection });
                     }
@@ -930,14 +929,10 @@ impl Agent {
                             graceful_shutdown_signal: Some(self.graceful_shutdown.clone()),
                             execution_mode: ToolExecutionMode::AgentTurn,
                         };
-                        crate::telemetry::record_tool_call();
                         let tool_result = self
                             .registry
                             .execute(&tool_name, ToolCall::normalize_input_to_object(input), ctx)
                             .await;
-                        if tool_result.is_err() {
-                            crate::telemetry::record_tool_failure();
-                        }
                         let native_result = match tool_result {
                             Ok(output) => NativeToolResult::success(request_id, output.output),
                             Err(e) => NativeToolResult::error(request_id, e.to_string()),
@@ -1066,12 +1061,6 @@ impl Agent {
                 || usage_cache_read.is_some()
                 || usage_cache_creation.is_some()
             {
-                crate::telemetry::record_token_usage(
-                    usage_input.unwrap_or(0),
-                    usage_output.unwrap_or(0),
-                    usage_cache_read,
-                    usage_cache_creation,
-                );
 
                 let input = usage_input.unwrap_or(0);
                 let output = usage_output.unwrap_or(0);
@@ -1185,7 +1174,6 @@ impl Agent {
             }
 
             let assistant_message_id = if !content_blocks.is_empty() {
-                crate::telemetry::record_assistant_response();
                 let token_usage = Some(crate::session::StoredTokenUsage {
                     prompt_tokens: Some(self.effective_context_tokens_from_usage(
                         self.last_usage.input_tokens,
@@ -1378,7 +1366,6 @@ impl Agent {
             for tool_index in 0..tool_count {
                 // === INJECTION POINT C (before): Check for urgent abort before each tool (except first) ===
                 if tool_index > 0 && self.has_urgent_interrupt() {
-                    crate::telemetry::record_user_cancelled();
                     // Add tool_results for all remaining skipped tools to maintain valid history
                     for skipped_tc in &tool_calls[tool_index..] {
                         self.add_message(

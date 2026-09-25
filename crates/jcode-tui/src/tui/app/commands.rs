@@ -719,14 +719,8 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let (output, is_error, title, status) = match result {
-            Ok(output) => {
-                crate::telemetry::record_tool_call();
-                (output.output, false, output.title, ToolStatus::Completed)
-            }
-            Err(error) => {
-                crate::telemetry::record_tool_failure();
-                (format!("Error: {}", error), true, None, ToolStatus::Error)
-            }
+            Ok(output) => (output.output, false, output.title, ToolStatus::Completed),
+            Err(error) => (format!("Error: {}", error), true, None, ToolStatus::Error),
         };
 
         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
@@ -3702,64 +3696,10 @@ pub(super) fn handle_feedback_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    crate::telemetry::record_feedback(feedback);
     app.push_display_message(DisplayMessage::system(
         "Thanks, recorded your feedback.".to_string(),
     ));
     app.set_status_notice("Feedback recorded");
-    true
-}
-
-/// `/telemetry [everything|no-prompts|nothing]` - show or change the same
-/// three-way telemetry level offered by the onboarding "Telemetry settings"
-/// page, so the promise made there ("change this later with /telemetry") holds.
-pub(super) fn handle_telemetry_command(app: &mut App, trimmed: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix("/telemetry") else {
-        return false;
-    };
-    if !rest.is_empty()
-        && !rest
-            .chars()
-            .next()
-            .map(|c| c.is_whitespace())
-            .unwrap_or(false)
-    {
-        return false;
-    }
-
-    use crate::tui::app::onboarding_flow::TelemetryLevel;
-    let arg = rest.trim().to_ascii_lowercase();
-    let level = match arg.as_str() {
-        "" => {
-            let current = TelemetryLevel::current();
-            let detail = match current {
-                TelemetryLevel::Everything => {
-                    "Sending everything, including prompts and transcripts. Thank you."
-                }
-                TelemetryLevel::NoContent => {
-                    "Sending usage stats and crash reports only. No prompts or transcripts."
-                }
-                TelemetryLevel::Nothing => "Sending nothing.",
-            };
-            app.push_display_message(DisplayMessage::system(format!(
-                "{detail}\nChange it with /telemetry everything | no-prompts | nothing."
-            )));
-            app.set_status_notice(current.status_label());
-            return true;
-        }
-        "everything" | "all" => TelemetryLevel::Everything,
-        "no-prompts" | "no-content" | "usage" => TelemetryLevel::NoContent,
-        "nothing" | "off" | "none" => TelemetryLevel::Nothing,
-        other => {
-            app.push_display_message(DisplayMessage::error(format!(
-                "Unknown telemetry level \"{other}\". Use everything, no-prompts, or nothing."
-            )));
-            return true;
-        }
-    };
-    level.persist();
-    app.push_display_message(DisplayMessage::system(level.status_label().to_string()));
-    app.set_status_notice(level.status_label());
     true
 }
 

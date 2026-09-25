@@ -327,6 +327,18 @@ fn persisted_headless_member(
 
 #[tokio::test]
 async fn background_task_wake_runs_live_session_immediately_when_idle() {
+    // This test relies on the default (non-external) wake mode so that
+    // `dispatch_background_task_completion` falls through to
+    // `run_live_turn_if_idle`. `crate::config::config()` is a process-global,
+    // periodically-reloaded cache, and the sibling test below
+    // (`external_background_task_wake_emits_request_without_starting_turn`)
+    // flips `JCODE_WAKE_MODE=external` for the same process; without sharing
+    // its `lock_test_env` guard, a parallel run can have this test observe
+    // "external" mid-run, `emit_external_wake` short-circuits before
+    // `run_live_turn_if_idle` ever runs, and the expected stream never
+    // arrives (looks like a hang, not a slow pass, since wake mode does not
+    // flip back until the sibling test's guard is dropped).
+    let _env_lock = crate::storage::lock_test_env();
     let provider = Arc::new(StreamingMockProvider::default());
     provider.queue_response(vec![
         StreamEvent::TextDelta("Build result processed.".to_string()),
@@ -372,7 +384,12 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     )
     .await;
 
-    let notification = timeout(Duration::from_secs(2), async {
+    // A generous wall-clock budget rather than a tight one: this waits on
+    // real scheduler-driven wake delivery (agent lock acquisition, turn
+    // start, first streamed token), whose latency grows under a loaded
+    // machine running the full suite in parallel (same rationale as the
+    // background-command timeout test in tool/bash_tests.rs, issue #593).
+    let notification = timeout(Duration::from_secs(5), async {
         loop {
             match member_event_rx.recv().await {
                 Some(ServerEvent::Notification {
@@ -397,7 +414,7 @@ async fn background_task_wake_runs_live_session_immediately_when_idle() {
     }
     assert!(notification.1.contains("**Background task** `bgwake`"));
 
-    let streamed = timeout(Duration::from_secs(2), async {
+    let streamed = timeout(Duration::from_secs(5), async {
         loop {
             match member_event_rx.recv().await {
                 Some(ServerEvent::TextDelta { text })

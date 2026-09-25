@@ -258,12 +258,6 @@ pub struct Agent {
     /// Persists across turns so the coordinator's viewport never blanks at
     /// turn boundaries or freezes during long tool calls.
     inline_tail: inline_tail::InlineTailBuffer,
-    /// Prevent duplicate content uploads when shutdown/finalization is invoked
-    /// more than once for the same in-memory agent.
-    transcript_telemetry_sent: bool,
-    /// One logical runtime session, independent of the process-global legacy
-    /// telemetry slot and of any TUI clients viewing this agent.
-    concurrency_session: Option<crate::telemetry::ConcurrencySession>,
 }
 
 impl Agent {
@@ -337,8 +331,6 @@ impl Agent {
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
-            transcript_telemetry_sent: false,
-            concurrency_session: None,
         }
     }
 
@@ -381,7 +373,7 @@ impl Agent {
         registry: Registry,
         working_dir: Option<&str>,
     ) -> Self {
-        Self::new_with_initial_ownership(provider, registry, working_dir, None, true)
+        Self::new_with_initial_ownership(provider, registry, working_dir, None)
     }
 
     /// A connection may only be a viewer attaching to an existing Agent.
@@ -391,7 +383,7 @@ impl Agent {
         registry: Registry,
         working_dir: Option<&str>,
     ) -> Self {
-        Self::new_with_initial_ownership(provider, registry, working_dir, None, false)
+        Self::new_with_initial_ownership(provider, registry, working_dir, None)
     }
 
     pub(crate) fn new_with_parent_and_initial_working_dir(
@@ -400,7 +392,7 @@ impl Agent {
         working_dir: Option<&str>,
         parent_id: Option<String>,
     ) -> Self {
-        Self::new_with_initial_ownership(provider, registry, working_dir, parent_id, true)
+        Self::new_with_initial_ownership(provider, registry, working_dir, parent_id)
     }
 
     fn new_with_initial_ownership(
@@ -408,7 +400,6 @@ impl Agent {
         registry: Registry,
         working_dir: Option<&str>,
         parent_id: Option<String>,
-        track_concurrency: bool,
     ) -> Self {
         let start = Instant::now();
         let tool_selection = crate::config::config().tools.selection();
@@ -431,21 +422,10 @@ impl Agent {
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
         agent.fire_session_lifecycle_hook("session_start", "create");
-        if track_concurrency {
-            agent.activate_concurrency_tracking();
-        }
         let setup_ms = start.elapsed().as_millis();
-        let telemetry_start = Instant::now();
-        crate::telemetry::begin_session_with_parent(
-            agent.provider.name(),
-            &agent.provider.model(),
-            agent.session.parent_id.clone(),
-            false,
-        );
         logging::info(&format!(
-            "[TIMING] agent_new: setup={}ms, telemetry={}ms, total={}ms",
+            "[TIMING] agent_new: setup={}ms, total={}ms",
             setup_ms,
-            telemetry_start.elapsed().as_millis(),
             start.elapsed().as_millis(),
         ));
         agent
@@ -503,13 +483,6 @@ impl Agent {
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("attach");
         agent.fire_session_lifecycle_hook("session_start", "attach");
-        agent.begin_concurrency_tracking();
-        crate::telemetry::begin_session_with_parent(
-            agent.provider.name(),
-            &agent.provider.model(),
-            agent.session.parent_id.clone(),
-            false,
-        );
         agent
     }
 
@@ -979,18 +952,11 @@ impl Agent {
 
     /// Mark this agent session as closed and persist it.
     pub fn mark_closed(&mut self) {
-        self.finish_concurrency_tracking();
         self.persist_soft_interrupt_snapshot();
         self.session.mark_closed();
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
         }
-        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::NormalExit);
-        crate::telemetry::end_session_with_reason(
-            self.provider.name(),
-            &self.provider.model(),
-            crate::telemetry::SessionEndReason::NormalExit,
-        );
         self.fire_session_lifecycle_hook("session_end", "close");
     }
 
@@ -1011,69 +977,10 @@ impl Agent {
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {
-        self.finish_concurrency_tracking();
         self.persist_soft_interrupt_snapshot();
         self.session.mark_crashed(message);
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session crash state");
-        }
-        self.upload_transcript_telemetry(crate::telemetry::SessionEndReason::Unknown);
-        crate::telemetry::record_crash(
-            self.provider.name(),
-            &self.provider.model(),
-            crate::telemetry::SessionEndReason::Unknown,
-        );
-    }
-
-    fn begin_concurrency_tracking(&mut self) {
-        // Release the old identity before registering a new one. An Agent can
-        // survive /clear and /resume, but its logical session does not.
-        self.finish_concurrency_tracking();
-        self.activate_concurrency_tracking();
-    }
-
-    /// Commit a provisional Agent to logical session ownership exactly once.
-    pub(crate) fn activate_concurrency_tracking(&mut self) {
-        if self.concurrency_session.is_some() {
-            return;
-        }
-        self.concurrency_session = Some(crate::telemetry::begin_concurrency_session(
-            &self.session.id,
-            self.session.parent_id.as_deref(),
-        ));
-    }
-
-    pub(crate) fn finish_concurrency_tracking(&mut self) {
-        if let Some(mut guard) = self.concurrency_session.take() {
-            guard.finish();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_concurrency_tracking(&self) -> bool {
-        self.concurrency_session.is_some()
-    }
-
-    fn upload_transcript_telemetry(&mut self, end_reason: crate::telemetry::SessionEndReason) {
-        if self.transcript_telemetry_sent || self.session.messages.is_empty() {
-            return;
-        }
-        // Keep code and ordinary transcript content intact, but reuse the
-        // session export redactor so credentials are removed recursively from
-        // text, reasoning, tool inputs, and tool results before leaving the
-        // machine.
-        let redacted_session = self.session.redacted_for_export();
-        let Ok(messages) = serde_json::to_value(&redacted_session.messages) else {
-            crate::logging::warn("failed to serialize consented transcript telemetry");
-            return;
-        };
-        if crate::telemetry::record_transcript(
-            self.provider.name(),
-            &self.provider.model(),
-            end_reason,
-            messages,
-        ) {
-            self.transcript_telemetry_sent = true;
         }
     }
 

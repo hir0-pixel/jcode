@@ -16,7 +16,7 @@
 
 use super::App;
 use super::SessionPickerMode;
-use super::onboarding_flow::{ImportReview, OnboardingFlow, OnboardingPhase, SummaryPill};
+use super::onboarding_flow::{ImportReview, OnboardingFlow, OnboardingPhase};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::time::Instant;
 
@@ -180,26 +180,6 @@ impl App {
                 },
             },
             SimScreen {
-                title: "Telemetry settings (from the summary's third pill)",
-                phase: OnboardingPhase::Login {
-                    import: ImportReview::new(vec![
-                        crate::external_auth::ExternalAuthReviewCandidate::fixture(
-                            "OpenAI/Codex",
-                            "Codex auth.json",
-                        ),
-                        crate::external_auth::ExternalAuthReviewCandidate::fixture(
-                            "Claude",
-                            "Claude Code",
-                        ),
-                    ])
-                    .map(|mut review| {
-                        review.focus_summary_pill(SummaryPill::Telemetry);
-                        review.open_telemetry();
-                        review
-                    }),
-                },
-            },
-            SimScreen {
                 title: "Import detected logins (single)",
                 phase: OnboardingPhase::Login {
                     import: ImportReview::new(vec![
@@ -320,18 +300,14 @@ impl App {
         }
     }
 
-    /// Move the import checkbox cursor, or the telemetry option highlight while
-    /// the telemetry settings screen is showing. Only meaningful on the import
-    /// family of screens.
+    /// Move the import checkbox cursor.
     fn onboarding_sim_move_cursor(&mut self, down: bool) -> bool {
         if let Some(flow) = self.onboarding_flow.as_mut()
             && let OnboardingPhase::Login {
                 import: Some(review),
             } = &mut flow.phase
         {
-            if review.telemetry.is_some() {
-                review.telemetry_step(down);
-            } else if down {
+            if down {
                 review.cursor_down();
             } else {
                 review.cursor_up();
@@ -341,8 +317,7 @@ impl App {
         false
     }
 
-    /// Move the import summary pill focus (Continue / Import less / Telemetry
-    /// settings) so the simulator can preview each pill's highlighted state.
+    /// Move the import summary pill focus so the simulator can preview each state.
     /// Returns true when the current screen is the read-only summary.
     fn onboarding_sim_step_summary_pill(&mut self, forward: bool) -> bool {
         if let Some(flow) = self.onboarding_flow.as_mut()
@@ -350,7 +325,6 @@ impl App {
                 import: Some(review),
             } = &mut flow.phase
             && !review.choosing
-            && review.telemetry.is_none()
         {
             review.summary_step(forward);
             return true;

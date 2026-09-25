@@ -10,31 +10,34 @@ fn desired_nofile_soft_limit_only_raises_when_possible() {
 #[cfg(unix)]
 #[test]
 fn spawn_detached_creates_new_session() {
-    use tempfile::NamedTempFile;
-
-    let output = NamedTempFile::new().expect("temp file");
-    let output_path = output.path().to_string_lossy().to_string();
     let parent_sid = unsafe { libc::getsid(0) };
 
+    // Query the session id directly via `getsid(2)` rather than shelling out
+    // to `ps`. `ps`'s session column is not portable in the way this test
+    // needs: procps (Linux) exposes `sid` (always the leader's pid), but
+    // BSD/macOS `ps` has no `sid` keyword at all ("keyword not found") and
+    // its `sess` column reports 0 for a process with no controlling
+    // terminal -- exactly what a freshly `setsid()`-ed detached child is.
+    // `getsid` gives the real, portable answer on both platforms.
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
-        .arg("ps -o sid= -p $$ > \"$JCODE_TEST_OUTPUT\"")
-        .env("JCODE_TEST_OUTPUT", &output_path)
+        .arg("sleep 1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     let mut child = super::spawn_detached(&mut cmd).expect("spawn detached child");
+    // `pre_exec` (where `spawn_detached` calls `setsid()`) runs in the forked
+    // child before it execs into `sh`, so the child's session is already
+    // established the moment `spawn` returns; no need to wait for the child
+    // to do anything first.
+    let child_sid = unsafe { libc::getsid(child.id() as libc::pid_t) };
+    assert!(child_sid >= 0, "getsid on detached child should succeed");
+
     let status = child.wait().expect("wait for child");
     assert!(status.success(), "child should exit successfully");
 
-    let child_sid = std::fs::read_to_string(&output_path)
-        .expect("read child sid")
-        .trim()
-        .parse::<u32>()
-        .expect("parse child sid");
-
     assert_eq!(
-        child_sid,
+        child_sid as u32,
         child.id(),
         "detached child should lead its own session"
     );

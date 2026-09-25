@@ -114,24 +114,6 @@ pub fn log_event(kind: &MemoryEventKind) {
             })),
         ),
 
-        MemoryEventKind::SidecarStarted => ("sidecar_started", None),
-
-        MemoryEventKind::SidecarRelevant { memory_preview } => (
-            "sidecar_relevant",
-            Some(serde_json::json!({
-                "memory_preview": memory_preview,
-            })),
-        ),
-
-        MemoryEventKind::SidecarNotRelevant => ("sidecar_not_relevant", None),
-
-        MemoryEventKind::SidecarComplete { latency_ms } => (
-            "sidecar_complete",
-            Some(serde_json::json!({
-                "latency_ms": latency_ms,
-            })),
-        ),
-
         MemoryEventKind::MemorySurfaced { memory_preview } => (
             "memory_surfaced",
             Some(serde_json::json!({

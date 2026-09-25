@@ -60,7 +60,7 @@ check() { # check <name> <expected-desc> <actual-desc> <condition-exit-status>
 
 # ---------------------------------------------------------------------------
 # Sandbox: mocked release endpoint + tools, identical shape to
-# test_install_conversion.sh so both exercise the same installer code paths.
+# test_install.sh so both exercise the same installer code paths.
 # ---------------------------------------------------------------------------
 mkdir -p "$work/bin"
 
@@ -86,7 +86,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$url" in
-  *telemetry.jcode.sh*) ;;
   *jcode.sh/releases/latest/version) printf 'v%s\n' "${EVAL_VERSION:-1.2.3}" ;;
   *jcode.sh/releases/v*/download-bases)
     printf 'https://github.com/1jehuang/jcode/releases/download/v%s\n' "${EVAL_VERSION:-1.2.3}"
@@ -137,7 +136,6 @@ run_install() {
   XDG_CONFIG_HOME="$home/.config" \
   JCODE_HOME="$home/.jcode" \
   JCODE_SKIP_SERVER_RELOAD=1 \
-  JCODE_NO_TELEMETRY=1 \
   bash "$install_sh" 2>&1
 }
 
@@ -359,7 +357,6 @@ HOME="$home_w" \
 LOCALAPPDATA="$work/localappdata" \
 JCODE_HOME="$home_w/.jcode" \
 JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
 bash "$install_sh" >/dev/null 2>&1
 win_install_status=$?
 check "Git Bash Windows install completes" "exit 0" "exit $win_install_status" "$win_install_status"

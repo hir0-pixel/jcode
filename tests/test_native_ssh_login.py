@@ -94,7 +94,7 @@ env = {
     "XDG_CONFIG_HOME": str(root / "home" / ".config"),
     "XDG_CACHE_HOME": str(root / "home" / ".cache"),
     "JCODE_NO_BROWSER": "1", "NO_BROWSER": "1", "BROWSER": "/bin/false",
-    "JCODE_NO_TELEMETRY": "1", "DO_NOT_TRACK": "1", "JCODE_WAKE_MODE": "external",
+    "DO_NOT_TRACK": "1", "JCODE_WAKE_MODE": "external",
     "HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
     "ALL_PROXY": "http://127.0.0.1:9", "NO_PROXY": "",
 }
@@ -586,7 +586,7 @@ def run_acceptance(config):
                        XDG_CONFIG_HOME=str(root / "home" / ".config"),
                        XDG_CACHE_HOME=str(root / "home" / ".cache"),
                        JCODE_NO_BROWSER="1", NO_BROWSER="1", BROWSER="/bin/false",
-                       JCODE_NO_TELEMETRY="1", DO_NOT_TRACK="1", JCODE_WAKE_MODE="external",
+                       DO_NOT_TRACK="1", JCODE_WAKE_MODE="external",
                        TERM="xterm-256color", NO_COLOR="0")
             sentinel = "JCODE_SSH_LOGIN_CONTEXT_" + uuid.uuid4().hex
             instance = "ssh-login-acceptance-" + uuid.uuid4().hex

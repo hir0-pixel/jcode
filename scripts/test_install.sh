@@ -18,19 +18,16 @@ EOF
 cat > "$tmp/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 output=""
-payload=""
 url=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) output="$2"; shift 2 ;;
-    --data) payload="$2"; shift 2 ;;
     http*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 [ -z "${DOWNLOAD_URL_LOG:-}" ] || printf '%s\n' "$url" >> "$DOWNLOAD_URL_LOG"
 case "$url" in
-  *telemetry.jcode.sh*) printf '%s\n' "$payload" >> "$INSTALL_TELEMETRY_LOG" ;;
   *jcode.sh/releases/latest/version)
     [ "${FAIL_RELEASE:-0}" != "1" ] || exit 22
     [ "${FAIL_METADATA_RELEASE:-0}" != "1" ] || exit 22
@@ -89,22 +86,15 @@ chmod +x "$dest/$artifact"
 EOF
 chmod +x "$tmp/bin/uname" "$tmp/bin/curl" "$tmp/bin/tar"
 
-conversion_id="11111111-2222-4333-8444-555555555555"
-telemetry_log="$tmp/telemetry.jsonl"
 hotkey_setup_log="$tmp/hotkey-setup.log"
 PATH="$tmp/bin:$PATH" \
 HOME="$tmp/home" \
 JCODE_HOME="$tmp/home/.jcode" \
 JCODE_INSTALL_DIR="$tmp/install" \
-JCODE_INSTALL_CONVERSION_ID="$conversion_id" \
 JCODE_SKIP_SERVER_RELOAD=1 \
-INSTALL_TELEMETRY_LOG="$telemetry_log" \
 HOTKEY_SETUP_LOG="$hotkey_setup_log" \
 bash "$repo_dir/scripts/install.sh" >/dev/null
 
-test "$(cat "$tmp/home/.jcode/install_conversion_id")" = "$conversion_id"
-grep -q '"stage":"installer_start".*"outcome":"success"' "$telemetry_log"
-grep -q '"stage":"installer_finish".*"outcome":"success"' "$telemetry_log"
 test "$(cat "$hotkey_setup_log")" = "setup-hotkey"
 
 # If GitHub's release page is blocked, the static jcode.sh version endpoint
@@ -114,7 +104,6 @@ HOME="$tmp/home-metadata-fallback" \
 JCODE_HOME="$tmp/home-metadata-fallback/.jcode" \
 JCODE_INSTALL_DIR="$tmp/install-metadata-fallback" \
 JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
 FAIL_GITHUB_RELEASE=1 \
 bash "$repo_dir/scripts/install.sh" >/dev/null
 test -x "$tmp/install-metadata-fallback/jcode"
@@ -126,7 +115,6 @@ HOME="$tmp/home-checksum-fallback" \
 JCODE_HOME="$tmp/home-checksum-fallback/.jcode" \
 JCODE_INSTALL_DIR="$tmp/install-checksum-fallback" \
 JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
 METADATA_CHECKSUM_HTML=1 \
 bash "$repo_dir/scripts/install.sh" >/dev/null
 test -x "$tmp/install-checksum-fallback/jcode"
@@ -140,7 +128,6 @@ LOCALAPPDATA="$tmp/localappdata-windows-arm64" \
 JCODE_HOME="$tmp/home-windows-arm64/.jcode" \
 JCODE_INSTALL_DIR="$tmp/install-windows-arm64" \
 JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
 TEST_UNAME_S=MINGW64_NT-10.0 \
 TEST_UNAME_M=x86_64 \
 PROCESSOR_ARCHITECTURE=AMD64 \
@@ -152,52 +139,29 @@ bash "$repo_dir/scripts/install.sh" >/dev/null
 grep -q '/jcode-windows-aarch64.tar.gz$' "$windows_url_log"
 test -x "$tmp/install-windows-arm64/jcode.exe"
 
-failure_log="$tmp/failure.jsonl"
 if PATH="$tmp/bin:$PATH" \
   HOME="$tmp/home-failure" \
   JCODE_HOME="$tmp/home-failure/.jcode" \
   JCODE_INSTALL_DIR="$tmp/install-failure" \
-  JCODE_INSTALL_CONVERSION_ID="$conversion_id" \
   JCODE_SKIP_SERVER_RELOAD=1 \
-  INSTALL_TELEMETRY_LOG="$failure_log" \
   FAIL_RELEASE=1 \
   bash "$repo_dir/scripts/install.sh" >/dev/null 2>&1; then
   echo "expected release lookup failure" >&2
   exit 1
 fi
-grep -q '"stage":"installer_finish".*"outcome":"failure".*"failure_stage":"release_lookup"' "$failure_log"
-
-checksum_failure_log="$tmp/checksum-failure.jsonl"
 if PATH="$tmp/bin:$PATH" \
   HOME="$tmp/home-checksum-failure" \
   JCODE_HOME="$tmp/home-checksum-failure/.jcode" \
   JCODE_INSTALL_DIR="$tmp/install-checksum-failure" \
-  JCODE_INSTALL_CONVERSION_ID="$conversion_id" \
   JCODE_SKIP_SERVER_RELOAD=1 \
-  INSTALL_TELEMETRY_LOG="$checksum_failure_log" \
   BAD_CHECKSUM=1 \
   bash "$repo_dir/scripts/install.sh" >/dev/null 2>&1; then
   echo "expected checksum verification failure" >&2
   exit 1
 fi
-grep -q '"stage":"installer_finish".*"outcome":"failure".*"failure_stage":"artifact_verification"' "$checksum_failure_log"
-
 if grep -q 'api.github.com' "$windows_url_log"; then
   echo "installer must not depend on the rate-limited unauthenticated GitHub API" >&2
   exit 1
 fi
 
-privacy_log="$tmp/privacy.jsonl"
-PATH="$tmp/bin:$PATH" \
-HOME="$tmp/home-private" \
-JCODE_HOME="$tmp/home-private/.jcode" \
-JCODE_INSTALL_DIR="$tmp/install-private" \
-JCODE_INSTALL_CONVERSION_ID="$conversion_id" \
-JCODE_SKIP_SERVER_RELOAD=1 \
-JCODE_NO_TELEMETRY=1 \
-INSTALL_TELEMETRY_LOG="$privacy_log" \
-bash "$repo_dir/scripts/install.sh" >/dev/null
-test ! -e "$privacy_log"
-test ! -e "$tmp/home-private/.jcode/install_conversion_id"
-
-echo "installer conversion telemetry tests passed"
+echo "installer tests passed"

@@ -376,7 +376,7 @@ def run_acceptance(config):
         for key in ("DISPLAY", "WAYLAND_DISPLAY", "KITTY_LISTEN_ON", "TMUX", "ZELLIJ"):
             env.pop(key, None)
         env.update(JCODE_HOME=str(home), JCODE_RUNTIME_DIR=str(runtime), XDG_RUNTIME_DIR=str(runtime),
-                   JCODE_NO_TELEMETRY="1", JCODE_WAKE_MODE="external", TERM="xterm-256color",
+                   JCODE_WAKE_MODE="external", TERM="xterm-256color",
                    DO_NOT_TRACK="1", NO_COLOR="0")
         # SSH agent may live under the original XDG runtime, but its absolute
         # SSH_AUTH_SOCK value is deliberately retained above.

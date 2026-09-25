@@ -206,7 +206,6 @@ impl App {
         }
 
         if let Some(ref mut picker) = self.inline_interactive_state {
-
             for entry in &mut picker.entries {
                 let matches_saved = configured.as_deref().map(|saved| {
                     let base = model_entry_base_name(entry);
@@ -282,7 +281,6 @@ impl App {
                     effort: None,
                 },
             );
-
 
             picker.filtered = (0..picker.entries.len()).collect();
             picker.selected = picker

@@ -1,9 +1,8 @@
 {
   "version": "0.76.0",
   "date": "2026-08-14",
-  "title": "Transcript privacy and broader provider support",
+  "title": "Broader provider support",
   "highlights": [
-    "Opt-in transcript telemetry now supports privacy-preserving collection with automatic secret redaction",
     "Anthropic-compatible provider profiles can now connect to additional compatible services",
     "Grok Build login can now be completed directly inside the TUI"
   ],

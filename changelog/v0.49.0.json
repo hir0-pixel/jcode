@@ -20,7 +20,6 @@
     "Windows account credentials use secure storage and canceled browser exchanges are cleaned up safely",
     "External CLI hooks launch Jcode through a trusted path instead of project-controlled executables",
     "Redirected output no longer attempts terminal image rendering",
-    "Background telemetry delivery is bounded to prevent unrestrained concurrency",
     "Handterm native scrolling animates multi-row input instead of jumping directly to the final position"
   ]
 }

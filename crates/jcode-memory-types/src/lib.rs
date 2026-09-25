@@ -111,8 +111,6 @@ pub enum MemoryState {
     Idle,
     /// Running embedding search.
     Embedding,
-    /// Sidecar checking relevance.
-    SidecarChecking { count: usize },
     /// Found relevant memories.
     FoundRelevant { count: usize },
     /// Extracting memories from conversation.
@@ -146,14 +144,6 @@ pub enum MemoryEventKind {
     EmbeddingStarted,
     /// Embedding search completed.
     EmbeddingComplete { latency_ms: u64, hits: usize },
-    /// Sidecar started checking.
-    SidecarStarted,
-    /// Sidecar found memory relevant.
-    SidecarRelevant { memory_preview: String },
-    /// Sidecar found memory not relevant.
-    SidecarNotRelevant,
-    /// Sidecar call completed with latency.
-    SidecarComplete { latency_ms: u64 },
     /// Memory was surfaced to main agent.
     MemorySurfaced { memory_preview: String },
     /// Memory payload was injected into model context.

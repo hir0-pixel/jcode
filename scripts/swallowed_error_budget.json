@@ -356,11 +356,6 @@
       "let_underscore": 0,
       "unwrap_or_default": 1
     },
-    "crates/jcode-app-core/src/telemetry_state.rs": {
-      "dot_ok": 18,
-      "let_underscore": 7,
-      "unwrap_or_default": 0
-    },
     "crates/jcode-app-core/src/tool/agentgrep.rs": {
       "dot_ok": 0,
       "let_underscore": 1,
@@ -1021,11 +1016,6 @@
       "let_underscore": 2,
       "unwrap_or_default": 0
     },
-    "crates/jcode-base/src/sponsors/provenance.rs": {
-      "dot_ok": 0,
-      "let_underscore": 1,
-      "unwrap_or_default": 0
-    },
     "crates/jcode-base/src/subscription_api.rs": {
       "dot_ok": 3,
       "let_underscore": 1,
@@ -1540,21 +1530,6 @@
       "dot_ok": 0,
       "let_underscore": 0,
       "unwrap_or_default": 1
-    },
-    "crates/jcode-telemetry-core/src/lib.rs": {
-      "dot_ok": 8,
-      "let_underscore": 10,
-      "unwrap_or_default": 3
-    },
-    "crates/jcode-telemetry-core/src/lifecycle.rs": {
-      "dot_ok": 0,
-      "let_underscore": 3,
-      "unwrap_or_default": 0
-    },
-    "crates/jcode-telemetry-core/src/state_support.rs": {
-      "dot_ok": 22,
-      "let_underscore": 8,
-      "unwrap_or_default": 0
     },
     "crates/jcode-terminal-image/src/display.rs": {
       "dot_ok": 0,

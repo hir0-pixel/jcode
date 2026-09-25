@@ -144,7 +144,6 @@ fn memory_status_badge(activity: Option<&MemoryActivity>) -> (String, Color) {
     match &activity.state {
         MemoryState::Idle => ("IDLE".to_string(), rgb(120, 120, 130)),
         MemoryState::Embedding => ("SEARCH".to_string(), rgb(140, 180, 255)),
-        MemoryState::SidecarChecking { .. } => ("JEV".to_string(), rgb(255, 200, 100)),
         MemoryState::FoundRelevant { .. } => ("READY".to_string(), rgb(100, 200, 100)),
         MemoryState::Extracting { .. } => ("SAVE".to_string(), rgb(200, 150, 255)),
         MemoryState::Maintaining { .. } => ("UPDATE".to_string(), rgb(120, 220, 180)),
@@ -318,13 +317,6 @@ fn fallback_pipeline_statuses(
             StepStatus::Pending,
             StepStatus::Pending,
             None,
-        ),
-        MemoryState::SidecarChecking { count } => (
-            StepStatus::Done,
-            StepStatus::Running,
-            StepStatus::Pending,
-            StepStatus::Pending,
-            Some((0, *count)),
         ),
         MemoryState::FoundRelevant { .. } => (
             StepStatus::Done,

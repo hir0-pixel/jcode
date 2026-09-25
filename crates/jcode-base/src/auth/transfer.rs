@@ -475,6 +475,46 @@ fn secure_publish(home: &Path, name: &str, bytes: &[u8]) -> Result<(), TransferE
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 
+    // Resolve the deepest *existing* ancestor once up front. On macOS
+    // `$HOME`-adjacent trees commonly cross a fixed OS alias (`/var` ->
+    // `/private/var`, `/tmp` -> `/private/tmp`) that is part of the trusted
+    // base system, not something an attacker controls; walking every
+    // component with O_NOFOLLOW from the *unresolved* `/` would reject those
+    // aliases as "unsafe" and refuse to publish at all. Canonicalizing the
+    // existing prefix absorbs only that fixed alias. Everything below still
+    // walks descriptor-by-descriptor with O_NOFOLLOW (including any trailing
+    // components this call still needs to `mkdirat`), so a symlink swapped in
+    // after this point -- the actual TOCTOU risk -- is still caught exactly
+    // as before.
+    // `Path::exists` follows symlinks, which would let a symlinked ancestor
+    // (the exact thing this function must refuse to follow, e.g. a crafted
+    // `alias -> real_home` component) get treated as "already there" and
+    // canonicalized away. Use `symlink_metadata` (lstat) instead, and require
+    // the entry to be a real directory, not a symlink to one.
+    let is_real_existing_dir = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| !metadata.is_symlink() && metadata.is_dir())
+    };
+    let mut existing_ancestor = home;
+    let mut trailing = Vec::new();
+    while !is_real_existing_dir(existing_ancestor) {
+        match (existing_ancestor.file_name(), existing_ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                trailing.push(name.to_owned());
+                existing_ancestor = parent;
+            }
+            _ => break,
+        }
+    }
+    let home = if let Ok(canonical) = std::fs::canonicalize(existing_ancestor) {
+        trailing
+            .into_iter()
+            .rev()
+            .fold(canonical, |path, part| path.join(part))
+    } else {
+        home.to_path_buf()
+    };
+    let home = home.as_path();
     // Walk directory descriptors, never following symlinks, including ancestors.
     // Publication remains anchored even if a parent path is renamed concurrently.
     let start = if home.is_absolute() { c"/" } else { c"." };

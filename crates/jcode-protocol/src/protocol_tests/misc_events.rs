@@ -46,7 +46,7 @@ fn test_transcript_event_roundtrip() -> Result<()> {
 fn test_memory_activity_event_roundtrip() -> Result<()> {
     let event = ServerEvent::MemoryActivity {
         activity: MemoryActivitySnapshot {
-            state: MemoryStateSnapshot::SidecarChecking { count: 3 },
+            state: MemoryStateSnapshot::FoundRelevant { count: 3 },
             state_age_ms: 275,
             pipeline: Some(MemoryPipelineSnapshot {
                 search: MemoryStepStatusSnapshot::Done,
@@ -73,7 +73,7 @@ fn test_memory_activity_event_roundtrip() -> Result<()> {
     };
     assert_eq!(
         activity.state,
-        MemoryStateSnapshot::SidecarChecking { count: 3 }
+        MemoryStateSnapshot::FoundRelevant { count: 3 }
     );
     assert_eq!(activity.state_age_ms, 275);
     let pipeline = activity

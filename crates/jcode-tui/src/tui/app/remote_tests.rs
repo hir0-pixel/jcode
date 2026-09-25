@@ -914,7 +914,7 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
         &mut app,
         ServerEvent::MemoryActivity {
             activity: MemoryActivitySnapshot {
-                state: MemoryStateSnapshot::SidecarChecking { count: 3 },
+                state: MemoryStateSnapshot::FoundRelevant { count: 3 },
                 state_age_ms: 180,
                 pipeline: Some(MemoryPipelineSnapshot {
                     search: MemoryStepStatusSnapshot::Done,
@@ -933,7 +933,7 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
     );
 
     let activity = crate::memory::get_activity().expect("memory activity should be populated");
-    assert_eq!(activity.state, MemoryState::SidecarChecking { count: 3 });
+    assert_eq!(activity.state, MemoryState::FoundRelevant { count: 3 });
     let pipeline = activity.pipeline.expect("pipeline should be restored");
     assert_eq!(pipeline.search, StepStatus::Done);
     assert_eq!(pipeline.verify, StepStatus::Running);

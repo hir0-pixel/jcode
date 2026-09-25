@@ -14,11 +14,8 @@ mod config_edit_notice;
 mod conversation_search;
 mod debug_socket;
 mod desktop_selfdev;
-mod discover;
-mod discover_secrets;
 mod edit;
 mod edit_stats;
-mod feedback;
 mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
@@ -493,12 +490,6 @@ impl Registry {
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
-                "maintainer_feedback",
-                feedback::MaintainerFeedbackTool::new,
-            );
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
                 "jcode_docs",
                 jcode_docs::JcodeDocsTool::new,
             );
@@ -589,16 +580,6 @@ impl Registry {
         // SOVEREIGN_REPL_WORKER to its own binary.
         if let Some(repl) = repl::ReplTool::from_env() {
             Self::insert_tool(&mut tools_map, "repl", repl);
-        }
-        // Integration discovery is on by default (opt-out); when disabled the
-        // tool is never registered and no discovery endpoint is ever
-        // contacted.
-        if crate::config::config().sponsors.enabled {
-            Self::insert_tool(
-                &mut tools_map,
-                "integration_tools",
-                discover::DiscoverToolsTool::new(),
-            );
         }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
@@ -1036,7 +1017,6 @@ impl Registry {
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-        crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
         Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
 
         let mut output = match result {

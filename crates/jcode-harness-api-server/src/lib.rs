@@ -583,8 +583,22 @@ mod public_acceptance_tests {
             json!({"working_dir": "/workspace/alpha", "messages": []}).to_string(),
         )
         .unwrap();
-        let api_path = root.join("api.sock");
-        let legacy_path = root.join("legacy.sock");
+        // `AF_UNIX` addresses are capped at `SUN_LEN` (~104 bytes on macOS,
+        // ~108 on Linux). `root` (an env::temp_dir()-based path, which on
+        // macOS is commonly a long `/var/folders/.../T/` path) plus this
+        // test's own long, doubly-unique directory name already eats most of
+        // that budget, so the socket files themselves must not add another
+        // directory level or a long name. Put them directly under `/tmp`
+        // (always short on Unix, which is exactly why it is the conventional
+        // place for socket files) with a short unique suffix instead of
+        // nesting them inside `root`.
+        let socket_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000;
+        let api_path = std::path::PathBuf::from(format!("/tmp/jcode-api-{socket_id}.sock"));
+        let legacy_path = std::path::PathBuf::from(format!("/tmp/jcode-legacy-{socket_id}.sock"));
         let legacy_listener = UnixListener::bind(&legacy_path).unwrap();
 
         let fake_daemon = tokio::spawn(async move {
@@ -624,7 +638,7 @@ mod public_acceptance_tests {
             panic!("API connection closed before the message reached the attached session");
         });
 
-        let bridge = tokio::spawn(run_bridge(api_path.clone(), legacy_path));
+        let bridge = tokio::spawn(run_bridge(api_path.clone(), legacy_path.clone()));
         let stream = loop {
             match UnixStream::connect(&api_path).await {
                 Ok(stream) => break stream,
@@ -657,6 +671,8 @@ mod public_acceptance_tests {
             .unwrap();
         bridge.abort();
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(&api_path);
+        let _ = std::fs::remove_file(&legacy_path);
     }
 }
 

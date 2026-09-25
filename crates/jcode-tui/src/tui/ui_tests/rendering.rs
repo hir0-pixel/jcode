@@ -635,6 +635,14 @@ fn test_light_theme_adapted_frame_has_readable_contrast() {
 /// guards the hook's presence and its ordering relative to the light/dark pass.
 #[test]
 fn test_configured_palette_recolors_a_real_rendered_frame() {
+    // Without COLORTERM (as under a headless test runner), rendering falls
+    // back to 256-color quantization, which can snap both the default and
+    // the reconfigured user color to the same nearest xterm index. Pin
+    // truecolor so this measures the palette substitution, not quantization.
+    // Scoped (not the permanent `pin_truecolor_for_tests`) so it cannot leak
+    // into unrelated rendering-snapshot tests elsewhere in the binary.
+    let _truecolor = jcode_tui_style::color::TruecolorTestGuard::pin();
+
     fn render() -> ratatui::buffer::Buffer {
         let messages = vec![
             DisplayMessage {

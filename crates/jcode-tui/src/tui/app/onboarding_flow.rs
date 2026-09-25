@@ -21,8 +21,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// How long we wait on a yes/no decision phase (login import, telemetry
-/// consent) before auto-selecting the highlighted default. We keep this short
+/// How long we wait on a login import decision before auto-selecting the
+/// highlighted default. We keep this short
 /// enough that the user doesn't get stuck deliberating, but long enough to
 /// read the prompt.
 pub(crate) const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -45,68 +45,6 @@ impl ExternalCli {
             ExternalCli::Pi => "Pi",
             ExternalCli::OpenCode => "OpenCode",
             ExternalCli::Cursor => "Cursor",
-        }
-    }
-}
-
-/// Which telemetry level the "Telemetry settings" page has highlighted.
-///
-/// The page is a three-way choice rather than a yes/no so the middle ground
-/// (usage stats without prompt content) is reachable without hunting through
-/// config. Order matches the on-screen order, most sharing first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TelemetryLevel {
-    /// Usage stats plus prompt/transcript content.
-    Everything,
-    /// Usage stats and crash reports only (no prompts or transcripts).
-    NoContent,
-    /// Nothing at all.
-    Nothing,
-}
-
-impl TelemetryLevel {
-    /// The on-screen order, most sharing first.
-    pub(crate) const ORDER: [TelemetryLevel; 3] = [
-        TelemetryLevel::Everything,
-        TelemetryLevel::NoContent,
-        TelemetryLevel::Nothing,
-    ];
-
-    /// The level currently persisted on this machine.
-    pub(crate) fn current() -> Self {
-        if !crate::telemetry::is_enabled() {
-            TelemetryLevel::Nothing
-        } else if crate::telemetry::content_sharing_enabled() {
-            TelemetryLevel::Everything
-        } else {
-            TelemetryLevel::NoContent
-        }
-    }
-
-    /// Persist this level (usage opt-out marker + content-sharing marker).
-    pub(crate) fn persist(self) {
-        match self {
-            TelemetryLevel::Everything => {
-                crate::telemetry::set_usage_telemetry_enabled(true);
-                crate::telemetry::set_content_sharing_enabled(true);
-            }
-            TelemetryLevel::NoContent => {
-                crate::telemetry::set_usage_telemetry_enabled(true);
-                crate::telemetry::set_content_sharing_enabled(false);
-            }
-            TelemetryLevel::Nothing => {
-                crate::telemetry::set_content_sharing_enabled(false);
-                crate::telemetry::set_usage_telemetry_enabled(false);
-            }
-        }
-    }
-
-    /// Short status-line label for the chosen level.
-    pub(crate) fn status_label(self) -> &'static str {
-        match self {
-            TelemetryLevel::Everything => "Telemetry: sending everything, thank you",
-            TelemetryLevel::NoContent => "Telemetry: usage and crashes only",
-            TelemetryLevel::Nothing => "Telemetry: off",
         }
     }
 }
@@ -142,9 +80,6 @@ pub(crate) struct ImportReview {
     pub(crate) choosing: bool,
     /// Which summary pill is focused when `choosing == false`.
     pub(crate) summary_pill: SummaryPill,
-    /// `Some` while the "Telemetry settings" sub-page is open, holding the
-    /// highlighted level. Committing or pressing Esc returns to the summary.
-    pub(crate) telemetry: Option<TelemetryLevel>,
     /// When the screen was first shown, for the single decision countdown.
     pub(crate) shown_at: Instant,
 }
@@ -158,16 +93,13 @@ pub(crate) enum SummaryPill {
     Subscription,
     /// Open the per-login checkbox list to import fewer logins.
     ImportLess,
-    /// Open the telemetry settings sub-page.
-    Telemetry,
 }
 
 impl SummaryPill {
-    const ORDER: [SummaryPill; 4] = [
+    const ORDER: [SummaryPill; 3] = [
         SummaryPill::Continue,
         SummaryPill::Subscription,
         SummaryPill::ImportLess,
-        SummaryPill::Telemetry,
     ];
 
     fn index(self) -> usize {
@@ -204,7 +136,6 @@ impl ImportReview {
             continue_focused: false,
             choosing: false,
             summary_pill: SummaryPill::Subscription,
-            telemetry: None,
             shown_at: Instant::now(),
         })
     }
@@ -215,32 +146,6 @@ impl ImportReview {
         self.choosing = true;
         self.continue_focused = false;
         self.cursor = 0;
-        self.telemetry = None;
-    }
-
-    /// Open the telemetry settings sub-page, highlighting "Send everything" so
-    /// the most helpful option is the default commit.
-    pub(crate) fn open_telemetry(&mut self) {
-        self.telemetry = Some(TelemetryLevel::Everything);
-    }
-
-    /// Close the telemetry sub-page and return to the summary screen with the
-    /// "Telemetry settings" pill still focused.
-    pub(crate) fn close_telemetry(&mut self) {
-        self.telemetry = None;
-    }
-
-    /// Move the telemetry highlight. No-op unless the sub-page is open.
-    pub(crate) fn telemetry_step(&mut self, forward: bool) {
-        let Some(level) = self.telemetry else { return };
-        let order = TelemetryLevel::ORDER;
-        let i = order.iter().position(|&l| l == level).unwrap_or(0);
-        let next = if forward {
-            (i + 1) % order.len()
-        } else {
-            (i + order.len() - 1) % order.len()
-        };
-        self.telemetry = Some(order[next]);
     }
 
     /// Move the summary pill focus. Keeps `continue_focused` in sync so the
@@ -250,8 +155,7 @@ impl ImportReview {
         self.continue_focused = self.summary_pill == SummaryPill::Continue;
     }
 
-    /// Focus a specific summary pill (used by the onboarding simulator to land
-    /// directly on a given screen state).
+    #[cfg(test)]
     pub(crate) fn focus_summary_pill(&mut self, pill: SummaryPill) {
         self.summary_pill = pill;
         self.continue_focused = pill == SummaryPill::Continue;
@@ -369,11 +273,9 @@ impl ImportReview {
             .as_secs()
     }
 
-    /// Whether the decision countdown has elapsed. Paused while the telemetry
-    /// settings sub-page is open so the screen never commits the import out
-    /// from under a user who is reading it.
+    /// Whether the decision countdown has elapsed.
     pub(crate) fn timed_out(&self) -> bool {
-        self.telemetry.is_none() && self.shown_at.elapsed() >= DECISION_TIMEOUT
+        self.shown_at.elapsed() >= DECISION_TIMEOUT
     }
 }
 

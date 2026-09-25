@@ -89,12 +89,8 @@ fn test_remote_model_command_opens_picker_without_catalog_request() {
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
     let request_id_before = remote.next_request_id_for_test();
 
-    rt.block_on(app.handle_remote_key(
-        KeyCode::Enter,
-        KeyModifiers::empty(),
-        &mut remote,
-    ))
-    .unwrap();
+    rt.block_on(app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote))
+        .unwrap();
 
     assert!(app.inline_interactive_state.is_some());
     assert_eq!(
@@ -545,11 +541,16 @@ fn test_subagent_model_large_catalog_uses_cached_searchable_picker() {
     app.handle_key(KeyCode::Char('3'), KeyModifiers::empty())
         .unwrap();
     let picker = app.inline_interactive_state.as_ref().unwrap();
-    assert!(!picker.filtered.is_empty(), "typed input should filter models");
+    assert!(
+        !picker.filtered.is_empty(),
+        "typed input should filter models"
+    );
     assert!(picker.filtered.len() < picker.entries.len());
 
-    app.handle_key(KeyCode::Enter, KeyModifiers::empty()).unwrap();
-    app.handle_key(KeyCode::Enter, KeyModifiers::empty()).unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
     assert!(app.session.subagent_model.is_some());
     assert_eq!(app.provider.model(), "counting-a");
 }
@@ -717,7 +718,11 @@ fn test_tui_api_key_auth_refreshes_catalog_shows_diff_without_opening_picker() {
     let activation = rt.block_on(async {
         loop {
             match tokio::time::timeout(Duration::from_secs(2), bus_rx.recv()).await {
-                Ok(Ok(event @ crate::bus::BusEvent::ProviderModelActivated { .. })) => break event,
+                Ok(Ok(
+                    ref event @ crate::bus::BusEvent::ProviderModelActivated {
+                        ref session_id, ..
+                    },
+                )) if session_id == &app.session.id => break event.clone(),
                 Ok(Ok(_)) => continue,
                 other => panic!("expected ProviderModelActivated event, got {other:?}"),
             }
@@ -841,6 +846,14 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
     rt.block_on(async {
         while !(saw_saved && saw_catalog_started && saw_activation && saw_catalog_ready) {
             match tokio::time::timeout(Duration::from_secs(2), bus_rx.recv()).await {
+                // The bus is process-global: a concurrently-running test can
+                // publish its own `LoginCompleted` (e.g. a real network login
+                // attempt for another provider) on the same channel. Only the
+                // event for the Cerebras login this test drove is ours; any
+                // other provider's event is cross-talk from a sibling test and
+                // must be ignored rather than asserted on.
+                Ok(Ok(crate::bus::BusEvent::LoginCompleted(login)))
+                    if login.provider != "Cerebras" => {}
                 Ok(Ok(crate::bus::BusEvent::LoginCompleted(login))) => {
                     if login.success {
                         login_success_events += 1;
@@ -887,7 +900,11 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                         Ok(crate::bus::BusEvent::UiActivity(activity)),
                     );
                 }
-                Ok(Ok(event @ crate::bus::BusEvent::ProviderModelActivated { .. })) => {
+                Ok(Ok(
+                    ref event @ crate::bus::BusEvent::ProviderModelActivated {
+                        ref session_id, ..
+                    },
+                )) if session_id == &app.session.id => {
                     activation_events += 1;
                     if let crate::bus::BusEvent::ProviderModelActivated {
                         model,
@@ -901,9 +918,10 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                         assert!(message.contains("Cerebras is ready."), "{message}");
                         assert!(!message.contains("wrong-profile-first"), "{message}");
                     }
-                    super::local::handle_bus_event(&mut app, Ok(event));
+                    super::local::handle_bus_event(&mut app, Ok(event.clone()));
                     saw_activation = true;
                 }
+                Ok(Ok(crate::bus::BusEvent::ProviderModelActivated { .. })) => {}
                 Ok(Ok(event @ crate::bus::BusEvent::AuthCatalogRefreshReady)) => {
                     super::local::handle_bus_event(&mut app, Ok(event));
                     saw_catalog_ready = true;
@@ -916,6 +934,10 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
 
     while let Ok(event) = bus_rx.try_recv() {
         match event {
+            // See the note above: the bus is process-global, so a sibling
+            // test's own login events can land here too. Only Cerebras events
+            // are this test's business.
+            crate::bus::BusEvent::LoginCompleted(login) if login.provider != "Cerebras" => {}
             crate::bus::BusEvent::LoginCompleted(login) => {
                 if login.success {
                     login_success_events += 1;
@@ -941,10 +963,9 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
                 provider_key,
                 message,
                 ..
-            } => {
+            } if provider_key.as_deref() == Some("cerebras") => {
                 activation_events += 1;
                 assert_eq!(model, "qwen-3-235b-a22b-instruct-2507");
-                assert_eq!(provider_key.as_deref(), Some("cerebras"));
                 assert!(message.contains("Cerebras is ready."), "{message}");
             }
             event @ crate::bus::BusEvent::AuthCatalogRefreshReady => {

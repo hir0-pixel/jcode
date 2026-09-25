@@ -11,7 +11,7 @@
 #   5. commit blast      - simulate HEAD moving (JCODE_BUILD_GIT_HASH change),
 #                          which reruns jcode-build-meta's build script and
 #                          recompiles every crate that depends on it
-#                          (base, app-core, tui, setup-hints, telemetry-core, root)
+#                          (base, app-core, tui, setup-hints, root)
 #
 # Touches are reverted after each run. Requires a clean-enough tree that
 # `scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode` succeeds.
@@ -113,4 +113,4 @@ echo "  - no-op should be a few seconds (cargo fingerprinting + link check)."
 echo "  - leaf/tui/core touches show per-crate recompile + link cost."
 echo "  - commit-blast shows the cost every commit pays because"
 echo "    jcode-build-meta embeds GIT_HASH via env! and jcode-base/app-core/"
-echo "    tui/setup-hints/telemetry-core all depend on it."
+echo "    tui/setup-hints all depend on it."

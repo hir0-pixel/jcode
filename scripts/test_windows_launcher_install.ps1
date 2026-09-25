@@ -71,11 +71,11 @@ try {
 
     Write-Host 'test_local_binary_version_output_parsing'
     Assert-Equal 'v0.47.0' (ConvertFrom-JcodeVersionOutput 'jcode v0.47.0 (f7f5898c)') 'local artifact version parser should accept normal jcode --version output'
-    Assert-Equal 'v0.47.0' (ConvertFrom-JcodeVersionOutput 'jcode collects anonymous usage statistics. jcode v0.47.0 (f7f5898c)') 'local artifact version parser should accept fresh-profile telemetry before version output'
+    Assert-Equal 'v0.47.0' (ConvertFrom-JcodeVersionOutput 'ready. jcode v0.47.0 (f7f5898c)') 'local artifact version parser should accept prefixed output'
     Assert-Equal $null (ConvertFrom-JcodeVersionOutput 'not a jcode binary') 'local artifact version parser should reject unrelated output'
     $freshProfileBinary = Join-Path $testRoot 'fresh-profile-version.cmd'
-    Set-Content -LiteralPath $freshProfileBinary -Value "@echo off`r`n>&2 echo jcode collects anonymous usage statistics.`r`necho jcode v0.47.0 (f7f5898c)" -NoNewline
-    Assert-Equal 'v0.47.0' (Get-JcodeVersionFromBinary $freshProfileBinary) 'binary version probe should tolerate a successful fresh-profile telemetry notice on stderr'
+    Set-Content -LiteralPath $freshProfileBinary -Value "@echo off`r`n>&2 echo ready.`r`necho jcode v0.47.0 (f7f5898c)" -NoNewline
+    Assert-Equal 'v0.47.0' (Get-JcodeVersionFromBinary $freshProfileBinary) 'binary version probe should tolerate a successful status notice on stderr'
 
     Write-Host 'test_windows_architecture_detection_prefers_native_arm64'
     Assert-Equal 'jcode-windows-x86_64' (Resolve-JcodeWindowsArtifact @('X64', 'AMD64')) 'x64 Windows should select the x64 release asset'

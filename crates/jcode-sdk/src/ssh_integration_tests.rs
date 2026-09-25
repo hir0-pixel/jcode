@@ -61,7 +61,6 @@ fn localhost_native_harness() {
         .env_clear()
         .env("HOME", &home)
         .env("JCODE_HOME", &home)
-        .env("JCODE_NO_TELEMETRY", "1")
         .env("JCODE_RUNTIME_DIR", &runtime)
         .env("XDG_RUNTIME_DIR", &runtime)
         .current_dir(root)
@@ -87,7 +86,6 @@ fn localhost_native_harness() {
         .env("JCODE_SOCKET", &daemon_socket)
         .env("JCODE_DEFERRED_AUTH_BOOTSTRAP", "1")
         .env("JCODE_WAKE_MODE", "external")
-        .env("JCODE_NO_TELEMETRY", "1")
         .args(["--no-update", "serve"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -132,7 +130,7 @@ fn localhost_native_harness() {
         .port();
     let remote_script = root.join("remote.sh");
     std::fs::write(&remote_script, format!(
-        "export HOME={} JCODE_HOME={} XDG_RUNTIME_DIR={} JCODE_SOCKET={} JCODE_WAKE_MODE=external JCODE_NO_TELEMETRY=1\nexport JCODE_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"\ncd \"$HOME\" || exit 1\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
+        "export HOME={} JCODE_HOME={} XDG_RUNTIME_DIR={} JCODE_SOCKET={} JCODE_WAKE_MODE=external\nexport JCODE_RUNTIME_DIR=\"$XDG_RUNTIME_DIR\"\ncd \"$HOME\" || exit 1\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
         shell_quote(home.to_str().unwrap()), shell_quote(home.to_str().unwrap()),
         shell_quote(runtime.to_str().unwrap()), shell_quote(daemon_socket.to_str().unwrap()),
     )).unwrap();

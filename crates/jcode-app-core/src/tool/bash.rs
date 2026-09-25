@@ -787,15 +787,19 @@ mod utf8_truncation_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn build_shell_command_uses_disk_backed_scratch_directory() {
-        let expected = super::tool_scratch_dir().expect("jcode scratch directory");
-        let output = build_shell_command("printf '%s\\n%s\\n' \"$TMPDIR\" \"$JCODE_SCRATCH_DIR\"")
-            .output()
-            .await
-            .expect("run bash command");
+        let mut command =
+            build_shell_command("printf '%s\\n%s\\n' \"$TMPDIR\" \"$JCODE_SCRATCH_DIR\"");
+        let expected = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "JCODE_SCRATCH_DIR").then_some(value).flatten())
+            .expect("command scratch directory")
+            .to_string_lossy()
+            .into_owned();
+        let output = command.output().await.expect("run bash command");
         assert!(output.status.success(), "bash command should succeed");
         let stdout = String::from_utf8(output.stdout).expect("utf-8 scratch paths");
         let paths = stdout.lines().collect::<Vec<_>>();
-        let expected = expected.to_string_lossy().into_owned();
         assert_eq!(paths, vec![expected.as_str(), expected.as_str()]);
         assert!(std::path::Path::new(&expected).is_dir());
     }

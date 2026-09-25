@@ -13,7 +13,6 @@
   ],
   "fixes": [
     "Background commands no longer inherit stdin unexpectedly",
-    "Telemetry respects opt-out before install events and isolates tests from user configuration",
     "Fallback tool-call identifiers remain unique when providers omit IDs"
   ]
 }

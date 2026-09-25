@@ -10,7 +10,6 @@
   ],
   "fixes": [
     "Remote TUI sessions now dispatch productivity results and handle Alt-key toggles correctly",
-    "Memory sidecars now preserve provider routing while omitting unnecessary metadata",
-    "Invalid CI telemetry overrides now fall back safely"
+    "Memory sidecars now preserve provider routing while omitting unnecessary metadata"
   ]
 }

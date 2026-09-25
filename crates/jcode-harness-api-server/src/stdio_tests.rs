@@ -88,20 +88,23 @@ async fn stdio_stream_rejects_bad_hello_without_dialing_daemon() {
 async fn session_tools_negotiation_and_stream_translation() {
     use serde_json::json;
     for supported in [false, true] {
-        let root = std::env::temp_dir().join(format!(
-            "jcode-tools-{}-{}-{supported}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let socket = root.join("daemon.sock");
+        // Socket paths are capped at `SUN_LEN` (~104 bytes on macOS, ~108 on
+        // Linux); `env::temp_dir()` is commonly a long `/var/folders/.../T/`
+        // path on macOS, so nesting the socket file under a uniquely-named
+        // subdirectory of it can exceed that budget. Bind directly under
+        // `/tmp` (always short, the conventional place for socket files)
+        // with a short unique suffix instead.
+        let socket_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000;
+        let socket =
+            std::path::PathBuf::from(format!("/tmp/jcode-tools-{socket_id}-{supported}.sock"));
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (client, bridge) = tokio::io::duplex(8192);
         let (bridge_read, bridge_write) = tokio::io::split(bridge);
-        let task = tokio::spawn(run_bridge_stream(bridge_read, bridge_write, socket));
+        let task = tokio::spawn(run_bridge_stream(bridge_read, bridge_write, socket.clone()));
         let (read, mut write) = tokio::io::split(client);
         let mut read = BufReader::new(read);
         write_json_line(&mut write, &json!({"v":1,"id":1,"req":"hello","min_version":1,"max_version":1,"client":"tool-test"})).await.unwrap();
@@ -208,6 +211,6 @@ async fn session_tools_negotiation_and_stream_translation() {
         write.shutdown().await.unwrap();
         task.await.unwrap().unwrap();
         drop(listener);
-        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_file(&socket);
     }
 }

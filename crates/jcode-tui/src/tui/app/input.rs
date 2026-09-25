@@ -1778,7 +1778,6 @@ impl App {
                 self.last_todo_ownership_fingerprint = ownership_fingerprint;
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
-                crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Ownership);
                 self.push_display_message(DisplayMessage::system(
                     "🔍 Checking end-to-end ownership before finishing...",
                 ));
@@ -1797,13 +1796,9 @@ impl App {
                 self.todo_completion_gate_attempts =
                     self.todo_completion_gate_attempts.saturating_add(1);
                 let notice = if confidence_summary.completion_confidence_needs_validation {
-                    crate::telemetry::record_todo_gate(crate::telemetry::TodoGateKind::Completion);
                     "🔍 Double-checking confidence for you..."
                 } else {
                     self.todo_confidence_spike_challenged = true;
-                    crate::telemetry::record_todo_gate(
-                        crate::telemetry::TodoGateKind::ConfidenceSpike,
-                    );
                     "🔍 Double-checking confidence jumps..."
                 };
                 self.push_display_message(DisplayMessage::system(notice));
@@ -3867,10 +3862,6 @@ impl App {
         let trimmed = input.trim();
         let handled = super::commands_dispatch::dispatch_local_command(self, trimmed);
         if handled {
-            let embedded = super::commands_dispatch::contains_registered_slash_command(trimmed);
-            if trimmed.starts_with('/') || embedded {
-                crate::telemetry::record_command_family(trimmed);
-            }
             return;
         }
 
@@ -4033,7 +4024,6 @@ impl App {
             });
             self.session.add_message(Role::User, blocks);
         }
-        crate::telemetry::record_turn();
         self.session_save_pending = true;
 
         // A fresh user turn supersedes any post-error fallback offer from the

@@ -2,7 +2,7 @@
 //!
 //! This crate holds the downward-closed set of modules that the upper
 //! server/tool/agent layer (`jcode-app-core`) depends on: provider, auth,
-//! config, session, message, memory, telemetry, and their supporting leaves.
+//! config, session, message, memory, and their supporting leaves.
 //! Splitting it out lets the two halves compile as separate rustc units so the
 //! largest compilation unit (and its peak memory) is roughly halved.
 //!
@@ -85,15 +85,11 @@ pub mod session_metrics;
 pub mod side_panel;
 pub mod skill;
 pub mod soft_interrupt_store;
-pub mod sponsors;
 pub mod stdin_detect;
 pub mod storage;
 pub mod subscription_api;
 pub mod subscription_catalog;
 pub mod telegram;
-pub mod telemetry {
-    pub use jcode_telemetry_core::*;
-}
 pub mod terminal_launch;
 pub mod todo;
 pub mod transcript_sample;

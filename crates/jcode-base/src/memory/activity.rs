@@ -150,7 +150,6 @@ pub fn clear_activity() {
 /// Record that a memory payload was injected into model context.
 /// This feeds the memory info widget with injected content + metadata.
 pub fn record_injected_prompt(prompt: &str, count: usize, age_ms: u64) {
-    crate::telemetry::record_memory_injected(count, age_ms);
     let items = parse_injected_items(prompt, 8);
     let preview = prompt_preview(prompt, 72);
     add_event(MemoryEventKind::MemoryInjected {
@@ -277,9 +276,6 @@ fn snapshot_state(state: &MemoryState) -> crate::protocol::MemoryStateSnapshot {
     match state {
         MemoryState::Idle => crate::protocol::MemoryStateSnapshot::Idle,
         MemoryState::Embedding => crate::protocol::MemoryStateSnapshot::Embedding,
-        MemoryState::SidecarChecking { count } => {
-            crate::protocol::MemoryStateSnapshot::SidecarChecking { count: *count }
-        }
         MemoryState::FoundRelevant { count } => {
             crate::protocol::MemoryStateSnapshot::FoundRelevant { count: *count }
         }
@@ -333,9 +329,6 @@ fn from_snapshot_state(snapshot: &crate::protocol::MemoryStateSnapshot) -> Memor
     match snapshot {
         crate::protocol::MemoryStateSnapshot::Idle => MemoryState::Idle,
         crate::protocol::MemoryStateSnapshot::Embedding => MemoryState::Embedding,
-        crate::protocol::MemoryStateSnapshot::SidecarChecking { count } => {
-            MemoryState::SidecarChecking { count: *count }
-        }
         crate::protocol::MemoryStateSnapshot::FoundRelevant { count } => {
             MemoryState::FoundRelevant { count: *count }
         }

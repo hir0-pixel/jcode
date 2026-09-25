@@ -85,7 +85,6 @@ jcode-provider-gemini = { path = "../jcode-provider-gemini" }
 jcode-render-core = { path = "../jcode-render-core" }
 jcode-terminal-launch = { path = "../jcode-terminal-launch" }
 jcode-terminal-image = { path = "../jcode-terminal-image" }
-jcode-telemetry-core = { path = "../jcode-telemetry-core" }
 jcode-usage-types = { path = "../jcode-usage-types" }
 
 # Native microphone input is opt-in so CLI builds need no audio development libraries.

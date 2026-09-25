@@ -44,10 +44,6 @@ static LAST_INJECTED_MEMORY_SET: Mutex<Option<LastInjectedMemorySetBySession>> =
 /// Keyed by session ID.
 static INJECTED_MEMORY_IDS: Mutex<Option<InjectedMemoryIdsBySession>> = Mutex::new(None);
 
-/// Guard to ensure only one memory check runs at a time, per session.
-/// Keyed by session ID.
-static MEMORY_CHECK_IN_PROGRESS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
 /// Suppress repeated identical memory payloads within this many seconds.
 const MEMORY_REPEAT_SUPPRESSION_SECS: u64 = 90;
 /// Suppress substantially overlapping memory sets for a bit longer.

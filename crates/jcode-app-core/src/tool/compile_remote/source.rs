@@ -169,6 +169,13 @@ fn collect(root: &Path, listing: &[u8]) -> Result<Snapshot> {
         "unterminated Git source listing"
     );
     let root_dir = std::fs::File::open(root)?;
+    // Compare canonicalized paths against a canonicalized root, not the raw
+    // `root` the caller passed in. On macOS the caller's path commonly runs
+    // through a symlinked prefix (`/var` -> `/private/var`, `/tmp` ->
+    // `/private/tmp`), while `canonicalize` always resolves it fully; a raw
+    // `starts_with(root)` check would then reject every real file as
+    // "escaping" the root and skip them all, leaving zero eligible files.
+    let canonical_root = std::fs::canonicalize(root)?;
     let mut paths = BTreeSet::new();
     for bytes in listing
         .split(|byte| *byte == 0)
@@ -193,7 +200,7 @@ fn collect(root: &Path, listing: &[u8]) -> Result<Snapshot> {
         // Additional containment check; descriptor-relative opens above close
         // the symlink race that canonicalization by itself would leave open.
         match std::fs::canonicalize(&full_path) {
-            Ok(canonical) if canonical.starts_with(root) => {}
+            Ok(canonical) if canonical.starts_with(&canonical_root) => {}
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("resolve source file"),
@@ -496,6 +503,14 @@ mod tests {
         assert!(error.to_string().contains("exceeds 2 bytes"));
     }
 
+    // APFS rejects non-UTF-8 filenames outright (`write` fails with EILSEQ
+    // "Illegal byte sequence"), so this repo cannot even create the fixture
+    // file on macOS. The path-rejection logic itself is still exercised on
+    // every platform via `relative_path(b"\xff")` in
+    // `rejects_invalid_paths_and_deduplicates_listing` below; this test adds
+    // the end-to-end real-git listing path, which needs a filesystem that
+    // allows the invalid name in the first place.
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn rejects_non_utf8_git_paths() {
         use std::os::unix::ffi::OsStrExt;

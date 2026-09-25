@@ -48,7 +48,7 @@ def main() -> int:
     env = os.environ.copy()
     env.update({
         "JCODE_HOME": str(home), "JCODE_RUNTIME_DIR": str(run),
-        "JCODE_SOCKET": str(run / "jcode.sock"), "JCODE_NO_TELEMETRY": "1",
+        "JCODE_SOCKET": str(run / "jcode.sock"),
         "JCODE_DEBUG_CONTROL": "1", "JCODE_TEMP_SERVER": "1",
         "JCODE_SERVER_OWNER_PID": str(os.getpid()), "JCODE_PERF_TIER": "full",
         "JCODE_THEME": "dark",

@@ -12,7 +12,6 @@
     "The swarm gallery and snapshots now show which provider and auth route each agent is using",
     "Markdown tables honour column alignment in every renderer, and copying a table gives you clean text",
     "Inline math stays inline in image mode and blends with the surrounding prose colour",
-    "The discover_tools browse card is now a single compact line, and the sponsored-discovery notice is gone",
     "Tool descriptions and parameter docs are capped, leaving more of the context window for your work",
     "Ollama reports the context window it is actually serving instead of the trained window",
     "Crash-resume hints now point at the session picker"

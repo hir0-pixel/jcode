@@ -40,6 +40,35 @@ pub fn pin_truecolor_for_tests() {
     CAPABILITY_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// RAII version of [`pin_truecolor_for_tests`] that restores the previous
+/// override on drop instead of leaving truecolor pinned for the rest of the
+/// process.
+///
+/// Prefer this over the permanent pin for a test that only needs exact RGB
+/// values for its own assertions (e.g. comparing two blended colors): a
+/// process-wide pin can flip color-quantization-dependent behavior in an
+/// unrelated test that happens to run later in the same binary (observed
+/// with the idle-animation partial-repaint snapshot test, whose frames
+/// compare equal only because both were quantized to the same 256-color
+/// index; pinning truecolor exposed a pre-existing sub-pixel timing
+/// difference between the two renders).
+pub struct TruecolorTestGuard {
+    previous: u8,
+}
+
+impl TruecolorTestGuard {
+    pub fn pin() -> Self {
+        let previous = CAPABILITY_OVERRIDE.swap(1, std::sync::atomic::Ordering::Relaxed);
+        Self { previous }
+    }
+}
+
+impl Drop for TruecolorTestGuard {
+    fn drop(&mut self) {
+        CAPABILITY_OVERRIDE.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Terminals whose GPU glyph atlas corrupts under heavy per-cell *truecolor*
 /// churn (the macOS 26 "garbled glyphs" bug in the VS Code integrated terminal
 /// and Apple Terminal; see `jcode_app_core::perf` and issue #330). These

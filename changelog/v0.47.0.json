@@ -9,7 +9,6 @@
   ],
   "improvements": [
     "Swarm spawn rows stay compact and stable in chat while rapidly changing todos, tool progress, and output remain on the live page",
-    "Sponsored tool discovery requires specific reporting context and blocks recognizable secrets or personal data before any request is sent",
     "Todo, batch, and remote todo results render more consistently as compact cards with clearer retry and feedback-loop details",
     "Terminal file drops attach directly without being misrouted through skill commands"
   ],

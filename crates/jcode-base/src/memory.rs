@@ -854,8 +854,6 @@ impl MemoryManager {
         Ok(false)
     }
 
-    // === Sidecar Integration ===
-
     // === Async Memory Checking ===
 
     /// Local recall (sovereign): an indexed full-text query over the stored

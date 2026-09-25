@@ -194,7 +194,7 @@ def main():
     for directory in ['home', 'runtime', 'config', 'cache', 'data', 'state', 'jcode', 'tmp', 'sdk/src', 'regular/jcode-desktop']:
         (root / directory).mkdir(mode=0o700, parents=True, exist_ok=True)
     (root / 'desktop-link').symlink_to(nested, target_is_directory=True)
-    (root / 'jcode/config.toml').write_text('[features]\nmemory = false\n[telemetry]\nenabled = false\n')
+    (root / 'jcode/config.toml').write_text('[features]\nmemory = false\n')
     (root / 'sdk/Cargo.toml').write_text(
         '[package]\nname = "desktop-selfdev-sdk-acceptance"\nversion = "0.0.0"\nedition = "2024"\n'
         '[workspace]\n[dependencies]\nserde_json = "1"\njcode-sdk = { path = '
@@ -218,7 +218,7 @@ def main():
         'TMPDIR': str(root / 'tmp'), 'JCODE_HOME': str(root / 'jcode'),
         'JCODE_RUNTIME_DIR': str(root / 'runtime'), 'JCODE_SOCKET': str(root / 'runtime/daemon.sock'),
         'JCODE_API_SOCKET': str(root / 'runtime/api.sock'), 'JCODE_DEBUG_CONTROL': '1',
-        'JCODE_NO_TELEMETRY': '1', 'JCODE_TEMP_SERVER': '1',
+        'JCODE_TEMP_SERVER': '1',
         'JCODE_SERVER_OWNER_PID': str(os.getpid()), 'JCODE_TEMP_SERVER_IDLE_SECS': '300',
     }
     processes, logs = [], []

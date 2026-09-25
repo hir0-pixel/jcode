@@ -191,10 +191,11 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
         .expect("retry should surface a connection status message");
     assert_eq!(retry_notice.role, "system");
     assert!(retry_notice.content.contains("Connection lost - retrying"));
-    assert!(retry_notice.content.contains(&format!(
-        "attempt 1/{}",
-        App::AUTO_RETRY_MAX_ATTEMPTS
-    )));
+    assert!(
+        retry_notice
+            .content
+            .contains(&format!("attempt 1/{}", App::AUTO_RETRY_MAX_ATTEMPTS))
+    );
     assert!(retry_notice.content.contains("Remote request failed"));
 }
 
@@ -1263,16 +1264,23 @@ fn test_tui_login_providers_have_real_tui_handlers() {
 
 #[test]
 fn test_tui_grok_build_login_starts_managed_oauth_flow() {
+    // Serialize against every other test that reads process-global runtime
+    // state: `start_login_provider` spawns a real background task on this
+    // test's tokio runtime that hits the network (xAI's device-code
+    // endpoint) and, on any outcome, publishes `BusEvent::LoginCompleted` on
+    // the *global* `Bus`. Without draining that event before this test ends,
+    // it lands in whichever other test happens to be subscribed to the bus
+    // at the time the background task finishes (observed leaking into the
+    // Cerebras login-lifecycle test as an unrelated failed-login event).
+    let _env_lock = crate::storage::lock_test_env();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = runtime.enter();
     let mut app = create_test_app();
+    let mut bus_rx = crate::bus::Bus::global().subscribe();
 
     app.start_login_provider(crate::provider_catalog::GROK_BUILD_LOGIN_PROVIDER);
 
-    assert!(matches!(
-        app.pending_login,
-        Some(PendingLogin::GrokBuild)
-    ));
+    assert!(matches!(app.pending_login, Some(PendingLogin::GrokBuild)));
     let rendered = app
         .display_messages()
         .iter()
@@ -1282,6 +1290,22 @@ fn test_tui_grok_build_login_starts_managed_oauth_flow() {
     assert!(rendered.contains("xAI sign-in URL and device code"));
     assert!(rendered.contains("You do not need to install the Grok CLI"));
     assert!(!rendered.contains("run `jcode login"));
+
+    // Drain the background task's outcome (there is no network here, so it
+    // fails fast) so its `LoginCompleted` never escapes to another test.
+    runtime.block_on(async {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), bus_rx.recv()).await {
+                Ok(Ok(crate::bus::BusEvent::LoginCompleted(login)))
+                    if login.provider == "grok-build" =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+    });
 }
 
 #[test]
@@ -1974,7 +1998,9 @@ fn test_debug_command_side_panel_latency_bench_reports_immediate_redraw() {
     // against 16.0ms purely from machine load, while passing in isolation. The
     // behavioral assertions above are the real subject, so gate only the timing
     // (refs #592).
-    let p95 = value["summary"]["latency_ms"]["p95"].as_f64().unwrap_or(0.0);
+    let p95 = value["summary"]["latency_ms"]["p95"]
+        .as_f64()
+        .unwrap_or(0.0);
     assert_perf_budget(p95 < 16.0, || {
         format!("side-panel p95 should stay within a 60fps frame budget: {result}")
     });
@@ -2261,7 +2287,10 @@ fn test_externally_started_turn_adopts_processing_state_and_settles_on_done() {
         app.status
     );
 
-    app.handle_server_event(crate::protocol::ServerEvent::MessageEnd { stop_reason: None }, &mut remote);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::MessageEnd { stop_reason: None },
+        &mut remote,
+    );
     app.handle_server_event(crate::protocol::ServerEvent::Done { id: 0 }, &mut remote);
 
     // Streaming text is revealed at a paced rate, so a `Done` that arrives with

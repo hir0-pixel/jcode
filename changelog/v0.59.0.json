@@ -12,8 +12,7 @@
     "The auth list hides providers you have no credentials for",
     "Webfetch extracts pages more cleanly: site chrome is stripped, output is capped, and attribute text no longer leaks into the result",
     "Snapshot dates render compactly and acronyms are uppercased in the TUI",
-    "The desktop preview remembers window geometry, supports mouse and keyboard text selection, and centres the composer text in its well",
-    "Onboarding opens the bug-review action instantly, and gained a telemetry settings screen"
+    "The desktop preview remembers window geometry, supports mouse and keyboard text selection, and centres the composer text in its well"
   ],
   "fixes": [
     "Bare OpenAI-compatible and named-profile model ids route to the right provider profile again",

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Arena cap applied at startup. `MALLOC_ARENA_MAX` still wins when set.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 const DEFAULT_ARENA_MAX: i32 = 2;
 /// Never trim more often than this; `malloc_trim` walks every arena.
 const MIN_TRIM_INTERVAL_MS: u64 = 2_000;

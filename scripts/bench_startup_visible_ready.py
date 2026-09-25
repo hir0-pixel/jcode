@@ -99,7 +99,6 @@ def build_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="jcode",
             argv=["jcode", "--no-update", "--no-selfdev"],
-            no_telem_env={"JCODE_NO_TELEMETRY": "1"},
             disable_selfdev=True,
         ),
         ToolSpec(name="pi", argv=[detect_pi_bin()]),

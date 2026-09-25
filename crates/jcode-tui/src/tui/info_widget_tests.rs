@@ -710,7 +710,7 @@ fn memory_widget_renders_current_cycle_activity() {
             global_count: 3,
             sidecar_model: Some("openai · gpt-5.3-codex-spark".to_string()),
             activity: Some(MemoryActivity {
-                state: MemoryState::SidecarChecking { count: 3 },
+                state: MemoryState::FoundRelevant { count: 3 },
                 state_since: now - Duration::from_secs(12),
                 pipeline: Some(pipeline),
                 recent_events: vec![
@@ -757,7 +757,7 @@ fn memory_widget_renders_current_cycle_activity() {
     assert!(text.contains("inject context"));
     assert!(text.contains("update memory"));
     assert!(text.contains("now:"));
-    assert!(text.contains("jev relevance: 3"));
+    assert!(text.contains("found 3 relevant"));
     assert!(!text.contains("model:"));
     assert!(!text.contains("gpt-5.3"));
     assert!(!text.contains("4 project"));
@@ -862,7 +862,7 @@ fn memory_widget_never_renders_uppercase_state_badges() {
         memory_info: Some(MemoryInfo {
             total_count: 128,
             activity: Some(MemoryActivity {
-                state: MemoryState::SidecarChecking { count: 3 },
+                state: MemoryState::FoundRelevant { count: 3 },
                 state_since: Instant::now(),
                 pipeline: None,
                 recent_events: Vec::new(),
@@ -1008,7 +1008,7 @@ fn memory_widget_shows_option_a_steps_without_pipeline_object() {
         memory_info: Some(MemoryInfo {
             sidecar_model: Some("openai · gpt-5.3-codex-spark".to_string()),
             activity: Some(MemoryActivity {
-                state: MemoryState::SidecarChecking { count: 3 },
+                state: MemoryState::FoundRelevant { count: 3 },
                 state_since: Instant::now(),
                 pipeline: None,
                 recent_events: Vec::new(),
@@ -1030,7 +1030,7 @@ fn memory_widget_shows_option_a_steps_without_pipeline_object() {
     assert!(text.contains("jev relevance"), "{text}");
     assert!(text.contains("inject context"), "{text}");
     assert!(text.contains("update memory"), "{text}");
-    assert!(text.contains("jev relevance: 3"), "{text}");
+    assert!(text.contains("found 3 relevant"), "{text}");
 }
 
 #[test]

@@ -11,12 +11,6 @@ use tokio_stream::wrappers::ReceiverStream;
 #[path = "agent_tests/tool_streaming.rs"]
 mod tool_streaming;
 
-#[path = "agent_tests/concurrency.rs"]
-mod concurrency;
-
-#[path = "agent_tests/concurrency_construction.rs"]
-mod concurrency_construction;
-
 #[path = "agent_tests/desktop_selfdev.rs"]
 mod desktop_selfdev;
 
@@ -389,6 +383,22 @@ impl Provider for NativeAutoCompactionProvider {
 
     async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
         Ok("manual summary from native-auto provider".to_string())
+    }
+
+    // Compaction calls `complete_simple_with_usage` directly (to capture
+    // token usage for cost accounting), so overriding only `complete_simple`
+    // above is bypassed: the default `complete_simple_with_usage` streams
+    // through `complete`, which this provider returns empty for compaction
+    // prompts. Override the method compaction actually calls.
+    async fn complete_simple_with_usage(
+        &self,
+        _prompt: &str,
+        _system: &str,
+    ) -> Result<jcode_provider_core::SimpleCompletion> {
+        Ok(jcode_provider_core::SimpleCompletion {
+            text: "manual summary from native-auto provider".to_string(),
+            usage: None,
+        })
     }
 }
 

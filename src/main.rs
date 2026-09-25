@@ -109,8 +109,7 @@ fn run_main() -> Result<()> {
     // SessionStart hooks should be effectively invisible to Claude Code and
     // Codex. Handle this tiny callback before the Tokio runtime and normal Jcode
     // startup path so it does not initialize providers, start cleanup threads,
-    // check for updates, or emit first-run telemetry disclosure text into the
-    // parent CLI's hook output.
+    // check for updates, or write to the parent CLI's hook output.
     if let Some(source) = cli_launch_hint_source_invocation() {
         return jcode::setup_hints::run_setup_hotkey(false, false, false, Some(&source));
     }

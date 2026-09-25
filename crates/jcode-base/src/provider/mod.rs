@@ -81,17 +81,17 @@ pub(crate) use routing::{
 
 /// Process-wide handle to the live agent provider.
 ///
-/// The memory sidecar ([`crate::sidecar::Sidecar`]) needs to make small,
-/// cheap model calls (rerank / relevance / extraction). It has dedicated fast
-/// paths for OpenAI (codex-spark) and Claude (haiku) OAuth, but jcode also runs
-/// on Copilot, Antigravity, Gemini, Cursor, Bedrock, and OpenRouter. For those
-/// providers there is no standalone sidecar HTTP client, so the sidecar falls
-/// back to *this* handle and dispatches through the already-working
-/// [`Provider::complete_simple`] path. `Server::new` registers the active
-/// provider here at startup.
+/// Background memory checking (rerank / relevance / extraction) needs to make
+/// small, cheap model calls. It has dedicated fast paths for OpenAI
+/// (codex-spark) and Claude (haiku) OAuth, but jcode also runs on Copilot,
+/// Antigravity, Gemini, Cursor, Bedrock, and OpenRouter. For those providers
+/// there is no standalone fast-path HTTP client, so background memory
+/// checking falls back to *this* handle and dispatches through the
+/// already-working [`Provider::complete_simple`] path. `Server::new`
+/// registers the active provider here at startup.
 static ACTIVE_PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 
-/// Register the live agent provider so background helpers (memory sidecar) can
+/// Register the live agent provider so background helpers (memory checking) can
 /// reach whatever provider the user is actually running on. Safe to call more
 /// than once; the most recent registration wins.
 pub fn set_active_provider(provider: Arc<dyn Provider>) {

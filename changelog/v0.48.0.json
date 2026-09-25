@@ -15,7 +15,6 @@
     "Tool discovery results and todo cards use more compact, focused presentation"
   ],
   "fixes": [
-    "Production telemetry events are delivered to the configured worker again",
     "GPT-5.6 Sol can be selected directly through OpenAI routes",
     "Autocomplete cancel commands work reliably",
     "Cold-cache notices remain on one line instead of disrupting the transcript layout"
