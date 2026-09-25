@@ -484,78 +484,82 @@ fn test_multiple_pastes() {
 fn test_restore_session_adds_reload_message() {
     use crate::session::Session;
 
-    let mut app = create_test_app();
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
 
-    // Create and save a session with a fake provider_session_id
-    let mut session = Session::create(None, None);
-    session.add_message(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "test message".to_string(),
-            cache_control: None,
-        }],
-    );
-    session.provider_session_id = Some("fake-uuid".to_string());
-    let session_id = session.id.clone();
-    session.save().unwrap();
+        // Create and save a session with a fake provider_session_id
+        let mut session = Session::create(None, None);
+        session.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "test message".to_string(),
+                cache_control: None,
+            }],
+        );
+        session.provider_session_id = Some("fake-uuid".to_string());
+        let session_id = session.id.clone();
+        session.save().unwrap();
 
-    // Restore the session
-    app.restore_session(&session_id);
+        // Restore the session
+        app.restore_session(&session_id);
 
-    // Should have the original message + reload success message in display
-    assert_eq!(app.display_messages().len(), 2);
-    assert_eq!(app.display_messages()[0].role, "user");
-    assert_eq!(app.display_messages()[0].content, "test message");
-    assert_eq!(app.display_messages()[1].role, "system");
-    assert!(
-        app.display_messages()[1]
-            .content
-            .contains("Reload complete - continuing.")
-    );
+        // Should have the original message + reload success message in display
+        assert_eq!(app.display_messages().len(), 2);
+        assert_eq!(app.display_messages()[0].role, "user");
+        assert_eq!(app.display_messages()[0].content, "test message");
+        assert_eq!(app.display_messages()[1].role, "system");
+        assert!(
+            app.display_messages()[1]
+                .content
+                .contains("Reload complete - continuing.")
+        );
 
-    // Local restore keeps provider messages lazy until the next active turn.
-    assert_eq!(app.messages.len(), 0);
-    assert_eq!(
-        app.session.debug_memory_profile()["provider_messages_cache"]["count"],
-        0
-    );
+        // Local restore keeps provider messages lazy until the next active turn.
+        assert_eq!(app.messages.len(), 0);
+        assert_eq!(
+            app.session.debug_memory_profile()["provider_messages_cache"]["count"],
+            0
+        );
 
-    // Provider session ID should be cleared (Claude sessions don't persist across restarts)
-    assert!(app.provider_session_id.is_none());
+        // Provider session ID should be cleared (Claude sessions don't persist across restarts)
+        assert!(app.provider_session_id.is_none());
 
-    // Clean up
-    let _ = std::fs::remove_file(crate::session::session_path(&session_id).unwrap());
+        // Clean up
+        let _ = std::fs::remove_file(crate::session::session_path(&session_id).unwrap());
+    });
 }
 
 #[test]
 fn test_restore_session_with_selfdev_reload_tool_result_queues_continuation() {
     use crate::session::Session;
 
-    let mut app = create_test_app();
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
 
-    let mut session = Session::create(None, None);
-    session.add_message(
-        Role::User,
-        vec![ContentBlock::ToolResult {
-            tool_use_id: "tool_selfdev_reload".to_string(),
-            content: "Reload initiated. Process restarting...".to_string(),
-            is_error: Some(false),
-        }],
-    );
-    let session_id = session.id.clone();
-    session.save().unwrap();
+        let mut session = Session::create(None, None);
+        session.add_message(
+            Role::User,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "tool_selfdev_reload".to_string(),
+                content: "Reload initiated. Process restarting...".to_string(),
+                is_error: Some(false),
+            }],
+        );
+        let session_id = session.id.clone();
+        session.save().unwrap();
 
-    app.restore_session(&session_id);
+        app.restore_session(&session_id);
 
-    assert!(
-        app.hidden_queued_system_messages
-            .iter()
-            .any(|message| message.contains("Continue exactly where you left off"))
-    );
-    assert!(app.pending_turn);
-    assert!(matches!(app.status, ProcessingStatus::Sending));
+        assert!(
+            app.hidden_queued_system_messages
+                .iter()
+                .any(|message| message.contains("Continue exactly where you left off"))
+        );
+        assert!(app.pending_turn);
+        assert!(matches!(app.status, ProcessingStatus::Sending));
 
-    let _ = std::fs::remove_file(crate::session::session_path(&session_id).unwrap());
+        let _ = std::fs::remove_file(crate::session::session_path(&session_id).unwrap());
+    });
 }
 
 #[test]
@@ -1197,14 +1201,17 @@ fn test_save_and_restore_reload_state_preserves_observe_mode() {
 
 #[test]
 fn test_save_and_restore_reload_state_preserves_split_view_mode() {
-    let mut app = create_test_app();
-    let session_id = format!("test-reload-splitview-{}", std::process::id());
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let session_id = format!("test-reload-splitview-{}", std::process::id());
 
-    app.set_split_view_enabled(true, true);
-    app.save_input_for_reload(&session_id);
+        app.set_split_view_enabled(true, true);
+        app.save_input_for_reload(&session_id);
 
-    let restored = App::restore_input_for_reload(&session_id).expect("reload state should exist");
-    assert!(restored.split_view_enabled);
+        let restored =
+            App::restore_input_for_reload(&session_id).expect("reload state should exist");
+        assert!(restored.split_view_enabled);
+    });
 }
 
 #[test]
@@ -1249,16 +1256,18 @@ fn test_new_for_remote_restores_split_view_from_reload_state() {
 
 #[test]
 fn test_restore_reload_state_supports_legacy_input_format() {
-    let session_id = format!("test-reload-legacy-{}", std::process::id());
-    let jcode_dir = crate::storage::jcode_dir().unwrap();
-    let path = jcode_dir.join(format!("client-input-{}", session_id));
-    std::fs::write(&path, "2\nhello").unwrap();
+    with_temp_jcode_home(|| {
+        let session_id = format!("test-reload-legacy-{}", std::process::id());
+        let jcode_dir = crate::storage::jcode_dir().unwrap();
+        let path = jcode_dir.join(format!("client-input-{}", session_id));
+        std::fs::write(&path, "2\nhello").unwrap();
 
-    let restored =
-        App::restore_input_for_reload(&session_id).expect("legacy reload state should restore");
-    assert_eq!(restored.input, "hello");
-    assert_eq!(restored.cursor, 2);
-    assert!(restored.queued_messages.is_empty());
+        let restored =
+            App::restore_input_for_reload(&session_id).expect("legacy reload state should restore");
+        assert_eq!(restored.input, "hello");
+        assert_eq!(restored.cursor, 2);
+        assert!(restored.queued_messages.is_empty());
+    });
 }
 
 #[test]

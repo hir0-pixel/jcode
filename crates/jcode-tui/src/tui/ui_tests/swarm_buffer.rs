@@ -142,6 +142,7 @@ fn right_fact_stack_uses_neutral_gray_except_for_context_usage() {
     use ratatui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
+    let _truecolor = jcode_tui_style::color::TruecolorTestGuard::pin();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
     let state = fact_test_state(String::new(), true);

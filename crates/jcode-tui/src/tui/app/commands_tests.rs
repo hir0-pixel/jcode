@@ -190,6 +190,7 @@ mod colors {
             }
         }
         let _lock = lock_shared_state();
+        let _render_lock = crate::tui::ui::render_state_test_lock();
         let _restore = Restore;
         {
             let mut config = crate::config::Config::load();

@@ -1512,6 +1512,20 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
         .iter()
         .map(|&key| (key, std::env::var_os(key)))
         .collect::<Vec<_>>();
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                if let Some(value) = value {
+                    crate::env::set_var(key, value);
+                } else {
+                    crate::env::remove_var(key);
+                }
+            }
+            crate::auth::AuthStatus::invalidate_cache();
+        }
+    }
+    let _restore_env = RestoreEnv(saved_env);
     for &key in &tracked_env {
         crate::env::remove_var(key);
     }
@@ -1556,11 +1570,14 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
     ];
 
     for (runtime_provider, provider_name, model, expected_auth) in cases {
+        crate::env::remove_var("JCODE_OPENROUTER_TRANSPORT_STATE");
         crate::env::set_var("JCODE_RUNTIME_PROVIDER", runtime_provider);
         crate::env::remove_var("JCODE_OPENROUTER_ALLOW_NO_AUTH");
         crate::auth::AuthStatus::invalidate_cache();
 
         let mut app = create_named_provider_test_app(provider_name, model);
+        crate::env::remove_var("JCODE_OPENROUTER_TRANSPORT_STATE");
+        crate::auth::AuthStatus::invalidate_cache();
         app.streaming.streaming_input_tokens = 1_000;
         app.streaming.streaming_output_tokens = 1_000;
         app.token_accounting.total_input_tokens = 12_000;
@@ -1589,6 +1606,8 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
 
     crate::env::set_var("JCODE_RUNTIME_PROVIDER", "jcode");
     crate::env::remove_var("JCODE_OPENROUTER_ALLOW_NO_AUTH");
+    crate::env::remove_var("JCODE_OPENROUTER_TRANSPORT_STATE");
+    crate::auth::AuthStatus::invalidate_cache();
     let mut app = create_named_provider_test_app("openrouter", "subscription-model");
     app.streaming.streaming_input_tokens = 1_000;
     app.streaming.streaming_output_tokens = 1_000;
@@ -1606,6 +1625,7 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
 
     crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-compatible");
     crate::env::set_var("JCODE_OPENROUTER_ALLOW_NO_AUTH", "1");
+    crate::env::remove_var("JCODE_OPENROUTER_TRANSPORT_STATE");
     let mut app = create_named_provider_test_app("openrouter", "local-model");
     app.streaming.streaming_input_tokens = 1_000;
     app.streaming.streaming_output_tokens = 1_000;
@@ -1620,15 +1640,6 @@ fn test_info_widget_local_direct_api_runtime_shows_cost_based_usage() {
         crate::tui::info_widget::AuthMethod::Unknown
     );
     assert!(data.usage_info.is_none());
-
-    for (key, value) in saved_env {
-        if let Some(value) = value {
-            crate::env::set_var(key, value);
-        } else {
-            crate::env::remove_var(key);
-        }
-    }
-    crate::auth::AuthStatus::invalidate_cache();
 }
 
 #[test]

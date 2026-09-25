@@ -15,6 +15,7 @@ pub mod learn;
 pub mod map;
 pub mod observability;
 mod rpc;
+mod learning_rest;
 mod sessions_rest;
 
 use anyhow::{Context, Result, bail};
@@ -434,6 +435,14 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
         }
         if let Some(result) = sessions_rest::route(&mut stream, &req, &config).await {
+            return result;
+        }
+    }
+    if req.path.starts_with("/api/learning") {
+        if !token_ok {
+            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+        }
+        if let Some(result) = learning_rest::route(&mut stream, &req, &config).await {
             return result;
         }
     }

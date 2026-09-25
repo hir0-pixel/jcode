@@ -494,6 +494,8 @@ impl Provider for CountingModelRoutesProvider {
 
 #[test]
 fn test_subagent_model_large_catalog_uses_cached_searchable_picker() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -557,6 +559,8 @@ fn test_subagent_model_large_catalog_uses_cached_searchable_picker() {
 
 #[test]
 fn test_model_picker_reuses_cached_entries_until_invalidated() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -675,6 +679,7 @@ fn test_new_local_session_does_not_run_post_login_model_refresh() {
 
 #[test]
 fn test_tui_api_key_auth_refreshes_catalog_shows_diff_without_opening_picker() {
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1116,6 +1121,7 @@ fn test_tui_cerebras_paste_key_lifecycle_has_no_degraded_success_messages() {
 
 #[test]
 fn test_tui_openai_compatible_empty_catalog_does_not_switch_to_profile_default() {
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1176,6 +1182,7 @@ fn test_tui_openai_compatible_empty_catalog_does_not_switch_to_profile_default()
 
 #[test]
 fn test_tui_openai_compatible_local_refresh_failure_is_pending_not_final_failure() {
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1243,6 +1250,8 @@ fn test_tui_openai_compatible_local_refresh_failure_is_pending_not_final_failure
 
 #[test]
 fn test_model_picker_opens_simplified_state_before_async_routes_complete() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1415,6 +1424,7 @@ fn test_local_model_picker_selection_failure_keeps_picker_open_and_shows_next_st
 
 #[test]
 fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1459,6 +1469,7 @@ fn test_login_completed_spawns_auth_refresh_when_runtime_is_available() {
 
 #[test]
 fn test_model_picker_waits_for_async_post_login_catalog_activation() {
+    let _env_lock = crate::storage::lock_test_env();
     ensure_test_jcode_home_if_unset();
     clear_persisted_test_ui_state();
     crate::tui::ui::clear_test_render_state_for_tests();
@@ -1544,6 +1555,7 @@ fn test_model_picker_waits_for_async_post_login_catalog_activation() {
 
 #[test]
 fn test_login_completed_surfaces_new_provider_models_in_local_model_picker() {
+    let _env_lock = crate::storage::lock_test_env();
     let mut app = create_auth_refresh_test_app();
 
     app.handle_login_completed(crate::bus::LoginCompleted {

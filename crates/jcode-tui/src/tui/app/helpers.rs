@@ -1282,10 +1282,15 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
 fn gather_ambient_info_inner(ambient_enabled: bool) -> Option<AmbientWidgetData> {
     let state = crate::ambient::AmbientState::load().unwrap_or_default();
     let manager = crate::ambient::AmbientManager::new().ok();
-    let queue_items: Vec<_> = manager
-        .as_ref()
-        .map(|m| m.queue().items().to_vec())
-        .unwrap_or_default();
+    let queue_items = manager.as_ref().map(|m| m.queue().items()).unwrap_or(&[]);
+    gather_ambient_info_from_queue(ambient_enabled, &state, queue_items)
+}
+
+fn gather_ambient_info_from_queue(
+    ambient_enabled: bool,
+    state: &crate::ambient::AmbientState,
+    queue_items: &[crate::ambient::ScheduledItem],
+) -> Option<AmbientWidgetData> {
     let queue_count = queue_items.len();
     let next_queue_item = queue_items.iter().min_by_key(|item| item.scheduled_for);
     let reminder_items: Vec<_> = queue_items
@@ -1332,13 +1337,13 @@ fn gather_ambient_info_inner(ambient_enabled: bool) -> Option<AmbientWidgetData>
 
     Some(AmbientWidgetData {
         show_widget: ambient_enabled || reminder_count > 1,
-        status: state.status,
+        status: state.status.clone(),
         queue_count,
         next_queue_preview,
         reminder_count,
         next_reminder_preview,
         last_run_ago,
-        last_summary: state.last_summary,
+        last_summary: state.last_summary.clone(),
         next_wake,
         next_reminder_wake: next_reminder_item
             .map(|item| format_countdown_until(item.scheduled_for)),

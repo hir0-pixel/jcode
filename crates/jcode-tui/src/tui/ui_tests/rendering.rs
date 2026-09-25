@@ -642,6 +642,7 @@ fn test_configured_palette_recolors_a_real_rendered_frame() {
     // Scoped (not the permanent `pin_truecolor_for_tests`) so it cannot leak
     // into unrelated rendering-snapshot tests elsewhere in the binary.
     let _truecolor = jcode_tui_style::color::TruecolorTestGuard::pin();
+    let _render_lock = viewport_snapshot_test_lock();
 
     fn render() -> ratatui::buffer::Buffer {
         let messages = vec![

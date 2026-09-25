@@ -1,6 +1,6 @@
 use super::{
     build_resume_command, effort_display_label, effort_display_label_with_root,
-    extract_bracketed_system_message, format_countdown_until, gather_ambient_info_inner,
+    extract_bracketed_system_message, format_countdown_until, gather_ambient_info_from_queue,
     inferred_reasoning_efforts, partition_queued_messages, resume_invocation_args,
     resumed_window_title,
 };
@@ -467,11 +467,11 @@ fn gather_ambient_info_filters_to_session_reminders_when_ambient_disabled() {
             additional_context: None,
         })
         .expect("schedule second reminder");
-    // This test exercises queue filtering, not the stale-while-revalidate cache.
-    // Read synchronously while the temporary JCODE_HOME and its files are pinned:
-    // an unrelated in-flight cache refresh can otherwise overwrite the cleared
-    // process-global cache with data loaded under another test's JCODE_HOME.
-    let info = gather_ambient_info_inner(false).expect("ambient info");
+    // This test exercises queue filtering, not disk reload or the cache. Feed
+    // the just-built queue directly so sibling tests cannot change the
+    // process-global JCODE_HOME between the write and the read.
+    let info = gather_ambient_info_from_queue(false, manager.state(), manager.queue().items())
+        .expect("ambient info");
     assert!(info.show_widget);
     assert_eq!(info.queue_count, 3);
     assert_eq!(info.reminder_count, 2);

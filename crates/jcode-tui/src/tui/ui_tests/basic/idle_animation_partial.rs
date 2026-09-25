@@ -109,6 +109,7 @@ fn draw_publishes_the_animated_rows_only_when_the_animation_rendered() {
 
 #[test]
 fn partial_repaint_matches_a_full_frame_at_the_same_animation_time() {
+    pin_full_tier();
     let _idle_animation = IdleAnimationEnvGuard::enable();
     let _lock = viewport_snapshot_test_lock();
     clear_flicker_frame_history_for_tests();
