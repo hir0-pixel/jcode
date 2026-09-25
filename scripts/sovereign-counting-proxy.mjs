@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Counting proxy in front of Ollama (or any OpenAI-compat upstream).
+ * Counting proxy in front of Ollama, a hosted OpenAI/Anthropic-compatible
+ * API, or a self-hosted OpenAI-compatible server (vLLM/SGLang/llama.cpp).
  *
  * Keeps the running totals file (SOVEREIGN_PROXY_STATS) and, when
  * SOVEREIGN_PROXY_CALLS is set, appends one JSON line per model call with
@@ -8,20 +9,33 @@
  * call can be attributed (main turn, tool follow-up, title, review, ...).
  *
  * Streaming /v1 requests get `stream_options.include_usage = true` when the
- * client did not ask for it, because Ollama only reports usage on streams
- * that request it. Ollama's `prompt_tokens` is the FULL prompt;
- * `prompt_tokens_details.cached_tokens` is the part served from the KV cache.
+ * client did not ask for it, because Ollama (and most OpenAI-compatible
+ * servers) only reports usage on streams that request it. Usage parsing
+ * (OpenAI/Ollama/Anthropic shapes, streaming or not) lives in
+ * scripts/lib/usage-parser.mjs, unit-tested separately.
+ *
+ * The client's own `Authorization` header (and everything else) is forwarded
+ * upstream unmodified via `req.headers`, so pointing SOVEREIGN_PROXY_UPSTREAM
+ * at a real `https://` API works as long as the backend under test was
+ * configured with the real API key (BENCH_API_KEY) - the proxy never needs
+ * to know the key itself, it just relays it.
  *
  *   SOVEREIGN_PROXY_UPSTREAM=http://127.0.0.1:11434 \
  *   SOVEREIGN_PROXY_LISTEN=127.0.0.1:18080 \
  *   SOVEREIGN_PROXY_STATS=/tmp/proxy-stats.json \
  *   SOVEREIGN_PROXY_CALLS=/tmp/calls.jsonl SOVEREIGN_PROXY_TAG=sovereign \
  *   node scripts/sovereign-counting-proxy.mjs
+ *
+ *   # Cloud/self-hosted endpoint (note https -> the http.request call below
+ *   # switches transport based on SOVEREIGN_PROXY_UPSTREAM's protocol):
+ *   SOVEREIGN_PROXY_UPSTREAM=https://api.example.com node scripts/sovereign-counting-proxy.mjs
  */
 import http from 'node:http'
+import https from 'node:https'
 import { URL } from 'node:url'
 import fs from 'node:fs'
 import crypto from 'node:crypto'
+import { usageFrom } from './lib/usage-parser.mjs'
 
 const listen = process.env.SOVEREIGN_PROXY_LISTEN || '127.0.0.1:18080'
 const upstream = process.env.SOVEREIGN_PROXY_UPSTREAM || 'http://127.0.0.1:11434'
@@ -86,36 +100,6 @@ function purposeOf(body) {
   return 'other'
 }
 
-function usageFrom(buf) {
-  const found = { prompt_tokens: null, cached_tokens: null, completion_tokens: null }
-  const take = j => {
-    const u = j.usage || {}
-    if (typeof u.prompt_tokens === 'number') found.prompt_tokens = u.prompt_tokens
-    if (typeof u.completion_tokens === 'number') found.completion_tokens = u.completion_tokens
-    const cached = u.prompt_tokens_details?.cached_tokens
-    if (typeof cached === 'number') found.cached_tokens = cached
-    if (typeof j.prompt_eval_count === 'number') found.prompt_tokens = j.prompt_eval_count
-    if (typeof j.eval_count === 'number') found.completion_tokens = j.eval_count
-  }
-  const text = buf.toString('utf8')
-  try {
-    take(JSON.parse(text))
-    return found
-  } catch {
-    // SSE or NDJSON stream
-  }
-  for (const line of text.split('\n')) {
-    const payload = line.startsWith('data:') ? line.slice(5).trim() : line.trim()
-    if (!payload || payload === '[DONE]') continue
-    try {
-      take(JSON.parse(payload))
-    } catch {
-      // partial line
-    }
-  }
-  return found
-}
-
 function writeStats() {
   if (!statsPath) return
   stats.updated_at = new Date().toISOString()
@@ -162,8 +146,12 @@ const server = http.createServer((req, res) => {
     if (body.length) headers['content-length'] = String(body.length)
     const started = Date.now()
 
-    const upReq = http.request(
-      { protocol: up.protocol, hostname: up.hostname, port: up.port || 80, path: u.pathname + u.search, method: req.method, headers },
+    // https upstream (a hosted API) needs the https module, not http; the
+    // Authorization header above is forwarded either way since it just came
+    // from req.headers.
+    const transport = up.protocol === 'https:' ? https : http
+    const upReq = transport.request(
+      { protocol: up.protocol, hostname: up.hostname, port: up.port || (up.protocol === 'https:' ? 443 : 80), path: u.pathname + u.search, method: req.method, headers },
       upRes => {
         const out = []
         res.writeHead(upRes.statusCode || 502, upRes.headers)

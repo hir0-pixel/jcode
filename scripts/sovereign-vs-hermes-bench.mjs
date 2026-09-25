@@ -11,8 +11,20 @@
  * skill review) are counted too. Homes are throwaway; the user's real
  * ~/.hermes and ~/.jcode are never touched.
  *
+ * Provider-agnostic: defaults to a local Ollama model exactly as before, but
+ * pointing BENCH_BASE_URL at any OpenAI-compatible endpoint (a hosted API, or
+ * a self-hosted vLLM/SGLang/llama.cpp server) runs the same tasks against it.
+ * See docs/BENCHMARK.md, "Running on a cloud or self-hosted model".
+ *
  *   node scripts/sovereign-vs-hermes-bench.mjs            # full: 5 tasks x 3 runs
  *   BENCH_RUNS=1 BENCH_TASKS=plain BENCH_IDLE_MS=20000 node scripts/...  # smoke
+ *   node scripts/sovereign-vs-hermes-bench.mjs --dry-run  # print resolved config + tasks, spawn nothing
+ *
+ *   # Cloud/self-hosted endpoint:
+ *   BENCH_BASE_URL=https://api.example.com/v1 BENCH_API_KEY=sk-... \
+ *   BENCH_MODEL=my-model BENCH_CONTEXT=131072 \
+ *   BENCH_PRICE_IN=3 BENCH_PRICE_CACHED=0.3 BENCH_PRICE_OUT=15 \
+ *   node scripts/sovereign-vs-hermes-bench.mjs
  *
  * Output: docs/benchmark-runs/<stamp>/{calls.jsonl, turns.jsonl, rss.jsonl, sessions.jsonl}
  */
@@ -22,24 +34,41 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolvePrice } from './lib/bench-prices.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const engineRoot = path.resolve(__dirname, '..')
+const DRY_RUN = process.argv.includes('--dry-run')
 const MODEL = process.env.BENCH_MODEL || 'sovereign/bench-hermes-64k:latest'
 const BASE_MODEL = process.env.BENCH_BASE_MODEL || 'qwen3.8:27b'
-const NUM_CTX = Number(process.env.BENCH_NUM_CTX || 65536)
+const NUM_CTX = Number(process.env.BENCH_CONTEXT || process.env.BENCH_NUM_CTX || 65536)
 const RUNS = Number(process.env.BENCH_RUNS || 3)
 const IDLE_MS = Number(process.env.BENCH_IDLE_MS || 120_000)
 const TURN_TIMEOUT_MS = Number(process.env.BENCH_TURN_TIMEOUT_MS || 20 * 60_000)
 const PRODUCTS = (process.env.BENCH_PRODUCTS || 'hermes,sovereign').split(',')
 const TASK_FILTER = process.env.BENCH_TASKS ? process.env.BENCH_TASKS.split(',') : null
 const OLLAMA = process.env.BENCH_OLLAMA || 'http://127.0.0.1:11434'
+// BENCH_BASE_URL unset means "use the local Ollama instance above" (old
+// behavior, unchanged). Set it to point both products at any other
+// OpenAI-compatible endpoint instead; USING_OLLAMA then gates the
+// Ollama-only warm-up/model-pull/keep-alive steps in main() and runTask().
+const BASE_URL = process.env.BENCH_BASE_URL || OLLAMA
+const USING_OLLAMA = !process.env.BENCH_BASE_URL
+const API_KEY = process.env.BENCH_API_KEY || 'ollama'
+const baseUrlParsed = new URL(BASE_URL)
+// The proxy forwards the request path verbatim onto its upstream's origin, so
+// the upstream env for the proxy is BASE_URL's origin, and each backend's own
+// base_url is "http://<proxy>" + BASE_URL's path (default "/v1" for Ollama's
+// OpenAI-compat surface, or whatever path a hosted API's base URL carries).
+const UPSTREAM_ORIGIN = `${baseUrlParsed.protocol}//${baseUrlParsed.host}`
+const PROXY_PATH = baseUrlParsed.pathname === '/' ? '/v1' : baseUrlParsed.pathname
 const PROXY = process.env.BENCH_PROXY || '127.0.0.1:18080'
 const HERMES_BIN = process.env.HERMES_BIN || path.join(os.homedir(), '.local/bin/hermes')
 const SOVEREIGN_BIN = process.env.SOVEREIGN_BIN || path.join(engineRoot, 'target/release/sovereign')
+const PRICE = resolvePrice(MODEL)
 const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
 const outDir = process.env.BENCH_OUT || path.join(engineRoot, 'docs/benchmark-runs', stamp)
-fs.mkdirSync(outDir, { recursive: true })
+if (!DRY_RUN) fs.mkdirSync(outDir, { recursive: true })
 const log = (file, row) => fs.appendFileSync(path.join(outDir, file), JSON.stringify(row) + '\n')
 const say = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -104,6 +133,25 @@ const TASKS = [
       'Thanks. Reply with just the word done.',
     ]],
   },
+  {
+    // Prime-learning "trap": `npm test` is a stub that fails and tells the
+    // model the real command; the model can only discover the repo's actual
+    // test convention by trying the obvious thing first and reading the
+    // failure. Session 1 hits the trap; the idle window after it (baked into
+    // the per-session loop below) gives a learning pass time to run; session
+    // 2 asks for the same kind of thing in a fresh session and should reach
+    // for the right command directly if the lesson stuck. See also the
+    // dedicated, stricter repeated-measures check in
+    // crates/sovereign-gateway/e2e/prime-trap.mjs (model/tool-call counts,
+    // N=5 repetitions, medians, pass criterion).
+    id: 'prime-trap',
+    setup: makeTrapRepo,
+    sessions: [
+      ['Run this project\'s test suite and tell me whether it passes.'],
+      ['Run this project\'s test suite and tell me whether it passes.'],
+    ],
+    checkReply: text => /pass|ok\b|succeed/i.test(text) && !/broken stub|use \.\/scripts\/check\.sh/i.test(text),
+  },
 ].filter(t => !TASK_FILTER || TASK_FILTER.includes(t.id))
 
 function makeRepo(dir) {
@@ -145,6 +193,38 @@ function makeRepo(dir) {
   spawnSync('git', ['init', '-q'], { cwd: dir })
 }
 
+/**
+ * A repo whose test convention can only be learned by failing first: `npm
+ * test` is a stub that exits non-zero and names the real command
+ * (`./scripts/check.sh --fast`), which the model has to notice and switch to.
+ * This is the Prime-learning "trap" (see the `prime-trap` task above and
+ * crates/sovereign-gateway/e2e/prime-trap.mjs).
+ */
+function makeTrapRepo(dir) {
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true })
+  fs.writeFileSync(
+    path.join(dir, 'package.json'),
+    JSON.stringify(
+      {
+        name: 'trap-project',
+        version: '1.0.0',
+        scripts: {
+          test: 'echo "npm test is a broken stub here - use ./scripts/check.sh --fast instead" && exit 1',
+        },
+      },
+      null,
+      2
+    ) + '\n'
+  )
+  fs.writeFileSync(
+    path.join(dir, 'scripts/check.sh'),
+    ['#!/bin/sh', 'set -e', 'echo "checking..."', 'test -f package.json', 'echo "all checks passed"', ''].join('\n')
+  )
+  fs.chmodSync(path.join(dir, 'scripts/check.sh'), 0o755)
+  fs.writeFileSync(path.join(dir, 'index.js'), 'module.exports.add = (a, b) => a + b\n')
+  spawnSync('git', ['init', '-q'], { cwd: dir })
+}
+
 // ---------------------------------------------------------------- processes
 function descendants(rootPid) {
   const rows = execFileSync('ps', ['-axo', 'pid=,ppid=,rss=,comm='], { encoding: 'utf8' })
@@ -182,8 +262,8 @@ async function startBackend(product, home, token) {
         'model:',
         `  default: "${MODEL}"`,
         '  provider: custom',
-        `  base_url: "http://${PROXY}/v1"`,
-        '  api_key: "ollama"',
+        `  base_url: "http://${PROXY}${PROXY_PATH}"`,
+        `  api_key: "${API_KEY}"`,
         `  context_length: ${NUM_CTX}`,
         `  ollama_num_ctx: ${NUM_CTX}`,
         'terminal:',
@@ -191,8 +271,8 @@ async function startBackend(product, home, token) {
         '',
       ].join('\n')
     )
-    fs.writeFileSync(path.join(hermesHome, '.env'), 'OPENAI_API_KEY=ollama\n')
-    Object.assign(env, { HERMES_HOME: hermesHome, OPENAI_API_KEY: 'ollama' })
+    fs.writeFileSync(path.join(hermesHome, '.env'), `OPENAI_API_KEY=${API_KEY}\n`)
+    Object.assign(env, { HERMES_HOME: hermesHome, OPENAI_API_KEY: API_KEY })
     cmd = HERMES_BIN
     args = ['serve', '--host', '127.0.0.1', '--port', '0', '--skip-build']
   } else {
@@ -203,8 +283,8 @@ async function startBackend(product, home, token) {
       [
         '[providers.bench]',
         'type = "openai-compatible"',
-        `base_url = "http://${PROXY}/v1"`,
-        'api_key = "ollama"',
+        `base_url = "http://${PROXY}${PROXY_PATH}"`,
+        `api_key = "${API_KEY}"`,
         'requires_api_key = false',
         `default_model = "${MODEL}"`,
         '',
@@ -214,7 +294,10 @@ async function startBackend(product, home, token) {
         '',
       ].join('\n')
     )
-    Object.assign(env, { JCODE_HOME: jcodeHome })
+    // Same shared price table the summarizer reads (scripts/lib/bench-prices.mjs);
+    // pointing the engine's own accounting at it too keeps its /api/analytics/usage
+    // cost figures consistent with the benchmark's dummy-cost math.
+    Object.assign(env, { JCODE_HOME: jcodeHome, SOVEREIGN_PRICE_TABLE: process.env.SOVEREIGN_PRICE_TABLE || path.join(__dirname, 'sovereign-prices.json') })
     cmd = SOVEREIGN_BIN
     args = ['--provider-profile', 'bench', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0']
   }
@@ -308,7 +391,7 @@ async function runTask(product, task, run) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `bench-${product}-${task.id}-`))
   const repo = path.join(home, 'repo')
   fs.mkdirSync(repo)
-  makeRepo(repo)
+  ;(task.setup || makeRepo)(repo)
   const token = crypto.randomBytes(24).toString('hex')
   const label = `${product}|${task.id}|run${run}`
   await tagProxy(`${label}|startup`)
@@ -384,27 +467,43 @@ function listMemory(home) {
   return found
 }
 
-async function main() {
-  const tags = await fetch(`${OLLAMA}/api/tags`).then(r => r.json()).catch(() => null)
-  if (!tags) throw new Error(`Ollama not reachable at ${OLLAMA}`)
-  if (!tags.models.some(m => m.name === MODEL)) {
-    say(`creating ${MODEL} (num_ctx ${NUM_CTX}) from ${BASE_MODEL}`)
-    await fetch(`${OLLAMA}/api/create`, { method: 'POST', body: JSON.stringify({ model: MODEL, from: BASE_MODEL, parameters: { num_ctx: NUM_CTX }, stream: false }) })
+function resolvedConfig() {
+  return {
+    MODEL, BASE_MODEL, NUM_CTX, RUNS, IDLE_MS, PRODUCTS, HERMES_BIN, SOVEREIGN_BIN,
+    BASE_URL, USING_OLLAMA, UPSTREAM_ORIGIN, PROXY_PATH, PROXY,
+    API_KEY: API_KEY === 'ollama' ? 'ollama' : '***', // never print a real key
+    price: PRICE,
+    tasks: TASKS.map(t => t.id),
   }
-  // Load once at the benchmark context so neither product pays the load.
-  await fetch(`${OLLAMA}/api/generate`, { method: 'POST', body: JSON.stringify({ model: MODEL, prompt: '.', stream: false, keep_alive: -1 }) })
+}
+
+async function main() {
+  if (DRY_RUN) {
+    console.log(JSON.stringify(resolvedConfig(), null, 2))
+    return
+  }
+  if (USING_OLLAMA) {
+    const tags = await fetch(`${OLLAMA}/api/tags`).then(r => r.json()).catch(() => null)
+    if (!tags) throw new Error(`Ollama not reachable at ${OLLAMA}`)
+    if (!tags.models.some(m => m.name === MODEL)) {
+      say(`creating ${MODEL} (num_ctx ${NUM_CTX}) from ${BASE_MODEL}`)
+      await fetch(`${OLLAMA}/api/create`, { method: 'POST', body: JSON.stringify({ model: MODEL, from: BASE_MODEL, parameters: { num_ctx: NUM_CTX }, stream: false }) })
+    }
+    // Load once at the benchmark context so neither product pays the load.
+    await fetch(`${OLLAMA}/api/generate`, { method: 'POST', body: JSON.stringify({ model: MODEL, prompt: '.', stream: false, keep_alive: -1 }) })
+  }
   const proxy = spawn(process.execPath, [path.join(__dirname, 'sovereign-counting-proxy.mjs')], {
     env: {
       ...process.env,
       SOVEREIGN_PROXY_LISTEN: PROXY,
-      SOVEREIGN_PROXY_UPSTREAM: OLLAMA,
+      SOVEREIGN_PROXY_UPSTREAM: UPSTREAM_ORIGIN,
       SOVEREIGN_PROXY_STATS: path.join(outDir, 'proxy-stats.json'),
       SOVEREIGN_PROXY_CALLS: path.join(outDir, 'calls.jsonl'),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   })
   await sleep(800)
-  fs.writeFileSync(path.join(outDir, 'config.json'), JSON.stringify({ MODEL, BASE_MODEL, NUM_CTX, RUNS, IDLE_MS, PRODUCTS, tasks: TASKS.map(t => t.id), HERMES_BIN, SOVEREIGN_BIN, started: new Date().toISOString() }, null, 2))
+  fs.writeFileSync(path.join(outDir, 'config.json'), JSON.stringify({ ...resolvedConfig(), started: new Date().toISOString() }, null, 2))
   try {
     for (let run = 1; run <= RUNS; run++) {
       // Alternate which product goes first so drift doesn't favour one side.
@@ -422,7 +521,7 @@ async function main() {
     }
   } finally {
     proxy.kill('SIGTERM')
-    await fetch(`${OLLAMA}/api/generate`, { method: 'POST', body: JSON.stringify({ model: MODEL, keep_alive: 0 }) }).catch(() => {})
+    if (USING_OLLAMA) await fetch(`${OLLAMA}/api/generate`, { method: 'POST', body: JSON.stringify({ model: MODEL, keep_alive: 0 }) }).catch(() => {})
   }
   say('done ->', outDir)
 }

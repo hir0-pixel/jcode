@@ -239,3 +239,122 @@ curl -s http://127.0.0.1:11434/api/generate -d '{"model":"qwen3.8:27b","prompt":
 # RSS: sum rss for Ollama / ollama / llama-server
 ps -axo rss,comm,args | …
 ```
+
+## Running on a cloud or self-hosted model
+
+`scripts/sovereign-vs-hermes-bench.mjs` and `crates/sovereign-gateway/e2e/prime-trap.mjs` are
+provider-agnostic: by default they use a local Ollama model exactly as before, but pointing a
+few env vars at any OpenAI-compatible endpoint (a hosted API, or a self-hosted
+vLLM/SGLang/llama.cpp server) runs the same tasks against it instead. `--dry-run` on either
+script prints the resolved config (endpoint, model, context, price, task list) and exits
+without spawning anything, which is how this change was verified without a running model.
+
+| Var | Meaning | Default |
+| --- | --- | --- |
+| `BENCH_BASE_URL` | OpenAI-compatible base URL (e.g. `https://api.example.com/v1`, or a self-hosted server's `http://host:port/v1`) | local Ollama (`http://127.0.0.1:11434`) |
+| `BENCH_API_KEY` | API key sent as `Authorization: Bearer <key>` | `ollama` (Ollama ignores it) |
+| `BENCH_MODEL` | Model id to send | `sovereign/bench-hermes-64k:latest` |
+| `BENCH_CONTEXT` | Context window advertised to both backends | `65536` |
+| `BENCH_PRICE_IN` / `BENCH_PRICE_CACHED` / `BENCH_PRICE_OUT` | USD per million tokens (input / cached input / output), overriding the shared price table below | unset (falls back to the table) |
+
+Both backends are still driven through `scripts/sovereign-counting-proxy.mjs` (so every call
+is still logged with tokens/purpose); the proxy's upstream becomes `BENCH_BASE_URL`'s origin,
+and it now speaks `https` as well as `http`, forwarding the client's own `Authorization` header
+upstream unmodified - the proxy itself never needs to know the key, only the backend under
+test does (configured from `BENCH_API_KEY`).
+
+**Price table.** `scripts/sovereign-prices.json` is the same file the engine itself reads at
+runtime via `SOVEREIGN_PRICE_TABLE` for its own `/api/analytics/usage` cost figures (see
+`cost_usd` in `crates/sovereign-gateway/src/observability.rs`), so a model priced there is
+priced identically in the benchmark's dummy-cost math and in the engine's own accounting.
+`scripts/lib/bench-prices.mjs` resolves the price for `BENCH_MODEL` in this order: the three
+`BENCH_PRICE_*` env vars, then `SOVEREIGN_PRICE_TABLE` if set, then the bundled
+`scripts/sovereign-prices.json`. The resolved price is written into the run's `config.json` so
+`sovereign-bench-summarize.mjs` uses exactly what the run used, not whatever the table says
+today.
+
+**Configuring each product for a provider:**
+
+- **Sovereign** (the engine): `$JCODE_HOME/config.toml`:
+  ```toml
+  [providers.bench]
+  type = "openai-compatible"
+  base_url = "https://api.example.com/v1"   # or the counting proxy in front of it
+  api_key = "sk-..."
+  requires_api_key = false                  # the key above is already supplied
+  default_model = "my-model"
+
+  [[providers.bench.models]]
+  id = "my-model"
+  context_window = 131072
+  ```
+  Launch with `sovereign --provider-profile bench --model my-model serve ...`. This is exactly
+  what the bench scripts generate into a throwaway `JCODE_HOME` per run; the real `~/.jcode` is
+  never touched.
+- **Hermes**: `$HERMES_HOME/config.yaml`:
+  ```yaml
+  model:
+    default: "my-model"
+    provider: custom
+    base_url: "https://api.example.com/v1"
+    api_key: "sk-..."
+    context_length: 131072
+  ```
+  plus `OPENAI_API_KEY` in the environment (Hermes's custom-provider path reads it from there
+  too). Same as above: generated into a throwaway `HERMES_HOME`, real `~/.hermes` untouched.
+
+**Parsing usage.** `scripts/lib/usage-parser.mjs` (unit-tested in
+`scripts/lib/usage-parser.test.mjs`, `node scripts/lib/usage-parser.test.mjs`) understands
+OpenAI-style `usage.prompt_tokens` / `usage.completion_tokens` /
+`usage.prompt_tokens_details.cached_tokens` (streaming, once `stream_options.include_usage` is
+set - the proxy injects it - or non-streaming), Ollama's native `prompt_eval_count` /
+`eval_count`, and Anthropic's `usage.input_tokens` / `usage.output_tokens` /
+`usage.cache_read_input_tokens` / `usage.cache_creation_input_tokens` (top-level, or nested
+under `message.usage` on a streaming `message_start` event, with `message_delta` carrying the
+final output count). "Prompt tokens" in the proxy's `calls.jsonl` always means total billed
+input (for Anthropic that's `input_tokens + cache_read + cache_creation`, matching what the
+provider actually invoices).
+
+## Prime-learning "trap" task
+
+`prime-trap` (in `TASKS` in `sovereign-vs-hermes-bench.mjs`, and standalone as
+`crates/sovereign-gateway/e2e/prime-trap.mjs`) tests whether Prime's learning loop actually
+saves the model work on a *procedural* lesson, not just a stated preference (the existing
+`memory` task). The repo's real test convention can only be discovered by failing first:
+`npm test` is a stub that exits non-zero and names the real command
+(`./scripts/check.sh --fast`, which does a real (trivial) check and exits 0).
+
+- **Session A** (cold): "Run this project's test suite and tell me whether it passes." The
+  model tries the obvious thing, hits the stub, reads the failure, and (ideally) retries with
+  the real command.
+- An idle window (`SOVEREIGN_LEARN_IDLE_MS`, default 15s in the e2e script) lets a learning
+  pass run over session A.
+- **Session B** (brand-new chat, fresh copy of the same repo): the identical instruction. If
+  the lesson stuck, B should reach the working command with fewer failed tool calls than A,
+  ideally without ever invoking `npm test`.
+
+`crates/sovereign-gateway/e2e/prime-trap.mjs` repeats this N times (`PRIME_TRAP_REPS`, default
+5) with a fresh engine + home per repetition (no cross-repetition contamination), reading
+model calls / tool calls / failed tool calls / token counts / dummy cost per session straight
+from the ledger (`GET /api/sovereign/observability/runs` and `/run?id=`, where top-level runs
+are turns, `chat` spans are model calls, and `execute_tool` spans are tool calls - a
+non-`complete` status or an `error` field marks a failed one). It reports medians across the N
+repetitions and applies the pass criterion: **B's median failed tool calls is below A's, and B
+avoids the trap (never fails a tool call diagnosed as the `npm test` stub) in at least 3 of 5
+runs.** Both are printed either way, pass or fail.
+
+## Atomic Agent (atomicagent.io) - feasibility
+
+Atomic Agent is an open-source, local-first agent runtime (MIT-licensed), not a coding-agent
+product like Sovereign/Hermes - closer to a general task-automation agent, benchmarked at
+69.8% on GAIA Level 1. It is driven via a CLI (with session commands like `/sessions`, `/new`)
+and, per its own docs, works with "any model your local llama-server can serve" plus Ollama,
+OpenRouter, and direct cloud providers (OpenAI/Anthropic/Gemini) when configured - so pointing
+it at the same `BENCH_BASE_URL` this benchmark uses looks feasible in principle. What's
+missing for a fair three-way comparison: its task/session model differs enough from the
+`session.create` + `prompt.submit` WebSocket protocol Hermes and Sovereign share (this
+benchmark's whole driving mechanism) that it would need its own CLI-scripting harness rather
+than reusing `sovereign-vs-hermes-bench.mjs`'s WebSocket client, and its GBNF grammar-constrained
+tool calling means token/call counts wouldn't be directly comparable without care. Verdict:
+plausible as a fourth product with a dedicated driver script, not a drop-in third arm of the
+existing harness. Not attempted here (no downloads, build only).

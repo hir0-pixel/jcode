@@ -6,6 +6,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { resolvePrice } from './lib/bench-prices.mjs'
 
 const dir = process.argv[2]
 if (!dir) {
@@ -35,10 +36,12 @@ const parse = tag => {
 }
 const modelCalls = calls.filter(c => c.purpose !== 'warm-up')
 
-// The engine reads this same per-model table when SOVEREIGN_PRICE_TABLE points
-// to it; local model pricing is opt-in at runtime.
-const prices = JSON.parse(fs.readFileSync(new URL('./sovereign-prices.json', import.meta.url)))
-const PRICE = prices[config.MODEL]
+// config.price is what the bench run itself resolved (BENCH_PRICE_IN/_CACHED/_OUT
+// env override, or the shared scripts/sovereign-prices.json / SOVEREIGN_PRICE_TABLE
+// table - the same file the engine reads for its own accounting, see
+// crates/sovereign-gateway/src/observability.rs). Older run directories predate
+// that field, so fall back to resolving it fresh for config.MODEL.
+const PRICE = config.price || resolvePrice(config.MODEL)
 if (!PRICE) throw new Error(`No benchmark price for ${config.MODEL}`)
 const costOf = c => {
   const prompt = c.prompt_tokens || 0
