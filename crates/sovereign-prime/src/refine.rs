@@ -172,8 +172,8 @@ pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], glo
 /// `/refine rollback [id]` (and the `refine.status()`-adjacent host call):
 /// undoes the given changeset, or the most recent one for `session`.
 pub fn rollback(store: &EntryStore, session: &str, id: Option<&str>) -> Result<String> {
-    let cs = store.rollback(id, Some(session))?;
-    Ok(format!("Rolled back: {}", cs.summary))
+    // The rollback changeset's summary already reads "Rolled back: ...".
+    Ok(store.rollback(id, Some(session))?.summary)
 }
 
 /// `/refine status`: a snapshot of what's currently learned and recently changed.
