@@ -21,3 +21,8 @@ captures/
 /*.avif
 /*.mp4
 /*.png
+
+# scripts/bench/{abeval,polyglot}.mjs output (sandboxes, throwaway homes,
+# meta.jsonl, proxy calls). Never a committed baseline; scripts/bench/
+# polyglot-exercises.json (the fixed-seed exercise selection) IS committed.
+/bench-results/

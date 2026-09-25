@@ -1,0 +1,63 @@
+{
+  "seed": 42,
+  "requested_count": 40,
+  "actual_count": 40,
+  "languages": [
+    "python",
+    "rust",
+    "cpp"
+  ],
+  "excluded_languages": {
+    "go": "not installed (per task brief)",
+    "java": "no JVM installed and gradle/gradlew would need a download",
+    "javascript": "jest/babel devDependencies not vendored; npm test needs npm install (network)"
+  },
+  "exercises": {
+    "python": [
+      "beer-song",
+      "book-store",
+      "bottle-song",
+      "bowling",
+      "dot-dsl",
+      "hangman",
+      "pig-latin",
+      "poker",
+      "react",
+      "robot-name",
+      "transpose",
+      "variable-length-quantity",
+      "wordy",
+      "zipper"
+    ],
+    "rust": [
+      "accumulate",
+      "acronym",
+      "alphametics",
+      "dot-dsl",
+      "doubly-linked-list",
+      "luhn-from",
+      "ocr-numbers",
+      "parallel-letter-frequency",
+      "poker",
+      "robot-name",
+      "two-bucket",
+      "variable-length-quantity",
+      "wordy"
+    ],
+    "cpp": [
+      "all-your-base",
+      "allergies",
+      "circular-buffer",
+      "clock",
+      "complex-numbers",
+      "diamond",
+      "gigasecond",
+      "knapsack",
+      "linked-list",
+      "phone-number",
+      "queen-attack",
+      "sublist",
+      "zebra-puzzle"
+    ]
+  }
+}
