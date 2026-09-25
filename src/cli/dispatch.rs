@@ -1456,6 +1456,7 @@ async fn run_gateway(
         let port = gateway.local_addr().port();
         if let Some(features) = &features {
             features.set_engine_env(format!("http://127.0.0.1:{port}"), token.clone());
+            crate::tool::set_browser_bridge(format!("http://127.0.0.1:{port}/api/browser/act"), token.clone());
         }
         // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval.
         let approval = serde_json::json!({ "addr": gateway.local_addr().to_string(), "secret": approval_secret });

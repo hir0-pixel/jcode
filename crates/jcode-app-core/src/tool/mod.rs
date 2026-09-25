@@ -4,6 +4,8 @@ mod apply_patch;
 mod bash;
 mod batch;
 mod bg;
+mod browser;
+pub use browser::set_bridge as set_browser_bridge;
 mod communicate;
 mod compile_remote;
 #[cfg(target_os = "macos")]
@@ -512,6 +514,7 @@ impl Registry {
             // Initiative is temporarily unavailable. Keep its implementation and
             // saved data intact so it can be restored without a migration.
             Self::insert_tool_timed(&mut m, &mut timings, "gmail", gmail::GmailTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "schedule", ambient::ScheduleTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "selfdev", selfdev::SelfDevTool::new);
             Self::insert_tool_timed(
