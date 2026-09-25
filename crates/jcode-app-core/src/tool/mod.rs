@@ -4,7 +4,6 @@ mod apply_patch;
 mod bash;
 mod batch;
 mod bg;
-mod browser;
 mod communicate;
 mod compile_remote;
 #[cfg(target_os = "macos")]
@@ -468,7 +467,6 @@ impl Registry {
                 "compile_remote",
                 compile_remote::CompileRemoteTool::new,
             );
-            Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "open", open::OpenTool::new);
             #[cfg(target_os = "macos")]
             Self::insert_tool_timed(

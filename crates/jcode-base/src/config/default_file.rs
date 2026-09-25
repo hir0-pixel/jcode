@@ -326,7 +326,7 @@ profile = "full"
 # All built-in tools, including gmail, are exposed by the full profile.
 # Use enabled = ["*"] to explicitly select the unrestricted full toolset.
 # Hide selected tools after applying the profile/allow-list.
-# disabled = ["browser", "gmail", "swarm"]
+# disabled = ["gmail", "swarm"]
 # Disable all built-in tools unless enabled is set.
 disable_base_tools = false
 # MCP tool exposure: "eager" sends every server tool definition, "deferred"
