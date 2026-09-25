@@ -2,7 +2,7 @@
 
 Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; every other Hermes method and route is forwarded to Hermes's own Python backend, which starts only when one of them is first used and stops after 10 idle minutes.
 
-**JSON-RPC methods (235):** 34 working, 22 placeholder, 179 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
+**JSON-RPC methods (235):** 51 working, 19 placeholder, 165 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
 
 | Namespace | Rust (working) | Rust (placeholder) | Forwarded to Hermes (Python) |
 |---|---|---|---|
@@ -22,18 +22,18 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | connection | – | – | `connection.respond` |
 | connectors | – | – | `connectors.accounts`, `connectors.accounts.remove`, `connectors.catalog`, `connectors.connect`, `connectors.list`, `connectors.operation.status`, `connectors.operation.wake`, `connectors.policy.get`, `connectors.policy.set`, `connectors.tools` |
 | cron | – | – | `cron.manage` |
-| delegation | – | – | `delegation.pause`, `delegation.status` |
+| delegation | `delegation.pause`, `delegation.status` | – | – |
 | diagnostics | – | – | `diagnostics.share_nous` |
 | display | – | – | `display.install`, `display.lease.acquire`, `display.lease.release`, `display.observe`, `display.start`, `display.status`, `display.stop`, `display.thumbnail` |
 | file | – | – | `file.attach` |
 | free_tier | – | `free_tier.status` | `free_tier.ack_notice`, `free_tier.provision` |
 | gateway | `gateway.capabilities` | – | – |
-| groups | – | – | `groups.approve`, `groups.capabilities`, `groups.create`, `groups.demote`, `groups.disband`, `groups.list`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
+| groups | `groups.capabilities`, `groups.list` | – | `groups.approve`, `groups.create`, `groups.demote`, `groups.disband`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
 | handoff | – | `handoff.fail`, `handoff.request`, `handoff.state` | – |
 | image | – | – | `image.attach`, `image.attach_bytes`, `image.detach`, `image.generate` |
 | input | – | – | `input.detect_drop` |
 | insights | `insights.get` | – | – |
-| learning | – | – | `learning.delete`, `learning.detail`, `learning.edit`, `learning.frames` |
+| learning | `learning.delete`, `learning.detail`, `learning.edit`, `learning.frames` | – | – |
 | llm | – | – | `llm.oneshot` |
 | mcp | – | – | `mcp.catalog`, `mcp.servers.add`, `mcp.servers.list`, `mcp.servers.oauth.callback`, `mcp.servers.oauth.cancel`, `mcp.servers.oauth.poll`, `mcp.servers.oauth.start`, `mcp.servers.remove`, `mcp.servers.set_api_key`, `mcp.servers.status`, `mcp.servers.test` |
 | message | – | – | `message.react` |
@@ -53,13 +53,13 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | reload | – | – | `reload.env`, `reload.mcp` |
 | request | – | – | `request.answer` |
 | rollback | – | – | `rollback.diff`, `rollback.list`, `rollback.restore` |
-| session | `session.activate`, `session.branch`, `session.close`, `session.compress`, `session.create`, `session.delete`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.redirect`, `session.resume`, `session.save`, `session.set_hidden`, `session.status`, `session.steer`, `session.title`, `session.undo`, `session.usage` | `session.active_list`, `session.context_breakdown`, `session.control`, `session.control.read`, `session.cwd.set`, `session.events.since`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.workspace.move` | – |
+| session | `session.activate`, `session.branch`, `session.close`, `session.compress`, `session.control`, `session.control.read`, `session.create`, `session.delete`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.redirect`, `session.resume`, `session.save`, `session.set_hidden`, `session.status`, `session.steer`, `session.title`, `session.undo`, `session.usage` | `session.active_list`, `session.context_breakdown`, `session.cwd.set`, `session.events.since`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.workspace.move` | – |
 | setup | `setup.runtime_check`, `setup.status` | – | – |
 | shell | – | – | `shell.exec` |
 | skills | – | – | `skills.manage`, `skills.reload` |
 | slash | `slash.exec` | – | – |
-| spawn_tree | – | – | `spawn_tree.list`, `spawn_tree.load`, `spawn_tree.save` |
-| subagent | – | `subagent.list` | `subagent.interrupt`, `subagent.steer`, `subagent.tail` |
+| spawn_tree | `spawn_tree.list`, `spawn_tree.load`, `spawn_tree.save` | – | – |
+| subagent | `subagent.interrupt`, `subagent.list`, `subagent.steer`, `subagent.tail` | – | – |
 | subscription | – | – | `subscription.change`, `subscription.preview`, `subscription.resume`, `subscription.state`, `subscription.upgrade` |
 | system | – | – | `system.battery` |
 | terminal | – | – | `terminal.resize` |
@@ -71,13 +71,14 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | voice | – | – | `voice.record`, `voice.toggle`, `voice.tts` |
 | wake | – | `wake.status` | `wake.feed`, `wake.pause`, `wake.resume`, `wake.start`, `wake.stop` |
 
-**HTTP routes in Hermes (267):** 25 served by the Rust engine, 8 chat-bound routes refused by the engine (not built yet; never proxied, since chats are not in Python's database); the rest are reverse-proxied to Hermes's Python backend.
+**HTTP routes in Hermes (264):** 28 served by the Rust engine, 8 chat-bound routes refused by the engine (not built yet; never proxied, since chats are not in Python's database); the rest are reverse-proxied to Hermes's Python backend.
 
 | Router | Rust | Refused by engine | Forwarded |
 |---|---|---|---|
 | actions | `GET /api/hermes/update/check` | – | `POST /api/gateway/restart`, `GET /api/gateway/migrate/plan`, `POST /api/gateway/migrate`, `POST /api/gateway/drain`, `POST /api/hermes/update`, `GET /api/actions/{name}/status`, `GET /api/hermes/update/receipt` |
 | analytics | `GET /api/analytics/usage` | – | `GET /api/config/raw`, `PUT /api/config/raw`, `GET /api/analytics/models` |
 | audio | – | – | `POST /api/audio/transcribe`, `GET /api/audio/voice-config`, `GET /api/audio/voice-live/status`, `POST /api/audio/voice-live/session`, `GET /api/audio/elevenlabs/voices`, `POST /api/audio/speak`, `POST /api/audio/tts-lease` |
+| browser | – | – | `POST /api/browser/act` |
 | chat_workspaces | – | – | `GET /api/chat/workspaces` |
 | config_env | – | – | `GET /api/config`, `GET /api/config/defaults`, `GET /api/config/schema`, `GET /api/egress/status`, `PUT /api/config`, `GET /api/env`, `PUT /api/env`, `GET /api/providers/custom-endpoints`, `POST /api/providers/custom-endpoints`, `POST /api/providers/custom-endpoints/{endpoint_id}/activate`, `DELETE /api/providers/custom-endpoints/{endpoint_id}`, `POST /api/providers/custom-endpoints/validate`, `POST /api/providers/validate`, `DELETE /api/env`, `POST /api/env/reveal` |
 | cron | `GET /api/cron/jobs` | – | `GET /api/cron/jobs/{job_id}`, `GET /api/cron/jobs/{job_id}/runs`, `POST /api/cron/jobs`, `GET /api/cron/delivery-targets`, `PUT /api/cron/jobs/{job_id}`, `POST /api/cron/jobs/{job_id}/pause`, `POST /api/cron/jobs/{job_id}/resume`, `POST /api/cron/jobs/{job_id}/trigger`, `DELETE /api/cron/jobs/{job_id}`, `POST /api/cron/fire`, `GET /api/cron/blueprints`, `POST /api/cron/blueprints/instantiate` |
@@ -93,6 +94,6 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | ops | `GET /api/memory` | – | `GET /api/pairing`, `POST /api/pairing/approve`, `POST /api/pairing/revoke`, `POST /api/pairing/clear-pending`, `GET /api/webhooks`, `POST /api/webhooks/enable`, `POST /api/webhooks`, `DELETE /api/webhooks/{name}`, `PUT /api/webhooks/{name}/enabled`, `POST /api/gateway/start`, `POST /api/gateway/stop`, `GET /api/credentials/pool`, `POST /api/credentials/pool`, `DELETE /api/credentials/pool/{provider}/{index}`, `PUT /api/memory/provider`, `POST /api/memory/reset`, `POST /api/ops/doctor`, `POST /api/ops/security-audit`, `POST /api/ops/backup`, `GET /api/ops/backup/download`, `POST /api/ops/import`, `POST /api/ops/import-upload`, `GET /api/ops/hooks`, `POST /api/ops/hooks`, `DELETE /api/ops/hooks`, `GET /api/ops/checkpoints`, `POST /api/ops/checkpoints/prune` |
 | profiles | `GET /api/profiles/sessions`, `GET /api/profiles/sessions/sidebar`, `GET /api/profiles`, `GET /api/profiles/active` | – | `GET /api/profiles/projects/tree`, `POST /api/profiles/sessions/pull-requests`, `POST /api/profiles`, `POST /api/profiles/active`, `GET /api/profiles/{name}/setup-command`, `POST /api/profiles/{name}/open-terminal`, `PATCH /api/profiles/{name}`, `DELETE /api/profiles/{name}`, `GET /api/profiles/{name}/soul`, `PUT /api/profiles/{name}/soul`, `PUT /api/profiles/{name}/description`, `PUT /api/profiles/{name}/model`, `POST /api/profiles/{name}/describe-auto`, `POST /api/profiles/{name}/export`, `POST /api/profiles/import`, `GET /api/profiles/{name}/desktop-overlay` |
 | sessions | `GET /api/sessions`, `GET /api/sessions/search`, `GET /api/sessions/{session_id}`, `GET /api/sessions/{session_id}/messages`, `GET /api/sessions/{session_id}/timeline`, `GET /api/sessions/{session_id}/messages/around`, `DELETE /api/sessions/{session_id}`, `POST /api/sessions/owner-backfill`, `PATCH /api/sessions/{session_id}` | `POST /api/sessions/bulk-delete`, `POST /api/sessions/import`, `GET /api/sessions/empty/count`, `DELETE /api/sessions/empty`, `GET /api/sessions/stats`, `GET /api/sessions/{session_id}/latest-descendant`, `GET /api/sessions/{session_id}/export`, `POST /api/sessions/prune` | – |
-| skills | – | – | `POST /api/skills/hub/install`, `POST /api/skills/hub/uninstall`, `POST /api/skills/hub/update`, `GET /api/skills/hub/official`, `GET /api/skills/hub/sources`, `GET /api/skills/hub/search`, `GET /api/skills/hub/preview`, `GET /api/skills/hub/scan`, `GET /api/skills`, `PUT /api/skills/toggle`, `GET /api/skills/content`, `POST /api/skills`, `PUT /api/skills/content` |
-| status | `GET /api/health`, `GET /api/host/identity`, `GET /api/status` | – | `GET /api/ssh/ownership`, `GET /api/health/idle`, `POST /api/health/retirement`, `GET /api/system/stats`, `GET /api/curator`, `PUT /api/curator/paused`, `POST /api/curator/run`, `GET /api/learning/graph`, `GET /api/learning/node`, `DELETE /api/learning/node`, `PUT /api/learning/node`, `GET /api/portal`, `POST /api/ops/prompt-size`, `POST /api/ops/dump`, `POST /api/ops/config-migrate`, `POST /api/ops/debug-share`, `GET /api/logs` |
+| skills | `GET /api/skills`, `PUT /api/skills/toggle`, `GET /api/skills/content` | – | `POST /api/skills/hub/install`, `POST /api/skills/hub/uninstall`, `POST /api/skills/hub/update`, `GET /api/skills/hub/official`, `GET /api/skills/hub/sources`, `GET /api/skills/hub/search`, `GET /api/skills/hub/preview`, `GET /api/skills/hub/scan`, `POST /api/skills`, `PUT /api/skills/content` |
+| status | `GET /api/health`, `GET /api/host/identity`, `GET /api/status` | – | `GET /api/ssh/ownership`, `GET /api/health/idle`, `POST /api/health/retirement`, `GET /api/system/stats`, `GET /api/curator`, `PUT /api/curator/paused`, `POST /api/curator/run`, `GET /api/portal`, `POST /api/ops/prompt-size`, `POST /api/ops/dump`, `POST /api/ops/config-migrate`, `POST /api/ops/debug-share`, `GET /api/logs` |
 | tools | `GET /api/tools/terminal/backends` | – | `GET /api/tools/toolsets`, `PUT /api/tools/toolsets/{name}`, `GET /api/tools/toolsets/{name}/config`, `GET /api/tools/toolsets/{name}/models`, `PUT /api/tools/toolsets/{name}/model`, `PUT /api/tools/toolsets/{name}/provider`, `PUT /api/tools/toolsets/{name}/env`, `POST /api/tools/toolsets/{name}/post-setup`, `PUT /api/tools/terminal/backend`, `GET /api/tools/computer-use/status`, `POST /api/tools/computer-use/permissions/grant` |

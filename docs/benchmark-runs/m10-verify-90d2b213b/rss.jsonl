@@ -1,0 +1,6 @@
+{"label":"sovereign|plain|run1","phase":"idle-before-chat","backend_kb":36800,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":21046624}
+{"label":"sovereign|plain|run1","phase":"idle-after-session-1","backend_kb":45712,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23878768}
+{"label":"sovereign|plain|run1","phase":"peak","backend_kb":47888,"ollama_kb":23878768,"python_kb":0}
+{"label":"sovereign|edit-code|run1","phase":"idle-before-chat","backend_kb":36496,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23878768}
+{"label":"sovereign|edit-code|run1","phase":"idle-after-session-1","backend_kb":46560,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":24655040}
+{"label":"sovereign|edit-code|run1","phase":"peak","backend_kb":48960,"ollama_kb":24655040,"python_kb":0}

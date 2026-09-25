@@ -1,0 +1,13 @@
+Using bench via OpenAI-compatible API as the initial provider
+Using model: sovereign/bench-hermes-64k:latest
+sovereign: learning on (local model: true)
+sovereign-observability: alerts failed: no such column: flags in SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN status IN ('error','failed') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN (flags & ?2) != 0 THEN 1 ELSE 0 END), 0)
+         FROM obs_runs WHERE started_at_ms>=?1 at offset 149
+sovereign-observability: alerts failed: no such column: flags in SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN status IN ('error','failed') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN (flags & ?2) != 0 THEN 1 ELSE 0 END), 0)
+         FROM obs_runs WHERE started_at_ms>=?1 at offset 149
+harness API bridge: list_sessions ids=1.1ms metadata=1.6ms total=1.6ms count=1
+harness API bridge: list_sessions ids=1.4ms metadata=2.0ms total=2.1ms count=1

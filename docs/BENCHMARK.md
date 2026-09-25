@@ -1,7 +1,25 @@
 # Sovereign vs stock Hermes — baseline benchmark
 
-Last updated: 2026-09-24  
+Last updated: 2026-09-26  
 Host: macOS arm64, Ollama app, model `qwen3.8:27b` (Q4_K_M, 27.3B).
+
+## M10 verification token check (2026-09-25)
+
+Same meter as the full bench (`scripts/sovereign-vs-hermes-bench.mjs` + counting
+proxy), tasks `plain` + `edit-code`, 1 run each, model
+`sovereign/bench-hermes-64k:latest`. Compared tip **276139934** (pre-M10b/c) to
+**90d2b213b** (M10b+M10c merged).
+
+| Commit | Tools/call | Tool-schema tokens (est.) | First-turn prompt (`plain`) | First-turn prompt (`edit-code`) |
+| --- | ---: | ---: | ---: | ---: |
+| 276139934 (before) | 23 | 7 157 | 8 222 | 8 226 |
+| 90d2b213b (after) | 26 | 7 744 | 8 864 | 8 869 |
+| Δ | +3 | **+587** | +642 | +643 |
+
+New tools are within the ~1 000-token schema budget (`delegate`, `session_goal`,
+`refine`/`heartbeat` surfaces — full `swarm` stays disabled). Raw logs:
+`docs/benchmark-runs/m10-verify-276139934/` and
+`docs/benchmark-runs/m10-verify-90d2b213b/`.
 
 ## Ollama serving context (RSS)
 

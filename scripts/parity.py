@@ -23,11 +23,11 @@ HERMES = Path(sys.argv[1] if len(sys.argv) > 1 else ENGINE.parent / "hermes-agen
 
 # Answered honestly as "off / empty" until the named module is built.
 PLACEHOLDER = {
-    "free_tier.status", "wake.status", "pet.info", "projects.tree", "subagent.list",
-    "process.list", "session.control.read", "profiles.list", "session.active_list",
+    "free_tier.status", "wake.status", "pet.info", "projects.tree",
+    "process.list", "profiles.list", "session.active_list",
     # Chat-bound but not built yet: refused by the engine, never forwarded
     # (Python's store has never seen these sessions).
-    "session.events.since", "session.events.stats", "session.cwd.set", "session.control",
+    "session.events.since", "session.events.stats", "session.cwd.set",
     "session.workspace.move", "session.context_breakdown", "session.foreign.import",
     "session.foreign.list", "session.foreign.preview",
     # Hosted-subscription bars (not applicable) and messaging handoff (M4).
@@ -38,11 +38,12 @@ PLAN = {
     "bot_relay": "M10 channels (ZeroClaw)", "connectors": "M10 channels (ZeroClaw)",
     "cron": "M10 cron (ZeroClaw)", "profiles": "M10 profiles", "pet": "M10 pet",
     "voice": "M10 voice", "wake": "M10 voice", "skills": "M10 skills hub",
-    "groups": "M10 group chats", "projects": "M10 projects", "vault": "M10 vault",
+    "groups": "bots keep Python groups; chat-engine groups.list/capabilities are empty stubs",
+    "projects": "M10 projects", "vault": "M10 vault",
     "mcp": "M10 MCP management", "browser": "M10 browser pane", "display": "M10 display",
     "billing": "not applicable (hosted billing)", "subscription": "not applicable (hosted billing)",
-    "free_tier": "not applicable (hosted free tier)", "learning": "M9/M10 learning views",
-    "spawn_tree": "M9 observability", "subagent": "M9 observability", "delegation": "M9 observability",
+    "free_tier": "not applicable (hosted free tier)",
+    # learning / subagent / spawn_tree / delegation / session.control* → engine (M10a/b)
     "handoff": "M10 handoff", "image": "M10 images", "rollback": "M10 rollback",
 }
 

@@ -1,0 +1,3 @@
+Using bench via OpenAI-compatible API as the initial provider
+Using model: sovereign/bench-hermes-64k:latest
+sovereign: learning on (local model: true)

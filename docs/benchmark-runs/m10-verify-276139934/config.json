@@ -1,0 +1,29 @@
+{
+  "MODEL": "sovereign/bench-hermes-64k:latest",
+  "BASE_MODEL": "qwen3.8:27b",
+  "NUM_CTX": 65536,
+  "RUNS": 1,
+  "IDLE_MS": 20000,
+  "PRODUCTS": [
+    "sovereign"
+  ],
+  "HERMES_BIN": "/Users/rameelmalik/.local/bin/hermes",
+  "SOVEREIGN_BIN": "/Users/rameelmalik/Documents/Sovereign AI/sovereign-engine/target/release/sovereign",
+  "BASE_URL": "http://127.0.0.1:11434",
+  "USING_OLLAMA": true,
+  "UPSTREAM_ORIGIN": "http://127.0.0.1:11434",
+  "PROXY_PATH": "/v1",
+  "PROXY": "127.0.0.1:18080",
+  "API_KEY": "ollama",
+  "price": {
+    "input": 3,
+    "cached": 0.3,
+    "output": 15,
+    "source": "/Users/rameelmalik/Documents/Sovereign AI/sovereign-engine/scripts/sovereign-prices.json"
+  },
+  "tasks": [
+    "plain",
+    "edit-code"
+  ],
+  "started": "2026-09-25T21:59:46.132Z"
+}

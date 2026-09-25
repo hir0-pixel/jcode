@@ -1,6 +1,7 @@
 # Sovereign memory and storage: design and build plan
 
-Status (2026-09-25): M1 and M2 built, M3 built (gate pending). Where the build departed from
+Status (2026-09-26): M1–M9 built; M10a Continual Harness, M10b agent loop, and M10c
+EveStack observability parity built (see M10 sections below). Where the build departed from
 this proposal:
 
 - **Chats stay in jcode's session store** (snapshot + append-only journal), not Hermes's
@@ -387,6 +388,32 @@ test stand-in, so llama.cpp bundling, KV-cache compression and warm-up are out o
   unbounded queues or scans, per-turn work that could be per-session).
 - Evidence required per finding (file, why it is dead/duplicate/slow, measured impact);
   remove or merge, then re-run the benchmark and the test suites to prove nothing regressed.
+
+**M10a Continual Harness** (built)
+- Harness entries (`prompt` / `memory` / `skill` / `subagent`) with local/global scope, CRUD,
+  rollback, rationale/expectedOutcome; `/refine` (+ `--global`, rollback, status) and `/harness`;
+  refine tool + REPL `refine()`; `learning.review` config; `learning.*` RPCs served by the engine.
+- Learning REST (`/api/learning/graph`, `/api/learning/node`) backs the desktop Skills star map.
+
+**M10b Agent loop** (built)
+- `/goal` durable per-session objective with turn/token/wall budgets; re-prompts until complete
+  or budget; `session_goal` model tool; served in `session.control.read` (Hermes goal shape).
+- `/autonomous` bounded continuations with quality gates (gate pass ≠ limit hit); projected into
+  the `loop` field (`self_paced`). `/loop` is an alias.
+- `/heartbeat every <dur> <prompt>` (+ list/cancel); persisted in `sovereign.db`; survives
+  disconnect/reattach; shown in `session.control.read`.
+- `subagent.list/interrupt/steer/tail`, `spawn_tree.*`, `delegation.*` from swarm child sessions;
+  `groups.list`/`capabilities` empty/disabled (bots keep Python groups).
+- Compact `delegate` tool over swarm internals (full `swarm` stays disabled — ~2.8k schema tokens
+  vs ~210 for delegate). RLM host stubs for spawn/message; goal get/complete via ControlStore.
+- Live e2e: `crates/sovereign-gateway/e2e/agent-loop.mjs`. See `docs/M10b_DECISIONS.md`.
+
+**M10c EveStack observability parity** (built)
+- Silent-failure `no_model_call` flag; monitors (p50/p95/p99, error rate, silent failures);
+  soft daily USD budget; transition-deduped `obs_alerts`; `obs_approvals` audit; Activity
+  filters/search; promote → `JCODE_HOME/evals/<id>.json`; replay via session branch.
+- Routes under `/api/sovereign/observability/{monitors,budget,approvals,promote,replay}`.
+- See `docs/M10c_DECISIONS.md`, `docs/eval-case-format.md`.
 
 UI wording and visual polish come after M9.
 
