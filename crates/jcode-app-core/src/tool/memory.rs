@@ -553,13 +553,24 @@ mod tests {
         .unwrap();
 
         // Recall works offline with no credentials, for the default and every old alias.
-        for mode in [None, Some("ranked"), Some("jev"), Some("semantic"), Some("cascade")] {
-            let mut input = json!({"action":"recall", "query":"staging deploy approvals", "scope":"project"});
+        for mode in [
+            None,
+            Some("ranked"),
+            Some("jev"),
+            Some("semantic"),
+            Some("cascade"),
+        ] {
+            let mut input =
+                json!({"action":"recall", "query":"staging deploy approvals", "scope":"project"});
             if let Some(mode) = mode {
                 input["mode"] = json!(mode);
             }
             let output = tool.execute(input.clone(), ctx()).await.unwrap();
-            assert!(output.output.contains("two approvals"), "{mode:?}: {}", output.output);
+            assert!(
+                output.output.contains("two approvals"),
+                "{mode:?}: {}",
+                output.output
+            );
 
             input["limit"] = json!(0);
             let output = tool.execute(input, ctx()).await.unwrap();
@@ -568,7 +579,10 @@ mod tests {
 
         // A scope never borrows memories from another scope.
         let empty = tool
-            .execute(json!({"action":"recall", "query":"staging deploy", "scope":"global"}), ctx())
+            .execute(
+                json!({"action":"recall", "query":"staging deploy", "scope":"global"}),
+                ctx(),
+            )
             .await
             .unwrap();
         assert!(empty.output.starts_with("No memories found"));

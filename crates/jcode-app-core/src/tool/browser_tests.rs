@@ -331,9 +331,22 @@ fn browser_tool_offers_direct_actions_only() {
     let tool = BrowserTool::new();
     let schema = tool.parameters_schema();
     let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
-    assert!(!actions.contains(&json!("handoff")), "no Jev handoff action");
-    for gone in ["goal", "context", "max_steps", "confidence_threshold", "text_values", "candidates"] {
-        assert!(schema["properties"].get(gone).is_none(), "{gone} was handoff-only");
+    assert!(
+        !actions.contains(&json!("handoff")),
+        "no Jev handoff action"
+    );
+    for gone in [
+        "goal",
+        "context",
+        "max_steps",
+        "confidence_threshold",
+        "text_values",
+        "candidates",
+    ] {
+        assert!(
+            schema["properties"].get(gone).is_none(),
+            "{gone} was handoff-only"
+        );
     }
     assert!(browser_tool_description_text().contains("direct actions"));
 }

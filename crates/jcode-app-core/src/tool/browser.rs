@@ -1112,4 +1112,3 @@ fn format_interactables_result(result: &Value) -> String {
 #[cfg(test)]
 #[path = "browser_tests.rs"]
 mod browser_tests;
-
