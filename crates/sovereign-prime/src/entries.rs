@@ -15,8 +15,9 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_CONTENT_CHARS: usize = 4_000;
@@ -296,6 +297,20 @@ impl EntryStore {
         let conn = Connection::open(home.join("sovereign.db")).context("opening sovereign.db")?;
         conn.execute_batch(SCHEMA).context("migrating harness entry tables")?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// One cached store per `home` per process, so callers (the gateway's
+    /// per-RPC harness commands, the automatic learning pass) do not reopen
+    /// `sovereign.db` on every call.
+    pub fn open_cached(home: &Path) -> Result<Arc<Self>> {
+        static STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<EntryStore>>>> = OnceLock::new();
+        let mut map = STORES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = map.get(home) {
+            return Ok(store.clone());
+        }
+        let store = Arc::new(Self::open(home)?);
+        map.insert(home.to_path_buf(), store.clone());
+        Ok(store)
     }
 
     /// In-memory store for unit tests.

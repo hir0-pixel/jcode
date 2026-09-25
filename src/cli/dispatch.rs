@@ -1906,5 +1906,7 @@ fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::le
         }
         Ok(manager.load_global_graph()?.memories.len().saturating_sub(before))
     });
-    Some(sovereign_gateway::learn::Learning { idle: std::time::Duration::from_millis(idle_ms), remember })
+    // Prime's auto-refine review, off by default: `SOVEREIGN_LEARN_REVIEW=on`.
+    let review = matches!(std::env::var("SOVEREIGN_LEARN_REVIEW").unwrap_or_default().trim().to_ascii_lowercase().as_str(), "on" | "true" | "1");
+    Some(sovereign_gateway::learn::Learning { idle: std::time::Duration::from_millis(idle_ms), remember, review })
 }

@@ -426,8 +426,10 @@ impl Conn {
             }
             "commands.catalog" => {
                 let pairs = json!([
-                    ["/refine", "Learn one durable improvement from this session (Continual Harness)"],
-                    ["/refine rollback", "Undo the last /refine"],
+                    ["/refine", "Propose evidence-backed Continual Harness edits from this session"],
+                    ["/refine --global", "Same, scoped to every session instead of just this one"],
+                    ["/refine rollback", "Undo the last /refine (or a specific changeset id)"],
+                    ["/refine status", "Show current harness entries and recent refinements"],
                     ["/harness", "Show the learned instructions"],
                 ]);
                 Ok(json!({
@@ -807,32 +809,53 @@ impl Conn {
         }
     }
 
-    /// `/refine`, `/refine rollback`, `/harness`. `None` for other commands.
+    /// `/refine [instructions] [--global]`, `/refine rollback [id] [--global]`,
+    /// `/refine status`, `/harness`. `None` for other commands.
     async fn harness_command(self: &Arc<Self>, words: &[&str], session_id: Option<&str>) -> Option<String> {
-        use sovereign_prime::harness::{Harness, Outcome, Turn};
-        let harness = Harness::new(std::path::Path::new(&self.config.home));
+        use sovereign_prime::entries::EntryStore;
+        use sovereign_prime::harness::Harness;
+        let legacy = Harness::new(std::path::Path::new(&self.config.home));
         let result: anyhow::Result<String> = match words {
-            ["harness", ..] => Ok(match harness.current() {
-                text if text.trim().is_empty() => "No learned instructions yet. Run /refine after a session worth learning from.".into(),
-                text => format!("Learned instructions (applied to new sessions):\n\n{}", text.trim()),
-            }),
-            ["refine", "rollback", ..] => harness.rollback().map(|previous| {
-                if previous.trim().is_empty() {
-                    "Rolled back: learned instructions are empty again.".to_string()
-                } else {
-                    format!("Rolled back to the previous learned instructions:\n\n{}", previous.trim())
+            ["harness", ..] => {
+                let mut text = match legacy.current() {
+                    t if t.trim().is_empty() => "No learned instructions yet. Run /refine after a session worth learning from.".to_string(),
+                    t => format!("Learned instructions (applied to new sessions):\n\n{}", t.trim()),
+                };
+                if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+                    if let Ok(store) = EntryStore::open_cached(std::path::Path::new(&self.config.home)) {
+                        let addenda = store.render_prompt(sid).unwrap_or_default();
+                        if !addenda.trim().is_empty() {
+                            text.push_str("\n\nContinual Harness prompt entries for this session:\n\n");
+                            text.push_str(addenda.trim());
+                        }
+                    }
                 }
-            }),
-            ["refine", ..] => async {
+                Ok(text)
+            }
+            ["refine", "status", ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/refine needs an open session"))?;
+                let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
+                Ok(sovereign_prime::refine::status(&store, sid))
+            })(),
+            ["refine", "rollback", rest @ ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/refine needs an open session"))?;
+                let id = rest.iter().find(|w| **w != "--global").copied();
+                let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
+                sovereign_prime::refine::rollback(&store, sid, id)
+            })(),
+            ["refine", rest @ ..] => async {
                 let sid = session_id.filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("/refine needs an open session"))?;
                 let complete = self.config.complete.clone().ok_or_else(|| anyhow!("no model is available for /refine"))?;
+                let global = rest.contains(&"--global");
+                let instructions: Vec<&str> = rest.iter().filter(|w| **w != "--global").copied().collect();
+                let instructions = (!instructions.is_empty()).then(|| instructions.join(" "));
                 self.ensure_attached(sid).await?;
                 let history = self.call(json!({ "req": "get_history", "session_id": sid })).await?;
-                let turns: Vec<Turn> = history["messages"]
+                let turns: Vec<sovereign_prime::harness::Turn> = history["messages"]
                     .as_array()
                     .map(|list| {
                         list.iter()
-                            .map(|m| Turn {
+                            .map(|m| sovereign_prime::harness::Turn {
                                 role: m["role"].as_str().unwrap_or_default().to_string(),
                                 text: m["content"].as_str().unwrap_or_default().to_string(),
                             })
@@ -842,25 +865,32 @@ impl Conn {
                 if turns.is_empty() {
                     return Ok("Nothing to learn from yet: this session has no messages.".to_string());
                 }
-                let (system, user) = harness.refine_request(&turns);
+                let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
+                let (system, user) = sovereign_prime::refine::build_request(&store, sid, &turns, instructions.as_deref(), global);
                 let started = crate::observability::now();
                 let reply = complete(system, user).await;
-                self.observer.record_aux(sid, "other", Some("Refine instructions"), None, None, started, reply.as_ref().ok().and_then(|done| done.usage), reply.as_ref().err().map(|err| err.to_string()).as_deref());
+                self.observer.record_aux(
+                    sid, "other", Some("Refine harness entries"), None, None, started,
+                    reply.as_ref().ok().and_then(|done| done.usage), reply.as_ref().err().map(|err| err.to_string()).as_deref(),
+                );
                 let reply = reply?.text;
-                Ok(match harness.apply(&reply, &turns)? {
-                    Outcome::Updated { changes, added, removed } => {
-                        let mut text = format!("Learned: {changes}\n");
-                        for line in &added {
-                            text.push_str(&format!("+ {line}\n"));
+                match sovereign_prime::refine::apply(&store, sid, &reply, &turns, global, "refine") {
+                    Ok(outcome) => {
+                        let mut text = format!("Refined ({}): {}\n", if global { "global" } else { "this session" }, outcome.summary);
+                        if !outcome.created.is_empty() {
+                            text.push_str(&format!("+ created {}\n", outcome.created.len()));
                         }
-                        for line in &removed {
-                            text.push_str(&format!("- {line}\n"));
+                        if !outcome.updated.is_empty() {
+                            text.push_str(&format!("~ updated {}\n", outcome.updated.len()));
                         }
-                        text.push_str("Applies to new sessions. Undo with /refine rollback.");
-                        text
+                        if !outcome.deleted.is_empty() {
+                            text.push_str(&format!("- deleted {}\n", outcome.deleted.len()));
+                        }
+                        text.push_str(&format!("Undo with /refine rollback {}", outcome.changeset_id));
+                        Ok(text)
                     }
-                    Outcome::NoChange { reason } => format!("No change: {reason}"),
-                })
+                    Err(err) => Ok(format!("No change: {err:#}")),
+                }
             }
             .await,
             _ => return None,

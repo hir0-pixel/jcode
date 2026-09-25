@@ -24,6 +24,13 @@ pub struct Learning {
     /// Idle time after a turn before a pass runs.
     pub idle: Duration,
     pub remember: Remember,
+    /// Prime's auto-refine review (`learning.review`, default off/`false`):
+    /// when on, every pass that has a learning signal (the same free gate
+    /// above) also asks the model for a full Continual Harness CRUD proposal
+    /// (`sovereign_prime::refine`) and applies it through the same
+    /// evidence-gated path `/refine` uses. Off, a pass behaves exactly as
+    /// before this existed.
+    pub review: bool,
 }
 
 /// Unexamined turns after which the short timer applies.
@@ -75,6 +82,30 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
         Ok(Some(SkillOutcome::Updated { name })) => Some(format!("updated skill \"{name}\"")),
         _ => None,
     };
+    // Prime's auto-refine review: same signal gate, one extra model call that
+    // may propose a full Continual Harness changeset (any of the 4 entry
+    // kinds), applied through the same gate `/refine` uses.
+    let mut review_summary = None;
+    if learning.review {
+        if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&conn.config().home)) {
+            let (rsystem, ruser) = sovereign_prime::refine::build_request(&store, session, fresh, None, false);
+            let rstarted = crate::observability::now();
+            let rreply = complete(rsystem, ruser).await;
+            conn.observer.record_aux(
+                session, "learning", Some("Auto-refine review"), None, None, rstarted,
+                rreply.as_ref().ok().and_then(|d| d.usage), rreply.as_ref().err().map(|e| e.to_string()).as_deref(),
+            );
+            if let Ok(done) = rreply {
+                match sovereign_prime::refine::apply(&store, session, &done.text, fresh, false, "auto") {
+                    Ok(outcome) => {
+                        harness.log(json!({"op": "auto_refine", "session": session, "changeset": outcome.changeset_id, "summary": outcome.summary}))?;
+                        review_summary = Some(outcome.summary);
+                    }
+                    Err(_) => {} // no durable edit this pass; not an error worth surfacing
+                }
+            }
+        }
+    }
     harness.log(json!({
         "op": "learn",
         "session": session,
@@ -95,6 +126,9 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
     }
     if let Some(skill) = &skill_name {
         parts.push(skill.clone());
+    }
+    if let Some(summary) = &review_summary {
+        parts.push(format!("auto-refine: {summary}"));
     }
     Ok((!parts.is_empty()).then(|| format!("Learned {}.", parts.join("; "))))
 }
