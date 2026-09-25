@@ -1,5 +1,12 @@
 //! Bounded, local run ledger. All SQLite work stays off the agent path.
 
+#[path = "observability_m10c.rs"]
+mod observability_m10c;
+
+use observability_m10c::{
+    apply_run_end_flags, budget_status, evaluate_alerts, list_alerts, list_approvals, list_filtered,
+    monitors, promote_run, turn_index, window_ms, write_approval,
+};
 use rusqlite::{Connection, params};
 use jcode_provider_core::SimpleUsage;
 use serde::Deserialize;
@@ -47,6 +54,20 @@ enum Op {
         id: String,
         status: String,
         error: Option<String>,
+        at: i64,
+        model_calls: u64,
+    },
+    RunReplayOf {
+        id: String,
+        replay_of: String,
+    },
+    Approval {
+        run_id: Option<String>,
+        session: String,
+        tool: String,
+        command: String,
+        decision: String,
+        actor: String,
         at: i64,
     },
     SpanStart {
@@ -111,11 +132,18 @@ pub struct Observer {
     pending: Arc<AtomicUsize>,
     dropped: Arc<AtomicU64>,
     capture_content: bool,
+    home: std::path::PathBuf,
+    alert_tx: Option<SyncSender<Value>>,
     sessions: Mutex<HashMap<String, Active>>,
 }
 
 impl Observer {
-    pub fn open(home: &Path, provider: &str, model: &str) -> rusqlite::Result<Arc<Self>> {
+    pub fn open(
+        home: &Path,
+        provider: &str,
+        model: &str,
+        alert_tx: Option<SyncSender<Value>>,
+    ) -> rusqlite::Result<Arc<Self>> {
         std::fs::create_dir_all(home).map_err(|_| rusqlite::Error::InvalidPath(home.into()))?;
         let path = home.join("sovereign.db");
         let mut db = Connection::open(&path)?;
@@ -145,6 +173,8 @@ impl Observer {
             pending: pending.clone(),
             dropped: dropped.clone(),
             capture_content,
+            home: home.to_path_buf(),
+            alert_tx: alert_tx.clone(),
             sessions: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&observer);
@@ -156,21 +186,37 @@ impl Observer {
         let writer_home = home.to_path_buf();
         let writer_provider = provider.to_string();
         let writer_model = model.to_string();
+        let writer_alert_tx = alert_tx.clone();
+        let writer_dropped = dropped.clone();
         std::thread::Builder::new()
             .name("sovereign-observability".into())
             .spawn(move || {
                 let mut db = db;
                 let mut last_prune = 0;
                 let mut last_child_check = Instant::now();
+                let mut last_alert = 0_i64;
                 loop {
                     let first = match rx.recv_timeout(Duration::from_secs(1)) {
                         Ok(op) => op,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if now() - last_prune >= 86_400_000 {
-                                if let Err(err) = prune(&db, now(), retention_days) {
+                            let at = now();
+                            if at - last_prune >= 86_400_000 {
+                                if let Err(err) = prune(&db, at, retention_days) {
                                     eprintln!("sovereign-observability: prune failed: {err}");
                                 }
-                                last_prune = now();
+                                last_prune = at;
+                            }
+                            if at - last_alert >= 60_000 {
+                                if let Err(err) = evaluate_alerts(
+                                    &mut db,
+                                    &writer_home,
+                                    at,
+                                    writer_dropped.load(Ordering::Relaxed),
+                                    writer_alert_tx.as_ref(),
+                                ) {
+                                    eprintln!("sovereign-observability: alerts failed: {err}");
+                                }
+                                last_alert = at;
                             }
                             if let Err(err) =
                                 refresh_children(&mut db, &writer_home, capture_content)
@@ -324,8 +370,16 @@ impl Observer {
             model, provider, session: session.into(), input: usage.input, output: usage.output,
             cache_read: usage.cache_read, cache_write: usage.cache_write, cost, usage_known,
             error: error.map(capped), started, ended: now() }, false);
-        self.send(Op::RunEnd { id: run, status: if error.is_some() { "error" } else { "complete" }.into(),
-            error: error.map(capped), at: now() }, false);
+        self.send(
+            Op::RunEnd {
+                id: run,
+                status: if error.is_some() { "error" } else { "complete" }.into(),
+                error: error.map(capped),
+                at: now(),
+                model_calls: 1,
+            },
+            false,
+        );
     }
 
     pub fn event(&self, session: &str, ty: &str, payload: &Value) {
@@ -451,12 +505,14 @@ impl Observer {
                     }, false);
                     active.model_calls += 1;
                 }
+                let model_calls = active.model_calls;
                 self.send(
                     Op::RunEnd {
                         id: run.clone(),
                         status: status.into(),
                         error: active.error.take(),
                         at: now(),
+                        model_calls,
                     },
                     false,
                 );
@@ -588,21 +644,107 @@ impl Observer {
                     status: "error".into(),
                     error: Some(capped(error)),
                     at: now(),
+                    model_calls: active.model_calls,
                 },
                 false,
             );
         }
     }
 
-    pub fn list(&self, limit: u64) -> rusqlite::Result<Value> {
+    pub fn list(
+        &self,
+        limit: u64,
+        status: Option<&str>,
+        kind: Option<&str>,
+        q: Option<&str>,
+    ) -> rusqlite::Result<Value> {
         let db = self.read_db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,title,unpriced_calls FROM obs_runs ORDER BY started_at_ms DESC LIMIT ?1")?;
-        let rows = stmt
-            .query_map([limit.min(200)], run_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(
-            json!({ "runs": rows, "dropped_events": self.dropped.load(Ordering::Relaxed), "capture_content": self.capture_content }),
-        )
+        let rows = list_filtered(&db, limit, status, kind, q)?;
+        let budget = budget_status(&db, &self.home, now())?;
+        Ok(json!({
+            "runs": rows,
+            "dropped_events": self.dropped.load(Ordering::Relaxed),
+            "capture_content": self.capture_content,
+            "budget": budget,
+        }))
+    }
+
+    pub fn monitors(&self, window: &str) -> Result<Value, &'static str> {
+        let Some(ms) = window_ms(window) else {
+            return Err("window must be 1h, 24h, or 7d");
+        };
+        let db = self.read_db.lock().unwrap();
+        let mut body = monitors(&db, now() - ms, self.dropped.load(Ordering::Relaxed)).map_err(|_| "query failed")?;
+        if let Ok(alerts) = list_alerts(&db) {
+            body["alerts"] = alerts["monitors"].clone();
+        }
+        Ok(body)
+    }
+
+    pub fn budget(&self) -> rusqlite::Result<Value> {
+        let db = self.read_db.lock().unwrap();
+        budget_status(&db, &self.home, now())
+    }
+
+    pub fn approvals(&self, limit: u64) -> rusqlite::Result<Value> {
+        let db = self.read_db.lock().unwrap();
+        list_approvals(&db, limit)
+    }
+
+    pub fn promote(&self, run_id: &str) -> rusqlite::Result<Value> {
+        let db = self.read_db.lock().unwrap();
+        promote_run(&db, &self.home, run_id, now())
+    }
+
+    pub fn replay_turn_index(&self, run_id: &str) -> rusqlite::Result<(String, i64, Option<String>)> {
+        let db = self.read_db.lock().unwrap();
+        let run = detail_from_db(&db, run_id)?;
+        let session = run["run"]["session_id"].as_str().unwrap_or_default().to_string();
+        let started = run["run"]["started_at_ms"].as_i64().unwrap_or(0);
+        let prompt = run
+            .get("content")
+            .and_then(|c| c.get("input"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let nth = turn_index(&db, &session, started)?;
+        Ok((session, nth, prompt))
+    }
+
+    pub fn link_replay(&self, new_run: &str, original: &str) {
+        self.send(
+            Op::RunReplayOf {
+                id: new_run.into(),
+                replay_of: original.into(),
+            },
+            false,
+        );
+    }
+
+    pub fn active_run_id(&self, session: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(session).and_then(|a| a.run.clone())
+    }
+
+    pub fn record_approval(
+        &self,
+        session: &str,
+        tool: &str,
+        command: &str,
+        decision: &str,
+        actor: &str,
+    ) {
+        let run_id = self.active_run_id(session);
+        self.send(
+            Op::Approval {
+                run_id,
+                session: session.into(),
+                tool: tool.into(),
+                command: command.into(),
+                decision: decision.into(),
+                actor: actor.into(),
+                at: now(),
+            },
+            false,
+        );
     }
 
     /// Hermes's `/api/analytics/usage` shape, from the ledger: runs are turns,
@@ -681,8 +823,13 @@ impl Observer {
 
     pub fn detail(&self, id: &str) -> rusqlite::Result<Value> {
         let db = self.read_db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,title,unpriced_calls FROM obs_runs WHERE id=?1")?;
-        let run = stmt.query_row([id], run_row)?;
+        detail_from_db(&db, id)
+    }
+}
+
+pub(crate) fn detail_from_db(db: &Connection, id: &str) -> rusqlite::Result<Value> {
+        let mut stmt = db.prepare("SELECT id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,title,unpriced_calls,flags,replay_of FROM obs_runs WHERE id=?1")?;
+        let run = stmt.query_row([id], observability_m10c::run_row_m10c)?;
         let mut spans = db.prepare("SELECT s.id,s.run_id,s.parent_id,s.root_id,s.kind,s.name,s.status,s.started_at_ms,s.ended_at_ms,s.input_tokens,s.output_tokens,s.cache_read_tokens,s.cache_write_tokens,s.cost_usd,s.error,c.input,c.output,s.model,s.provider,s.attributes FROM obs_spans s LEFT JOIN obs_content c ON c.id=s.id WHERE s.run_id=?1 ORDER BY s.started_at_ms")?;
         let spans = spans.query_map([id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"parent_id":r.get::<_,String>(2)?,"root_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"name":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"started_at_ms":r.get::<_,i64>(7)?,"ended_at_ms":r.get::<_,Option<i64>>(8)?,"input_tokens":r.get::<_,i64>(9)?,"output_tokens":r.get::<_,i64>(10)?,"cache_read_tokens":r.get::<_,i64>(11)?,"cache_write_tokens":r.get::<_,i64>(12)?,"cost_usd":r.get::<_,Option<f64>>(13)?,"error":r.get::<_,Option<String>>(14)?,"input":r.get::<_,Option<String>>(15)?,"output":r.get::<_,Option<String>>(16)?,"model":r.get::<_,Option<String>>(17)?,"provider":r.get::<_,Option<String>>(18)?,"attributes":serde_json::from_str::<Value>(&r.get::<_,String>(19)?).unwrap_or_else(|_| json!({}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let content: Option<(Option<String>, Option<String>)> = db
@@ -693,13 +840,6 @@ impl Observer {
         Ok(
             json!({"run":run,"spans":spans,"content":content.map(|(input,output)| json!({"input":input,"output":output}))}),
         )
-    }
-}
-
-fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    Ok(
-        json!({"id":r.get::<_,String>(0)?,"session_id":r.get::<_,String>(1)?,"parent_id":r.get::<_,Option<String>>(2)?,"root_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"model":r.get::<_,String>(5)?,"provider":r.get::<_,String>(6)?,"status":r.get::<_,String>(7)?,"started_at_ms":r.get::<_,i64>(8)?,"ended_at_ms":r.get::<_,Option<i64>>(9)?,"input_tokens":r.get::<_,i64>(10)?,"output_tokens":r.get::<_,i64>(11)?,"cache_read_tokens":r.get::<_,i64>(12)?,"cache_write_tokens":r.get::<_,i64>(13)?,"cost_usd":r.get::<_,Option<f64>>(14)?,"error":r.get::<_,Option<String>>(15)?,"title":r.get::<_,Option<String>>(16)?,"unpriced_calls":r.get::<_,i64>(17)?}),
-    )
 }
 
 fn import_old(db: &mut Connection, home: &Path) -> rusqlite::Result<()> {
@@ -777,12 +917,26 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 status,
                 error,
                 at,
+                model_calls,
             } => {
                 tx.execute(
                     "UPDATE obs_runs SET status=?2,error=?3,ended_at_ms=?4 WHERE id=?1",
                     params![id, status, error, at],
                 )?;
+                apply_run_end_flags(&tx, &id, &status, &error, model_calls)?;
             }
+            Op::RunReplayOf { id, replay_of } => {
+                tx.execute("UPDATE obs_runs SET replay_of=?2 WHERE id=?1", params![id, replay_of])?;
+            }
+            Op::Approval {
+                run_id,
+                session,
+                tool,
+                command,
+                decision,
+                actor,
+                at,
+            } => write_approval(&tx, run_id.as_deref(), &session, &tool, &command, &decision, &actor, at)?,
             Op::SpanStart {
                 id,
                 run,
@@ -1084,14 +1238,14 @@ mod tests {
             INSERT INTO spans VALUES('old:chat','old','old','old','chat','Model call','complete',1,2,10,3,0,0,NULL,NULL);
             INSERT INTO content VALUES('old','hello','world');").unwrap();
         drop(old);
-        let observer = Observer::open(&dir, "ollama", "local").unwrap();
-        assert_eq!(observer.list(10).unwrap()["runs"].as_array().unwrap().len(), 1);
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        assert_eq!(observer.list(10, None, None, None).unwrap()["runs"].as_array().unwrap().len(), 1);
         assert_eq!(observer.detail("old").unwrap()["spans"].as_array().unwrap().len(), 1);
         assert_eq!(observer.detail("old").unwrap()["content"]["output"], "world");
         assert!(dir.join("observability.sqlite3.imported").is_file());
         drop(observer);
-        let observer = Observer::open(&dir, "ollama", "local").unwrap();
-        assert_eq!(observer.list(10).unwrap()["runs"].as_array().unwrap().len(), 1);
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        assert_eq!(observer.list(10, None, None, None).unwrap()["runs"].as_array().unwrap().len(), 1);
         drop(observer);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1200,7 +1354,7 @@ mod tests {
             r#"{"capture_content":true}"#,
         )
         .unwrap();
-        let observer = Observer::open(&dir, "Ollama", "local").unwrap();
+        let observer = Observer::open(&dir, "Ollama", "local", None).unwrap();
         let root = observer.start_turn("parent", "hello", "invoke_agent", None);
         observer.event(
             "parent",
@@ -1218,12 +1372,12 @@ mod tests {
             &json!({"status":"complete","text":"done"}),
         );
         for _ in 0..100 {
-            if observer.list(10).unwrap()["runs"].as_array().unwrap().len() == 2 {
+            if observer.list(10, None, None, None).unwrap()["runs"].as_array().unwrap().len() == 2 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let rows = observer.list(10).unwrap();
+        let rows = observer.list(10, None, None, None).unwrap();
         let child = rows["runs"]
             .as_array()
             .unwrap()
@@ -1243,7 +1397,7 @@ mod tests {
             ]
         }).to_string()).unwrap();
         for _ in 0..200 {
-            if observer.list(10).unwrap()["runs"]
+            if observer.list(10, None, None, None).unwrap()["runs"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1253,7 +1407,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let complete = observer.list(10).unwrap();
+        let complete = observer.list(10, None, None, None).unwrap();
         let child = complete["runs"]
             .as_array()
             .unwrap()
@@ -1279,6 +1433,8 @@ mod tests {
             pending: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
             capture_content: false,
+            home: std::env::temp_dir(),
+            alert_tx: None,
             sessions: Mutex::new(HashMap::new()),
         };
 
@@ -1318,7 +1474,7 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("sovereign-observability-bench-{}", now()));
         let before = rss_kb();
-        let observer = Observer::open(&dir, "Ollama", "local").unwrap();
+        let observer = Observer::open(&dir, "Ollama", "local", None).unwrap();
         let idle_delta_kb = rss_kb().saturating_sub(before);
         let mut nanos = 0_u128;
         for i in 0..1000 {
@@ -1382,7 +1538,7 @@ mod tests {
             samples.sort_by(f64::total_cmp);
             (samples[50], samples[95])
         }
-        let list = measure(|| { observer.list(200).unwrap(); });
+        let list = measure(|| { observer.list(200, None, None, None).unwrap(); });
         let analytics = measure(|| { observer.analytics(30).unwrap(); });
         let detail = measure(|| { observer.detail(&runs[0]).unwrap(); });
         let mut bytes = 0;

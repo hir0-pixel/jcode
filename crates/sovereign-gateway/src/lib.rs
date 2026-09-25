@@ -87,12 +87,21 @@ pub type Complete = std::sync::Arc<
     dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jcode_provider_core::SimpleCompletion>> + Send>> + Send + Sync,
 >;
 
+struct AlertLoop(tokio::task::JoinHandle<()>);
+
+impl Drop for AlertLoop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct Gateway {
     listener: TcpListener,
     local: SocketAddr,
     config: Arc<Config>,
     hub: Arc<approvals::Hub>,
     observer: Arc<observability::Observer>,
+    _alert_loop: AlertLoop,
 }
 
 impl Gateway {
@@ -105,8 +114,41 @@ impl Gateway {
         }
         let listener = TcpListener::bind(config.bind).await.context("binding gateway")?;
         let local = listener.local_addr()?;
-        let observer = observability::Observer::open(std::path::Path::new(&config.home), &config.provider, &config.model)?;
-        Ok(Self { listener, local, config: Arc::new(config), hub: Arc::default(), observer })
+        let (alert_tx, alert_rx) = std::sync::mpsc::sync_channel::<Value>(64);
+        let observer = observability::Observer::open(
+            std::path::Path::new(&config.home),
+            &config.provider,
+            &config.model,
+            Some(alert_tx),
+        )?;
+        let hub = Arc::new(approvals::Hub::default());
+        hub.set_observer(observer.clone());
+        let alert_hub = hub.clone();
+        let alert_loop = AlertLoop(tokio::spawn(async move {
+            loop {
+                match alert_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(payload) => {
+                        let frame = json!({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": { "type": "observability.alert", "payload": payload },
+                        })
+                        .to_string();
+                        alert_hub.broadcast_text(frame).await;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }));
+        Ok(Self {
+            listener,
+            local,
+            config: Arc::new(config),
+            hub,
+            observer,
+            _alert_loop: alert_loop,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -641,10 +683,73 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         }
         ("GET", "/api/sovereign/observability/runs") => {
             let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
-            let result = tokio::task::spawn_blocking(move || observer.list(limit)).await?;
+            let query = req.query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let q = query.as_deref().unwrap_or_default();
+                let status = auth::query_param(q, "status");
+                let kind = auth::query_param(q, "kind");
+                let text = auth::query_param(q, "q");
+                observer.list(limit, status.as_deref(), kind.as_deref(), text.as_deref())
+            })
+            .await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
                 Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/sovereign/observability/monitors") => {
+            let window = auth::query_param(req.query.as_deref().unwrap_or_default(), "window")
+                .unwrap_or_else(|| "24h".into());
+            let result = tokio::task::spawn_blocking(move || observer.monitors(&window)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(msg) => respond(&mut stream, "400 Bad Request", &json!({"detail": msg})).await,
+            }
+        }
+        ("GET", "/api/sovereign/observability/budget") => {
+            let result = tokio::task::spawn_blocking(move || observer.budget()).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/sovereign/observability/approvals") => {
+            let limit = query_u64(&req, "limit").unwrap_or(100).clamp(1, 500);
+            let result = tokio::task::spawn_blocking(move || observer.approvals(limit)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("POST", "/api/sovereign/observability/promote") => {
+            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let Some(run_id) = body["run_id"].as_str().filter(|s| !s.is_empty()) else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail":"run_id is required"})).await;
+            };
+            let run_id = run_id.to_string();
+            let result = tokio::task::spawn_blocking(move || observer.promote(&run_id)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    respond(&mut stream, "404 Not Found", &json!({"detail":"run not found"})).await
+                }
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("POST", "/api/sovereign/observability/replay") => {
+            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let Some(run_id) = body["run_id"].as_str().filter(|s| !s.is_empty()) else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail":"run_id is required"})).await;
+            };
+            let run_id = run_id.to_string();
+            let config = config.clone();
+            let hub = hub.clone();
+            let observer = observer.clone();
+            match rpc::replay_run(config, hub, observer, &run_id).await {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
             }
         }
         ("GET", "/api/sovereign/observability/run") => {

@@ -44,9 +44,25 @@ pub struct Hub {
     /// Sessions running unattended (`/api/agent/run`): every approval is
     /// denied immediately, with no desktop prompt and no grant ever applying.
     headless: Mutex<HashSet<String>>,
+    observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
 }
 
 impl Hub {
+    pub fn set_observer(&self, observer: std::sync::Arc<crate::observability::Observer>) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    fn audit(&self, session_id: &str, tool: &str, command: &str, decision: &str, actor: &str) {
+        if let Some(observer) = self.observer.lock().unwrap().as_ref() {
+            observer.record_approval(session_id, tool, command, decision, actor);
+        }
+    }
+    pub async fn broadcast_text(&self, frame: String) {
+        for client in self.clients.lock().await.iter() {
+            let _ = client.to_ws.send(Message::Text(frame.clone())).await;
+        }
+    }
+
     pub async fn add(&self, client: Arc<Client>) {
         self.clients.lock().await.push(client);
     }
@@ -75,10 +91,19 @@ impl Hub {
     /// (`once` / `session` / `always` / `deny`).
     pub async fn decide(&self, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
         if self.headless.lock().await.contains(session_id) {
-            return "deny".into();
+            let choice = "deny".to_string();
+            self.audit(session_id, tool, command, &choice, "headless-deny");
+            return choice;
         }
-        if self.always.load(Ordering::Relaxed) || self.session_grants.lock().await.contains(session_id) {
-            return "session".into();
+        if self.always.load(Ordering::Relaxed) {
+            let choice = "session".to_string();
+            self.audit(session_id, tool, command, &choice, "session-grant");
+            return choice;
+        }
+        if self.session_grants.lock().await.contains(session_id) {
+            let choice = "session".to_string();
+            self.audit(session_id, tool, command, &choice, "session-grant");
+            return choice;
         }
         let clients: Vec<Arc<Client>> = {
             let all = self.clients.lock().await.clone();
@@ -91,7 +116,9 @@ impl Hub {
             if showing.is_empty() { all } else { showing }
         };
         if clients.is_empty() {
-            return "deny".into();
+            let choice = "deny".to_string();
+            self.audit(session_id, tool, command, &choice, "headless-deny");
+            return choice;
         }
         let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
@@ -124,7 +151,15 @@ impl Hub {
             "always" => self.always.store(true, Ordering::Relaxed),
             _ => {}
         }
-        if matches!(choice.as_str(), "once" | "session" | "always") { choice } else { "deny".into() }
+        let timed_out = choice == "deny";
+        let final_choice = if matches!(choice.as_str(), "once" | "session" | "always") {
+            choice
+        } else {
+            "deny".into()
+        };
+        let actor = if final_choice == "deny" && timed_out { "user" } else { "user" };
+        self.audit(session_id, tool, command, &final_choice, actor);
+        final_choice
     }
 
     /// Open prompts for a session (`approval.pending`, e.g. after a reload).

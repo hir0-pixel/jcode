@@ -1338,6 +1338,122 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
 /// completion (or `timeout`), with every tool approval denied outright and no
 /// desktop involved at all. Mirrors [`run`]'s `Conn` setup, minus the
 /// WebSocket: `to_ws` just feeds a channel this function drains itself.
+/// Replay a completed run: branch the session, rewind to that turn, resubmit the prompt.
+pub async fn replay_run(
+    config: Arc<Config>,
+    hub: Arc<Hub>,
+    observer: Arc<Observer>,
+    run_id: &str,
+) -> Result<Value> {
+    let run_id = run_id.to_string();
+    let (session, turn_index, prompt) = tokio::task::spawn_blocking({
+        let observer = observer.clone();
+        let run_id = run_id.clone();
+        move || observer.replay_turn_index(&run_id)
+    })
+    .await??;
+    let prompt = prompt.ok_or_else(|| anyhow!("run has no captured prompt; enable content capture"))?;
+
+    let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
+    let client = Arc::new(Client {
+        id: hub.next_client_id(),
+        to_ws: to_ws.clone(),
+        sessions: Mutex::new(Default::default()),
+    });
+    hub.add(client.clone()).await;
+    let conn = Arc::new(Conn {
+        config: config.clone(),
+        to_ws,
+        control: Mutex::new(None),
+        links: Mutex::new(HashMap::new()),
+        link_tasks: Mutex::new(Vec::new()),
+        known: Mutex::new(HashMap::new()),
+        fresh: Mutex::new(std::collections::HashSet::new()),
+        learn_state: Mutex::new(HashMap::new()),
+        learning_now: Mutex::new(std::collections::HashSet::new()),
+        next_id: AtomicU64::new(1),
+        next_server_request: AtomicU64::new(1),
+        pending: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        approvals: Mutex::new(HashMap::new()),
+        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+        accept_waiters: Mutex::new(HashMap::new()),
+        upstream: Mutex::new(None),
+        next_forward: AtomicU64::new(1),
+        hub: hub.clone(),
+        client,
+        observer: observer.clone(),
+        run_kind: "invoke_agent",
+        run_title: Some(format!("Replay {run_id}")),
+    });
+    let control = conn.open_link().await.context("engine unavailable")?;
+    *conn.control.lock().await = Some(control);
+
+    let branched = conn
+        .dispatch(
+            "session.branch",
+            &json!({ "session_id": session, "name": format!("Replay {}", run_id.chars().take(24).collect::<String>()) }),
+        )
+        .await
+        .map_err(|e| anyhow!(e.message))?;
+    let child = branched["session_id"].as_str().unwrap_or_default().to_string();
+    if child.is_empty() {
+        bail!("branch did not return a session id");
+    }
+
+    let history = conn
+        .call(json!({ "req": "get_history", "session_id": child }))
+        .await
+        .context("history")?;
+    let messages = history["messages"].as_array().cloned().unwrap_or_default();
+    let mut user_seen = 0_i64;
+    let mut cut: Option<usize> = None;
+    for (i, message) in messages.iter().enumerate() {
+        if message["role"] == "user" {
+            if user_seen == turn_index {
+                cut = Some(i);
+                break;
+            }
+            user_seen += 1;
+        }
+    }
+    match cut {
+        None if turn_index == 0 => {
+            conn.call(json!({ "req": "clear", "session_id": child })).await?;
+        }
+        Some(0) => {
+            conn.call(json!({ "req": "clear", "session_id": child })).await?;
+        }
+        Some(index) => {
+            conn.call(json!({ "req": "rewind", "session_id": child, "message_index": index }))
+                .await?;
+        }
+        None => bail!("turn index {turn_index} not found in branched session"),
+    }
+
+    let new_run = observer.start_turn(&child, &prompt, "invoke_agent", Some("Replay"));
+    observer.link_replay(&new_run, &run_id);
+    if let Err(err) = conn
+        .dispatch("prompt.submit", &json!({ "session_id": child, "text": prompt }))
+        .await
+    {
+        observer.failed_submit(&child, &new_run, &err.message);
+        return Err(anyhow!("{}", err.message));
+    }
+    drop(ws_out);
+    hub.remove(conn.client.id).await;
+    for task in conn.link_tasks.lock().await.drain(..) {
+        task.abort();
+    }
+    Ok(json!({
+        "ok": true,
+        "session_id": child,
+        "run_id": new_run,
+        "replay_of": run_id,
+        "status": "streaming",
+    }))
+}
+
 pub(crate) async fn agent_run(
     config: Arc<Config>,
     hub: Arc<Hub>,

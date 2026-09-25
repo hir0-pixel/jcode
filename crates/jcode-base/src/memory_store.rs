@@ -61,10 +61,12 @@ const SCHEMA: &str = "
         status TEXT NOT NULL, started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER,
         input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
         cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-        cost_usd REAL, error TEXT, unpriced_calls INTEGER NOT NULL DEFAULT 0
+        cost_usd REAL, error TEXT, unpriced_calls INTEGER NOT NULL DEFAULT 0,
+        flags INTEGER NOT NULL DEFAULT 0, replay_of TEXT
     );
     CREATE INDEX IF NOT EXISTS obs_runs_recent ON obs_runs(started_at_ms DESC);
     CREATE INDEX IF NOT EXISTS obs_runs_session ON obs_runs(session_id, started_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS obs_runs_kind_recent ON obs_runs(kind, started_at_ms DESC);
     CREATE TABLE IF NOT EXISTS obs_spans(
         id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_id TEXT NOT NULL, root_id TEXT NOT NULL,
         kind TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL,
@@ -76,6 +78,16 @@ const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS obs_spans_run ON obs_spans(run_id, started_at_ms);
     CREATE TABLE IF NOT EXISTS obs_content(id TEXT PRIMARY KEY, input TEXT, output TEXT);
+    CREATE TABLE IF NOT EXISTS obs_approvals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, session_id TEXT NOT NULL,
+        tool TEXT NOT NULL, command_preview TEXT NOT NULL, decision TEXT NOT NULL,
+        actor TEXT NOT NULL, at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS obs_approvals_recent ON obs_approvals(at_ms DESC);
+    CREATE TABLE IF NOT EXISTS obs_alerts(
+        monitor_key TEXT PRIMARY KEY, state TEXT NOT NULL, severity TEXT NOT NULL,
+        message TEXT, updated_at_ms INTEGER NOT NULL, last_notified_ms INTEGER
+    );
 ";
 
 /// Everything in a `MemoryGraph` except the memories themselves.
@@ -123,7 +135,7 @@ fn with_db<R>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<R>) -> Resu
     f(map.get_mut(path).expect("inserted above"))
 }
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Gateway startup uses the same versioned schema migration as memory.
 pub fn migrate_sovereign_db(db: &mut Connection) -> Result<()> {
@@ -153,7 +165,36 @@ fn migrate(db: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
     db.execute_batch(SCHEMA)?;
+    ensure_obs_m10c(db)?;
     db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES ('schema_version', ?1)", [SCHEMA_VERSION.to_string()])?;
+    Ok(())
+}
+
+/// M10c observability columns and tables on databases created before v4.
+fn ensure_obs_m10c(db: &Connection) -> Result<()> {
+    if !db
+        .prepare("SELECT 1 FROM pragma_table_info('obs_runs') WHERE name='flags'")?
+        .exists([])?
+    {
+        db.execute("ALTER TABLE obs_runs ADD COLUMN flags INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !db
+        .prepare("SELECT 1 FROM pragma_table_info('obs_runs') WHERE name='replay_of'")?
+        .exists([])?
+    {
+        db.execute("ALTER TABLE obs_runs ADD COLUMN replay_of TEXT", [])?;
+    }
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS obs_runs_kind_recent ON obs_runs(kind, started_at_ms DESC);
+         CREATE TABLE IF NOT EXISTS obs_approvals(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, session_id TEXT NOT NULL,
+            tool TEXT NOT NULL, command_preview TEXT NOT NULL, decision TEXT NOT NULL,
+            actor TEXT NOT NULL, at_ms INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS obs_approvals_recent ON obs_approvals(at_ms DESC);
+         CREATE TABLE IF NOT EXISTS obs_alerts(
+            monitor_key TEXT PRIMARY KEY, state TEXT NOT NULL, severity TEXT NOT NULL,
+            message TEXT, updated_at_ms INTEGER NOT NULL, last_notified_ms INTEGER);",
+    )?;
     Ok(())
 }
 
