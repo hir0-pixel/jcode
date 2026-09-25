@@ -471,12 +471,13 @@ impl Conn {
             return json!("running");
         }
         let status = info["swarm_status"].as_str().or(info["status"].as_str()).unwrap_or("ready");
+        // Desktop SubagentStatus: completed|failed|interrupted|queued|running
         let mapped = match status {
-            "running" | "processing" => "running",
-            "ready" | "idle" => "ready",
+            "running" | "processing" | "ready" | "idle" => "running",
+            "queued" => "queued",
             "completed" => "completed",
-            "failed" | "error" => "failed",
-            "stopped" | "interrupted" => "stopped",
+            "failed" | "error" | "timeout" => "failed",
+            "stopped" | "interrupted" | "cancelled" | "canceled" => "interrupted",
             other => other,
         };
         json!(mapped)
@@ -667,41 +668,53 @@ impl Conn {
                 let parent = sid()?;
                 let subagent_id = p["subagent_id"].as_str().ok_or_else(|| RpcError::params("subagent_id is required"))?;
                 let content = p["content"].as_str().or(p["text"].as_str()).unwrap_or_default();
+                if content.trim().is_empty() {
+                    return Err(RpcError::params("text is required"));
+                }
                 let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
-                    return Err(RpcError::params("subagent not found"));
+                    return Ok(json!({ "status": "rejected", "subagent_id": subagent_id, "text": content }));
                 };
-                call(json!({ "req": "soft_interrupt", "session_id": child, "content": content })).await?;
-                Ok(json!({ "subagent_id": subagent_id, "steered": true }))
+                match call(json!({ "req": "soft_interrupt", "session_id": child, "content": content })).await {
+                    Ok(_) => Ok(json!({ "status": "queued", "subagent_id": subagent_id, "text": content })),
+                    Err(_) => Ok(json!({ "status": "rejected", "subagent_id": subagent_id, "text": content })),
+                }
             }
             "subagent.tail" => {
+                // Desktop SubagentTranscript expects { available, text, truncated } (≤16 KiB).
+                const TAIL_BYTES: usize = 16_384;
                 let parent = sid()?;
                 let subagent_id = p["subagent_id"].as_str().ok_or_else(|| RpcError::params("subagent_id is required"))?;
                 let Some(child) = self.resolve_child_session(parent, subagent_id).await else {
-                    return Ok(json!({ "subagent_id": subagent_id, "available": false, "entries": [] }));
+                    return Ok(json!({ "subagent_id": subagent_id, "available": false, "text": "", "truncated": false }));
                 };
                 self.ensure_attached(&child).await.map_err(RpcError::internal)?;
                 let history = call(json!({ "req": "get_history", "session_id": child })).await?;
-                let entries: Vec<Value> = history["messages"]
-                    .as_array()
-                    .map(|list| {
-                        list.iter()
-                            .rev()
-                            .filter(|m| {
-                                let role = m["role"].as_str().unwrap_or_default();
-                                role == "assistant" || role == "tool" || m.get("tool_name").is_some()
-                            })
-                            .take(20)
-                            .map(|m| {
-                                let tool = m["tool_name"].as_str().or(m["name"].as_str()).unwrap_or("assistant").to_string();
-                                let preview = m["content"].as_str().unwrap_or("").chars().take(240).collect::<String>();
-                                let is_error = m["is_error"].as_bool().unwrap_or(false)
-                                    || preview.starts_with("Error:");
-                                json!({ "tool": tool, "preview": preview, "is_error": is_error })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(json!({ "subagent_id": subagent_id, "available": !entries.is_empty(), "entries": entries }))
+                let mut text = String::new();
+                if let Some(list) = history["messages"].as_array() {
+                    for m in list {
+                        let role = m["role"].as_str().unwrap_or("assistant");
+                        let body = m["content"].as_str().unwrap_or("").trim();
+                        if body.is_empty() {
+                            continue;
+                        }
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(role);
+                        text.push_str(": ");
+                        text.push_str(body);
+                    }
+                }
+                let truncated = text.len() > TAIL_BYTES;
+                if truncated {
+                    text = text.chars().rev().take(TAIL_BYTES).collect::<String>().chars().rev().collect();
+                }
+                Ok(json!({
+                    "subagent_id": subagent_id,
+                    "available": !text.is_empty(),
+                    "text": text,
+                    "truncated": truncated,
+                }))
             }
             "spawn_tree.list" => Ok(json!({ "entries": [] })),
             "spawn_tree.save" => Ok(json!({ "ok": true, "path": p["path"].as_str().unwrap_or("") })),
@@ -712,7 +725,9 @@ impl Conn {
                 let children = self.list_owned_children(id).await.map_err(RpcError::internal)?;
                 let active: Vec<Value> = children
                     .into_iter()
-                    .filter(|c| c["status"] == "running" || c["status"] == "ready")
+                    .filter(|c| {
+                        matches!(c["status"].as_str(), Some("running" | "queued"))
+                    })
                     .collect();
                 Ok(json!({
                     "active": active,
