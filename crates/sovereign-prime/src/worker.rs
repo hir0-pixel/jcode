@@ -18,7 +18,7 @@ use std::io::{BufRead, Write};
 use std::time::Duration;
 
 /// Functions the sandboxed code may call; the parent implements them.
-pub const HOST_FUNCTIONS: &[&str] = &["llm_query", "load"];
+pub const HOST_FUNCTIONS: &[&str] = &["llm_query", "load", "refine"];
 
 pub struct Limits {
     pub max_memory: usize,

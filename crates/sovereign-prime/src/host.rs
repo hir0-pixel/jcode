@@ -25,6 +25,11 @@ const MAX_QUERY_CHARS: usize = 200_000;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Recursive model call used by `llm_query(prompt)`.
 pub type LlmQuery = Arc<dyn Fn(String) -> BoxFuture<Result<String>> + Send + Sync>;
+/// `refine(op_json)` where `op_json` is `{"op":"run","instructions":...,"global":...}`
+/// or `{"op":"status"}`; mirrors Prime's `refine.run()`/`refine.status()`. Like
+/// the model-callable `refine` tool, this only *schedules* a refinement
+/// (applied at turn end, never mid-turn) or reports whether one is pending.
+pub type Refine = Arc<dyn Fn(String) -> BoxFuture<Result<String>> + Send + Sync>;
 
 pub struct RunOutput {
     pub stdout: String,
@@ -109,7 +114,7 @@ impl ReplHost {
         Ok(Worker { child, stdin, stdout, last_used: Instant::now() })
     }
 
-    pub async fn run(&self, session: &str, code: &str, workdir: Option<&Path>, llm_query: LlmQuery) -> Result<RunOutput> {
+    pub async fn run(&self, session: &str, code: &str, workdir: Option<&Path>, llm_query: LlmQuery, refine: Refine) -> Result<RunOutput> {
         let slot = self.workers.lock().await.entry(session.to_string()).or_default().clone();
         let mut guard = slot.lock().await;
         let fresh_state = guard.is_none();
@@ -117,7 +122,7 @@ impl ReplHost {
             *guard = Some(self.spawn().await?);
         }
         let worker = guard.as_mut().expect("worker present");
-        let result = tokio::time::timeout(RUN_TIMEOUT, drive(worker, code, workdir, &llm_query)).await;
+        let result = tokio::time::timeout(RUN_TIMEOUT, drive(worker, code, workdir, &llm_query, &refine)).await;
         match result {
             Ok(Ok((stdout, value, error, host_calls))) => {
                 worker.last_used = Instant::now();
@@ -150,6 +155,7 @@ async fn drive(
     code: &str,
     workdir: Option<&Path>,
     llm_query: &LlmQuery,
+    refine: &Refine,
 ) -> Result<(String, Option<String>, Option<String>, usize)> {
     send(worker, json!({"op": "run", "code": code})).await?;
     let mut host_calls = 0;
@@ -167,6 +173,7 @@ async fn drive(
                 let reply = match msg["fn"].as_str() {
                     Some("llm_query") => llm_query(truncate(arg, MAX_QUERY_CHARS)).await,
                     Some("load") => load(workdir, &arg).await,
+                    Some("refine") => refine(truncate(arg, MAX_QUERY_CHARS)).await,
                     _ => Err(anyhow!("unknown host function")),
                 };
                 let reply = match reply {

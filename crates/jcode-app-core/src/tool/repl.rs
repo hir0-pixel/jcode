@@ -101,9 +101,25 @@ impl Tool for ReplTool {
                 result.map(|reply| reply.text)
             })
         });
+        let session_id = ctx.session_id.clone();
+        let refine: sovereign_prime::host::Refine = Arc::new(move |op_json: String| {
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let op: Value = serde_json::from_str(&op_json).unwrap_or_default();
+                let home = jcode_base::storage::jcode_dir()?;
+                let store = sovereign_prime::entries::EntryStore::open_cached(&home)?;
+                match op["op"].as_str().unwrap_or("run") {
+                    "status" => Ok(json!({ "pending": store.refine_pending(&session_id)? }).to_string()),
+                    _ => {
+                        store.schedule_refine(&session_id, op["instructions"].as_str(), op["global"].as_bool().unwrap_or(false))?;
+                        Ok(json!({ "scheduled": true }).to_string())
+                    }
+                }
+            })
+        });
         let out = self
             .host
-            .run(&ctx.session_id, code, ctx.working_dir.as_deref(), llm_query)
+            .run(&ctx.session_id, code, ctx.working_dir.as_deref(), llm_query, refine)
             .await?;
         let mut text = String::new();
         if out.fresh_state {

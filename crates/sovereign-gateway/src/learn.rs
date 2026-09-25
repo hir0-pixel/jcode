@@ -54,16 +54,40 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
                 .collect()
         })
         .unwrap_or_default();
+    // The model-callable `refine` tool (and the REPL's `refine` host
+    // function) never apply mid-turn: they only schedule a request, run here
+    // once the turn has actually ended. At most one pending request survives
+    // per session (a later call before turn-end just replaces it).
+    let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&conn.config().home)).ok();
+    let mut refine_summary = None;
+    if let Some(store) = &store {
+        if let Ok(Some((instructions, global))) = store.take_pending_refine(session) {
+            let (system, user) = sovereign_prime::refine::build_request(store, session, &turns, instructions.as_deref(), global);
+            let started = crate::observability::now();
+            let reply = complete(system, user).await;
+            conn.observer.record_aux(
+                session, "learning", Some("Scheduled refine"), None, None, started,
+                reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
+            );
+            refine_summary = match reply {
+                Ok(done) => match sovereign_prime::refine::apply(store, session, &done.text, &turns, global, "refine-tool") {
+                    Ok(outcome) => Some(outcome.summary),
+                    Err(err) => Some(format!("no change ({err:#})")),
+                },
+                Err(err) => Some(format!("no change ({err:#})")),
+            };
+        }
+    }
     // An undo or rewind can leave fewer messages than the watermark.
     let seen = harness.watermark(session).min(turns.len());
     let fresh = &turns[seen..];
     if fresh.is_empty() {
-        return Ok(None);
+        return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
     let signals = learning::signals(fresh);
     if !signals.any() {
         harness.set_watermark(session, turns.len())?;
-        return Ok(None);
+        return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
     let (system, user) = learning::request(&harness, fresh, signals.effort);
     let started = crate::observability::now();
@@ -87,8 +111,8 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
     // kinds), applied through the same gate `/refine` uses.
     let mut review_summary = None;
     if learning.review {
-        if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&conn.config().home)) {
-            let (rsystem, ruser) = sovereign_prime::refine::build_request(&store, session, fresh, None, false);
+        if let Some(store) = &store {
+            let (rsystem, ruser) = sovereign_prime::refine::build_request(store, session, fresh, None, false);
             let rstarted = crate::observability::now();
             let rreply = complete(rsystem, ruser).await;
             conn.observer.record_aux(
@@ -129,6 +153,9 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
     }
     if let Some(summary) = &review_summary {
         parts.push(format!("auto-refine: {summary}"));
+    }
+    if let Some(summary) = &refine_summary {
+        parts.push(format!("refine: {summary}"));
     }
     Ok((!parts.is_empty()).then(|| format!("Learned {}.", parts.join("; "))))
 }

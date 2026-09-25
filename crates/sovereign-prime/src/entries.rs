@@ -59,6 +59,12 @@ const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS harness_changesets_recent ON harness_changesets(session, created_at_ms DESC);
     CREATE TABLE IF NOT EXISTS harness_seq(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS harness_pending_refine(
+        session TEXT PRIMARY KEY,
+        instructions TEXT,
+        global INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL
+    );
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,6 +648,41 @@ impl EntryStore {
         )?;
         self.changeset(&rollback_id)?.context("just-recorded changeset vanished")
     }
+
+    /// `refine.run(instructions)` (the model-callable tool and the REPL host
+    /// function): schedule a refinement for `session`, applied at turn end,
+    /// never mid-turn. A later call before turn end just updates the pending
+    /// instructions (Prime's "single pending request per turn").
+    pub fn schedule_refine(&self, session: &str, instructions: Option<&str>, global: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO harness_pending_refine(session, instructions, global, created_at_ms) VALUES (?1,?2,?3,?4) \
+             ON CONFLICT(session) DO UPDATE SET instructions = ?2, global = ?3, created_at_ms = ?4",
+            params![session, instructions, global as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// `refine.status()`: whether a refinement is scheduled for `session`.
+    pub fn refine_pending(&self, session: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(conn.query_row("SELECT 1 FROM harness_pending_refine WHERE session = ?1", [session], |_| Ok(())).optional()?.is_some())
+    }
+
+    /// Take (and clear) `session`'s pending refine request, if any, so the
+    /// turn-end scheduler runs it exactly once.
+    pub fn take_pending_refine(&self, session: &str) -> Result<Option<(Option<String>, bool)>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let row = conn
+            .query_row("SELECT instructions, global FROM harness_pending_refine WHERE session = ?1", [session], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)? != 0))
+            })
+            .optional()?;
+        if row.is_some() {
+            conn.execute("DELETE FROM harness_pending_refine WHERE session = ?1", [session])?;
+        }
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -762,6 +803,21 @@ mod tests {
         let restored = store.get(&created.id).unwrap().unwrap();
         assert_eq!(restored.id, created.id);
         assert_eq!(restored.content, created.content);
+    }
+
+    #[test]
+    fn schedule_refine_is_pending_until_taken_once() {
+        let store = EntryStore::memory().unwrap();
+        assert!(!store.refine_pending("s1").unwrap());
+        store.schedule_refine("s1", Some("be terser"), false).unwrap();
+        assert!(store.refine_pending("s1").unwrap());
+        // A second schedule before turn-end just updates instructions.
+        store.schedule_refine("s1", Some("be terser and use Nim"), true).unwrap();
+        let (instructions, global) = store.take_pending_refine("s1").unwrap().unwrap();
+        assert_eq!(instructions.as_deref(), Some("be terser and use Nim"));
+        assert!(global);
+        assert!(store.take_pending_refine("s1").unwrap().is_none(), "taken exactly once");
+        assert!(!store.refine_pending("s1").unwrap());
     }
 
     #[test]

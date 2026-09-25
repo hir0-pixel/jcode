@@ -438,6 +438,59 @@ impl Conn {
                     "skills": {}, "skill_count": jcode_base::skill::SkillRegistry::shared_snapshot().list().len(), "warning": "",
                 }))
             }
+            // Hermes desktop's Learning UI, served natively over Continual
+            // Harness entries instead of forwarded to the Python backend.
+            "learning.frames" => {
+                let cols = p["cols"].as_u64().unwrap_or(80).max(1) as usize;
+                let rows = p["rows"].as_u64().unwrap_or(24).max(1) as usize;
+                let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                let entries = store.list_all(None, None).map_err(RpcError::internal)?;
+                let categories: Vec<Value> =
+                    ["prompt", "memory", "skill", "subagent"].iter().map(|k| json!({ "name": k, "count": entries.iter().filter(|e| e.kind.as_str() == *k).count() })).collect();
+                let summary: Vec<String> = entries
+                    .iter()
+                    .rev()
+                    .take(rows.saturating_sub(2).max(1))
+                    .map(|e| format!("[{}/{}] {}", e.kind.as_str(), e.scope.as_str(), e.title))
+                    .collect();
+                let frame = summary.iter().cloned().collect::<Vec<_>>().join("\n");
+                Ok(json!({
+                    "frames": [{ "text": frame, "cols": cols, "rows": rows }],
+                    "legend": { "prompt": "P", "memory": "M", "skill": "S", "subagent": "A" },
+                    "categories": categories,
+                    "buckets": categories,
+                    "summary": summary,
+                    "axis": { "start": entries.first().map(|e| e.created_at_ms).unwrap_or(0), "end": entries.last().map(|e| e.updated_at_ms).unwrap_or(0) },
+                    "count": entries.len(),
+                    "cols": cols,
+                    "rows": rows,
+                }))
+            }
+            "learning.detail" => {
+                let id = p["id"].as_str().unwrap_or_default();
+                let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                Ok(match store.get(id).map_err(RpcError::internal)? {
+                    Some(e) => json!({ "ok": true, "kind": e.kind.as_str(), "id": e.id, "label": e.title, "content": e.content }),
+                    None => json!({ "ok": false, "message": format!("no harness entry {id}") }),
+                })
+            }
+            "learning.delete" => {
+                let id = p["id"].as_str().unwrap_or_default();
+                let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                Ok(match store.delete(id) {
+                    Ok(_) => json!({ "ok": true }),
+                    Err(err) => json!({ "ok": false, "message": err.to_string() }),
+                })
+            }
+            "learning.edit" => {
+                let id = p["id"].as_str().unwrap_or_default();
+                let content = p["content"].as_str().map(str::to_string);
+                let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&self.config.home)).map_err(RpcError::internal)?;
+                Ok(match store.update(id, sovereign_prime::entries::EntryPatch { content, ..Default::default() }) {
+                    Ok(_) => json!({ "ok": true }),
+                    Err(err) => json!({ "ok": false, "message": err.to_string() }),
+                })
+            }
             "profiles.list" => Ok(json!({
                 "profiles": [{
                     "name": "default", "path": self.config.home, "is_default": true,

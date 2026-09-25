@@ -32,6 +32,7 @@ mod open;
 mod panel;
 mod patch;
 mod read;
+mod refine;
 mod repl;
 mod replace;
 pub(crate) mod sdk;
@@ -578,8 +579,14 @@ impl Registry {
         );
         // Prime-style REPL: only inside the sovereign engine, which sets
         // SOVEREIGN_REPL_WORKER to its own binary.
+        let is_sovereign_engine = std::env::var_os("SOVEREIGN_REPL_WORKER").is_some();
         if let Some(repl) = repl::ReplTool::from_env() {
             Self::insert_tool(&mut tools_map, "repl", repl);
+        }
+        // Continual Harness refinement: only inside the sovereign engine,
+        // same gate as the REPL (both are sovereign-prime features).
+        if is_sovereign_engine {
+            Self::insert_tool(&mut tools_map, "refine", refine::RefineTool);
         }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
