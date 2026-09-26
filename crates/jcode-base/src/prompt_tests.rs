@@ -40,6 +40,13 @@ fn mermaid_prompt_module_follows_capability() {
     assert!(!disabled.static_part.contains("fenced `mermaid` code block"));
 }
 
+#[test]
+fn recursive_repl_guidance_is_in_the_cached_static_prompt() {
+    let (prompt, _) = build_system_prompt_split(None, &[], false, None, None);
+    assert!(prompt.static_part.contains("## Recursive REPL"));
+    assert!(prompt.static_part.contains("llm_query(prompt)"));
+}
+
 /// Verify skill prompts don't accidentally introduce "Claude Code" identity
 #[test]
 fn test_skill_prompt_integration() {
@@ -899,8 +906,7 @@ fn prompt_guidance_missing_or_unreadable_project_keeps_global_content() {
 /// and asserts lazy is far smaller.
 #[test]
 fn skills_section_is_lazy_summary_not_full_bodies_with_20_skills() {
-    let skill_body =
-        "Full instructions body.\n".repeat(200); // ~4.6KB, representative of a real SKILL.md
+    let skill_body = "Full instructions body.\n".repeat(200); // ~4.6KB, representative of a real SKILL.md
     let skills: Vec<SkillInfo> = (0..20)
         .map(|i| SkillInfo {
             name: format!("skill-{i}"),

@@ -1,37 +1,40 @@
 # Prime Agent parity
 
-Feature audit against Prime Agent README, `docs/usage.md`, `docs/rlm.md`,
+Audit basis: Prime Agent README, `docs/usage.md`, `docs/rlm.md`,
 `docs/rlm-runtime.md`, `docs/skills.md`, `docs/long-running-agents.md`,
-`docs/architecture.md`, the RLM prompt, and built-in skill packages. Audited
-against the desktop product as Akira; product and binary names are unchanged.
+`docs/architecture.md`, `src/core/prompts/rlm.ts`, and its built-in skill
+packages. The Prime repository is reference-only; Akira keeps its single Rust
+agent loop.
 
-| Feature | Prime Agent | Akira implementation | Status |
+| Feature | Prime behavior | Akira implementation | Status |
 |---|---|---|---|
-| Persistent REPL variables | Long-lived CPython per session | `crates/sovereign-prime/src/host.rs` plus the `repl` tool; uses Monty, a Python subset without imports | Partial; real CPython is a gap |
-| Python stdlib and package imports | Full Python kernel | Monty intentionally rejects imports | Gap |
-| `load(path)` for large context | Host-mediated file loading | Monty host function in `crates/sovereign-prime/src/host.rs`, constrained to the worktree | Present |
-| Recursive `llm_query` | Programmatic focused model calls | REPL host callback in `crates/jcode-app-core/src/tool/repl.rs` | Present; remains Monty-limited |
-| Subagents from the REPL | `rlm.spawn`, admission handle and later result | `delegate` tool in `crates/jcode-app-core/src/tool/delegate.rs`; REPL `spawn_subagent` hook is unavailable by default | Partial; native delegation exists, kernel bridge is a gap |
-| Agent-to-agent messaging | Role-addressed send/read/list and receipts | `delegate` routes through `CommunicateTool`; Monty host exposes a message hook, but no dedicated compact send/read/list model tool exists | Partial |
-| Persistent goals | Goal lifecycle via host bridge | `/goal`, gateway autonomous endpoints, and `ControlStore` in `crates/sovereign-prime/src/agent_loop.rs` | Present in Rust; Python skill bridge missing |
-| User heartbeat | Persistent scheduled user prompts | `/heartbeat` and the gateway wake path | Present |
-| RLM internal heartbeat | Kernel-owned scheduled callbacks | No separate RLM heartbeat API | Gap |
-| Continual harness / refine | Persistent local/global entries, rationale and rollback | `crates/sovereign-prime/src/{entries,harness,refine}.rs`, `/refine`, `/harness`, `/skill create`, and the refine tool | Present in Rust; Python skill package missing |
-| Executable Python skills | `SKILL.md` plus importable package | Existing skill store and `/skill create` support instructions, not Python packages | Gap |
-| Prime built-in skills: goal, refine, heartbeat, messages, observe, compact | Python packages forwarding to host | Corresponding Rust features exist for goal, refine, compaction, heartbeat, and swarm operations; package imports/host bridge are absent | Partial; Python package layer missing |
-| Web search skill | Prime uses Serper | Rust `websearch` tool in `crates/jcode-app-core/src/tool/websearch.rs` uses configured key-free DuckDuckGo by default, with optional configured providers | Present in Rust; importable skill wrapper missing |
-| Context compaction | Manual and automatic compaction | Engine compaction paths and desktop controls | Present; REPL skill wrapper missing |
-| Long-running sessions and detach/reattach | Supervisor keeps sessions and children alive while clients detach | Gateway session recovery and persistent control stores | Present at the session layer; requested combined live reattach test is missing |
-| Reattach with goal, heartbeat and subagent all alive | Explicit end-to-end continuity | Individual session, goal, heartbeat and delegation paths exist | Unverified; required Prime parity e2e missing |
-| Cached RLM prompt guidance | Static prompt describes variable context and programmatic subcalls | No Prime RLM-specific static prompt section | Gap |
-| Approval for real Python side effects | Python has host access and needs explicit policy | Existing approval hook in `crates/sovereign-gateway/src/approvals.rs` classifies shell commands only; Monty currently denies OS access | Gap blocks replacing Monty safely |
-| Prime terminal UI, installer, hosted inference/team services | Prime-specific UI, setup and hosted products | Not part of the Hermes desktop product | Intentionally out of scope |
+| Persistent REPL state | Long-lived Python state per session | `crates/sovereign-prime/src/host.rs` and `python_worker.py`; lazy CPython worker, idle reap, session cleanup | Done; 9 REPL integration tests pass |
+| Python imports | CPython stdlib and skill packages | Isolated CPython with `-I -S`; stdlib imports and installed skill paths are tested | Done for imports and user-installed packages |
+| File context | `load(path)` reads workspace files | Host resolves symlinks, confines reads to workdir, caps at 8 MiB | Done |
+| Recursive model calls | Programmatic `llm_query` | Existing-provider callback with per-run host-call cap | Done |
+| Kernel lifecycle and limits | Lazy worker, timeout, memory cap, recovery | 20 s run timeout, 128 MiB RSS watchdog, 10 min idle reap, lazy restart; macOS RSS via `proc_pidinfo` | Implemented; cold/warm latency budgets lack a bench gate |
+| Kernel isolation | Restricted Python side effects | macOS `sandbox-exec` denies network and limits file writes to project/session temp; other platforms require approval per cell and headless sessions deny | Implemented; macOS sandbox tests pass outside restricted test sandbox |
+| Spawn a subagent from REPL | Spawn and obtain child lifecycle/result | `spawn_subagent` calls the existing `delegate`/swarm path | Partial; spawn is bridged, but await/result lifecycle is not exposed |
+| Agent messaging | Send, read, list family agents | Python `agent_message` uses swarm internals; model-facing `agent_message` tool routes send/read/list through `CommunicateTool` | Partial; roster and message actions exist, but Prime role-addressed family observation is not fully ported |
+| Goals | Get/create/complete persistent objective | Rust `ControlStore`, `/goal`, session goal tool, and REPL host callback | Partial; basic operations work, Prime token budget and result shape are absent |
+| User heartbeat | Schedule prompts for a session | `/heartbeat`, `ControlStore`, and Python host callback | Done for user heartbeats |
+| RLM internal heartbeat | Kernel-managed recurring callbacks | No distinct internal RLM heartbeat storage or API | Gap |
+| Refine / continual harness | Local/global CRUD, rollback, evidence and rationale | Rust `sovereign-prime` entries/harness/refine; REPL callback schedules or checks refine | Done in Rust; Prime Python skill package is missing |
+| Executable Python skills | `SKILL.md` plus importable package | Existing store imports user-provided package paths; skill creation currently creates instructions only | Partial; package authoring and bundled Prime wrappers are missing |
+| Prime skill packages | goal, refine, heartbeat, messages, observe, compact, websearch, skill creator | Equivalent Rust features exist for several jobs; no Prime-compatible package bundle/bridge for all listed APIs | Gap |
+| Web search | Prime Serper integration | Existing Rust `websearch` tool uses its key-free configured backend | Rust tool works; Python skill wrapper missing |
+| Compaction | Check and schedule host compaction | Engine compaction is available to chat and desktop | Rust path exists; REPL skill bridge is missing |
+| RLM static prompt | Prompt-as-variable and programmatic subcalls | Concise static section added to `crates/jcode-base/src/prompt/system_prompt.md` | Done |
+| Detach / reattach | Long-running session survives client disconnect | Gateway persists sessions and control state | Partial; combined session/goal/heartbeat/subagent reattach e2e is missing |
+| Prime terminal, installer, hosted services | Prime-specific UI, deployment, and paid/hosted services | Not included in Hermes desktop product | Intentionally out of scope |
 
-## Implementation decision
+## Remaining Part 3 work
 
-Monty remains in place. A real Python process could not meet the mandatory
-memory cap on this macOS host: attempts to set `RLIMIT_DATA`, `RLIMIT_AS`, and
-`RLIMIT_RSS` to a finite value fail with `EINVAL`/`ValueError: current limit
-exceeds maximum limit`. The approval gate also only applies the shell risk
-classifier to `bash`; arbitrary Python requires a separately verified policy
-before execution. No incomplete or unrestricted Python replacement was kept.
+The Monty runtime and dependency were already removed; real CPython runs lazily
+behind the existing engine-owned framed pipe. Part 3 is not complete. The
+remaining work is the Prime skill package bundle and complete host API
+(`rlm_heartbeat`, `agent_observe`, compaction, and exact goal semantics),
+subagent result/await support, combined reattach e2e, and a failing latency
+budget benchmark for dispatch, warm REPL, and cold start. No measurements are
+claimed for those budgets. The compact `agent_message` tool added in this pass
+reuses `CommunicateTool` and its schema stays below 200 estimated tokens.

@@ -1,4 +1,5 @@
 mod agentgrep;
+mod agent_message;
 pub mod ambient;
 mod apply_patch;
 mod bash;
@@ -555,6 +556,11 @@ impl Registry {
             Self::insert_tool(&mut tools_map, "session_goal", session_goal::SessionGoalTool);
             Self::insert_tool(&mut tools_map, "heartbeat", session_heartbeat::SessionHeartbeatTool);
             Self::insert_tool(&mut tools_map, "delegate", delegate::DelegateTool::new());
+            Self::insert_tool(
+                &mut tools_map,
+                "agent_message",
+                agent_message::AgentMessageTool::new(),
+            );
         }
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
