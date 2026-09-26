@@ -38,11 +38,17 @@ const SCHEMA: &str = "
 ";
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn now_secs_f64() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Empty completion-contract fields the desktop parser requires.
@@ -102,7 +108,12 @@ pub fn run_gate(gate: &mut QualityGate) -> GateResult {
     gate.attempts += 1;
     let timeout = Duration::from_secs(gate.timeout_seconds.max(1) as u64);
     let started = Instant::now();
-    let mut child = match Command::new("sh").arg("-c").arg(&gate.command).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(&gate.command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
         Ok(c) => c,
         Err(err) => {
@@ -127,9 +138,19 @@ pub fn run_gate(gate: &mut QualityGate) -> GateResult {
                     if let Some(mut err) = child.stderr.take() {
                         let _ = std::io::Read::read_to_string(&mut err, &mut buf);
                     }
-                    buf.chars().rev().take(3000).collect::<String>().chars().rev().collect()
+                    buf.chars()
+                        .rev()
+                        .take(3000)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect()
                 };
-                return GateResult { passed: code == 0, exit_code: code, output: stdout };
+                return GateResult {
+                    passed: code == 0,
+                    exit_code: code,
+                    output: stdout,
+                };
             }
             Ok(None) if started.elapsed() >= timeout => {
                 let _ = child.kill();
@@ -144,7 +165,11 @@ pub fn run_gate(gate: &mut QualityGate) -> GateResult {
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(err) => {
                 gate.last_exit_code = Some(1);
-                return GateResult { passed: false, exit_code: 1, output: err.to_string() };
+                return GateResult {
+                    passed: false,
+                    exit_code: 1,
+                    output: err.to_string(),
+                };
             }
         }
     }
@@ -306,9 +331,23 @@ impl SessionGoal {
             paused_reason: v["paused_reason"].as_str().map(str::to_string),
             last_verdict: v["last_verdict"].as_str().map(str::to_string),
             last_reason: v["last_reason"].as_str().map(str::to_string),
-            subgoals: v["subgoals"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
-            gates: v["gates"].as_array().map(|a| a.iter().filter_map(QualityGate::from_json).collect()).unwrap_or_default(),
-            contract: if v["contract"].is_object() { v["contract"].clone() } else { empty_contract() },
+            subgoals: v["subgoals"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            gates: v["gates"]
+                .as_array()
+                .map(|a| a.iter().filter_map(QualityGate::from_json).collect())
+                .unwrap_or_default(),
+            contract: if v["contract"].is_object() {
+                v["contract"].clone()
+            } else {
+                empty_contract()
+            },
             waiting_on_subagents: v["waiting_on_subagents"].as_bool().unwrap_or(false),
         })
     }
@@ -317,16 +356,28 @@ impl SessionGoal {
         match self.status {
             GoalStatus::Active => {
                 if self.waiting_on_subagents {
-                    format!("⏳ Goal (parked, {}/{} turns): {}", self.turns_used, self.max_turns, self.title)
+                    format!(
+                        "⏳ Goal (parked, {}/{} turns): {}",
+                        self.turns_used, self.max_turns, self.title
+                    )
                 } else {
-                    format!("⊙ Goal (active, {}/{} turns): {}", self.turns_used, self.max_turns, self.title)
+                    format!(
+                        "⊙ Goal (active, {}/{} turns): {}",
+                        self.turns_used, self.max_turns, self.title
+                    )
                 }
             }
             GoalStatus::Paused => {
                 let detail = self.paused_reason.as_deref().unwrap_or("paused");
-                format!("⏸ Goal paused — {}. Use /goal resume to keep going.", detail)
+                format!(
+                    "⏸ Goal paused — {}. Use /goal resume to keep going.",
+                    detail
+                )
             }
-            GoalStatus::Done => format!("✓ Goal done ({}/{} turns): {}", self.turns_used, self.max_turns, self.title),
+            GoalStatus::Done => format!(
+                "✓ Goal done ({}/{} turns): {}",
+                self.turns_used, self.max_turns, self.title
+            ),
         }
     }
 
@@ -486,7 +537,10 @@ impl AutonomousState {
     fn from_json(v: &Value) -> Option<Self> {
         Some(Self {
             status: AutonomousStatus::parse(v["status"].as_str()?)?,
-            prompt: v["prompt"].as_str().unwrap_or("Continue the current task.").to_string(),
+            prompt: v["prompt"]
+                .as_str()
+                .unwrap_or("Continue the current task.")
+                .to_string(),
             max_continuations: v["max_continuations"].as_i64().unwrap_or(3),
             continuations_used: v["continuations_used"].as_i64().unwrap_or(0),
             max_turns: v["max_turns"].as_i64().unwrap_or(0),
@@ -498,7 +552,10 @@ impl AutonomousState {
             created_at_ms: v["created_at_ms"].as_i64().unwrap_or(0),
             updated_at_ms: v["updated_at_ms"].as_i64().unwrap_or(0),
             last_fired_at_ms: v["last_fired_at_ms"].as_i64().unwrap_or(0),
-            gates: v["gates"].as_array().map(|a| a.iter().filter_map(QualityGate::from_json).collect()).unwrap_or_default(),
+            gates: v["gates"]
+                .as_array()
+                .map(|a| a.iter().filter_map(QualityGate::from_json).collect())
+                .unwrap_or_default(),
             waiting_on_subagents: v["waiting_on_subagents"].as_bool().unwrap_or(false),
             paused_reason: v["paused_reason"].as_str().map(str::to_string),
             last_stop_reason: v["last_stop_reason"].as_str().map(str::to_string),
@@ -515,10 +572,22 @@ impl AutonomousState {
         match self.status {
             AutonomousStatus::Active => format!(
                 "Autonomous on ({}/{} continuations, {}, {}).",
-                self.continuations_used, self.max_continuations, gates, if self.waiting_on_subagents { "waiting on subagents" } else { "running" }
+                self.continuations_used,
+                self.max_continuations,
+                gates,
+                if self.waiting_on_subagents {
+                    "waiting on subagents"
+                } else {
+                    "running"
+                }
             ),
-            AutonomousStatus::Paused => format!("Autonomous paused — {}.", self.paused_reason.as_deref().unwrap_or("paused")),
-            AutonomousStatus::Done if self.succeeded => "Autonomous complete — quality gates passed.".to_string(),
+            AutonomousStatus::Paused => format!(
+                "Autonomous paused — {}.",
+                self.paused_reason.as_deref().unwrap_or("paused")
+            ),
+            AutonomousStatus::Done if self.succeeded => {
+                "Autonomous complete — quality gates passed.".to_string()
+            }
             AutonomousStatus::Done => format!(
                 "Autonomous stopped — {} (not success).",
                 self.last_stop_reason.as_deref().unwrap_or("limit reached")
@@ -583,7 +652,11 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    pub fn new(session_id: impl Into<String>, prompt: impl Into<String>, interval_seconds: i64) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        prompt: impl Into<String>,
+        interval_seconds: i64,
+    ) -> Self {
         let now = now_ms();
         let floor = std::env::var("SOVEREIGN_HEARTBEAT_MIN_SECS")
             .ok()
@@ -601,14 +674,19 @@ impl Heartbeat {
             created_at_ms: now,
             // In test floors (<60s), make the first tick due immediately so e2e
             // can observe a fire without waiting a full minute.
-            last_fired_at_ms: if floor < 60 { now - interval * 1000 } else { now },
+            last_fired_at_ms: if floor < 60 {
+                now - interval * 1000
+            } else {
+                now
+            },
             fire_count: 0,
         }
     }
 
     pub fn is_due(&self, now: i64) -> bool {
         self.status == HeartbeatStatus::Active
-            && now.saturating_sub(self.last_fired_at_ms) >= self.interval_seconds.saturating_mul(1000)
+            && now.saturating_sub(self.last_fired_at_ms)
+                >= self.interval_seconds.saturating_mul(1000)
     }
 
     pub fn to_control_json(&self) -> Value {
@@ -689,7 +767,11 @@ fn regex_lite_duration(token: &str) -> Option<i64> {
             _ => return None,
         };
     }
-    if matched && total > 0 { Some(total) } else { None }
+    if matched && total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 pub struct ControlStore {
@@ -700,13 +782,19 @@ impl ControlStore {
     pub fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home).ok();
         let conn = Connection::open(home.join("sovereign.db")).context("opening sovereign.db")?;
-        conn.execute_batch(SCHEMA).context("migrating session control tables")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        conn.execute_batch(SCHEMA)
+            .context("migrating session control tables")?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_cached(home: &Path) -> Result<Arc<Self>> {
         static STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<ControlStore>>>> = OnceLock::new();
-        let mut map = STORES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = STORES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(store) = map.get(home) {
             return Ok(store.clone());
         }
@@ -719,22 +807,33 @@ impl ControlStore {
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn get_goal(&self, session_id: &str) -> Result<Option<SessionGoal>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let state: Option<String> = conn
-            .query_row("SELECT state FROM session_goals WHERE session_id=?1", [session_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM session_goals WHERE session_id=?1",
+                [session_id],
+                |r| r.get(0),
+            )
             .optional()?;
-        Ok(state.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| SessionGoal::from_json(&v)))
+        Ok(state
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| SessionGoal::from_json(&v)))
     }
 
     pub fn set_goal(&self, session_id: &str, goal: Option<&SessionGoal>) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         match goal {
             None => {
-                conn.execute("DELETE FROM session_goals WHERE session_id=?1", [session_id])?;
+                conn.execute(
+                    "DELETE FROM session_goals WHERE session_id=?1",
+                    [session_id],
+                )?;
             }
             Some(goal) => {
                 conn.execute(
@@ -750,16 +849,25 @@ impl ControlStore {
     pub fn get_autonomous(&self, session_id: &str) -> Result<Option<AutonomousState>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let state: Option<String> = conn
-            .query_row("SELECT state FROM session_autonomous WHERE session_id=?1", [session_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM session_autonomous WHERE session_id=?1",
+                [session_id],
+                |r| r.get(0),
+            )
             .optional()?;
-        Ok(state.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| AutonomousState::from_json(&v)))
+        Ok(state
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| AutonomousState::from_json(&v)))
     }
 
     pub fn set_autonomous(&self, session_id: &str, state: Option<&AutonomousState>) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         match state {
             None => {
-                conn.execute("DELETE FROM session_autonomous WHERE session_id=?1", [session_id])?;
+                conn.execute(
+                    "DELETE FROM session_autonomous WHERE session_id=?1",
+                    [session_id],
+                )?;
             }
             Some(state) => {
                 conn.execute(
@@ -774,7 +882,9 @@ impl ControlStore {
 
     pub fn list_heartbeats(&self, session_id: &str) -> Result<Vec<Heartbeat>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare("SELECT state FROM session_heartbeats WHERE session_id=?1 ORDER BY updated_at_ms")?;
+        let mut stmt = conn.prepare(
+            "SELECT state FROM session_heartbeats WHERE session_id=?1 ORDER BY updated_at_ms",
+        )?;
         let rows = stmt.query_map([session_id], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -789,7 +899,10 @@ impl ControlStore {
     }
 
     pub fn user_heartbeat(&self, session_id: &str) -> Result<Option<Heartbeat>> {
-        Ok(self.list_heartbeats(session_id)?.into_iter().find(|h| h.source == "user"))
+        Ok(self
+            .list_heartbeats(session_id)?
+            .into_iter()
+            .find(|h| h.source == "user"))
     }
 
     pub fn upsert_heartbeat(&self, hb: &Heartbeat) -> Result<()> {
@@ -810,7 +923,10 @@ impl ControlStore {
 
     pub fn clear_user_heartbeat(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM session_heartbeats WHERE session_id=?1 AND source='user'", [session_id])?;
+        conn.execute(
+            "DELETE FROM session_heartbeats WHERE session_id=?1 AND source='user'",
+            [session_id],
+        )?;
         Ok(())
     }
 
@@ -918,7 +1034,10 @@ pub fn after_turn(
             goal.waiting_on_subagents = false;
             if let Some(reason) = goal.out_of_budget() {
                 goal.status = GoalStatus::Paused;
-                goal.paused_reason = Some(format!("{}/{} turns used ({})", goal.turns_used, goal.max_turns, reason));
+                goal.paused_reason = Some(format!(
+                    "{}/{} turns used ({})",
+                    goal.turns_used, goal.max_turns, reason
+                ));
                 goal.last_verdict = Some("blocked".into());
                 goal.last_reason = Some(reason.into());
                 store.set_goal(session_id, Some(&goal))?;
@@ -1018,7 +1137,11 @@ pub fn due_heartbeat(store: &ControlStore, session_id: &str) -> Result<Option<Co
 
 pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -> Result<String> {
     let args = args.trim();
-    let first = args.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let first = args
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match first.as_str() {
         "" | "status" => Ok(store
             .get_goal(session_id)?
@@ -1029,7 +1152,9 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             Ok("✓ Goal cleared.".into())
         }
         "pause" => {
-            let mut goal = store.get_goal(session_id)?.ok_or_else(|| anyhow::anyhow!("No goal to pause."))?;
+            let mut goal = store
+                .get_goal(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No goal to pause."))?;
             goal.status = GoalStatus::Paused;
             goal.paused_reason = Some("paused by user".into());
             goal.updated_at_ms = now_ms();
@@ -1037,7 +1162,9 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             Ok(format!("⏸ Goal paused: {}", goal.title))
         }
         "resume" => {
-            let mut goal = store.get_goal(session_id)?.ok_or_else(|| anyhow::anyhow!("No goal to resume."))?;
+            let mut goal = store
+                .get_goal(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No goal to resume."))?;
             goal.status = GoalStatus::Active;
             goal.paused_reason = None;
             goal.updated_at_ms = now_ms();
@@ -1045,7 +1172,9 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             Ok(format!("▶ Goal resumed: {}", goal.title))
         }
         "complete" => {
-            let mut goal = store.get_goal(session_id)?.ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
+            let mut goal = store
+                .get_goal(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
             goal.updated_at_ms = now_ms();
@@ -1062,7 +1191,9 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             while let Some(w) = iter.next() {
                 match w {
                     "--budget" | "--token-budget" | "--max-tokens" => {
-                        token_budget = iter.next().and_then(|n| n.replace(',', "").replace('_', "").parse().ok());
+                        token_budget = iter
+                            .next()
+                            .and_then(|n| n.replace(',', "").replace('_', "").parse().ok());
                     }
                     "--turns" | "--max-turns" => {
                         max_turns = iter.next().and_then(|n| n.parse().ok()).unwrap_or(20);
@@ -1071,7 +1202,11 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
                         wall_budget_ms = iter.next().and_then(|n| n.replace(',', "").parse().ok());
                     }
                     other if other.starts_with("--budget=") => {
-                        token_budget = other.trim_start_matches("--budget=").replace(',', "").parse().ok();
+                        token_budget = other
+                            .trim_start_matches("--budget=")
+                            .replace(',', "")
+                            .parse()
+                            .ok();
                     }
                     other if other.starts_with("--turns=") => {
                         max_turns = other.trim_start_matches("--turns=").parse().unwrap_or(20);
@@ -1088,19 +1223,29 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             goal.token_budget = token_budget;
             goal.wall_budget_ms = wall_budget_ms;
             store.set_goal(session_id, Some(&goal))?;
-            Ok(format!("⊙ Goal set ({}-turn budget): {}", goal.max_turns, goal.title))
+            Ok(format!(
+                "⊙ Goal set ({}-turn budget): {}",
+                goal.max_turns, goal.title
+            ))
         }
     }
 }
 
-pub fn handle_autonomous_command(store: &ControlStore, session_id: &str, args: &str) -> Result<String> {
+pub fn handle_autonomous_command(
+    store: &ControlStore,
+    session_id: &str,
+    args: &str,
+) -> Result<String> {
     let args = args.trim();
     let mut words: Vec<&str> = args.split_whitespace().collect();
     if words.is_empty() {
         words.push("status");
     }
     match words[0].to_ascii_lowercase().as_str() {
-        "status" => Ok(store.get_autonomous(session_id)?.map(|a| a.status_text()).unwrap_or_else(|| "Autonomous off.".into())),
+        "status" => Ok(store
+            .get_autonomous(session_id)?
+            .map(|a| a.status_text())
+            .unwrap_or_else(|| "Autonomous off.".into())),
         "off" | "stop" => {
             store.set_autonomous(session_id, None)?;
             Ok("Autonomous off.".into())
@@ -1186,7 +1331,11 @@ fn parse_limit(s: &str) -> Option<i64> {
     s.replace(',', "").replace('_', "").parse().ok()
 }
 
-pub fn handle_heartbeat_command(store: &ControlStore, session_id: &str, args: &str) -> Result<String> {
+pub fn handle_heartbeat_command(
+    store: &ControlStore,
+    session_id: &str,
+    args: &str,
+) -> Result<String> {
     let args = args.trim();
     let mut words: Vec<&str> = args.split_whitespace().collect();
     if words.is_empty() {
@@ -1196,7 +1345,9 @@ pub fn handle_heartbeat_command(store: &ControlStore, session_id: &str, args: &s
         "status" | "list" => {
             let list = store.list_heartbeats(session_id)?;
             if list.is_empty() {
-                return Ok("No heartbeat. Set one with /heartbeat every <interval> <prompt>.".into());
+                return Ok(
+                    "No heartbeat. Set one with /heartbeat every <interval> <prompt>.".into(),
+                );
             }
             let lines: Vec<_> = list
                 .iter()
@@ -1214,13 +1365,17 @@ pub fn handle_heartbeat_command(store: &ControlStore, session_id: &str, args: &s
             Ok(lines.join("\n"))
         }
         "pause" => {
-            let mut hb = store.user_heartbeat(session_id)?.ok_or_else(|| anyhow::anyhow!("No heartbeat to pause."))?;
+            let mut hb = store
+                .user_heartbeat(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No heartbeat to pause."))?;
             hb.status = HeartbeatStatus::Paused;
             store.upsert_heartbeat(&hb)?;
             Ok("Heartbeat paused.".into())
         }
         "resume" => {
-            let mut hb = store.user_heartbeat(session_id)?.ok_or_else(|| anyhow::anyhow!("No heartbeat to resume."))?;
+            let mut hb = store
+                .user_heartbeat(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No heartbeat to resume."))?;
             hb.status = HeartbeatStatus::Active;
             store.upsert_heartbeat(&hb)?;
             Ok("Heartbeat resumed.".into())
@@ -1235,7 +1390,10 @@ pub fn handle_heartbeat_command(store: &ControlStore, session_id: &str, args: &s
             Ok("Heartbeat cleared.".into())
         }
         "every" => {
-            let interval = words.get(1).and_then(|t| parse_duration_token(t)).ok_or_else(|| anyhow::anyhow!("Usage: /heartbeat every <interval> <prompt>"))?;
+            let interval = words
+                .get(1)
+                .and_then(|t| parse_duration_token(t))
+                .ok_or_else(|| anyhow::anyhow!("Usage: /heartbeat every <interval> <prompt>"))?;
             let prompt = words.get(2..).map(|w| w.join(" ")).unwrap_or_default();
             if prompt.trim().is_empty() {
                 bail!("Usage: /heartbeat every <interval> <prompt> — the prompt is required.");
@@ -1258,7 +1416,10 @@ pub fn handle_heartbeat_command(store: &ControlStore, session_id: &str, args: &s
                 store.clear_user_heartbeat(session_id)?;
                 let hb = Heartbeat::new(session_id, prompt, interval);
                 store.upsert_heartbeat(&hb)?;
-                return Ok(format!("Heartbeat set: every {}.", format_duration(interval)));
+                return Ok(format!(
+                    "Heartbeat set: every {}.",
+                    format_duration(interval)
+                ));
             }
             bail!("Usage: /heartbeat every <interval> <prompt> | status | pause | resume | clear")
         }
@@ -1283,7 +1444,12 @@ fn format_duration(seconds: i64) -> String {
 }
 
 /// Dispatch envelope for `session.control` actions.
-pub fn control_action(store: &ControlStore, session_id: &str, action: &str, args: &Value) -> Result<(Value, Value)> {
+pub fn control_action(
+    store: &ControlStore,
+    session_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<(Value, Value)> {
     let message = match action {
         "goal.clear" => handle_goal_command(store, session_id, "clear")?,
         "goal.pause" => handle_goal_command(store, session_id, "pause")?,
@@ -1432,7 +1598,9 @@ mod tests {
         store.set_goal("s1", Some(&SessionGoal::new("x"))).unwrap();
         let auto = AutonomousState::default_on();
         store.set_autonomous("s1", Some(&auto)).unwrap();
-        store.upsert_heartbeat(&Heartbeat::new("s1", "ping", 60)).unwrap();
+        store
+            .upsert_heartbeat(&Heartbeat::new("s1", "ping", 60))
+            .unwrap();
         let snap = store.control_snapshot("s1").unwrap();
         assert!(snap["goal"].is_object());
         assert!(snap["loop"].is_object());
@@ -1440,17 +1608,47 @@ mod tests {
         assert!(snap["revision"].is_string());
         assert!(snap["updated_at"].as_f64().is_some());
         // Goal required fields
-        for key in ["title", "status", "turns_used", "max_turns", "contract", "subgoals", "gates"] {
+        for key in [
+            "title",
+            "status",
+            "turns_used",
+            "max_turns",
+            "contract",
+            "subgoals",
+            "gates",
+        ] {
             assert!(snap["goal"].get(key).is_some(), "missing goal.{key}");
         }
         for key in [
-            "prompt", "status", "mode", "interval_seconds", "current_delay", "times", "until", "max_ticks", "ticks_fired",
-            "created_at", "last_fired_at", "next_due_at", "awaiting_response", "deferred_by_goal",
+            "prompt",
+            "status",
+            "mode",
+            "interval_seconds",
+            "current_delay",
+            "times",
+            "until",
+            "max_ticks",
+            "ticks_fired",
+            "created_at",
+            "last_fired_at",
+            "next_due_at",
+            "awaiting_response",
+            "deferred_by_goal",
         ] {
             assert!(snap["loop"].get(key).is_some(), "missing loop.{key}");
         }
-        for key in ["prompt", "status", "interval_seconds", "created_at", "last_fired_at", "fire_count"] {
-            assert!(snap["heartbeat"].get(key).is_some(), "missing heartbeat.{key}");
+        for key in [
+            "prompt",
+            "status",
+            "interval_seconds",
+            "created_at",
+            "last_fired_at",
+            "fire_count",
+        ] {
+            assert!(
+                snap["heartbeat"].get(key).is_some(),
+                "missing heartbeat.{key}"
+            );
         }
     }
 
@@ -1481,6 +1679,9 @@ mod tests {
         store.set_goal("s1", Some(&SessionGoal::new("x"))).unwrap();
         let c = after_turn(&store, "s1", 0, false, true).unwrap();
         assert!(c.is_none());
-        assert_eq!(store.get_goal("s1").unwrap().unwrap().status, GoalStatus::Paused);
+        assert_eq!(
+            store.get_goal("s1").unwrap().unwrap().status,
+            GoalStatus::Paused
+        );
     }
 }

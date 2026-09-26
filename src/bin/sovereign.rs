@@ -7,14 +7,6 @@
 
 use anyhow::Result;
 
-// Counts allocations so a REPL worker (this binary with `__repl-worker`) can
-// enforce a hard memory ceiling. The engine process never arms a limit, so
-// for it this is the system allocator plus one counter. monty-alloc is
-// Unix-only in this workspace today.
-#[cfg(unix)]
-#[global_allocator]
-static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
-
 fn translate(args: Vec<String>) -> Vec<String> {
     let mut out = vec!["sovereign".to_string()];
     let mut rest = args.into_iter();
@@ -34,14 +26,12 @@ fn translate(args: Vec<String>) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
-    // Prime REPL worker mode: no runtime, no jcode startup, no environment.
-    if std::env::args().nth(1).as_deref() == Some("__repl-worker") {
-        return Ok(sovereign_prime::worker::run(sovereign_prime::worker::Limits::default())?);
-    }
     // pre_tool gate (spawned by jcode before each tool call): ask a human
     // before risky shell commands. Exit 0 allows, 2 blocks.
     if std::env::args().nth(1).as_deref() == Some("__pre-tool") {
-        let file = jcode::storage::jcode_dir().map(|d| d.join("sovereign-approval.json")).unwrap_or_default();
+        let file = jcode::storage::jcode_dir()
+            .map(|d| d.join("sovereign-approval.json"))
+            .unwrap_or_default();
         std::process::exit(sovereign_gateway::approvals::hook::run(&file));
     }
 
@@ -51,13 +41,18 @@ fn main() -> Result<()> {
     install_ollama_signal_unload();
 
     #[cfg(unix)]
-    if let Some(parent) = std::env::var("HERMES_PARENT_PID").ok().and_then(|pid| pid.parse::<libc::pid_t>().ok()) {
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            // A direct Electron child is reparented when the app is force-killed.
-            if unsafe { libc::getppid() } != parent {
-                unload_ollama_from_warm_file();
-                std::process::exit(0);
+    if let Some(parent) = std::env::var("HERMES_PARENT_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                // A direct Electron child is reparented when the app is force-killed.
+                if unsafe { libc::getppid() } != parent {
+                    unload_ollama_from_warm_file();
+                    std::process::exit(0);
+                }
             }
         });
     }
@@ -149,11 +144,11 @@ fn install_ollama_signal_unload() {
     {
         // Catch SIGTERM before the default terminate-without-destructors path.
         std::thread::spawn(|| {
-            let mut signals = match signal_hook::iterator::Signals::new([libc::SIGTERM, libc::SIGINT])
-            {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+            let mut signals =
+                match signal_hook::iterator::Signals::new([libc::SIGTERM, libc::SIGINT]) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
             for _ in signals.forever() {
                 unload_ollama_from_warm_file();
                 std::process::exit(0);
@@ -173,7 +168,15 @@ mod tests {
     #[test]
     fn hermes_serve_becomes_gateway() {
         assert_eq!(
-            t(&["--profile", "work", "serve", "--host", "127.0.0.1", "--port", "0"]),
+            t(&[
+                "--profile",
+                "work",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0"
+            ]),
             ["sovereign", "gateway", "--host", "127.0.0.1", "--port", "0"]
         );
     }

@@ -30,8 +30,18 @@ pub struct RefineOutcome {
 }
 
 /// (system, user) prompts for a /refine (or auto-review) model call.
-pub fn build_request(store: &EntryStore, session: &str, turns: &[Turn], instructions: Option<&str>, global: bool) -> (String, String) {
-    let scope_word = if global { "global (applies to every session)" } else { "local to this session" };
+pub fn build_request(
+    store: &EntryStore,
+    session: &str,
+    turns: &[Turn],
+    instructions: Option<&str>,
+    global: bool,
+) -> (String, String) {
+    let scope_word = if global {
+        "global (applies to every session)"
+    } else {
+        "local to this session"
+    };
     let system = format!(
         "You maintain an agent's Continual Harness: durable entries of 4 kinds - prompt (a system-prompt addendum), \
          memory (a reference to something already remembered, never new memory content), skill (a reusable \
@@ -49,12 +59,24 @@ pub fn build_request(store: &EntryStore, session: &str, turns: &[Turn], instruct
     let existing = store.list_visible(session, None).unwrap_or_default();
     let listing = existing
         .iter()
-        .map(|e| format!("- [{}] {} (id={}): {}", e.kind.as_str(), e.title, e.id, truncate(&e.content, 200)))
+        .map(|e| {
+            format!(
+                "- [{}] {} (id={}): {}",
+                e.kind.as_str(),
+                e.title,
+                e.id,
+                truncate(&e.content, 200)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let user = format!(
         "Existing entries visible to this session:\n{}\n\nInstructions from the user: {}\n\nSession transcript:\n{}",
-        if listing.is_empty() { "(none)".to_string() } else { listing },
+        if listing.is_empty() {
+            "(none)".to_string()
+        } else {
+            listing
+        },
         instructions.unwrap_or("(none; use your judgement about what is worth keeping)"),
         Harness::transcript(turns),
     );
@@ -63,37 +85,60 @@ pub fn build_request(store: &EntryStore, session: &str, turns: &[Turn], instruct
 
 /// Validate the model's proposal against the session and apply it as one
 /// changeset (rejecting the whole proposal if any single edit fails a gate).
-pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], global: bool, source: &str) -> Result<RefineOutcome> {
+pub fn apply(
+    store: &EntryStore,
+    session: &str,
+    reply: &str,
+    turns: &[Turn],
+    global: bool,
+    source: &str,
+) -> Result<RefineOutcome> {
     let proposal = parse_json_object(reply).context("the refine reply was not valid JSON")?;
     let edits = proposal["edits"].as_array().cloned().unwrap_or_default();
     if edits.is_empty() {
         bail!("no durable lesson in this session");
     }
     if edits.len() > MAX_EDITS {
-        bail!("rejected: {} edits exceeds the limit of {MAX_EDITS}", edits.len());
+        bail!(
+            "rejected: {} edits exceeds the limit of {MAX_EDITS}",
+            edits.len()
+        );
     }
-    let trusted: String =
-        turns.iter().filter(|t| t.role == "user" || t.role == "assistant").map(|t| normalize(&t.text)).collect::<Vec<_>>().join("\n");
+    let trusted: String = turns
+        .iter()
+        .filter(|t| t.role == "user" || t.role == "assistant")
+        .map(|t| normalize(&t.text))
+        .collect::<Vec<_>>()
+        .join("\n");
     let scope = if global { Scope::Global } else { Scope::Local };
     let mut applied_ops: Vec<AppliedEdit> = Vec::new();
     let (mut created, mut updated, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
     let result: Result<()> = (|| {
         for edit in &edits {
-            let quotes: Vec<String> =
-                edit["evidence"].as_array().into_iter().flatten().filter_map(Value::as_str).map(normalize).collect();
+            let quotes: Vec<String> = edit["evidence"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(normalize)
+                .collect();
             let valid = |q: &String| q.len() >= MIN_EVIDENCE_CHARS && trusted.contains(q.as_str());
             if quotes.is_empty() || !quotes.iter().all(valid) {
-                bail!("rejected: an edit cited no evidence in the session's user/assistant messages");
+                bail!(
+                    "rejected: an edit cited no evidence in the session's user/assistant messages"
+                );
             }
             match edit["action"].as_str().unwrap_or_default() {
                 "create" => {
-                    let kind = EntryKind::parse(edit["kind"].as_str().unwrap_or_default()).context("rejected: edit has no valid kind")?;
+                    let kind = EntryKind::parse(edit["kind"].as_str().unwrap_or_default())
+                        .context("rejected: edit has no valid kind")?;
                     let title = edit["title"].as_str().unwrap_or_default();
                     let content = edit["content"].as_str().unwrap_or_default();
                     if content.trim().is_empty() {
                         bail!("rejected: a create edit has empty content");
                     }
-                    let mut new_entry = NewEntry::new(kind, scope, title, content).with_source(source);
+                    let mut new_entry =
+                        NewEntry::new(kind, scope, title, content).with_source(source);
                     if let Some(path) = edit["path"].as_str() {
                         new_entry = new_entry.with_path(path);
                     }
@@ -102,11 +147,20 @@ pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], glo
                     }
                     let after = store.create(new_entry)?;
                     created.push(after.id.clone());
-                    applied_ops.push(AppliedEdit { action: Action::Create, id: after.id.clone(), before: None, after: Some(after) });
+                    applied_ops.push(AppliedEdit {
+                        action: Action::Create,
+                        id: after.id.clone(),
+                        before: None,
+                        after: Some(after),
+                    });
                 }
                 "update" => {
-                    let id = edit["id"].as_str().context("rejected: an update edit has no id")?;
-                    let before = store.get(id)?.context("rejected: update targets an entry that does not exist")?;
+                    let id = edit["id"]
+                        .as_str()
+                        .context("rejected: an update edit has no id")?;
+                    let before = store
+                        .get(id)?
+                        .context("rejected: update targets an entry that does not exist")?;
                     let patch = EntryPatch {
                         title: edit["title"].as_str().map(str::to_string),
                         content: edit["content"].as_str().map(str::to_string),
@@ -115,13 +169,25 @@ pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], glo
                     };
                     let after = store.update(id, patch)?;
                     updated.push(id.to_string());
-                    applied_ops.push(AppliedEdit { action: Action::Update, id: id.to_string(), before: Some(before), after: Some(after) });
+                    applied_ops.push(AppliedEdit {
+                        action: Action::Update,
+                        id: id.to_string(),
+                        before: Some(before),
+                        after: Some(after),
+                    });
                 }
                 "delete" => {
-                    let id = edit["id"].as_str().context("rejected: a delete edit has no id")?;
+                    let id = edit["id"]
+                        .as_str()
+                        .context("rejected: a delete edit has no id")?;
                     let before = store.delete(id)?;
                     deleted.push(id.to_string());
-                    applied_ops.push(AppliedEdit { action: Action::Delete, id: id.to_string(), before: Some(before), after: None });
+                    applied_ops.push(AppliedEdit {
+                        action: Action::Delete,
+                        id: id.to_string(),
+                        before: Some(before),
+                        after: None,
+                    });
                 }
                 other => bail!("rejected: unknown action {other:?}"),
             }
@@ -138,9 +204,14 @@ pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], glo
                 Action::Delete => {
                     if let Some(before) = &op.before {
                         let _ = store.create(
-                            NewEntry::new(before.kind, before.scope, &before.title, &before.content)
-                                .with_path(&before.path)
-                                .with_source(&before.source),
+                            NewEntry::new(
+                                before.kind,
+                                before.scope,
+                                &before.title,
+                                &before.content,
+                            )
+                            .with_path(&before.path)
+                            .with_source(&before.source),
                         );
                     }
                 }
@@ -161,12 +232,37 @@ pub fn apply(store: &EntryStore, session: &str, reply: &str, turns: &[Turn], glo
         }
         return Err(err);
     }
-    let summary = proposal["summary"].as_str().unwrap_or("updated the Continual Harness").to_string();
-    let rationale = proposal["rationale"].as_str().unwrap_or_default().to_string();
-    let expected_outcome = proposal["expectedOutcome"].as_str().unwrap_or_default().to_string();
-    let changeset_id =
-        store.record_changeset((!global).then_some(session), scope, &summary, &rationale, &expected_outcome, &applied_ops, None, source)?;
-    Ok(RefineOutcome { changeset_id, summary, rationale, expected_outcome, created, updated, deleted })
+    let summary = proposal["summary"]
+        .as_str()
+        .unwrap_or("updated the Continual Harness")
+        .to_string();
+    let rationale = proposal["rationale"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let expected_outcome = proposal["expectedOutcome"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let changeset_id = store.record_changeset(
+        (!global).then_some(session),
+        scope,
+        &summary,
+        &rationale,
+        &expected_outcome,
+        &applied_ops,
+        None,
+        source,
+    )?;
+    Ok(RefineOutcome {
+        changeset_id,
+        summary,
+        rationale,
+        expected_outcome,
+        created,
+        updated,
+        deleted,
+    })
 }
 
 /// `/refine rollback [id]` (and the `refine.status()`-adjacent host call):
@@ -179,15 +275,28 @@ pub fn rollback(store: &EntryStore, session: &str, id: Option<&str>) -> Result<S
 /// `/refine status`: a snapshot of what's currently learned and recently changed.
 pub fn status(store: &EntryStore, session: &str) -> String {
     let entries = store.list_visible(session, None).unwrap_or_default();
-    let recent = store.recent_changesets(Some(session), 5).unwrap_or_default();
+    let recent = store
+        .recent_changesets(Some(session), 5)
+        .unwrap_or_default();
     let mut text = format!("{} entries visible to this session.\n", entries.len());
     for e in &entries {
-        text.push_str(&format!("- [{}/{}] {} (id={})\n", e.kind.as_str(), e.scope.as_str(), e.title, e.id));
+        text.push_str(&format!(
+            "- [{}/{}] {} (id={})\n",
+            e.kind.as_str(),
+            e.scope.as_str(),
+            e.title,
+            e.id
+        ));
     }
     if !recent.is_empty() {
         text.push_str("\nRecent refinements:\n");
         for cs in &recent {
-            text.push_str(&format!("- {} {}{}\n", cs.id, cs.summary, if cs.rolled_back { " (rolled back)" } else { "" }));
+            text.push_str(&format!(
+                "- {} {}{}\n",
+                cs.id,
+                cs.summary,
+                if cs.rolled_back { " (rolled back)" } else { "" }
+            ));
         }
     }
     text
@@ -239,7 +348,10 @@ mod tests {
         })
         .to_string();
         assert!(apply(&store, "s1", &reply, &turns(), false, "refine").is_err());
-        assert!(store.list_visible("s1", None).unwrap().is_empty(), "the valid first edit was rolled back too");
+        assert!(
+            store.list_visible("s1", None).unwrap().is_empty(),
+            "the valid first edit was rolled back too"
+        );
     }
 
     #[test]

@@ -16,7 +16,10 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
         }
         "complete" => Ok(handle_goal_command(store, session_id, "complete")?),
         "create" => {
-            let text = op["text"].as_str().or(op["title"].as_str()).unwrap_or_default();
+            let text = op["text"]
+                .as_str()
+                .or(op["title"].as_str())
+                .unwrap_or_default();
             if text.trim().is_empty() {
                 anyhow::bail!("goal create requires text");
             }
@@ -32,12 +35,19 @@ pub fn heartbeat_host(store: &ControlStore, session_id: &str, op_json: &str) -> 
         "list" => Ok(handle_heartbeat_command(store, session_id, "list")?),
         "clear" => Ok(handle_heartbeat_command(store, session_id, "clear")?),
         "set" => {
-            let interval = op["interval"].as_str().or(op["every"].as_str()).unwrap_or_default();
+            let interval = op["interval"]
+                .as_str()
+                .or(op["every"].as_str())
+                .unwrap_or_default();
             let prompt = op["prompt"].as_str().unwrap_or_default();
             if interval.is_empty() || prompt.trim().is_empty() {
                 anyhow::bail!("heartbeat set requires interval and prompt");
             }
-            Ok(handle_heartbeat_command(store, session_id, &format!("every {interval} {prompt}"))?)
+            Ok(handle_heartbeat_command(
+                store,
+                session_id,
+                &format!("every {interval} {prompt}"),
+            )?)
         }
         other => anyhow::bail!("unknown heartbeat op: {other}"),
     }

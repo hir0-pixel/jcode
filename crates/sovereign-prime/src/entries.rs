@@ -152,7 +152,12 @@ pub struct NewEntry {
 }
 
 impl NewEntry {
-    pub fn new(kind: EntryKind, scope: Scope, title: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(
+        kind: EntryKind,
+        scope: Scope,
+        title: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             title: title.into(),
@@ -245,7 +250,10 @@ pub struct EntryStore {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn entry_to_json(e: &HarnessEntry) -> Value {
@@ -301,8 +309,11 @@ impl EntryStore {
     pub fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home).ok();
         let conn = Connection::open(home.join("sovereign.db")).context("opening sovereign.db")?;
-        conn.execute_batch(SCHEMA).context("migrating harness entry tables")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        conn.execute_batch(SCHEMA)
+            .context("migrating harness entry tables")?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// One cached store per `home` per process, so callers (the gateway's
@@ -310,7 +321,10 @@ impl EntryStore {
     /// `sovereign.db` on every call.
     pub fn open_cached(home: &Path) -> Result<Arc<Self>> {
         static STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<EntryStore>>>> = OnceLock::new();
-        let mut map = STORES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = STORES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(store) = map.get(home) {
             return Ok(store.clone());
         }
@@ -324,7 +338,9 @@ impl EntryStore {
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn next_seq(conn: &Connection) -> Result<i64> {
@@ -332,7 +348,11 @@ impl EntryStore {
             "INSERT INTO harness_seq(name, value) VALUES ('seq', 1) ON CONFLICT(name) DO UPDATE SET value = value + 1",
             [],
         )?;
-        Ok(conn.query_row("SELECT value FROM harness_seq WHERE name = 'seq'", [], |r| r.get(0))?)
+        Ok(conn.query_row(
+            "SELECT value FROM harness_seq WHERE name = 'seq'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<HarnessEntry> {
@@ -361,26 +381,41 @@ impl EntryStore {
     pub fn get(&self, id: &str) -> Result<Option<HarnessEntry>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         Ok(conn
-            .query_row("SELECT * FROM harness_entries WHERE id = ?1", [id], Self::row_to_entry)
+            .query_row(
+                "SELECT * FROM harness_entries WHERE id = ?1",
+                [id],
+                Self::row_to_entry,
+            )
             .optional()?)
     }
 
     /// Entries visible to `session`: all globals plus that session's locals,
     /// in deterministic (`seq`) order. On a `path` collision between a global
     /// and a local entry, the local one wins (Prime's local-override rule).
-    pub fn list_visible(&self, session: &str, kind: Option<EntryKind>) -> Result<Vec<HarnessEntry>> {
+    pub fn list_visible(
+        &self,
+        session: &str,
+        kind: Option<EntryKind>,
+    ) -> Result<Vec<HarnessEntry>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT * FROM harness_entries WHERE (scope = 'global' OR (scope = 'local' AND session = ?1)) \
              AND (?2 IS NULL OR kind = ?2) ORDER BY seq ASC",
         )?;
         let kind_str = kind.map(|k| k.as_str());
-        let rows: Vec<HarnessEntry> = stmt.query_map(params![session, kind_str], Self::row_to_entry)?.collect::<rusqlite::Result<_>>()?;
+        let rows: Vec<HarnessEntry> = stmt
+            .query_map(params![session, kind_str], Self::row_to_entry)?
+            .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
-        let mut by_path: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut by_path: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut out: Vec<HarnessEntry> = Vec::new();
         for entry in rows {
-            let key = if entry.path.is_empty() { format!("__id:{}", entry.id) } else { entry.path.clone() };
+            let key = if entry.path.is_empty() {
+                format!("__id:{}", entry.id)
+            } else {
+                entry.path.clone()
+            };
             if let Some(&idx) = by_path.get(&key) {
                 if entry.scope == Scope::Local {
                     out[idx] = entry;
@@ -394,23 +429,40 @@ impl EntryStore {
         Ok(out)
     }
 
-    pub fn list_all(&self, scope: Option<Scope>, session: Option<&str>) -> Result<Vec<HarnessEntry>> {
+    pub fn list_all(
+        &self,
+        scope: Option<Scope>,
+        session: Option<&str>,
+    ) -> Result<Vec<HarnessEntry>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT * FROM harness_entries WHERE (?1 IS NULL OR scope = ?1) AND (?2 IS NULL OR session = ?2) ORDER BY seq ASC",
         )?;
         let scope_str = scope.map(|s| s.as_str());
-        Ok(stmt.query_map(params![scope_str, session], Self::row_to_entry)?.collect::<rusqlite::Result<_>>()?)
+        Ok(stmt
+            .query_map(params![scope_str, session], Self::row_to_entry)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Prompt-kind entries rendered for `session`, newest-appended order,
     /// joined with blank lines: the stable, cacheable addendum text.
     pub fn render_prompt(&self, session: &str) -> Result<String> {
         let entries = self.list_visible(session, Some(EntryKind::Prompt))?;
-        Ok(entries.iter().map(|e| e.content.trim()).filter(|c| !c.is_empty()).collect::<Vec<_>>().join("\n\n"))
+        Ok(entries
+            .iter()
+            .map(|e| e.content.trim())
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
     }
 
-    fn insert_entry(conn: &Connection, e: &NewEntry, id: &str, seq: i64, at: i64) -> Result<HarnessEntry> {
+    fn insert_entry(
+        conn: &Connection,
+        e: &NewEntry,
+        id: &str,
+        seq: i64,
+        at: i64,
+    ) -> Result<HarnessEntry> {
         if e.scope == Scope::Local && e.session.is_none() {
             bail!("a local entry needs a session");
         }
@@ -426,9 +478,21 @@ impl EntryStore {
             ],
         )?;
         Ok(HarnessEntry {
-            id: id.to_string(), kind: e.kind, title, content, path, scope: e.scope, session: e.session.clone(),
-            reference: e.reference.clone(), arguments: e.arguments.clone(), metadata: e.metadata.clone(),
-            source: e.source.clone(), created_at_ms: at, updated_at_ms: at, version: 1, seq,
+            id: id.to_string(),
+            kind: e.kind,
+            title,
+            content,
+            path,
+            scope: e.scope,
+            session: e.session.clone(),
+            reference: e.reference.clone(),
+            arguments: e.arguments.clone(),
+            metadata: e.metadata.clone(),
+            source: e.source.clone(),
+            created_at_ms: at,
+            updated_at_ms: at,
+            version: 1,
+            seq,
         })
     }
 
@@ -469,7 +533,17 @@ impl EntryStore {
             "UPDATE harness_entries SET title=?1, content=?2, path=?3, reference=?4, arguments=?5, metadata=?6, updated_at_ms=?7, version=?8 WHERE id=?9",
             params![title, content, path, reference.to_string(), arguments.to_string(), metadata.to_string(), at, version, id],
         )?;
-        Ok(HarnessEntry { title, content, path, reference, arguments, metadata, updated_at_ms: at, version, ..existing })
+        Ok(HarnessEntry {
+            title,
+            content,
+            path,
+            reference,
+            arguments,
+            metadata,
+            updated_at_ms: at,
+            version,
+            ..existing
+        })
     }
 
     /// Overwrite an entry back to an exact prior snapshot (rollback of an update).
@@ -559,8 +633,13 @@ impl EntryStore {
     fn row_to_changeset(row: &rusqlite::Row) -> rusqlite::Result<Changeset> {
         let ops: String = row.get("ops")?;
         let scope: String = row.get("scope")?;
-        let edits: Vec<AppliedEdit> =
-            serde_json::from_str::<Value>(&ops).ok().and_then(|v| v.as_array().map(|a| a.iter().filter_map(applied_edit_from_json).collect())).unwrap_or_default();
+        let edits: Vec<AppliedEdit> = serde_json::from_str::<Value>(&ops)
+            .ok()
+            .and_then(|v| {
+                v.as_array()
+                    .map(|a| a.iter().filter_map(applied_edit_from_json).collect())
+            })
+            .unwrap_or_default();
         Ok(Changeset {
             id: row.get("id")?,
             session: row.get("session")?,
@@ -578,7 +657,13 @@ impl EntryStore {
 
     pub fn changeset(&self, id: &str) -> Result<Option<Changeset>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(conn.query_row("SELECT * FROM harness_changesets WHERE id = ?1", [id], Self::row_to_changeset).optional()?)
+        Ok(conn
+            .query_row(
+                "SELECT * FROM harness_changesets WHERE id = ?1",
+                [id],
+                Self::row_to_changeset,
+            )
+            .optional()?)
     }
 
     pub fn recent_changesets(&self, session: Option<&str>, limit: usize) -> Result<Vec<Changeset>> {
@@ -586,7 +671,9 @@ impl EntryStore {
         let mut stmt = conn.prepare(
             "SELECT * FROM harness_changesets WHERE (?1 IS NULL OR session = ?1) ORDER BY created_at_ms DESC LIMIT ?2",
         )?;
-        Ok(stmt.query_map(params![session, limit as i64], Self::row_to_changeset)?.collect::<rusqlite::Result<_>>()?)
+        Ok(stmt
+            .query_map(params![session, limit as i64], Self::row_to_changeset)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Roll back `id` (or, if `None`, the most recent non-rolled-back
@@ -597,7 +684,9 @@ impl EntryStore {
     /// `update` restores the prior snapshot.
     pub fn rollback(&self, id: Option<&str>, session: Option<&str>) -> Result<Changeset> {
         let target = match id {
-            Some(id) => self.changeset(id)?.with_context(|| format!("no changeset {id}"))?,
+            Some(id) => self
+                .changeset(id)?
+                .with_context(|| format!("no changeset {id}"))?,
             None => self
                 .recent_changesets(session, 20)?
                 .into_iter()
@@ -611,17 +700,36 @@ impl EntryStore {
         for edit in target.edits.iter().rev() {
             match edit.action {
                 Action::Create => {
-                    let after = edit.after.as_ref().context("create edit missing its snapshot")?;
+                    let after = edit
+                        .after
+                        .as_ref()
+                        .context("create edit missing its snapshot")?;
                     let before = self.delete(&after.id)?;
-                    inverse.push(AppliedEdit { action: Action::Delete, id: after.id.clone(), before: Some(before), after: None });
+                    inverse.push(AppliedEdit {
+                        action: Action::Delete,
+                        id: after.id.clone(),
+                        before: Some(before),
+                        after: None,
+                    });
                 }
                 Action::Delete => {
-                    let before = edit.before.as_ref().context("delete edit missing its snapshot")?;
+                    let before = edit
+                        .before
+                        .as_ref()
+                        .context("delete edit missing its snapshot")?;
                     let after = self.create_with_id(before)?;
-                    inverse.push(AppliedEdit { action: Action::Create, id: before.id.clone(), before: None, after: Some(after) });
+                    inverse.push(AppliedEdit {
+                        action: Action::Create,
+                        id: before.id.clone(),
+                        before: None,
+                        after: Some(after),
+                    });
                 }
                 Action::Update => {
-                    let before = edit.before.as_ref().context("update edit missing its snapshot")?;
+                    let before = edit
+                        .before
+                        .as_ref()
+                        .context("update edit missing its snapshot")?;
                     let after = self.restore(before)?;
                     inverse.push(AppliedEdit {
                         action: Action::Update,
@@ -634,7 +742,10 @@ impl EntryStore {
         }
         {
             let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute("UPDATE harness_changesets SET rolled_back = 1 WHERE id = ?1", [&target.id])?;
+            conn.execute(
+                "UPDATE harness_changesets SET rolled_back = 1 WHERE id = ?1",
+                [&target.id],
+            )?;
         }
         let rollback_id = self.record_changeset(
             target.session.as_deref(),
@@ -646,7 +757,8 @@ impl EntryStore {
             Some(&target.id),
             "refine",
         )?;
-        self.changeset(&rollback_id)?.context("just-recorded changeset vanished")
+        self.changeset(&rollback_id)?
+            .context("just-recorded changeset vanished")
     }
 
     /// Resolve a stored `subagent` entry by name (case-insensitive title
@@ -656,14 +768,21 @@ impl EntryStore {
     /// tools) and `arguments` (a model hint) — not wired to the swarm here.
     pub fn resolve_subagent_spec(&self, session: &str, name: &str) -> Result<Option<HarnessEntry>> {
         let entries = self.list_visible(session, Some(EntryKind::Subagent))?;
-        Ok(entries.into_iter().find(|e| e.title.eq_ignore_ascii_case(name)))
+        Ok(entries
+            .into_iter()
+            .find(|e| e.title.eq_ignore_ascii_case(name)))
     }
 
     /// `refine.run(instructions)` (the model-callable tool and the REPL host
     /// function): schedule a refinement for `session`, applied at turn end,
     /// never mid-turn. A later call before turn end just updates the pending
     /// instructions (Prime's "single pending request per turn").
-    pub fn schedule_refine(&self, session: &str, instructions: Option<&str>, global: bool) -> Result<()> {
+    pub fn schedule_refine(
+        &self,
+        session: &str,
+        instructions: Option<&str>,
+        global: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO harness_pending_refine(session, instructions, global, created_at_ms) VALUES (?1,?2,?3,?4) \
@@ -676,7 +795,14 @@ impl EntryStore {
     /// `refine.status()`: whether a refinement is scheduled for `session`.
     pub fn refine_pending(&self, session: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(conn.query_row("SELECT 1 FROM harness_pending_refine WHERE session = ?1", [session], |_| Ok(())).optional()?.is_some())
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM harness_pending_refine WHERE session = ?1",
+                [session],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Take (and clear) `session`'s pending refine request, if any, so the
@@ -684,12 +810,17 @@ impl EntryStore {
     pub fn take_pending_refine(&self, session: &str) -> Result<Option<(Option<String>, bool)>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let row = conn
-            .query_row("SELECT instructions, global FROM harness_pending_refine WHERE session = ?1", [session], |r| {
-                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)? != 0))
-            })
+            .query_row(
+                "SELECT instructions, global FROM harness_pending_refine WHERE session = ?1",
+                [session],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
             .optional()?;
         if row.is_some() {
-            conn.execute("DELETE FROM harness_pending_refine WHERE session = ?1", [session])?;
+            conn.execute(
+                "DELETE FROM harness_pending_refine WHERE session = ?1",
+                [session],
+            )?;
         }
         Ok(row)
     }
@@ -710,9 +841,19 @@ mod tests {
     #[test]
     fn crud_roundtrip() {
         let store = EntryStore::memory().unwrap();
-        let created = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let created = store
+            .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
+            .unwrap();
         assert_eq!(store.get(&created.id).unwrap().unwrap().content, "Content");
-        let updated = store.update(&created.id, EntryPatch { content: Some("New".into()), ..Default::default() }).unwrap();
+        let updated = store
+            .update(
+                &created.id,
+                EntryPatch {
+                    content: Some("New".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(updated.version, 2);
         assert_eq!(store.get(&created.id).unwrap().unwrap().content, "New");
         let deleted = store.delete(&created.id).unwrap();
@@ -723,8 +864,18 @@ mod tests {
     #[test]
     fn scope_resolution_local_overrides_global_by_path() {
         let store = EntryStore::memory().unwrap();
-        let g = store.create(entry(EntryKind::Prompt, Scope::Global, None)).unwrap();
-        store.update(&g.id, EntryPatch { content: Some("global rule".into()), ..Default::default() }).unwrap();
+        let g = store
+            .create(entry(EntryKind::Prompt, Scope::Global, None))
+            .unwrap();
+        store
+            .update(
+                &g.id,
+                EntryPatch {
+                    content: Some("global rule".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let visible_before = store.list_visible("s1", Some(EntryKind::Prompt)).unwrap();
         assert_eq!(visible_before.len(), 1);
         assert_eq!(visible_before[0].content, "global rule");
@@ -733,7 +884,11 @@ mod tests {
         local.content = "local override".into();
         store.create(local).unwrap();
         let visible_after = store.list_visible("s1", Some(EntryKind::Prompt)).unwrap();
-        assert_eq!(visible_after.len(), 1, "same path collapses to one, local wins");
+        assert_eq!(
+            visible_after.len(),
+            1,
+            "same path collapses to one, local wins"
+        );
         assert_eq!(visible_after[0].content, "local override");
 
         // A different session never sees another session's local entry.
@@ -751,36 +906,74 @@ mod tests {
             e.content = text.to_string();
             store.create(e).unwrap();
         }
-        assert_eq!(store.render_prompt("s1").unwrap(), "first\n\nsecond\n\nthird");
+        assert_eq!(
+            store.render_prompt("s1").unwrap(),
+            "first\n\nsecond\n\nthird"
+        );
     }
 
     #[test]
     fn promote_copies_local_entry_to_global_without_moving_it() {
         let store = EntryStore::memory().unwrap();
-        let local = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let local = store
+            .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
+            .unwrap();
         let global = store.promote(&local.id).unwrap();
         assert_ne!(global.id, local.id, "promotion copies, it does not move");
         assert_eq!(global.scope, Scope::Global);
-        assert!(store.get(&local.id).unwrap().is_some(), "the local copy still exists");
+        assert!(
+            store.get(&local.id).unwrap().is_some(),
+            "the local copy still exists"
+        );
     }
 
     #[test]
     fn rollback_restores_create_update_delete_exactly() {
         let store = EntryStore::memory().unwrap();
-        let created = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let created = store
+            .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
+            .unwrap();
         let cs1 = store
             .record_changeset(
-                Some("s1"), Scope::Local, "created", "r", "e",
-                &[AppliedEdit { action: Action::Create, id: created.id.clone(), before: None, after: Some(created.clone()) }],
-                None, "refine",
+                Some("s1"),
+                Scope::Local,
+                "created",
+                "r",
+                "e",
+                &[AppliedEdit {
+                    action: Action::Create,
+                    id: created.id.clone(),
+                    before: None,
+                    after: Some(created.clone()),
+                }],
+                None,
+                "refine",
             )
             .unwrap();
-        let updated = store.update(&created.id, EntryPatch { content: Some("v2".into()), ..Default::default() }).unwrap();
+        let updated = store
+            .update(
+                &created.id,
+                EntryPatch {
+                    content: Some("v2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let cs2 = store
             .record_changeset(
-                Some("s1"), Scope::Local, "updated", "r", "e",
-                &[AppliedEdit { action: Action::Update, id: created.id.clone(), before: Some(created.clone()), after: Some(updated) }],
-                None, "refine",
+                Some("s1"),
+                Scope::Local,
+                "updated",
+                "r",
+                "e",
+                &[AppliedEdit {
+                    action: Action::Update,
+                    id: created.id.clone(),
+                    before: Some(created.clone()),
+                    after: Some(updated),
+                }],
+                None,
+                "refine",
             )
             .unwrap();
 
@@ -800,13 +993,25 @@ mod tests {
     #[test]
     fn rollback_of_a_delete_recreates_the_entry_with_the_same_id() {
         let store = EntryStore::memory().unwrap();
-        let created = store.create(entry(EntryKind::Memory, Scope::Global, None)).unwrap();
+        let created = store
+            .create(entry(EntryKind::Memory, Scope::Global, None))
+            .unwrap();
         let deleted = store.delete(&created.id).unwrap();
         let cs = store
             .record_changeset(
-                None, Scope::Global, "deleted", "r", "e",
-                &[AppliedEdit { action: Action::Delete, id: created.id.clone(), before: Some(deleted), after: None }],
-                None, "refine",
+                None,
+                Scope::Global,
+                "deleted",
+                "r",
+                "e",
+                &[AppliedEdit {
+                    action: Action::Delete,
+                    id: created.id.clone(),
+                    before: Some(deleted),
+                    after: None,
+                }],
+                None,
+                "refine",
             )
             .unwrap();
         store.rollback(Some(&cs), None).unwrap();
@@ -819,14 +1024,21 @@ mod tests {
     fn schedule_refine_is_pending_until_taken_once() {
         let store = EntryStore::memory().unwrap();
         assert!(!store.refine_pending("s1").unwrap());
-        store.schedule_refine("s1", Some("be terser"), false).unwrap();
+        store
+            .schedule_refine("s1", Some("be terser"), false)
+            .unwrap();
         assert!(store.refine_pending("s1").unwrap());
         // A second schedule before turn-end just updates instructions.
-        store.schedule_refine("s1", Some("be terser and use Nim"), true).unwrap();
+        store
+            .schedule_refine("s1", Some("be terser and use Nim"), true)
+            .unwrap();
         let (instructions, global) = store.take_pending_refine("s1").unwrap().unwrap();
         assert_eq!(instructions.as_deref(), Some("be terser and use Nim"));
         assert!(global);
-        assert!(store.take_pending_refine("s1").unwrap().is_none(), "taken exactly once");
+        assert!(
+            store.take_pending_refine("s1").unwrap().is_none(),
+            "taken exactly once"
+        );
         assert!(!store.refine_pending("s1").unwrap());
     }
 
@@ -838,14 +1050,19 @@ mod tests {
         e.content = "Review diffs for correctness bugs.".into();
         store.create(e).unwrap();
         let resolved = store.resolve_subagent_spec("s1", "code reviewer").unwrap();
-        assert_eq!(resolved.unwrap().content, "Review diffs for correctness bugs.");
+        assert_eq!(
+            resolved.unwrap().content,
+            "Review diffs for correctness bugs."
+        );
         assert!(store.resolve_subagent_spec("s1", "nope").unwrap().is_none());
     }
 
     #[test]
     fn no_local_entry_leaks_into_another_session() {
         let store = EntryStore::memory().unwrap();
-        store.create(entry(EntryKind::Subagent, Scope::Local, Some("s1"))).unwrap();
+        store
+            .create(entry(EntryKind::Subagent, Scope::Local, Some("s1")))
+            .unwrap();
         assert_eq!(store.list_visible("s1", None).unwrap().len(), 1);
         assert_eq!(store.list_visible("s2", None).unwrap().len(), 0);
     }

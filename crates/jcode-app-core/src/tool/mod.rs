@@ -43,6 +43,11 @@ mod webfetch;
 mod websearch;
 mod write;
 
+/// Stop the session's persistent Python REPL when its chat is deleted.
+pub async fn stop_repl_session(session_id: &str) {
+    repl::stop_session(session_id).await;
+}
+
 use crate::compaction::CompactionManager;
 use crate::provider::Provider;
 use crate::skill::SkillRegistry;

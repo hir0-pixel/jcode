@@ -1,27 +1,17 @@
-//! Prime-style recursive REPL for the sovereign engine.
-//!
-//! Follows Prime Agent / Recursive Language Models (Zhang, Kraska, Khattab):
-//! large context lives in REPL variables instead of the prompt, and the model
-//! works over it with code and recursive `llm_query` calls. The interpreter is
-//! Pydantic Monty (a sandboxed Python subset in Rust), run in a separate,
-//! memory-capped worker process so a runaway snippet cannot take the engine
-//! down.
+//! Prime-style recursive REPL and continual harness for the sovereign engine.
+//! Rust owns provider and host calls; CPython runs in a sandboxed per-session
+//! worker using the Python runtime bundled with Hermes.
 
 pub mod agent_loop;
 pub mod agent_loop_host;
 pub mod entries;
 pub mod harness;
-pub mod learning;
 pub mod host;
+pub mod learning;
 pub mod refine;
-pub mod worker;
+mod worker;
 
 pub use host::{LlmQuery, ReplHost, RunOutput};
 
-/// Tool description shown to the model; kept short on purpose (every token
-/// here is paid on every request).
-pub const TOOL_DESCRIPTION: &str = "Persistent sandboxed Python REPL (Monty subset: no imports of os/sys, no network, no files). \
-Use it to work over large text without pasting it into the conversation: `text = load(\"path\")` reads a \
-workspace file into a variable, then slice/search it with code, and call `llm_query(prompt)` for a focused \
-sub-question on a chunk (max 16 host calls per run). Variables persist across calls in this session. \
-Returns print() output and the last expression's value.";
+/// Tool description shown to the model; kept short because it is sent on every request.
+pub const TOOL_DESCRIPTION: &str = "Persistent Python REPL with imports and session variables; `load(path)` reads workspace files and `llm_query(prompt)` asks a focused sub-question. Cells run in a macOS sandbox; other platforms require per-cell approval (headless sessions deny). Max 16 host calls per run. Returns print() output and the last expression's value.";

@@ -150,6 +150,7 @@ impl Agent {
         );
 
         self.append_continual_harness_addenda(&mut split);
+        self.append_repl_guidance(&mut split);
         self.append_current_turn_system_reminder(&mut split);
         crate::prompt::append_swarm_effort_directive(
             &mut split,
@@ -167,12 +168,18 @@ impl Agent {
     /// the same env var as the REPL and `refine` tool), and best-effort: any
     /// storage error here must never break prompt building.
     fn append_continual_harness_addenda(&self, split: &mut crate::prompt::SplitSystemPrompt) {
-        if std::env::var_os("SOVEREIGN_REPL_WORKER").is_none() {
+        if std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_none() {
             return;
         }
-        let Ok(home) = jcode_base::storage::jcode_dir() else { return };
-        let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(&home) else { return };
-        let Ok(addenda) = store.render_prompt(&self.session.id) else { return };
+        let Ok(home) = jcode_base::storage::jcode_dir() else {
+            return;
+        };
+        let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(&home) else {
+            return;
+        };
+        let Ok(addenda) = store.render_prompt(&self.session.id) else {
+            return;
+        };
         let addenda = addenda.trim();
         if addenda.is_empty() {
             return;
@@ -182,6 +189,18 @@ impl Agent {
         }
         split.static_part.push_str("# Continual Harness\n\n");
         split.static_part.push_str(addenda);
+    }
+
+    fn append_repl_guidance(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        if std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_none() {
+            return;
+        }
+        if !split.static_part.is_empty() {
+            split.static_part.push_str("\n\n");
+        }
+        split.static_part.push_str(
+            "# Recursive REPL\nTreat large context as a variable: load it, inspect it programmatically, and call llm_query only on focused chunks. Keep useful state in variables and use host functions for goals, refinement, subagents, messages, and heartbeat.\n",
+        );
     }
 
     /// Non-blocking memory prompt - takes pending result and spawns check for next turn
