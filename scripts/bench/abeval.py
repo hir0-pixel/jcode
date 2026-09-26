@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes toolperf A/B eval: stock Hermes vs Sovereign, same model, same tasks.
+"""Hermes toolperf benchmark: Hermes, Sovereign, and Prime, same tasks/model.
 
 Two arms on the SAME 9 trap tasks, imported (never copied) from hermes-agent's
 own harness at evals/toolperf_abeval/ab_eval.py:
@@ -10,11 +10,13 @@ own harness at evals/toolperf_abeval/ab_eval.py:
              Sovereign's one-shot endpoint: POST /api/agent/run
              {prompt, cwd, title, timeout_s} -> {ok, text, error, session_id,
              usage}.
+  prime      Prime Agent JSON mode, installed in a disposable /tmp clone; its
+             model provider points through the same counting proxy.
 
 Fairness rules:
   - Same TASKS dict, same make_sandbox(), same SUCCESS checks (all imported
     from hermes-agent, not reimplemented) for both arms.
-  - Every model call from BOTH arms is routed through the shared counting
+  - Every model call from all arms is routed through the shared counting
     proxy (scripts/sovereign-counting-proxy.mjs), so prompt/cached/completion
     tokens, dummy cost (scripts/lib/bench-prices.mjs's table, reimplemented
     here for Python) and wall time are measured identically regardless of
@@ -54,6 +56,7 @@ Environment (mirrors scripts/sovereign-vs-hermes-bench.mjs):
   BENCH_TURN_TIMEOUT_S  per-task timeout, seconds (default: 600)
   HERMES_VENV_PY   python inside hermes-agent's venv (default: <hermes-agent>/.venv/bin/python3)
   SOVEREIGN_BIN    sovereign engine binary (default: <engine>/target/release/sovereign)
+  PRIME_CLI        Prime Agent CLI bundle (default: /tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js)
 
 This script only BUILDS/verifies via --dry-run; it never starts Ollama or any
 model server itself (that is the caller's job, same as the existing mjs bench).
@@ -121,6 +124,7 @@ def cfg():
         "OUT": Path(os.environ.get("BENCH_OUT", str(ENGINE_ROOT / "bench-results" / "abeval"))),
         "HERMES_VENV_PY": os.environ.get("HERMES_VENV_PY", str(HERMES_ROOT / ".venv" / "bin" / "python3")),
         "SOVEREIGN_BIN": os.environ.get("SOVEREIGN_BIN", str(ENGINE_ROOT / "target" / "release" / "sovereign")),
+        "PRIME_CLI": os.environ.get("PRIME_CLI", "/tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js"),
         "PRICE_TABLE": os.environ.get("SOVEREIGN_PRICE_TABLE", str(ENGINE_ROOT / "scripts" / "sovereign-prices.json")),
     }
 
@@ -421,8 +425,61 @@ def run_sovereign_task(c, proxy, work, run_id, task_name, timeout_s):
     }, text, work
 
 
+# ---------------------------------------------------------------- Prime Agent arm
+def run_prime_task(c, proxy, work, run_id, task_name, timeout_s):
+    cli = Path(c["PRIME_CLI"])
+    if not cli.is_file():
+        raise RuntimeError(f"Prime CLI missing at {cli}; shallow-clone and build it under /tmp")
+    home = work / "home"
+    agent_dir = home / ".prime" / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "models.json").write_text(json.dumps({"providers": {"bench": {
+        "baseUrl": f'http://{c["PROXY"]}{c["PROXY_PATH"]}',
+        "api": "openai-completions",
+        "apiKey": c["API_KEY"],
+        "models": [{"id": c["MODEL"], "contextWindow": c["NUM_CTX"], "maxTokens": 4096}],
+    }}}), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not any(s in k for s in ("API_KEY", "TOKEN", "SECRET"))}
+    env.update({"HOME": str(home), "PRIME_AGENT_CODING_AGENT_DIR": str(agent_dir)})
+    proxy.tag(run_id)
+    prompt = TASKS[task_name].replace("{WORK}", str(work))
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            ["node", str(cli), "--mode", "rpc", "--provider", "bench", "--model", c["MODEL"],
+             "--cwd", str(work), "--daemon-socket", str(work / "prime-daemon.sock"),
+             "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-context-files"],
+            input=json.dumps({"type": "prompt", "message": prompt}) + "\n",
+            cwd=str(work), env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout_s,
+        )
+        raw, rc = proc.stdout or "", proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        raw, rc = (exc.stdout or ""), -9
+    lines = raw.splitlines()
+    text_parts, tool_calls, tool_errors = [], 0, 0
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if event.get("type") == "message_end":
+            message = event.get("message", {})
+            if message.get("role") == "assistant":
+                text_parts.extend(block.get("text", "") for block in message.get("content", []) if block.get("type") == "text")
+        elif event.get("type") == "tool_execution_end":
+            tool_calls += 1
+            tool_errors += int(bool(event.get("isError")))
+    output = "\n".join(text_parts) or raw
+    return {
+        "ok": rc == 0, "exit": rc, "tail": output[-2000:],
+        "wall_s": round(time.time() - started, 1),
+        "tool_calls": tool_calls, "tool_errors": tool_errors,
+    }, output, work
+
+
 # ---------------------------------------------------------------- run / report
-ARM_RUNNERS = {"hermes": run_hermes_task, "sovereign": run_sovereign_task}
+ARM_RUNNERS = {"hermes": run_hermes_task, "sovereign": run_sovereign_task, "prime": run_prime_task}
 
 
 def do_run(c, arm, reps, only):

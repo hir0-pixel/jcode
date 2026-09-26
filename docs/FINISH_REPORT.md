@@ -40,3 +40,20 @@ Part 2 has not passed its green-suite requirement. The full-suite logs are in `/
 Verification: `cargo check -p sovereign-prime -p jcode-app-core -p sovereign-gateway --tests --offline` passed with two existing gateway dead-code warnings. Bundled-CPython integration tests passed 9/9, including persistence, stdlib/package imports, `load`, recursive `llm_query`, host-call cap, project/network restrictions, timeout recovery, and RSS kill. These tests required the documented local-only escalation because macOS sandbox-exec cannot run inside the default restricted sandbox.
 
 Remaining acceptance gaps: the user-requested Prime skill packages have not been ported; the kernel bridge still lacks proven async result-await semantics for spawned agents and full read/send/list message parity; the compact model-facing messaging tool/token count is unverified; no reattach live e2e exists; no p50/p95 budget bench exists for cold start, warm REPL, or Rust dispatch; no measured token comparison against 7,744; and `crates/sovereign-gateway/e2e/prime-parity.mjs` is absent. Therefore Prime Part 3 is not complete and must not be treated as shipped parity. The requested all-done status in `docs/PRIME_PARITY.md` is deliberately not asserted.
+
+## Part 4: Prime paper components and benchmark arm
+
+The paper audit finds no per-component numeric ablation table: its conclusion explicitly says targeted training on RLM and Continual Harness is still needed to isolate their contributions. The reported system-level ARC-AGI-3 result is RHAE Best@1 30% to 95.5%; it is not a causal estimate for any individual component. Other reported findings include competitive long-context scores, no material final-record effect from harness choice in the noisy multi-day nanoGPT comparison, and lower token usage in the Prime runs. These figures are not reproduced here. Source: [Prime Agent paper, arXiv:2608.23552v1](https://arxiv.org/html/2608.23552v1).
+
+| Paper component credited as part of the harness | Contribution isolated by paper | Akira status at this checkpoint |
+|---|---:|---|
+| Persistent Python RLM, variables, programmatic context and recursive subcalls | Not isolated | CPython base committed; cold/warm latency budget and child-await parity missing |
+| Continual Harness: typed prompts, memories, skills and subagent specs; versioning/refinement/rollback | Not isolated | Rust harness exists; executable Prime skill packages and some bridges missing |
+| Recursive subagents and direct agent messaging | Not isolated | Native delegate/communication exists; model-facing compact send/read/list and live pair test missing |
+| Long-lived daemon sessions, detach/reattach and recovery | Not isolated | Engine recovery paths exist; requested combined continuity e2e missing |
+| Standard execution, verification, termination and resource accounting | Not isolated | Rust observability/replay/control paths exist; Prime-style full accounting parity unverified |
+| Autonomous mode, goals and heartbeats | Not isolated | Rust endpoints exist; full Prime control semantics unverified |
+
+Added the `prime` arm to `scripts/bench/abeval.py`; it uses the same imported 9 tasks, success checks, counting proxy, task timeout and per-run throwaway home, invoking Prime's documented RPC mode with a unique daemon socket. The Prime shallow clone at `/tmp/prime-agent` installed 430 packages in its disposable `node_modules` and built the CLI successfully. A direct Prime RPC smoke test reached local Ollama with no login and returned `prime-local-ok`. The benchmark runner's first task did not issue a counting-proxy request and remained active until interrupted; therefore full arm integration is **not verified**. The arm is prepared but requires debugging before benchmark use. Prime's initial no-custom-socket attempt returned `supervisor_generation_stale`; unique socket resolved that failure for the direct RPC smoke.
+
+`python3 -m py_compile scripts/bench/abeval.py` passed when directing bytecode to `/private/tmp/akira-pycache`; the default sandbox blocks Python's global cache path. `abeval.py --dry-run` lists all three arms and nine shared tasks.
