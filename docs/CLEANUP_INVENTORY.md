@@ -137,18 +137,20 @@ listed reachability audit is complete.
 | `docs/benchmark-runs/2026-09-24T12-41-44` | Older archived benchmark run | Directory mtime `2026-09-24 17:43:31`, predates retained newest run. Deleted as requested. | delete | 5 |
 | `docs/plans/MCP_SKILLS_PLAN.md` | Completed dynamic skills/MCP implementation proposal with stale “No MCP support” status | Current `crates/jcode-app-core/src/mcp/` and `mcp_tools` implementation plus `server.rs` MCP pool lifecycle implement MCP support; the plan states the opposite and is not current system documentation. Delete the stale plan. | delete | 5 |
 | Other `docs/plans/**`, other `docs/*_PROMPT.md` | Plans and remaining task prompts | Multiple plans are active proposals or preserved implementation history; `MEMORY_GRAPH_PLAN.md` reflects an architecture concern. Keep pending per-file status/evidence audit. `CLEANUP_CODEX_PROMPT.md` is active; `BENCH_CODEX_PROMPT.md` is explicit keep. | keep: unsure per-file audit needed | 5 |
-| Engine `target/**` | Generated Rust build output | `du` reports 73 GB; `cargo clean` and a fresh release build are explicitly required only after source gates pass. Current release build fails at baseline. | keep: unsure until final clean/build | 6 |
-| `hermes-agent/apps/desktop/release/**`, old stage/build output | Packaged/test output | Need identify and preserve the current packaged app; no release-directory inventory completed. | keep: unsure | 6 |
-| `/private/tmp/hermes-baseline`, `/private/tmp/hermes-tip`, `/tmp/sov-bench`, `/tmp/prime-agent`, `/tmp/evestack`, other stale clones/worktrees | Temporary clones, outputs and worktrees | `git worktree list` showed only each repository’s primary checkout. No removable stale worktree was found. Files under `/private/tmp` were not removed; exact ownership/freshness audit remains. | keep: unsure | 6 |
+| Engine `target/**` | Generated Rust build output | Required shared target was cleaned after source gates; 244,390 files / 77.7 GiB removed, then one fresh release binary built. | retain current build output; cleanup complete | 6 |
+| `hermes-agent/apps/desktop/release/**`, old stage/build output | Current packaged app plus generated/test outputs | Enumerated direct release children. Kept only current `release/mac-arm64/Hermes.app`; removed stale e2e folders, archives, installer outputs and regenerated `build/` and `dist/` after pack. | delete stale outputs; keep current app | 6 |
+| `/private/tmp/hermes-baseline`, `/private/tmp/hermes-tip`, `/tmp/sov-bench`, `/tmp/prime-agent`, `/tmp/evestack`, other stale clones/worktrees | Temporary clones, outputs and worktrees | `git worktree list` showed only each repository’s primary checkout. `/private/tmp/prime-agent` (32 MB), `/private/tmp/evestack` (13 MB), benchmark raw temp directories and copied package cache (114 MB) were removed. No `hermes-baseline`, `hermes-tip`, or `sov-bench` existed at those paths. | delete identified stale outputs; no stale worktrees found | 6 |
 
 ## Next proof required
 
-1. Finish candidate-level graph traces and `check_index_coverage` checks; use
-   source searches for non-indexed files and literal configuration.
-2. Expand this register to concrete paths, commands, and one verdict per
-   candidate before each further deletion batch.
-3. Audit desktop RPC/REST calls and Python forwarding before deleting either
-   area.
+1. Remaining self-update/install/self-dev/pairing/daemon flows and workspace
+   crate closures still need candidate-level proof; retain them until that
+   audit and compiler trial are complete.
+2. The full Hermes desktop RPC/REST inventory and Python import closure are
+   incomplete; retain route code and duplicate Python modules until those are
+   mapped to product callers.
+3. Full workspace tests and packaged cron-idle e2e remain failed as recorded in
+   Phase 3; investigate those failures before calling the cleanup fully green.
 
 ## Tracked Rust source lines by workspace crate
 
