@@ -75,7 +75,7 @@ async fn memory_cli_project_import_fails_without_durable_project_store() {
 }
 
 #[tokio::test]
-async fn memory_cli_semantic_requires_jev_but_keyword_search_remains_local() {
+async fn memory_cli_ranked_search_remains_local_without_jev_credentials() {
     let _guard = crate::storage::lock_test_env();
     let keys = [
         "JCODE_HOME",
@@ -115,11 +115,9 @@ async fn memory_cli_semantic_requires_jev_but_keyword_search_remains_local() {
     run_memory_command_for_dir(command(false), Some(project.clone()))
         .await
         .expect("local keyword search must remain available without credentials");
-    let error = run_memory_command_for_dir(command(true), Some(project))
+    run_memory_command_for_dir(command(true), Some(project))
         .await
-        .expect_err("--semantic must report missing Jev access, not silently use embeddings");
-    assert!(error.to_string().contains("Jev memory search failed"));
-    assert!(!format!("{error:#}").contains("cli-jev-probe"));
+        .expect("ranked FTS recall is local and must not require Jev credentials");
 
     // Scope still comes from the explicit directory, never the process cwd.
     run_memory_command_for_dir(command(true), Some(temp.path().join("empty-project")))
