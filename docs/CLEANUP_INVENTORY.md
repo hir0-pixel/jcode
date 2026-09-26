@@ -1,6 +1,6 @@
 # Sovereign cleanup inventory
 
-Status: baseline complete; deletion batches 1–5 recorded. Route verification, remaining candidate trials, phase 3 gates, and phase 4 disk work remain in progress.
+Status: source deletion batches 1–5 recorded; batch 6 disk cleanup completed. Phase 3 found two environment/product gate failures recorded below. Remaining uncertain candidates stay retained.
 
 ## Baseline (2026-09-26)
 
@@ -10,13 +10,13 @@ Both repositories were clean before work. Engine HEAD: `295a74fce` on
 | Area / measurement | Before |
 | --- | ---: |
 | Rust tracked source, workspace crates | 681,352 lines / 1,200 files |
-| Rust tracked source, root engine | 32,144 lines / 52 files |
+| Rust tracked source, root engine `src/` | 32,144 lines / 52 files |
 | `jcode-tui` | 214,658 lines |
 | `jcode-app-core` | 143,155 lines |
 | `jcode-base` | 121,099 lines |
 | `sovereign-gateway` | 7,390 lines |
 | `sovereign-prime` | 4,061 lines |
-| Hermes desktop tracked JS/TS source | 644,761 lines / 2,903 files |
+| Hermes desktop tracked JS/TS source | 644,305 lines / 2,899 files (uniform git-blob count) |
 | Hermes shared tracked JS/TS source | 11,150 lines / 40 files |
 | Hermes Python agent / gateway / CLI / cron | 125,052 / 93,801 / 235,787 / 16,969 lines |
 | Engine repository / shared `target` | 74 GB / 73 GB (rounded by `du`) |
@@ -29,6 +29,24 @@ Both repositories were clean before work. Engine HEAD: `295a74fce` on
 | Live plain-task first-turn prompt | 8,860 Sovereign; 14,462 stock Hermes |
 | Live plain-task runs / correctness | 1 each; all 4 turns passed |
 | Live model / task / idle interval | local `sovereign/bench-hermes-64k:latest`, `plain`, 20 seconds |
+
+After measurements before final disk clean (2026-09-26):
+
+| Area / measurement | After current source batches |
+| --- | ---: |
+| Rust workspace crates | 672,889 lines / 83 crates (same tracked `.rs` blob method as baseline) |
+| Root engine `src/` | 30,174 lines / 49 files |
+| Hermes desktop JS/TS | 644,308 lines / 2,899 files |
+| Hermes shared JS/TS | 11,150 lines / 40 files |
+| Hermes Python agent / gateway / CLI / cron | 125,052 / 93,801 / 235,787 / 16,969 lines (unchanged) |
+| `target/release/sovereign` | 110 MB |
+| Engine repo / shared `target` | 75 GB / 75 GB before final clean |
+| Hermes repo | 4.7 GB before release-output cleanup |
+| Live plain-task tool schema | 7,744 Sovereign; 10,664 Hermes tokens/call (unchanged) |
+| Engine idle / post-session / peak RSS | 36,912 / 45,680 / 48,016 KiB (36.1 / 44.6 / 46.9 MiB) |
+| Python idle / post-session / peak RSS | 161,648 / 252,640 / 279,936 KiB (157.9 / 246.7 / 273.4 MiB) |
+| Plain-task correctness | Both products passed 2/2 turns |
+| Final clean build / pack time and post-clean disk | Fresh release build passed (about 8 minutes); pack passed (about 25 seconds); engine repo / shared target 4.9 / 4.4 GB, Hermes repo 2.9 GB |
 
 Baseline gates:
 
@@ -54,6 +72,28 @@ benchmark used temporary homes under `/private/tmp` and did not read or write
 real `.jcode` or `.hermes` homes. RSS was sampled by the benchmark's `ps -axo`
 process-tree measurement while each temporary backend ran. Raw benchmark files
 are under `/private/tmp/sov-cleanup-baseline`.
+
+## Current full-gate evidence (Phase 3)
+
+| Gate | Result |
+| --- | --- |
+| `cargo check --workspace --tests` | Pass after latest source batches; 11 baseline warnings, no new warnings. |
+| `cargo test -p sovereign-gateway -p sovereign-prime` | Pass: gateway 39 passed / 1 ignored, contract 5 passed, Prime 33 passed and REPL 8 passed (85 passed / 2 ignored total). |
+| `cargo build --release --bin sovereign` | Pass; latest binary 110 MB. |
+| Desktop `npx tsc --noEmit -p .` | Pass, no TypeScript errors. |
+| Full `cargo test --workspace` | Failed in `jcode` lib: 241 passed / 29 failed. Failures include macOS `system-configuration` panic `Attempted to create a NULL object.` and local socket bind `Operation not permitted`; Cargo stopped at `-p jcode --lib`, so not every workspace crate test ran. Test homes were `/private/tmp/sov-cleanup-test-*`; real homes were untouched. |
+| Gateway live e2e | Pass 7/7: `sessions.mjs`, `learning.mjs`, `refine.mjs`, `agent-loop.mjs`, `agent-run.mjs`, `accounting.mjs`, `replay.mjs`; local model `sovereign/bench-hermes-64k:latest`. |
+| Hermes Python `serve` | Pass: staged Python 3.12 server started on loopback with isolated `HOME`, `HERMES_HOME`, `JCODE_HOME`; one authenticated forwarded JSON-RPC `agents.list` returned `result.processes=[]`. |
+| Forwarded Python REST spot-check | 20 namespaces sampled. 19 returned HTTP 200; `actions` returned the expected 404 for a nonexistent action name, confirming the route handler responds. Requests were local, read-only except browser's deliberately unknown action (no browser action executed). |
+| Packaged desktop e2e | `sovereign-install-launch.mjs` pass (one Sovereign, Python starts for Cron and stops after closing); `sovereign-packaged-chat-approval.mjs` pass (authorized local model, approval writes only inside temp sandbox). |
+| Packaged cron-due e2e | Fail: the one-shot agent cron executed and completed, but bundled Python remained running beyond the configured 180-second hold cap. The e2e now waits through that configured cap; the failure remains. |
+| Python staging | Pass using the already-present managed 3.12.12 runtime and package cache copied to `/private/tmp`; no download. The initial default staging attempt stopped at uv cache permission before installation. |
+| Desktop pack | Pass: current `release/mac-arm64/Hermes.app` produced. |
+| `python3 scripts/parity.py` | Pass; generated map still reports 235 RPC methods (51 Rust, 19 placeholders, 165 Python-forwarded) and 264 Hermes HTTP routes (28 Rust, 8 refused, 228 forwarded). Rust-only learning/observability desktop paths are separately inventoried above. |
+| Phase 4 stale worktrees | `git worktree list` showed only each primary checkout; no stale managed worktrees remained to remove. |
+| Phase 4 release/build outputs | Removed old e2e outputs (`sovereign-chat`, `sovereign-install`, `sovereign-orphan`, `sovereign-apikey`, `sovereign-cron-due`), old ZIP/DMG/blockmap and Windows package outputs; retained the newly packed `release/mac-arm64/Hermes.app` (902 MB). Removed generated desktop `build/` and `dist/` after packing. Removed `/private/tmp/evestack` (13 MB), `/private/tmp/prime-agent` (32 MB), temporary copied Python packages (114 MB), and benchmark raw temp directories. |
+| Phase 4 target cleanup | `cargo clean` removed 244,390 files / 77.7 GiB from the required shared target. One fresh release build passed; final target is 4.4 GB. Net target reduction from the pre-clean 75 GB measurement is about 70.6 GB; `du` rounds values. |
+| Phase 4 final disk | Engine repo 4.9 GB (target 4.4 GB); Hermes repo 2.9 GB. Previous measurements were 75 GB and 4.7 GB respectively. Desktop release folder now contains only the current packaged app. |
 
 ## Candidate register
 
@@ -109,3 +149,93 @@ listed reachability audit is complete.
    candidate before each further deletion batch.
 3. Audit desktop RPC/REST calls and Python forwarding before deleting either
    area.
+
+## Tracked Rust source lines by workspace crate
+
+Counts use every tracked `.rs` blob in the baseline commit and current HEAD, grouped by `crates/<package>/`; the `root package` row contains non-`crates/` Rust. This is the full workspace comparison.
+
+| Crate/package | Before | After |
+| --- | ---: | ---: |
+| jcode-agent-runtime | 283 | 283 |
+| jcode-ambient-types | 32 | 32 |
+| jcode-app-core | 143155 | 136033 |
+| jcode-auth-types | 180 | 180 |
+| jcode-azure-auth | 8 | 8 |
+| jcode-background-types | 201 | 201 |
+| jcode-base | 121099 | 119763 |
+| jcode-batch-types | 37 | 37 |
+| jcode-build-meta | 457 | 457 |
+| jcode-build-support | 3371 | 3371 |
+| jcode-command-risk | 2542 | 2542 |
+| jcode-compaction-core | 1042 | 1042 |
+| jcode-config-types | 2608 | 2608 |
+| jcode-core | 2216 | 2216 |
+| jcode-embedding | 702 | 702 |
+| jcode-fuzzy | 833 | 833 |
+| jcode-gateway-types | 19 | 19 |
+| jcode-harness-api | 3166 | 3166 |
+| jcode-harness-api-server | 8573 | 8573 |
+| jcode-import-core | 2833 | 2833 |
+| jcode-logging | 1265 | 1265 |
+| jcode-memory-types | 1975 | 1975 |
+| jcode-message-types | 1010 | 1010 |
+| jcode-notify-email | 529 | 529 |
+| jcode-overnight-core | 1471 | 1471 |
+| jcode-pdf | 51 | 51 |
+| jcode-plan | 5806 | 5806 |
+| jcode-productivity-core | 1736 | 1736 |
+| jcode-protocol | 5624 | 5624 |
+| jcode-provider-anthropic | 1649 | 1649 |
+| jcode-provider-anthropic-runtime | 5452 | 5452 |
+| jcode-provider-antigravity | 580 | 580 |
+| jcode-provider-antigravity-runtime | 1622 | 1622 |
+| jcode-provider-bedrock | 1937 | 1937 |
+| jcode-provider-copilot | 313 | 313 |
+| jcode-provider-copilot-runtime | 1957 | 1957 |
+| jcode-provider-core | 8245 | 8245 |
+| jcode-provider-cursor-runtime | 1303 | 1303 |
+| jcode-provider-doctor | 6785 | 6785 |
+| jcode-provider-env | 408 | 408 |
+| jcode-provider-gemini | 804 | 804 |
+| jcode-provider-gemini-runtime | 2997 | 2997 |
+| jcode-provider-grok-build-runtime | 369 | 369 |
+| jcode-provider-metadata | 2107 | 2107 |
+| jcode-provider-openai | 3018 | 3018 |
+| jcode-provider-openai-runtime | 10488 | 10488 |
+| jcode-provider-openrouter | 2872 | 2872 |
+| jcode-provider-openrouter-runtime | 9272 | 9272 |
+| jcode-render-core | 4532 | 4532 |
+| jcode-schema-dialect | 2657 | 2657 |
+| jcode-sdk | 9258 | 9258 |
+| jcode-selfdev-types | 281 | 281 |
+| jcode-session-types | 1117 | 1117 |
+| jcode-setup-hints | 11132 | 11132 |
+| jcode-side-panel-types | 102 | 102 |
+| jcode-storage | 1340 | 1340 |
+| jcode-swarm-core | 846 | 846 |
+| jcode-task-types | 853 | 853 |
+| jcode-terminal-image | 759 | 759 |
+| jcode-terminal-launch | 1730 | 1730 |
+| jcode-tool-core | 330 | 330 |
+| jcode-tool-types | 151 | 151 |
+| jcode-transport | 589 | 589 |
+| jcode-tui | 214658 | 214653 |
+| jcode-tui-account-picker | 1607 | 1607 |
+| jcode-tui-anim | 1131 | 1131 |
+| jcode-tui-core | 3241 | 3241 |
+| jcode-tui-markdown | 9847 | 9847 |
+| jcode-tui-mermaid | 11452 | 11452 |
+| jcode-tui-messages | 1139 | 1139 |
+| jcode-tui-permissions | 866 | 866 |
+| jcode-tui-render | 5590 | 5590 |
+| jcode-tui-session-picker | 295 | 295 |
+| jcode-tui-style | 5283 | 5283 |
+| jcode-tui-tool-display | 255 | 255 |
+| jcode-tui-usage-overlay | 928 | 928 |
+| jcode-tui-visual-debug | 857 | 857 |
+| jcode-tui-workspace | 1228 | 1228 |
+| jcode-update-core | 622 | 622 |
+| jcode-usage-types | 223 | 223 |
+| root package | 40947 | 38977 |
+| sovereign-gateway | 7390 | 7390 |
+| sovereign-prime | 4061 | 4061 |
