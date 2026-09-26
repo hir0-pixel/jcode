@@ -141,6 +141,7 @@ export type ApiRequest =
   | { req: "restore_session"; session_id: string }
   | { req: "set_retention_policy"; archive_after_days?: number }
   | { req: "create_session"; working_dir?: string; system_prompt?: string }
+  | { req: "set_working_dir"; session_id: string; working_dir: string }
   | { req: "attach_session"; session_id: string }
   | { req: "fork_session"; session_id: string }
   | { req: "detach_session"; session_id: string }
@@ -407,6 +408,7 @@ export const KNOWN_REQUEST_KINDS = [
   "restore_session",
   "set_retention_policy",
   "create_session",
+  "set_working_dir",
   "attach_session",
   "fork_session",
   "detach_session",
