@@ -2,7 +2,6 @@
 //! Hermes desktop can launch it exactly as it launches `hermes serve`:
 //!
 //!   sovereign [--profile P] serve --host H --port N   →  jcode gateway --host H --port N
-//!   sovereign [--profile P] dashboard --no-open ...   →  same (legacy spelling)
 //!
 //! Anything else passes through unchanged, so `sovereign login` etc. still work.
 
@@ -18,7 +17,7 @@ static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
 fn translate(args: Vec<String>) -> Vec<String> {
     let mut out = vec!["sovereign".to_string()];
-    let mut rest = args.into_iter().peekable();
+    let mut rest = args.into_iter();
     let mut profile_skipped = false;
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -28,12 +27,6 @@ fn translate(args: Vec<String>) -> Vec<String> {
                 profile_skipped = true;
             }
             "serve" => out.push("gateway".into()),
-            "dashboard" => {
-                out.push("gateway".into());
-                if rest.peek().map(String::as_str) == Some("--no-open") {
-                    rest.next();
-                }
-            }
             _ => out.push(arg),
         }
     }
@@ -183,7 +176,6 @@ mod tests {
             t(&["--profile", "work", "serve", "--host", "127.0.0.1", "--port", "0"]),
             ["sovereign", "gateway", "--host", "127.0.0.1", "--port", "0"]
         );
-        assert_eq!(t(&["dashboard", "--no-open", "--port", "0"]), ["sovereign", "gateway", "--port", "0"]);
     }
 
     #[test]
