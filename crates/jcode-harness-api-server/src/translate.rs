@@ -339,6 +339,7 @@ impl BridgeState {
                             | "invalidate_openai_usage"
                             | "invalidate_anthropic_usage"
                             | "rename_session"
+                            | "set_working_dir"
                     )
                 )
                 && let Some(id) = value["id"].as_u64()
@@ -1114,6 +1115,13 @@ impl BridgeState {
                     rename["title"] = json!(title);
                 }
                 vec![Outbound::Legacy(rename)]
+            }
+            "set_working_dir" => {
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                vec![Outbound::Legacy(json!({
+                    "type": "set_working_dir", "id": id, "working_dir": request["working_dir"]
+                }))]
             }
             "rewind_undo" => {
                 let id = self.legacy_id();

@@ -21,6 +21,24 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const QUEUE: usize = 1024;
 const BATCH: usize = 128;
 const CONTENT_LIMIT: usize = 4096;
+const REPLAY_EVENTS: usize = 512;
+const REPLAY_SESSIONS: usize = 64;
+const REPLAY_SESSION_BYTES: usize = 4 * 1024 * 1024;
+const REPLAY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct ReplaySession {
+    seq: u64,
+    evicted_through: u64,
+    bytes: usize,
+    events: VecDeque<(Value, usize)>,
+}
+
+#[derive(Default)]
+struct ReplayState {
+    sessions: HashMap<String, ReplaySession>,
+    bytes: usize,
+}
 
 pub(crate) fn now() -> i64 {
     SystemTime::now()
@@ -135,6 +153,8 @@ pub struct Observer {
     home: std::path::PathBuf,
     alert_tx: Option<SyncSender<Value>>,
     sessions: Mutex<HashMap<String, Active>>,
+    replay: Mutex<ReplayState>,
+    replay_epoch: String,
 }
 
 impl Observer {
@@ -176,6 +196,8 @@ impl Observer {
             home: home.to_path_buf(),
             alert_tx: alert_tx.clone(),
             sessions: Mutex::new(HashMap::new()),
+            replay: Mutex::new(ReplayState::default()),
+            replay_epoch: format!("{}-{}", std::process::id(), now()),
         });
         let weak = Arc::downgrade(&observer);
         jcode_app_core::tool::set_aux_model_observer(Some(Arc::new(move |title, session, provider, model, started, usage, error| {
@@ -539,6 +561,76 @@ impl Observer {
             "error" => active.error = payload["message"].as_str().map(capped),
             _ => {}
         }
+    }
+
+    pub fn replay_event(&self, mut params: Value) -> Value {
+        let sid = params["session_id"].as_str().unwrap_or_default().to_string();
+        if sid.is_empty() { return params; }
+        let size = params.to_string().len();
+        let mut replay = self.replay.lock().unwrap();
+        let seq = {
+            let event = replay.sessions.entry(sid.clone()).or_default();
+            event.seq += 1;
+            event.seq
+        };
+        while replay.sessions.len() > REPLAY_SESSIONS {
+            let oldest = replay.sessions.keys().find(|id| **id != sid).cloned();
+            let Some(oldest) = oldest else { break };
+            replay.bytes -= replay.sessions.remove(&oldest).map_or(0, |entry| entry.bytes);
+        }
+        let event = replay.sessions.get_mut(&sid).unwrap();
+        params["seq"] = json!(seq);
+        if size <= REPLAY_SESSION_BYTES && size <= REPLAY_TOTAL_BYTES {
+            event.bytes += size;
+            replay.bytes += size;
+            replay.sessions.get_mut(&sid).unwrap().events.push_back((params.clone(), size));
+            while replay.sessions[&sid].events.len() > REPLAY_EVENTS || replay.sessions[&sid].bytes > REPLAY_SESSION_BYTES {
+                let (removed, bytes) = replay.sessions.get_mut(&sid).unwrap().events.pop_front().unwrap();
+                replay.sessions.get_mut(&sid).unwrap().bytes -= bytes;
+                replay.bytes -= bytes;
+                replay.sessions.get_mut(&sid).unwrap().evicted_through = removed["seq"].as_u64().unwrap_or(0);
+            }
+            while replay.bytes > REPLAY_TOTAL_BYTES {
+                let oldest = replay.sessions.iter().find(|(_, entry)| !entry.events.is_empty()).map(|(id, _)| id.clone());
+                let Some(oldest) = oldest else { break };
+                let entry = replay.sessions.get_mut(&oldest).unwrap();
+                let (removed, bytes) = entry.events.pop_front().unwrap();
+                entry.bytes -= bytes;
+                entry.evicted_through = removed["seq"].as_u64().unwrap_or(0);
+                replay.bytes -= bytes;
+            }
+        } else {
+            replay.sessions.get_mut(&sid).unwrap().evicted_through = seq;
+        }
+        params["epoch"] = json!(self.replay_epoch);
+        params
+    }
+
+    pub fn replay_since(&self, sid: &str, last_seen: u64) -> (Vec<Value>, u64, bool, String) {
+        let replay = self.replay.lock().unwrap();
+        let entry = replay.sessions.get(sid);
+        let Some(entry) = entry else { return (Vec::new(), 0, false, self.replay_epoch.clone()); };
+        let events = entry.events.iter().filter(|(event, _)| event["seq"].as_u64().unwrap_or(0) > last_seen).map(|(event, _)| event.clone()).collect();
+        (events, entry.seq, last_seen < entry.evicted_through, self.replay_epoch.clone())
+    }
+
+    pub fn replay_stats(&self) -> Value {
+        let replay = self.replay.lock().unwrap();
+        json!({
+            "sessions": replay.sessions.len(),
+            "events": replay.sessions.values().map(|entry| entry.events.len()).sum::<usize>(),
+            "bytes": replay.bytes,
+            "max_per_session": REPLAY_EVENTS,
+            "max_bytes_per_session": REPLAY_SESSION_BYTES,
+            "max_bytes_process": REPLAY_TOTAL_BYTES,
+        })
+    }
+
+    pub fn metered_usage(&self) -> rusqlite::Result<(f64, u64)> {
+        let db = self.read_db.lock().unwrap();
+        db.query_row("SELECT COALESCE(SUM(cost_usd), 0), COUNT(cost_usd) FROM obs_runs", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
     }
 
     pub fn harness_event(&self, frame: &Value) {
@@ -1227,6 +1319,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replays_sequenced_events_and_reports_eviction() {
+        let dir = std::env::temp_dir().join(format!("sovereign-replay-{}", now()));
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        let mut latest = Value::Null;
+        for i in 0..=REPLAY_EVENTS {
+            latest = observer.replay_event(json!({"session_id":"s","type":"message.delta","payload":{"i":i}}));
+        }
+        assert_eq!(latest["seq"], REPLAY_EVENTS as u64 + 1);
+        let (events, seq, truncated, epoch) = observer.replay_since("s", 0);
+        assert_eq!(seq, REPLAY_EVENTS as u64 + 1);
+        assert!(truncated);
+        assert_eq!(events.len(), REPLAY_EVENTS);
+        assert_eq!(events[0]["seq"], 2);
+        assert!(!epoch.is_empty());
+        assert_eq!(observer.replay_stats()["events"], REPLAY_EVENTS);
+        drop(observer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn imports_the_old_ledger_once() {
         let dir = std::env::temp_dir().join(format!("sovereign-observability-import-{}", now()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1436,6 +1548,8 @@ mod tests {
             home: std::env::temp_dir(),
             alert_tx: None,
             sessions: Mutex::new(HashMap::new()),
+            replay: Mutex::new(ReplayState::default()),
+            replay_epoch: "test".into(),
         };
 
         observer.harness_event(&json!({"ev":"model_info","session_id":"s","provider":"openai","model":"gpt-5.4"}));

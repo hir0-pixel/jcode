@@ -23,13 +23,11 @@ HERMES = Path(sys.argv[1] if len(sys.argv) > 1 else ENGINE.parent / "hermes-agen
 
 # Answered honestly as "off / empty" until the named module is built.
 PLACEHOLDER = {
-    "free_tier.status", "wake.status", "pet.info", "projects.tree",
-    "process.list", "profiles.list", "session.active_list",
+    "session.events.since", "session.events.stats",
     # Chat-bound but not built yet: refused by the engine, never forwarded
     # (Python's store has never seen these sessions).
-    "session.events.since", "session.events.stats", "session.cwd.set",
-    "session.workspace.move", "session.context_breakdown", "session.foreign.import",
-    "session.foreign.list", "session.foreign.preview",
+    "session.cwd.set", "session.workspace.move", "session.context_breakdown",
+    "session.foreign.import", "session.foreign.list", "session.foreign.preview",
     # Hosted-subscription bars (not applicable) and messaging handoff (M4).
     "usage.bars", "handoff.request", "handoff.state", "handoff.fail",
 }

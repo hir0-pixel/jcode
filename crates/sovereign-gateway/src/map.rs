@@ -14,7 +14,6 @@ pub struct SessionState {
     pub model: Option<String>,
     turn: Turn,
     usage: Usage,
-    seq: u64,
 }
 
 #[derive(Default)]
@@ -77,11 +76,6 @@ struct Usage {
 }
 
 impl SessionState {
-    pub fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
-    }
-
     pub fn turn_active(&self) -> bool {
         self.turn.started
     }

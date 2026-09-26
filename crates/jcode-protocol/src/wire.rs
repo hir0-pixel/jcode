@@ -376,6 +376,10 @@ pub enum Request {
         label: Option<String>,
     },
 
+    /// Change and persist the active session's working directory.
+    #[serde(rename = "set_working_dir")]
+    SetWorkingDir { id: u64, working_dir: String },
+
     /// Split the current session — clone conversation into a new session
     #[serde(rename = "split")]
     Split { id: u64 },

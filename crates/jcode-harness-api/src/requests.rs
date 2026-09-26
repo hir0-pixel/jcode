@@ -250,6 +250,8 @@ pub enum ApiRequest {
         title: Option<String>,
     },
 
+    SetWorkingDir { session_id: String, working_dir: String },
+
     /// Restore the history that the last `Rewind` removed.
     ///
     /// `Rewind` is destructive, so without an undo a client cannot offer it

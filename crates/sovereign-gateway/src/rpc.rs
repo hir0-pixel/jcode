@@ -240,9 +240,8 @@ impl Conn {
     async fn emit(&self, ty: &str, session_id: Option<&str>, payload: Value) {
         let mut params = json!({ "type": ty, "payload": payload });
         if let Some(sid) = session_id {
-            let seq = self.sessions.lock().await.entry(sid.to_string()).or_default().next_seq();
             params["session_id"] = json!(sid);
-            params["seq"] = json!(seq);
+            params = self.observer.replay_event(params);
         }
         self.send_json(json!({ "jsonrpc": "2.0", "method": "event", "params": params })).await;
     }
@@ -322,6 +321,27 @@ impl Conn {
 
     pub(crate) async fn session_cwd(&self, session: &str) -> Option<String> {
         self.known.lock().await.get(session).and_then(|info| info["working_dir"].as_str().map(str::to_string))
+    }
+
+    async fn set_session_cwd(self: &Arc<Self>, session: &str, raw: &str) -> Result<Value, RpcError> {
+        let cwd = std::fs::canonicalize(raw).map_err(|e| RpcError::internal(anyhow!(e)))?;
+        if !cwd.is_dir() { return Err(RpcError::params("cwd must be an existing directory")); }
+        if self.sessions.lock().await.get(session).is_some_and(SessionState::turn_active) {
+            return Err(RpcError { code: 409, message: "session busy".into(), data: None });
+        }
+        self.ensure_attached(session).await.map_err(RpcError::internal)?;
+        self.call(json!({ "req": "set_working_dir", "session_id": session, "working_dir": cwd })).await.map_err(RpcError::internal)?;
+        let cwd = cwd.to_string_lossy().into_owned();
+        let mut known = self.known.lock().await;
+        let info = known.entry(session.to_string()).or_insert_with(|| json!({"session_id": session}));
+        info["working_dir"] = json!(cwd);
+        let result = json!({
+            "model": self.config.model, "provider": self.config.provider, "cwd": cwd,
+            "running": false, "stored_session_id": session, "desktop_contract": 8,
+        });
+        drop(known);
+        self.emit("session.info", Some(session), result.clone()).await;
+        Ok(result)
     }
 
     /// Start the learning timer for `session` after a completed turn.
@@ -533,10 +553,6 @@ impl Conn {
                 "model": self.config.model,
                 "source": "engine",
             })),
-            "free_tier.status" => Ok(json!({
-                "has_guest": false, "enabled": false, "available": false,
-                "notice_pending": false, "model": "", "label": "",
-            })),
             "model.options" => Ok(json!({
                 "providers": [{
                     "slug": self.config.provider,
@@ -549,23 +565,18 @@ impl Conn {
                 "model": self.config.model,
                 "provider": self.config.provider,
             })),
-            "wake.status" => Ok(json!({
-                "listening": false, "owned_by_caller": false, "phrase": "", "provider": "",
-                "configured_surface": "", "input_device": {}, "available": false,
-                "hint": "Wake word is not available in this engine.", "enabled": false,
-                "audio_silent": false, "capture": "off", "local_input_available": false,
-                "sample_rate": 16000, "frame_length": 512,
-            })),
             "session.active_list" => {
                 let sessions = self.sessions.lock().await;
+                let current = p["current_session_id"].as_str().unwrap_or_default();
+                let known = self.known.lock().await;
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
                 let items: Vec<Value> = sessions
                     .iter()
                     .filter(|(_, s)| s.turn_active())
                     .map(|(id, s)| json!({
-                        "current": false, "id": id, "session_key": id, "last_active": now, "started_at": now,
-                        "message_count": 0, "model": s.model.clone().unwrap_or_default(), "preview": "",
-                        "status": "streaming", "title": "",
+                        "current": id == current, "id": id, "session_key": id, "last_active": now, "started_at": now,
+                        "message_count": 0, "model": s.model.clone().unwrap_or_else(|| self.config.model.clone()), "preview": "",
+                        "status": "streaming", "title": known.get(id).and_then(|v| v["title"].as_str()).unwrap_or("Untitled"),
                     }))
                     .collect();
                 Ok(json!({ "sessions": items }))
@@ -641,15 +652,6 @@ impl Conn {
                     Err(err) => json!({ "ok": false, "message": err.to_string() }),
                 })
             }
-            "profiles.list" => Ok(json!({
-                "profiles": [{
-                    "name": "default", "path": self.config.home, "is_default": true,
-                    "model": self.config.model, "provider": self.config.provider,
-                    "display_name": "Default", "description": "", "skill_count": jcode_base::skill::SkillRegistry::shared_snapshot().list().len(),
-                }],
-                "bot_mode_protocol": false,
-            })),
-            "pet.info" => Ok(json!({ "enabled": false })),
             "subagent.list" => {
                 let id = sid()?;
                 let subagents = self.list_owned_children(id).await.map_err(RpcError::internal)?;
@@ -748,7 +750,6 @@ impl Conn {
                 "methods": [],
                 "max_log_limit": 0,
             })),
-            "process.list" => Ok(json!({ "processes": [] })),
             "session.control.read" => {
                 let id = sid()?;
                 let store = sovereign_prime::agent_loop::ControlStore::open_cached(Path::new(&self.config.home)).map_err(RpcError::internal)?;
@@ -778,7 +779,6 @@ impl Conn {
                 let message = format!("/{} is not available in this engine yet.", command.trim_start_matches('/'));
                 Ok(json!({ "status": "error", "message": message, "output": message }))
             }
-            "projects.tree" => Ok(json!({ "projects": [], "active_id": null, "scoped_session_ids": [] })),
             "gateway.capabilities" => Ok(json!({ "per_session_exclusive_submit": false })),
             "client.capabilities" => Ok(json!({ "server_requests": ["approval"] })),
             "session.create" => {
@@ -976,13 +976,47 @@ impl Conn {
                 call(json!({ "req": "soft_interrupt", "session_id": id, "content": text })).await?;
                 Ok(json!({ "status": "queued", "text": text }))
             }
-            // No replay buffer: tell a reconnecting client to refetch state.
-            "session.events.since" => Ok(json!({
-                "events": [], "latest_seq": 0, "truncated": true, "count": 0, "epoch": 0, "open_requests": [],
-            })),
-            "session.events.stats" => Ok(json!({
-                "sessions": 0, "events": 0, "bytes": 0, "max_per_session": 0, "max_bytes_per_session": 0, "max_bytes_process": 0,
-            })),
+            "session.events.since" => {
+                let id = sid()?;
+                let last_seen = p["last_seen"].as_u64().ok_or_else(|| RpcError::params("last_seen must be an integer"))?;
+                let (events, latest_seq, truncated, epoch) = self.observer.replay_since(id, last_seen);
+                let count = events.len();
+                let approvals = self.approvals.lock().await;
+                let open_requests: Vec<Value> = approvals.iter().filter(|(_, (session, _))| session == id)
+                    .map(|(id, (session_id, request_id))| json!({
+                        "id": id, "method": "approval", "params": {"session_id": session_id, "request_id": request_id}
+                    })).collect();
+                Ok(json!({ "events": events, "latest_seq": latest_seq, "truncated": truncated,
+                    "count": count, "epoch": epoch, "open_requests": open_requests }))
+            }
+            "session.events.stats" => Ok(self.observer.replay_stats()),
+            "session.context_breakdown" => {
+                let id = sid()?;
+                let history = self.history(id).await.map_err(RpcError::internal)?;
+                let text: String = history["messages"].as_array().into_iter().flatten()
+                    .map(|message| message["content"].as_str().map(str::to_owned).unwrap_or_default())
+                    .collect::<Vec<_>>().join("\n");
+                let tokens = text.chars().count().div_ceil(4);
+                let model = self.sessions.lock().await.get(id).and_then(|s| s.model.clone()).unwrap_or_else(|| self.config.model.clone());
+                let context_max = jcode_base::provider::context_limit_for_model_with_provider(&model, Some(&self.config.provider)).unwrap_or(0);
+                Ok(json!({
+                    "categories": [{"id":"conversation","label":"Conversation","color":"#8a8a8a","tokens":tokens}],
+                    "context_max": context_max, "context_percent": if context_max > 0 { tokens * 100 / context_max } else { 0 },
+                    "context_used": tokens, "estimated_total": tokens, "context_estimated": true,
+                    "context_source": "engine_transcript_estimate", "model": model, "context_files": [],
+                }))
+            }
+            "session.cwd.set" => {
+                let id = sid()?;
+                let cwd = p["cwd"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| RpcError::params("cwd is required"))?;
+                self.set_session_cwd(id, cwd).await
+            }
+            "session.workspace.move" => {
+                let id = p["session_key"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| RpcError::params("session_key is required"))?;
+                let cwd = p["cwd"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| RpcError::params("cwd is required"))?;
+                let result = self.set_session_cwd(id, cwd).await?;
+                Ok(json!({ "cwd": result["cwd"], "branch": Value::Null, "git_repo_root": Value::Null }))
+            }
             "insights.get" => {
                 let days = p["days"].as_u64().unwrap_or(30).clamp(1, 3650);
                 let observer = self.observer.clone();
@@ -991,15 +1025,22 @@ impl Conn {
                     .map_err(|e| RpcError::internal(anyhow!(e)))?
                     .map_err(|e| RpcError::internal(anyhow!(e)))
             }
-            // Hermes's hosted-subscription dollar bars; nothing to show here.
-            "usage.bars" => Ok(json!({ "ok": true, "available": false, "status": "not_applicable" })),
-            // Handoff hands a chat to Hermes's messaging gateway, which looks it up
-            // in Python's database; it arrives with messaging on the engine (M4).
-            "handoff.request" | "handoff.state" | "handoff.fail" => {
-                crate::note_unsupported("rpc", method);
-                Err(RpcError::unsupported(method))
+            "usage.bars" => {
+                let (spent, priced_calls) = self.observer.metered_usage().map_err(|e| RpcError::internal(anyhow!(e)))?;
+                if priced_calls == 0 {
+                    Ok(json!({ "available": false, "status": "no_priced_usage" }))
+                } else {
+                    let spent = format!("${spent:.4}");
+                    Ok(json!({
+                        "ok": true, "available": true, "status": "engine_metered", "plan_name": "Engine usage",
+                        "subscription_remaining_display": "uncapped", "total_spendable_display": "uncapped", "has_topup": false,
+                        "plan_bar": { "kind": "plan", "remaining_display": "uncapped", "total_display": "uncapped",
+                            "spent_display": spent, "pct_used": null, "fill_fraction": 0.0 },
+                        "topup_bar": null,
+                    }))
+                }
             }
-            "session.cwd.set" | "session.workspace.move" | "session.context_breakdown" | "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
+            "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
                 crate::note_unsupported("rpc", method);
                 Err(RpcError::unsupported(method))
             }

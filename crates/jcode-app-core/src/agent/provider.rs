@@ -329,6 +329,11 @@ impl Agent {
         self.log_env_snapshot("working_dir");
     }
 
+    pub fn update_working_dir(&mut self, dir: &str) -> Result<()> {
+        self.set_working_dir(dir);
+        self.session.save()
+    }
+
     /// Get the working directory for this session
     pub fn working_dir(&self) -> Option<&str> {
         self.session.working_dir.as_deref()

@@ -2098,6 +2098,23 @@ pub(super) async fn handle_client(
                 }
             }
 
+            Request::SetWorkingDir { id, working_dir } => {
+                if reject_if_agent_busy_for_request(
+                    id, "set_working_dir", &client_session_id, client_is_processing, &agent, &client_event_tx,
+                ) { continue; }
+                let result = agent.lock().await.update_working_dir(&working_dir);
+                match result {
+                    Ok(()) => {
+                        let _ = client_event_tx.send(ServerEvent::Done { id });
+                    }
+                    Err(error) => {
+                        let _ = client_event_tx.send(ServerEvent::Error {
+                            id, message: crate::util::format_error_chain(&error), retry_after_secs: None,
+                        });
+                    }
+                }
+            }
+
             Request::RenameSession { id, title } => {
                 if reject_if_agent_busy_for_request(
                     id,
