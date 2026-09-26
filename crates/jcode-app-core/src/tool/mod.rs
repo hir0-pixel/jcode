@@ -7,9 +7,6 @@ mod bg;
 mod browser;
 pub use browser::set_bridge as set_browser_bridge;
 mod communicate;
-mod compile_remote;
-#[cfg(target_os = "macos")]
-mod computer;
 mod config_edit_notice;
 mod conversation_search;
 mod debug_socket;
@@ -18,18 +15,15 @@ mod edit;
 mod edit_stats;
 mod file_diff;
 pub(crate) mod file_lock;
-mod gmail;
 // The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
 #[allow(dead_code)]
 mod goal;
 pub mod inflight;
 mod invalid;
-mod jcode_docs;
 mod ls;
 pub mod mcp;
 mod memory;
 mod open;
-mod panel;
 mod patch;
 mod read;
 mod refine;
@@ -43,7 +37,6 @@ pub mod selfdev;
 pub(crate) mod serde_coerce;
 mod session_search;
 pub(crate) mod session_search_index;
-mod side_panel;
 mod skill;
 mod todo;
 mod webfetch;
@@ -445,13 +438,6 @@ impl Registry {
                 "agentgrep",
                 agentgrep::AgentGrepTool::new,
             );
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "side_panel",
-                side_panel::SidePanelTool::new,
-            );
-            Self::insert_tool_timed(&mut m, &mut timings, "panel", panel::PanelTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "edit", edit::EditTool::new);
             // `multiedit` merged into `edit`, and `patch` into `apply_patch`.
             // Both old names still resolve through `resolve_tool_name`.
@@ -464,20 +450,7 @@ impl Registry {
             );
             Self::insert_tool_timed(&mut m, &mut timings, "ls", ls::LsTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bash", bash::BashTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "compile_remote",
-                compile_remote::CompileRemoteTool::new,
-            );
             Self::insert_tool_timed(&mut m, &mut timings, "open", open::OpenTool::new);
-            #[cfg(target_os = "macos")]
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "macos_computer_use",
-                computer::ComputerTool::new,
-            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -491,12 +464,6 @@ impl Registry {
                 websearch::WebSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "jcode_docs",
-                jcode_docs::JcodeDocsTool::new,
-            );
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
@@ -506,11 +473,7 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
-            // Initiative is temporarily unavailable. Keep its implementation and
-            // saved data intact so it can be restored without a migration.
-            Self::insert_tool_timed(&mut m, &mut timings, "gmail", gmail::GmailTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "schedule", ambient::ScheduleTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "selfdev", selfdev::SelfDevTool::new);
             Self::insert_tool_timed(
                 &mut m,
@@ -538,12 +501,6 @@ impl Registry {
             "skill_manage",
             skill::SkillTool::new(skills.clone()),
         );
-        // The swarm tool captures the user-editable swarm prompt in its
-        // description. Construct it once per session rather than sharing the
-        // process-wide instance. Existing sessions keep their stable tool
-        // definition (and provider KV cache), while newly created agents see
-        // prompt edits immediately.
-        Self::insert_tool(&mut tools, "swarm", communicate::CommunicateTool::new());
         tools
     }
 
@@ -617,9 +574,6 @@ impl Registry {
         &self,
         allowed_tools: Option<&HashSet<String>>,
     ) -> Vec<ToolDefinition> {
-        if allowed_tools.is_none_or(|allowed| allowed.contains("compile_remote")) {
-            self.remote_compile_definition().await;
-        }
         let tools = self.tools.read().await;
         let mut defs: Vec<ToolDefinition> = tools
             .iter()
@@ -639,15 +593,6 @@ impl Registry {
         // Sort by name for deterministic ordering - critical for prompt cache hits
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         defs
-    }
-
-    /// Subscription guidance is the one built-in definition that can change
-    /// after sign-in, sign-out, or entitlement refresh. Do not hold the registry
-    /// lock during the bounded account request.
-    pub(crate) async fn remote_compile_definition(&self) -> Option<ToolDefinition> {
-        let tool = self.tools.read().await.get("compile_remote").cloned()?;
-        compile_remote::refresh_access().await;
-        Some(tool.to_definition())
     }
 
     pub async fn tool_names(&self) -> Vec<String> {
@@ -930,7 +875,7 @@ impl Registry {
         if !is_custom
             && matches!(
                 resolved_name,
-                "selfdev" | "debug_socket" | "desktop_selfdev" | "jcode_docs"
+                "selfdev" | "debug_socket" | "desktop_selfdev"
             )
         {
             let desktop = ctx
@@ -938,11 +883,6 @@ impl Registry {
                 .as_deref()
                 .and_then(jcode_selfdev_types::desktop_repo_root)
                 .is_some();
-            if desktop && resolved_name == "jcode_docs" {
-                anyhow::bail!(
-                    "Tool 'jcode_docs' is disabled in Desktop self-development mode. Read the working tree documentation instead."
-                );
-            }
             if desktop && matches!(resolved_name, "selfdev" | "debug_socket") {
                 anyhow::bail!(
                     "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev'.",

@@ -14,8 +14,6 @@ mod tool_streaming;
 #[path = "agent_tests/desktop_selfdev.rs"]
 mod desktop_selfdev;
 
-#[path = "agent_tests/compile_remote.rs"]
-mod compile_remote;
 
 struct DelayedProvider {
     open_delay: Duration,
@@ -996,159 +994,6 @@ async fn new_agent_registers_active_pid_and_clear_swaps_it() {
         !active.contains(&first_session_id),
         "cleared session should no longer be tracked as active"
     );
-}
-
-#[tokio::test]
-async fn gmail_is_exposed_by_default_and_can_be_explicitly_disabled() {
-    let _guard = crate::storage::lock_test_env();
-    let prev_home = std::env::var_os("JCODE_HOME");
-    let prev_tools = std::env::var_os("JCODE_TOOLS");
-    let prev_disabled_tools = std::env::var_os("JCODE_DISABLED_TOOLS");
-    let prev_tool_profile = std::env::var_os("JCODE_TOOL_PROFILE");
-    let prev_disable_base_tools = std::env::var_os("JCODE_DISABLE_BASE_TOOLS");
-    let temp_home = tempfile::TempDir::new().expect("temp home");
-
-    crate::env::set_var("JCODE_HOME", temp_home.path());
-    crate::env::remove_var("JCODE_TOOLS");
-    crate::env::remove_var("JCODE_DISABLED_TOOLS");
-    crate::env::remove_var("JCODE_TOOL_PROFILE");
-    crate::env::remove_var("JCODE_DISABLE_BASE_TOOLS");
-    crate::config::Config::invalidate_cache();
-
-    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
-    let definitions = agent.tool_definitions().await;
-    let tool_names = agent.tool_names().await;
-    let tool_name = "gmail";
-
-    assert!(
-        tool_names.iter().any(|name| name == "jcode_docs"),
-        "jcode_docs must be model-visible in regular sessions"
-    );
-    assert!(
-        !tool_names.iter().any(|name| name == "selfdev"),
-        "selfdev must not be model-visible in regular sessions"
-    );
-
-    assert!(
-        definitions
-            .iter()
-            .any(|definition| definition.name == tool_name),
-        "{tool_name} must be sent in model-visible tool definitions by default"
-    );
-    assert!(
-        tool_names.iter().any(|name| name == tool_name),
-        "{tool_name} must be listed as model-visible by default"
-    );
-    agent
-        .validate_tool_allowed(tool_name)
-        .expect("gmail must be executable by default");
-
-    agent
-        .validate_tool_allowed("jcode_docs")
-        .expect("jcode_docs must be executable in regular sessions");
-    agent.set_canary("docs-tool-regression");
-    let definitions = agent.tool_definitions().await;
-    assert!(definitions.iter().any(|tool| tool.name == "selfdev"));
-    assert!(
-        !definitions.iter().any(|tool| tool.name == "jcode_docs"),
-        "jcode_docs must not be model-visible in self-dev sessions"
-    );
-    assert!(
-        !agent
-            .tool_definitions()
-            .await
-            .iter()
-            .any(|tool| tool.name == "jcode_docs"),
-        "cached provider definitions must also exclude bundled docs"
-    );
-    assert!(
-        !agent
-            .tool_names()
-            .await
-            .iter()
-            .any(|name| name == "jcode_docs"),
-        "debug tool introspection must agree with provider definitions"
-    );
-    assert!(
-        agent
-            .execute_tool("jcode_docs", serde_json::json!({"action": "list"}))
-            .await
-            .is_err(),
-        "direct execution must reject bundled docs in self-dev mode"
-    );
-    assert!(
-        agent
-            .validate_tool_allowed("jcode_docs")
-            .expect_err("jcode_docs must not be executable in self-dev sessions")
-            .to_string()
-            .contains("disabled in self-development mode")
-    );
-    agent.session.is_canary = false;
-    agent.unlock_tools();
-    assert!(
-        agent
-            .tool_definitions()
-            .await
-            .iter()
-            .any(|tool| tool.name == "jcode_docs"),
-        "jcode_docs must remain available after leaving self-dev mode"
-    );
-    agent
-        .validate_tool_allowed("jcode_docs")
-        .expect("jcode_docs must be executable again outside self-dev mode");
-
-    crate::env::set_var("JCODE_DISABLED_TOOLS", tool_name);
-    crate::config::Config::invalidate_cache();
-
-    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
-    let definitions = agent.tool_definitions().await;
-    let tool_names = agent.tool_names().await;
-
-    assert!(
-        !definitions
-            .iter()
-            .any(|definition| definition.name == tool_name),
-        "explicitly disabled {tool_name} must not be sent in model-visible tool definitions"
-    );
-    assert!(
-        !tool_names.iter().any(|name| name == tool_name),
-        "explicitly disabled {tool_name} must not be listed as model-visible"
-    );
-    let err = agent
-        .validate_tool_allowed(tool_name)
-        .expect_err("explicitly disabled gmail must not be executable");
-    assert!(err.to_string().contains("disabled"));
-
-    if let Some(previous) = prev_home {
-        crate::env::set_var("JCODE_HOME", previous);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
-    if let Some(previous) = prev_tools {
-        crate::env::set_var("JCODE_TOOLS", previous);
-    } else {
-        crate::env::remove_var("JCODE_TOOLS");
-    }
-    if let Some(previous) = prev_disabled_tools {
-        crate::env::set_var("JCODE_DISABLED_TOOLS", previous);
-    } else {
-        crate::env::remove_var("JCODE_DISABLED_TOOLS");
-    }
-    if let Some(previous) = prev_tool_profile {
-        crate::env::set_var("JCODE_TOOL_PROFILE", previous);
-    } else {
-        crate::env::remove_var("JCODE_TOOL_PROFILE");
-    }
-    if let Some(previous) = prev_disable_base_tools {
-        crate::env::set_var("JCODE_DISABLE_BASE_TOOLS", previous);
-    } else {
-        crate::env::remove_var("JCODE_DISABLE_BASE_TOOLS");
-    }
-    crate::config::Config::invalidate_cache();
 }
 
 fn seed_transient_session_state(agent: &mut Agent) {
@@ -2404,39 +2249,6 @@ async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
         text.contains("Reconsidered and completed safely"),
         "{text:?}"
     );
-}
-
-#[tokio::test]
-async fn sdk_custom_compile_remote_schema_survives_locked_refresh() {
-    let _lock = crate::storage::lock_test_env();
-    let provider: Arc<dyn Provider> = Arc::new(SignatureSessionProvider::default());
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    crate::tool::sdk::configure(
-        agent.session_id(),
-        "cache-owner",
-        crate::protocol::SessionToolConfig {
-            enabled: Some(vec![]),
-            disabled: vec![],
-            custom: vec![crate::protocol::SessionToolDefinition {
-                name: "compile_remote".into(),
-                description: "SDK override".into(),
-                parameters: serde_json::json!({"type":"object", "additionalProperties":false}),
-            }],
-        },
-        tx,
-    )
-    .unwrap();
-    for _ in 0..2 {
-        let definitions = agent.tool_definitions().await;
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].description, "SDK override");
-        assert_eq!(
-            definitions[0].input_schema,
-            serde_json::json!({"type":"object", "additionalProperties":false})
-        );
-    }
 }
 
 #[test]

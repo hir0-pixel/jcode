@@ -1,6 +1,6 @@
 # Sovereign cleanup inventory
 
-Status: baseline and inventory in progress. No cleanup deletion has been made.
+Status: baseline complete; batch 1 deletions complete. Inventory remains open for batches 2–6.
 
 ## Baseline (2026-09-26)
 
@@ -23,8 +23,12 @@ Both repositories were clean before work. Engine HEAD: `295a74fce` on
 | Hermes repository | 4.5 GB |
 | Existing `target/release/sovereign` | 126.9 MB; pre-existing artifact, not rebuilt |
 | Tool schema tokens per call | Latest checked-in benchmark: 7,744 (M10 verification; not freshly measured) |
-| Engine / Python idle RSS | unavailable: host process listing fails (`sysmond` unavailable) |
-| Fresh live model benchmark | unavailable: local Ollama at `127.0.0.1:11434` is not running |
+| Engine idle RSS | 35.3 MiB before chat; 45.1 MiB after the plain session |
+| Python idle RSS | 163.3 MiB before chat; 256.6 MiB after the plain session |
+| Live plain-task tool-schema tokens / call | 7,744 Sovereign; 10,664 stock Hermes |
+| Live plain-task first-turn prompt | 8,860 Sovereign; 14,462 stock Hermes |
+| Live plain-task runs / correctness | 1 each; all 4 turns passed |
+| Live model / task / idle interval | local `sovereign/bench-hermes-64k:latest`, `plain`, 20 seconds |
 
 Baseline gates:
 
@@ -32,15 +36,18 @@ Baseline gates:
 | --- | --- |
 | `cargo check --workspace --tests` | Pass, 327 crates, 0 errors, 11 warnings |
 | `cargo test -p sovereign-gateway -p sovereign-prime` | Pass, 85 passed, 2 ignored (8 suites) |
-| `cargo build --release --bin sovereign` | Fail before cleanup: two non-exhaustive matches in `crates/jcode-base/src/memory/activity.rs:276` and `crates/jcode-base/src/memory_log.rs:106` for `jcode_memory_types` sidecar variants |
+| `cargo build --release --bin sovereign` | First attempt exposed stale shared-target artifacts from an earlier bisect. Per user direction, `cargo clean -p jcode-memory-types -p jcode-base -p jcode-protocol -p jcode-app-core -p jcode-tui --release` removed 28,168 files / 21.2 GB; release rebuild passed in 1m 06s. No source variants were re-added. |
 | Desktop `npx tsc --noEmit -p .` | Pass, no errors |
-| Current tool-schema benchmark | Not run: local Ollama/model unavailable; existing documentation value retained as reference only |
+| Current tool-schema benchmark | Completed; detailed raw data in `/private/tmp/sov-cleanup-baseline` (outside the repos). 0 unknown-token calls. |
+| Batch 1 gates | Workspace check: pass, same 11 warnings; gateway + prime: pass, 85 passed / 2 ignored; release build: pass, 1m 55s after final source changes; desktop TypeScript: pass. Focused app-core/base unit suite: 1,021 passed / 226 failed / 6 ignored; first failure is macOS `system-configuration` panic `Attempted to create a NULL object.` in this sandbox, and many tests rely on that platform store. |
 
-The first Cargo attempt with temporary `HOME` could not see the dependency cache
-and retried GitHub; it was stopped. Subsequent Cargo commands explicitly used
-the existing `CARGO_HOME` and the required shared `CARGO_TARGET_DIR`. The
-temporary test home is `/private/tmp/sov-cleanup-home`; real `.jcode` and
-`.hermes` homes were not used.
+The first focused Cargo test attempt with temporary `HOME` could not see the dependency cache
+and failed while trying GitHub; retry it with existing `CARGO_HOME` and temporary test homes. Other Cargo commands explicitly use
+the required shared `CARGO_TARGET_DIR`. The live
+benchmark used temporary homes under `/private/tmp` and did not read or write
+real `.jcode` or `.hermes` homes. RSS was sampled by the benchmark's `ps -axo`
+process-tree measurement while each temporary backend ran. Raw benchmark files
+are under `/private/tmp/sov-cleanup-baseline`.
 
 ## Candidate register
 
@@ -57,9 +64,13 @@ listed reachability audit is complete.
 | `crates/jcode-tui-*` | TUI support crates | Workspace members are listed in root `Cargo.toml`; no dependency closure audit completed yet. | keep: unsure | 2 |
 | `src/cli/**`, root CLI command definitions and subcommands | Hermes-compatible binary pass-through and inherited jcode CLI | `src/bin/sovereign.rs` translates `serve` to `gateway`, pre-tool and REPL-worker are explicit spawn roots; other args pass through. Desktop/electron reachability is not exhaustively traced. | keep: unsure | 3 |
 | self-update/install, stable/canary, self-dev, pairing, browser-extension bridge, daemon/shared-server flows | Inherited install and development paths | No exhaustive symbol/reference and Electron spawn audit yet. | keep: unsure | 3 |
-| `crates/jcode-app-core/src/tool/compile_remote.rs`, `crates/jcode-app-core/src/tool/side_panel.rs`, `crates/jcode-app-core/src/tool/panel.rs`, `crates/jcode-app-core/src/tool/jcode_docs.rs` | Tool implementations named as disabled candidates | Literal search found these source paths. `src/bin/sovereign.rs` defaults `JCODE_DISABLED_TOOLS` to `gmail,compile_remote,macos_computer_use,panel,side_panel,schedule,jcode_docs,swarm`; this alone does not prove there are no overrides or other callers. | keep: unsure | 1 |
-| Integration tools, Gmail, maintainer feedback, macOS computer use, schedule tool definitions/config/tests | Other tool candidates named in the brief | Initial literal search found references in protocol/config/tool modules, tests, and desktop; no per-tool gateway/schema/desktop-path trace completed. `gmail` is in the engine default-disabled list. | keep: unsure | 1 |
-| `crates/jcode-swarm-core` and swarm-only code | Swarm support, with `delegate` explicitly retained | `swarm` appears in `DEFAULT_DISABLED_TOOLS`; the requested compact `delegate` path may share internals. No call-graph closure audit yet. | keep: unsure | 1 |
+| `crates/jcode-app-core/src/tool/{compile_remote.rs,computer/**,gmail.rs,jcode_docs.rs,panel.rs,side_panel.rs}`; `crates/jcode-base/src/gmail.rs` | Permanently disabled model tools and implementations | Removed from `tool/mod.rs` registry and module declarations; no remaining registry constructor references (`rg -n 'compile_remote|macos_computer_use|"gmail"|"jcode_docs"|"panel"|"side_panel"' crates/jcode-app-core/src/tool/mod.rs src/bin/sovereign.rs`). `cargo check --workspace --tests` and `cargo build --release --bin sovereign` pass after trial removal. Product desktop tool inventory and current gateway schema do not request these IDs. | delete | 1 |
+| ScheduleTool implementation/helpers/tests in `crates/jcode-app-core/src/tool/ambient.rs` | Inherited generic scheduled-task model tool | Removed only `ScheduleTool` and its helpers/tests. The registry no longer exposes it; `schedule_ambient` / `ScheduleAmbientTool` remains a separate ambient-session feature with registry reference in `tool/mod.rs`, so that code is retained. Workspace check and gateway/prime tests pass. | delete ScheduleTool; keep ambient scheduler | 1 |
+| `jcode_docs` generated documentation corpus/build script and self-development exceptions | Internal model tool and build-time docs embedding | No product call sites; removed its registry, `build.rs` generator, direct validation guards and tests. `cargo check --workspace --tests` and release build pass. | delete | 1 |
+| `DEFAULT_DISABLED_TOOLS` startup mutation in `src/bin/sovereign.rs` | Default suppression of removed tools | The disabled IDs are no longer registered; product tool schema baseline measured 7,744 tokens/call. Deleted startup mutation. | delete | 1 |
+| Swarm model-visible registry entry and tool-only tests | Standalone swarm tool vs delegate internals | Removed registry entry and tool-name expectations. `delegate` uses the `CommunicateTool` implementation and its internal coordination path (`tool/delegate.rs` references `CommunicateTool`); retained communicator and swarm coordination internals needed by delegate. | delete standalone entry; keep delegate internals | 1 |
+| Underlying side-panel state and goal-tool snapshots | UI state infrastructure shared with goal tools | `tool/goal.rs` calls `crate::side_panel::{snapshot_for_session,...}`; not the disabled side-panel model tool. Kept because reachable from goal tools. | keep: needed by goal | 1 |
+| Desktop's removed-tool UI and endpoints | Views, controls, or endpoint calls for candidates above | Desktop RPC/REST call inventory is not complete yet; no desktop files changed in batch 1. | keep: unsure | 1 |
 | Other root `Cargo.toml` workspace crates, providers, bins, examples, benches and features | Inherited jcode workspace members | Full member list is in `Cargo.toml`; initial literal scan identified `src/bin/tui_bench.rs` and `src/bin/mermaid_side_panel_probe.rs`, but no complete workspace dependency/target audit exists. | keep: unsure | 2–3 |
 | Hermes Python agent, memory/learning/skills/tracing duplicates | Python features potentially replaced by Rust engine | `docs/PARITY.md` says Python is still forwarded for non-chat routes; user brief additionally retains cron fallback, bots, browser and other forwarded routes. No Python import/route closure audit completed. | keep: unsure | 4 |
 | Hermes desktop code for disabled features | Desktop routes, views, and controls potentially made unreachable by tool deletion | Need exact desktop RPC/REST call inventory and connection to Rust/Python routes before removing code. `apps/desktop/src` and `apps/shared/src` are the specified roots. | keep: unsure | 1 |
@@ -74,7 +85,6 @@ listed reachability audit is complete.
 1. Finish candidate-level graph traces and `check_index_coverage` checks; use
    source searches for non-indexed files and literal configuration.
 2. Expand this register to concrete paths, commands, and one verdict per
-   candidate before deleting anything.
-3. Resolve the pre-existing release-build failure and obtain local Ollama plus
-   host process visibility before treating the requested live baseline as
-   complete.
+   candidate before each further deletion batch.
+3. Audit desktop RPC/REST calls and Python forwarding before deleting either
+   area.

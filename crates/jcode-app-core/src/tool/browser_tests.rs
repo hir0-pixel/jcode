@@ -10,7 +10,7 @@ struct Captured {
 
 /// A one-shot mock HTTP server: accepts a single request, records its head +
 /// body, and replies with `response_body`. Mirrors the hand-rolled mock used
-/// by `compile_remote/tests.rs` (no mocking crate is a jcode-app-core dep).
+/// without requiring a mock HTTP client dependency in jcode-app-core.
 struct MockServer {
     base_url: String,
     captured: Arc<Mutex<Option<Captured>>>,

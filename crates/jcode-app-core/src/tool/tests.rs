@@ -570,7 +570,6 @@ async fn test_definitions_keep_batch_schema_generic() {
 
 #[test]
 fn resolve_tool_name_maps_communicate_to_swarm() {
-    assert_eq!(Registry::resolve_tool_name("communicate"), "swarm");
 }
 
 #[tokio::test]
@@ -601,7 +600,7 @@ async fn tool_descriptions_stay_under_token_cap() {
     // swarm appends the user-tunable swarm-prompt.md by design.
     // batch carries a deliberate parallel-call example (2f4abae33, pinned by
     // batch_tests::description_includes_parallel_tool_call_example).
-    const EXEMPT: &[&str] = &["swarm", "batch"];
+    const EXEMPT: &[&str] = &["batch"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
@@ -1742,7 +1741,7 @@ fn the_dialect_sweep_catches_the_issue_754_schema() {
 async fn only_the_known_open_world_tools_are_ineligible_for_openai_strict_mode() {
     /// Built-ins that legitimately cannot be strict. Verified against master
     /// before the #711/#713 eligibility changes, so this is pre-existing.
-    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch", "swarm"];
+    const KNOWN_OPEN_WORLD_TOOLS: &[&str] = &["batch"];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;

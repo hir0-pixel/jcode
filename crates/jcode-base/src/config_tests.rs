@@ -581,7 +581,7 @@ fn tool_config_mcp_exposure_env_overrides() {
 #[test]
 fn tool_config_explicit_enabled_uses_allow_list() {
     let cfg = ToolConfig {
-        enabled: vec!["gmail".to_string()],
+        enabled: vec!["example_tool".to_string()],
         ..ToolConfig::default()
     };
     let selection = cfg.selection();
@@ -589,8 +589,8 @@ fn tool_config_explicit_enabled_uses_allow_list() {
         .allowed_tools
         .expect("explicit enabled is an allow-list");
 
-    assert!(allowed.contains("gmail"));
-    assert!(!selection.disabled_tools.contains("gmail"));
+    assert!(allowed.contains("example_tool"));
+    assert!(!selection.disabled_tools.contains("example_tool"));
 }
 
 #[test]
@@ -602,20 +602,20 @@ fn tool_config_all_enabled_sentinel_keeps_unrestricted_toolset() {
     let selection = cfg.selection();
 
     assert!(selection.allowed_tools.is_none());
-    assert!(!selection.disabled_tools.contains("gmail"));
+    assert!(!selection.disabled_tools.contains("example_tool"));
 }
 
 #[test]
 fn tool_config_explicit_disabled_overrides_all_enabled_sentinel() {
     let cfg = ToolConfig {
         enabled: vec!["*".to_string()],
-        disabled: vec!["gmail".to_string()],
+        disabled: vec!["example_tool".to_string()],
         ..ToolConfig::default()
     };
     let selection = cfg.selection();
 
     assert!(selection.allowed_tools.is_none());
-    assert!(selection.disabled_tools.contains("gmail"));
+    assert!(selection.disabled_tools.contains("example_tool"));
 }
 
 #[test]
@@ -633,9 +633,7 @@ fn tool_config_acp_profile_allows_core_coding_plus_batch() {
     assert!(allowed.contains("agentgrep"));
     assert!(allowed.contains("batch"));
     assert!(allowed.contains("mcp"));
-    assert!(!allowed.contains("swarm"));
     assert!(!allowed.contains("subagent"));
-    assert!(!allowed.contains("side_panel"));
 }
 
 #[test]
@@ -661,7 +659,6 @@ fn tool_config_minimal_profile_allows_core_coding_tools() {
     assert!(allowed.contains("apply_patch"));
     assert!(allowed.contains("agentgrep"));
     assert!(!allowed.contains("browser"));
-    assert!(!allowed.contains("swarm"));
 }
 
 #[test]
@@ -704,15 +701,15 @@ fn tool_config_none_profile_disables_all_tools() {
 #[test]
 fn tool_config_disabled_only_keeps_full_profile_with_deny_list() {
     let cfg = ToolConfig {
-        disabled: vec!["browser".to_string(), "swarm".to_string()],
+        disabled: vec!["browser".to_string(), "example_tool".to_string()],
         ..ToolConfig::default()
     };
     let selection = cfg.selection();
 
     assert!(selection.allowed_tools.is_none());
     assert!(selection.disabled_tools.contains("browser"));
-    assert!(selection.disabled_tools.contains("swarm"));
-    assert!(!selection.disabled_tools.contains("gmail"));
+    assert!(selection.disabled_tools.contains("example_tool"));
+    assert!(!selection.disabled_tools.contains("example_tool"));
 }
 
 #[test]

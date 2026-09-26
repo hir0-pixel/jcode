@@ -417,24 +417,6 @@ impl Agent {
             self.registry.register_selfdev_tools().await;
         }
 
-        // Account sign-in/out and verified entitlement changes must reach the
-        // model even when the tool list is frozen (including deferred MCP).
-        // Only update this definition when its guidance actually changes.
-        if !crate::tool::sdk::custom(&self.session.id, "compile_remote")
-            && self
-                .locked_tools
-                .as_ref()
-                .is_some_and(|tools| tools.iter().any(|tool| tool.name == "compile_remote"))
-            && let Some(fresh) = self.registry.remote_compile_definition().await
-            && let Some(locked) = self.locked_tools.as_mut()
-            && let Some(previous) = locked.iter_mut().find(|tool| tool.name == "compile_remote")
-            && (previous.description != fresh.description
-                || previous.input_schema != fresh.input_schema)
-        {
-            *previous = fresh;
-            self.cache_tracker.reset();
-        }
-
         // Return locked tools if available (prevents cache invalidation from
         // tools arriving asynchronously after the first API request).
         //
@@ -562,12 +544,6 @@ impl Agent {
     }
 
     /// Expose the `selfdev` tool only while running in self-development mode.
-    /// Self-dev agents use the working tree rather than bundled `jcode_docs`,
-    /// which can lag behind the source they are editing.
-    ///
-    /// The registry keeps the implementation available for self-dev sessions,
-    /// but regular agents should not spend tool-list context on an internal
-    /// development surface.
     fn apply_selfdev_tool_surface(
         tools: &mut Vec<ToolDefinition>,
         is_canary: bool,
@@ -579,7 +555,7 @@ impl Agent {
             tools.retain(|tool| {
                 !matches!(
                     tool.name.as_str(),
-                    "selfdev" | "debug_socket" | "jcode_docs"
+                    "selfdev" | "debug_socket"
                 )
             });
             return;
@@ -589,7 +565,6 @@ impl Agent {
             tools.retain(|tool| tool.name != "selfdev");
             return;
         }
-        tools.retain(|tool| tool.name != "jcode_docs");
         for tool in tools.iter_mut() {
             if tool.name == "selfdev" {
                 tool.description =
@@ -748,11 +723,6 @@ impl Agent {
         if !is_desktop && name == "desktop_selfdev" {
             return Err(anyhow::anyhow!(
                 "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
-            ));
-        }
-        if (self.session.is_canary || is_desktop) && name == "jcode_docs" {
-            return Err(anyhow::anyhow!(
-                "Tool 'jcode_docs' is disabled in self-development mode. Read the working tree documentation instead."
             ));
         }
         if sdk_enabled {

@@ -72,7 +72,7 @@ async fn desktop_selfdev_is_automatic_separate_and_restored() {
     );
     let definitions = agent.tool_definitions().await;
     assert!(definitions.iter().any(|t| t.name == "desktop_selfdev"));
-    for name in ["selfdev", "debug_socket", "jcode_docs"] {
+    for name in ["selfdev", "debug_socket"] {
         assert!(!definitions.iter().any(|t| t.name == name));
         assert!(agent.validate_tool_allowed(name).is_err());
     }
@@ -86,7 +86,7 @@ async fn desktop_selfdev_is_automatic_separate_and_restored() {
     assert!(!prompt.static_part.contains("selfdev build target=tui"));
 
     // The central dispatch guard also covers batch and direct API invocations.
-    for name in ["selfdev", "debug_socket", "jcode_docs"] {
+    for name in ["selfdev", "debug_socket"] {
         let result = registry
             .execute(
                 name,
@@ -141,7 +141,6 @@ async fn desktop_selfdev_is_automatic_separate_and_restored() {
             .iter()
             .any(|t| t.name == "desktop_selfdev" || t.name == "selfdev")
     );
-    assert!(ordinary.iter().any(|t| t.name == "jcode_docs"));
     assert!(restored.validate_tool_allowed("desktop_selfdev").is_err());
     assert!(
         !restored
