@@ -748,6 +748,14 @@ impl JcodeClient {
         .map(drop)
     }
 
+    /// Permanently delete a session's stored transcript. Refused while it is live.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.request_ok(ApiRequest::DeleteSession {
+            session_id: session_id.to_string(),
+        })
+        .map(drop)
+    }
+
     /// Put an archived session back in the default session list.
     pub fn restore_session(&self, session_id: &str) -> Result<()> {
         self.request_ok(ApiRequest::RestoreSession {

@@ -7,3 +7,28 @@
 The local Ollama `/v1/chat/completions` endpoint answered the same prompt with `sovereign-cron-agent-ok` when checked outside the sandbox. This does not establish why the packaged engine's `/api/agent/run` returned an empty response. No root cause for the originally reported post-completion Python lifetime is proven by this run, so no timeout or lease behavior was changed. The requested three consecutive passing `SOVEREIGN_CRON_AGENT=1` runs remain unverified. Continue with Part 2 and revisit Part 1 if later diagnostics identify a product fault.
 
 Validation so far: `cargo check -p sovereign-gateway --tests` passed (two existing dead-code warnings); `cargo build --release --bin sovereign` passed. `node --check e2e/sovereign-packaged-cron-due.mjs` passed. `cargo fmt --all -- --check` fails on repository-wide pre-existing formatting differences, including untouched files; no workspace-wide formatting was applied.
+
+## Part 2: workspace test triage
+
+**Status: blocked; 12 targets still fail outside the sandbox.** The first sandboxed run had 27 failed targets; examples include `PermissionDenied` on loopback listeners and child process creation. The full rerun outside the sandbox, with the shared target, offline dependencies, and isolated homes, completed 213 targets: 8,031 passed, 24 failed, 59 ignored. A serial rerun completed the same 213 targets: 8,028 passed, 27 failed, 59 ignored. The failures below reproduce outside the sandbox, so they are not classified as sandbox-only.
+
+Fixed the SDK parity failure: Rust now exposes `delete_session`, includes it in `CAPABILITIES`, and tests its `DeleteSession` request. Focused parity and client transport tests pass.
+
+Unresolved failures in the serial run:
+
+| Target | Failing test(s) | Evidence / disposition |
+| --- | --- | --- |
+| `jcode --lib` | `memory_cli_semantic_requires_jev_but_keyword_search_remains_local` | Semantic/keyword assertions disagree; needs inspection of the test's full assertion and current optional embedding behavior. |
+| `jcode-core --lib` | `stdin_detect::stdin_detect_tests::test_own_process_not_reading_stdin` | Reproduces outside the sandbox even with stdin redirected from `/dev/null`; current macOS detector treats any vnode stdin as interactive. |
+| `jcode-provider-bedrock --lib` | `detects_bedrock_login_env_file_credentials`; `detects_env_credentials_requires_region_and_credential_hint` | Credential-presence assertions fail outside the sandbox; investigate shared process environment and provider detection. |
+| `jcode-provider-openai-runtime --lib` | `persistent_failed_missing_tool_output_recovers_with_full_replay` | Mock response fails with `Protocol(MissingConnectionUpgradeHeader)`. |
+| `jcode-provider-openrouter-runtime --lib` | `autodetected_profile_seeds_default_model_and_cache_namespace`; `autodetects_single_saved_local_openai_compatible_profile`; `autodetects_single_saved_openai_compatible_profile`; `named_openai_compatible_loads_api_key_from_env_file` | Profile and key discovery assertions fail using temporary config paths; needs source and path review. |
+| `jcode-sdk --lib` | `auth::tests::processes::timeout_reaps_process_and_unique_ids_isolate_cancellation`; `worktrees::tests::creation_isolates_dirty_edits_and_nested_invocation`; `worktrees::tests::lists_existing_detached_locked_prunable_and_bare_worktrees` | Timeout test fails; worktree tests hit path normalization / missing result assertions. `neither_sdk_has_an_untriaged_public_capability` is fixed and passes focused. |
+| `jcode-sdk --test lifecycle_events` | `global_events_discovers_existing_and_new_sessions_then_closes_children`; `global_events_reports_bounded_queue_overflow`; `public_client_exposes_swarm_metadata_from_list_and_attach`; `public_client_exposes_titles_from_list_and_attach` | Mock harness connection closes or breaks its pipe outside the sandbox. |
+| `jcode-setup-hints --lib` | `setup_hints_tests::first_three_launches_can_include_hotkey_notice_too` | Expected startup hint missing; needs test/setup counter review. |
+| `jcode-tui --lib` | `tui::app::tests::command_palette_open_does_not_move_existing_rows`; `tui::app::tests::overscroll_reveal_does_not_relayout_transcript`; `tui::app::tests::test_chat_mouse_scroll_down_reaches_bottom_without_dead_zone`; `tui::app::tests::test_full_redraw_clears_out_of_band_backend_artifacts_after_native_scroll_like_mutation` | Four UI behavior assertions fail; this crate is scheduled for product removal in Part 6. |
+| `jcode-tui --test glyph_safe_wire` | `indexed_color_emits_256_sgr_not_truecolor`; `truecolor_color_emits_truecolor_sgr` | Emitted ANSI color mode is empty; this crate is scheduled for product removal in Part 6. |
+| `jcode-tui-style --lib` | `palette::buffer_tests::configured_role_recolors_role_cells_and_named_colors_only`; `palette::light_theme_interaction::configured_colors_survive_the_light_theme_pass` | Configured colors are transformed; scheduled for review with the TUI removal in Part 6. |
+| `jcode-tui-workspace --lib` | `workspace_map_widget::tests::render_workspace_map_colors_completed_tiles_green` | Workspace map color assertion fails; scheduled for review with the TUI removal in Part 6. |
+
+Part 2 has not passed its green-suite requirement. The full-suite logs are in `/private/tmp/akira-part2-fulltest-escalated.log` and `/private/tmp/akira-part2-fulltest-serial.log`.

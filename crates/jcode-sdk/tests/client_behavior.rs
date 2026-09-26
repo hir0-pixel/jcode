@@ -200,6 +200,7 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
             .push(frame.request.clone());
         let event = match &frame.request {
             ApiRequest::ArchiveSession { .. }
+            | ApiRequest::DeleteSession { .. }
             | ApiRequest::RestoreSession { .. }
             | ApiRequest::SetRetentionPolicy { .. }
             | ApiRequest::NotifyAuthChanged { .. }
@@ -254,6 +255,7 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
     });
 
     client.archive_session("s1").expect("archive");
+    client.delete_session("s1").expect("delete");
     client.restore_session("s1").expect("restore");
     client
         .set_retention_policy(Some(30))
@@ -319,6 +321,9 @@ fn ga_runtime_and_file_methods_map_requests_and_typed_replies() {
         *requests.lock().expect("request log"),
         vec![
             ApiRequest::ArchiveSession {
+                session_id: "s1".to_string(),
+            },
+            ApiRequest::DeleteSession {
                 session_id: "s1".to_string(),
             },
             ApiRequest::RestoreSession {
