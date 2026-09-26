@@ -1226,6 +1226,7 @@ fn openrouter_transport_state_distinguishes_runtime_identities() {
     // autodetect tests do, so this test does not read whatever provider
     // profile happens to be configured on the host machine.
     let temp = TempDir::new().expect("create temp dir");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().join("jcode-home"));
     let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path());
     let _home = EnvVarGuard::set("HOME", temp.path());
     let _appdata = EnvVarGuard::set("APPDATA", temp.path().join("AppData").join("Roaming"));
