@@ -222,9 +222,11 @@ mod macos {
             buffer: *mut libc::c_void,
             buffersize: i32,
         ) -> i32;
+        fn proc_pidfdinfo(pid: i32, fd: i32, flavor: i32, buffer: *mut libc::c_void, buffersize: i32) -> i32;
     }
 
     const PROC_PIDLISTFDS: i32 = 1;
+    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
 
     #[repr(C)]
     struct proc_fdinfo {
@@ -299,15 +301,38 @@ mod macos {
             std::slice::from_raw_parts(buf.as_ptr() as *const proc_fdinfo, num_fds as usize)
         };
 
-        // Check if fd 0 exists and is a pipe or vnode (pty)
+        // Pipes are used for explicit stdin prompts. A vnode is interactive
+        // only when its resolved path is a terminal; `/dev/null` and regular
+        // files are vnodes too and must not make unrelated waiting threads
+        // look like stdin readers.
         for fd in fds {
             if fd.proc_fd == 0 {
-                // fd type 1 = vnode (could be pty), 6 = pipe
-                return fd.proc_fdtype == 1 || fd.proc_fdtype == 6;
+                // fd type 1 = vnode, 6 = pipe
+                return fd.proc_fdtype == 6 || (fd.proc_fdtype == 1 && stdin_vnode_is_tty(pid));
             }
         }
 
         false
+    }
+
+    fn stdin_vnode_is_tty(pid: i32) -> bool {
+        let mut buffer = [0u8; 8192];
+        let size = unsafe {
+            proc_pidfdinfo(
+                pid,
+                0,
+                PROC_PIDFDVNODEPATHINFO,
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                buffer.len() as i32,
+            )
+        };
+        if size <= 0 {
+            return false;
+        }
+        let info = &buffer[..size as usize];
+        [b"/dev/tty".as_slice(), b"/dev/console".as_slice()]
+            .iter()
+            .any(|needle| info.windows(needle.len()).any(|window| window == *needle))
     }
 
     fn is_thread_waiting(pid: i32) -> bool {
