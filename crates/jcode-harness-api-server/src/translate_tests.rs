@@ -2292,6 +2292,30 @@ fn observer_turn_ignores_control_done_even_after_the_control_reply() {
 }
 
 #[test]
+fn observer_turn_ignores_late_rename_done_after_prompt_acceptance() {
+    let mut state = state_with_session();
+    let actions = state.api_request_to_legacy(&json!({
+        "req": "rename_session", "id": 21, "session_id": "s1", "title": "cron probe",
+    }));
+    let Outbound::Legacy(rename) = &actions[0] else { panic!() };
+    state.legacy_event_to_api(&json!({"type":"ack", "id":rename["id"]}));
+
+    let actions = state.api_request_to_legacy(&json!({
+        "req": "send_message", "id": 22, "session_id": "s1", "content": "reply",
+    }));
+    let Outbound::Legacy(message) = &actions[0] else { panic!() };
+    state.legacy_event_to_api(&json!({"type":"ack", "id":message["id"]}));
+    assert!(state.observed_turn_active);
+
+    assert!(state.legacy_event_to_api(&json!({"type":"done", "id":rename["id"]})).is_empty());
+    assert!(state.observed_turn_active);
+    assert!(matches!(
+        state.legacy_event_to_api(&json!({"type":"done", "id":message["id"]})).last().unwrap().event,
+        ApiEvent::TurnDone { .. }
+    ));
+}
+
+#[test]
 fn reconnect_activity_is_forwarded_and_busy_attach_can_finish_without_more_text() {
     for active in [false, true] {
         let mut state = BridgeState::default();

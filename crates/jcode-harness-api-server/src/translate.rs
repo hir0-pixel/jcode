@@ -338,6 +338,7 @@ impl BridgeState {
                             | "notify_auth_changed"
                             | "invalidate_openai_usage"
                             | "invalidate_anthropic_usage"
+                            | "rename_session"
                     )
                 )
                 && let Some(id) = value["id"].as_u64()
