@@ -1,6 +1,6 @@
 # Sovereign cleanup inventory
 
-Status: baseline complete; deletion batches 1–5 recorded. Inventory and remaining candidates remain in progress.
+Status: baseline complete; deletion batches 1–5 recorded. Route verification, remaining candidate trials, phase 3 gates, and phase 4 disk work remain in progress.
 
 ## Baseline (2026-09-26)
 
@@ -61,7 +61,7 @@ Evidence convention: `rg` results are literal-reference checks, not proof of
 reachability by themselves. The graph is indexed as `sovereign-engine` and
 `Users-rameelmalik-Documents-Sovereign-AI-hermes-agent`; structural candidates
 need targeted caller/callee traces and coverage checks before a delete verdict.
-No candidate below has been deleted. “Keep: unsure” means retain until the
+Committed delete verdicts record completed batches. “Keep: unsure” means retain until the
 listed reachability audit is complete.
 
 | Path / candidate | What it is | Reachability evidence / check | Verdict | Batch |
