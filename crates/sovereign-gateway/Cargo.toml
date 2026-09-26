@@ -9,6 +9,7 @@ description = "Hermes tui_gateway-compatible HTTP/WebSocket front end for the jc
 anyhow = "1"
 futures-util = "0.3"
 httparse = "1"
+libc = "0.2"
 jcode-base = { path = "../jcode-base" }
 jcode-app-core = { path = "../jcode-app-core" }
 jcode-command-risk = { path = "../jcode-command-risk" }

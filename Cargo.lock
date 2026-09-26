@@ -7740,6 +7740,7 @@ dependencies = [
  "jcode-harness-api-server",
  "jcode-provider-core",
  "jsonschema",
+ "libc",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rusqlite",

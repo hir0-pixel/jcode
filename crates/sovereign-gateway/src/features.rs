@@ -107,6 +107,8 @@ impl Features {
         }
         let (program, args) = self.command.split_first().context("no Hermes backend command configured")?;
         let mut command = Command::new(program);
+        #[cfg(unix)]
+        command.process_group(0);
         if let Ok(pythonpath) = std::env::var("SOVEREIGN_HERMES_PYTHONPATH") {
             command.env("PYTHONPATH", pythonpath);
         }
@@ -178,15 +180,27 @@ impl Features {
             return;
         }
         if let Some(mut r) = self.running.lock().await.take() {
-            let _ = r.child.kill().await;
+            kill_backend(&mut r.child).await;
         }
     }
 
     pub async fn stop(&self) {
         if let Some(mut r) = self.running.lock().await.take() {
-            let _ = r.child.kill().await;
+            kill_backend(&mut r.child).await;
         }
     }
+}
+
+async fn kill_backend(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The Python backend can leave worker subprocesses behind; own a process
+        // group so idle-stop reclaims the entire feature service tree.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        let _ = child.wait().await;
+        return;
+    }
+    let _ = child.kill().await;
 }
 
 #[cfg(test)]
