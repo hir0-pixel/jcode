@@ -1,0 +1,16 @@
+{
+  "MODEL": "sovereign/bench-hermes-64k:latest",
+  "BASE_MODEL": "qwen3.8:27b",
+  "NUM_CTX": 65536,
+  "RUNS": 3,
+  "IDLE_MS": 120000,
+  "PRODUCTS": [
+    "sovereign"
+  ],
+  "tasks": [
+    "memory"
+  ],
+  "HERMES_BIN": "/Users/rameelmalik/.local/bin/hermes",
+  "SOVEREIGN_BIN": "/Users/rameelmalik/Documents/Sovereign AI/sovereign-engine/target/release/sovereign",
+  "started": "2026-09-24T16:36:44.698Z"
+}
