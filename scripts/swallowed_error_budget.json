@@ -2186,11 +2186,6 @@
       "let_underscore": 5,
       "unwrap_or_default": 21
     },
-    "src/bin/tui_bench.rs": {
-      "dot_ok": 0,
-      "let_underscore": 4,
-      "unwrap_or_default": 4
-    },
     "src/cli/acp.rs": {
       "dot_ok": 1,
       "let_underscore": 5,

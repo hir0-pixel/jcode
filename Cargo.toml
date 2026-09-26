@@ -114,15 +114,6 @@ path = "src/bin/harness.rs"
 
 
 
-[[bin]]
-name = "mermaid_side_panel_probe"
-path = "src/bin/mermaid_side_panel_probe.rs"
-required-features = ["dev-bins"]
-
-[[bin]]
-name = "tui_bench"
-path = "src/bin/tui_bench.rs"
-required-features = ["dev-bins"]
 
 [dependencies]
 # Memory allocator (reduces fragmentation for long-running server)
@@ -211,7 +202,6 @@ sovereign-prime = { path = "crates/sovereign-prime" }
 # Memory recall uses Jev Decisions and needs no local inference stack.
 # Keep embeddings opt-in for historical benchmarks/debugging only.
 default = ["pdf", "bedrock"]
-dev-bins = ["jcode-tui/dev-bins"]
 jemalloc = [
     "dep:tikv-jemallocator",
     "tikv-jemallocator/stats",
