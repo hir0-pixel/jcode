@@ -11,6 +11,8 @@ async fn persistent_terminal_public_case(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
+    let _transport = EnvVarGuard::set("JCODE_OPENAI_TRANSPORT", "websocket");
+    let _prewarm = EnvVarGuard::set("JCODE_OPENAI_PREWARM", "0");
     let error_kind = error_kind.to_owned();
     let code = code.map(str::to_owned);
     let recover = code.as_deref() == Some("previous_response_not_found") || missing_output;
@@ -47,7 +49,25 @@ async fn persistent_terminal_public_case(
                 _ => break,
             }
         }
-        let (tcp, _) = listener.accept().await.unwrap();
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let mut raw_request = [0; 2048];
+        let peeked = tcp.peek(&mut raw_request).await.unwrap_or_default();
+        if raw_request[..peeked].starts_with(b"GET /v1/models ") {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = tcp.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "model catalog request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            tcp.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}"
+            )
+            .await
+            .unwrap();
+            (tcp, _) = listener.accept().await.unwrap();
+        }
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let fresh: Value =
             serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();

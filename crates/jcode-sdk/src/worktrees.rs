@@ -202,8 +202,9 @@ mod tests {
         assert_eq!(created.head, before.head);
         assert_eq!(created.branch.as_deref(), Some("refs/heads/feature/one"));
         assert_eq!(
-            Path::new(&created.path),
-            temp.path().join("repo with spaces-worktrees/feature%2Fone")
+            std::fs::canonicalize(&created.path).unwrap(),
+            std::fs::canonicalize(temp.path().join("repo with spaces-worktrees/feature%2Fone"))
+                .unwrap()
         );
         assert_eq!(
             std::fs::read_to_string(Path::new(&created.path).join("tracked")).unwrap(),
@@ -271,6 +272,8 @@ mod tests {
             &["worktree", "lock", "--reason", "keep\nthis", detached],
         )
         .unwrap();
+        let detached = std::fs::canonicalize(detached).unwrap();
+        let detached = detached.to_str().unwrap();
         let entry = list(&path)
             .unwrap()
             .into_iter()

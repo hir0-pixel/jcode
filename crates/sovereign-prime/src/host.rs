@@ -173,15 +173,13 @@ impl ReplHost {
             std::fs::create_dir_all(&session_tmp)?;
             let skills = jcode_storage::jcode_dir()?.join("skills");
             std::fs::create_dir_all(&skills)?;
-            let runtime = self
-                .python
-                .parent()
-                .and_then(Path::parent)
-                .context("resolving bundled Python runtime")?;
-            let profile = sandbox_profile(&self.python, runtime, &project, &session_tmp, &skills);
+            let python = std::fs::canonicalize(&self.python)
+                .context("resolving the Hermes CPython executable")?;
+            let runtime = python_runtime_root(&python)?;
+            let profile = sandbox_profile(&python, &runtime, &project, &session_tmp, &skills);
             let child = Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile])
-                .arg(&self.python)
+                .arg(&python)
                 .args(["-I", "-S", "-u", "-c", crate::worker::PYTHON_WORKER])
                 .arg(&project)
                 .arg(&skills)
@@ -427,6 +425,30 @@ fn sandbox_profile(
         sbpl_path(project),
         sbpl_path(temp)
     )
+}
+
+fn python_runtime_root(python: &Path) -> Result<PathBuf> {
+    if let Ok(executable) = std::fs::canonicalize(python) {
+        if let Some(root) = executable.parent().and_then(Path::parent) {
+            return Ok(root.to_path_buf());
+        }
+    }
+    let venv_root = python
+        .parent()
+        .and_then(Path::parent)
+        .context("resolving bundled Python runtime")?;
+    let config = std::fs::read_to_string(venv_root.join("pyvenv.cfg"));
+    if let Ok(config) = config {
+        if let Some(home) = config
+            .lines()
+            .find_map(|line| line.strip_prefix("home = ").map(PathBuf::from))
+        {
+            if let Some(root) = home.parent() {
+                return Ok(root.to_path_buf());
+            }
+        }
+    }
+    Ok(venv_root.to_path_buf())
 }
 
 async fn send(worker: &mut Worker, value: Value) -> Result<()> {

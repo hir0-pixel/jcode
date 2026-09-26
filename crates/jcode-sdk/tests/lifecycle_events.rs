@@ -180,6 +180,9 @@ fn serve_connection(
     include_archived: Arc<AtomicBool>,
     events_per_attach: usize,
 ) {
+    socket
+        .set_nonblocking(false)
+        .expect("make accepted harness socket blocking");
     let mut reader = BufReader::new(socket.try_clone().expect("clone server socket"));
     let mut writer = socket;
     while let Ok(frame) = read_frame::<_, ClientFrame>(&mut reader) {

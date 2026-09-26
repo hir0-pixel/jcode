@@ -1518,6 +1518,7 @@ mod tests {
     fn detects_env_credentials_requires_region_and_credential_hint() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
+        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
         let _removed = [
             "JCODE_BEDROCK_ENABLE",
@@ -1529,6 +1530,9 @@ mod tests {
             "JCODE_BEDROCK_PROFILE",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             "AWS_SHARED_CREDENTIALS_FILE",
             "AWS_CONFIG_FILE",
         ]
@@ -1551,6 +1555,7 @@ mod tests {
     fn detects_bedrock_login_env_file_credentials() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
+        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
         for key in [
             "JCODE_BEDROCK_ENABLE",
@@ -1561,6 +1566,12 @@ mod tests {
             "AWS_PROFILE",
             "JCODE_BEDROCK_PROFILE",
             "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE",
         ] {
             jcode_core::env::remove_var(key);
         }
@@ -1590,6 +1601,7 @@ mod tests {
     fn configured_profile_from_bedrock_env_overrides_stale_bearer_token() {
         let _guard = lock_test_env();
         let temp = tempfile::tempdir().unwrap();
+        let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path().as_os_str());
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path().as_os_str());
         let _removed = [
             "JCODE_BEDROCK_ENABLE",
