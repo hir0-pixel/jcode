@@ -171,8 +171,10 @@ impl ReplHost {
             let session_tmp =
                 std::env::temp_dir().join(format!("sovereign-repl-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&session_tmp)?;
+            let session_tmp = std::fs::canonicalize(session_tmp)?;
             let skills = jcode_storage::jcode_dir()?.join("skills");
             std::fs::create_dir_all(&skills)?;
+            let skills = std::fs::canonicalize(skills)?;
             let python = std::fs::canonicalize(&self.python)
                 .context("resolving the Hermes CPython executable")?;
             let runtime = python_runtime_root(&python)?;
@@ -417,7 +419,7 @@ fn sandbox_profile(
     skills: &Path,
 ) -> String {
     format!(
-        "(version 1)\n(deny default)\n(import \"system.sb\")\n(deny network*)\n(deny file-write*)\n(deny file-read* (subpath \"/Users\"))\n(deny file-read* (subpath \"/etc\"))\n(deny file-read* (subpath \"/private/etc\"))\n(deny file-read* (subpath \"/Volumes\"))\n(allow process-exec (literal \"{}\"))\n(allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/Library/Developer/CommandLineTools\"))\n(allow file-write* (subpath \"{}\") (subpath \"{}\"))\n",
+        "(version 1)\n(deny default)\n(import \"system.sb\")\n(deny network*)\n(deny file-write*)\n(deny file-read* (subpath \"/etc\"))\n(deny file-read* (subpath \"/private/etc\"))\n(deny file-read* (subpath \"/Volumes\"))\n(allow process-exec (literal \"{}\"))\n(allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/Library/Developer/CommandLineTools\"))\n(allow file-write* (subpath \"{}\") (subpath \"{}\"))\n",
         sbpl_path(python),
         sbpl_path(runtime),
         sbpl_path(project),
