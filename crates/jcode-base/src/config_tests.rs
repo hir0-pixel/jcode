@@ -709,7 +709,7 @@ fn tool_config_disabled_only_keeps_full_profile_with_deny_list() {
     assert!(selection.allowed_tools.is_none());
     assert!(selection.disabled_tools.contains("browser"));
     assert!(selection.disabled_tools.contains("example_tool"));
-    assert!(!selection.disabled_tools.contains("example_tool"));
+    assert!(!selection.disabled_tools.contains("another_tool"));
 }
 
 #[test]
