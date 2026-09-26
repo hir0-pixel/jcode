@@ -311,7 +311,7 @@ async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::F
     upstream.write_all(head.as_bytes()).await?;
     upstream.write_all(&req.body_prefix).await?;
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-    features.touch();
+    features.touch(&req.path, "forwarded-http");
     Ok(())
 }
 

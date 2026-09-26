@@ -68,8 +68,11 @@ impl Features {
         *self.engine_env.lock().unwrap_or_else(|e| e.into_inner()) = Some((url, token));
     }
 
-    pub fn touch(&self) {
+    pub fn touch(&self, route: &str, source: &str) {
         self.last_used_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() {
+            eprintln!("feature_activity at={:?} route={} source={}", SystemTime::now(), route, source);
+        }
     }
 
     pub fn set_cron_hold_until(&self, until: SystemTime) {
@@ -97,7 +100,7 @@ impl Features {
 
     /// Port of the running backend, starting it if needed.
     pub async fn port(&self) -> Result<u16> {
-        self.touch();
+        self.touch("backend-start-or-reuse", "feature-port");
         let mut running = self.running.lock().await;
         if let Some(r) = running.as_mut() {
             if r.child.try_wait().ok().flatten().is_none() {
@@ -169,16 +172,20 @@ impl Features {
     /// Stop the backend if it has been idle for `IDLE_STOP_AFTER`.
     pub async fn stop_if_idle(&self) {
         if self.cron_held() {
+            if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=hold reason=cron-lease"); }
             return;
         }
         if let Ok(home) = std::env::var("HERMES_HOME") {
             if crate::cron_wake::due_within_wake_lead(std::path::Path::new(&home)) {
+                if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=hold reason=due-within-wake-lead"); }
                 return;
             }
         }
         if self.idle_for() < idle_stop_after() {
+            if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=keep idle_ms={} threshold_ms={}", self.idle_for().as_millis(), idle_stop_after().as_millis()); }
             return;
         }
+        if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=stop idle_ms={}", self.idle_for().as_millis()); }
         if let Some(mut r) = self.running.lock().await.take() {
             kill_backend(&mut r.child).await;
         }

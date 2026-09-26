@@ -130,10 +130,11 @@ pub async fn run(features: Arc<Features>) {
         if let Some((id, stamped, due, deadline)) = watching.clone() {
             let still = earliest_due(&home).filter(|(d, jid, raw)| jid == &id && raw == &stamped && *d == due);
             if still.is_none() || SystemTime::now() >= deadline {
+                if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("cron_lease release job={} still_present={} deadline_reached={}", id, still.is_some(), SystemTime::now() >= deadline); }
                 watching = None;
                 features.clear_cron_hold();
             } else {
-                features.touch();
+                features.touch("cron-wake-lease", "cron-wake");
                 features.set_cron_hold_until(deadline);
                 if let Err(err) = features.port().await {
                     eprintln!("sovereign-gateway: cron hold wake failed: {err}");
@@ -155,6 +156,7 @@ pub async fn run(features: Arc<Features>) {
         }
 
         let deadline = due.checked_add(hold_cap()).unwrap_or(due);
+        if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("cron_lease acquire job={} due={:?} deadline={:?}", id, due, deadline); }
         features.set_cron_hold_until(deadline);
         if let Err(err) = features.port().await {
             eprintln!("sovereign-gateway: cron wake failed: {err}");

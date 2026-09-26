@@ -1256,7 +1256,7 @@ impl Conn {
             .await
             .map_err(|_| RpcError::internal(anyhow!("{method} timed out in the feature backend")))?
             .map_err(|_| RpcError::internal(anyhow!("the feature backend restarted; try again")))?;
-        features.touch();
+        features.touch(method, "forwarded-rpc");
         match reply.get("error") {
             Some(err) => Err(RpcError {
                 code: err["code"].as_i64().unwrap_or(INTERNAL),
