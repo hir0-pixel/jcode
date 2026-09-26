@@ -1,3 +1,0 @@
-Using bench via OpenAI-compatible API as the initial provider
-Using model: sovereign/bench-hermes-64k:latest
-Error: Another jcode server process is already running for runtime dir /var/folders/7z/q6rbz8rd6j11f0mbgzrfhyhc0000gn/T/
