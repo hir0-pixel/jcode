@@ -114,13 +114,6 @@ async fn run_with_args(args: Args) -> Result<()> {
             .collect()
     });
 
-    // Invert the legacy server -> tui dependency: the TUI session picker owns
-    // the session-list cache and registers its invalidator here, so the server
-    // can drop the cache (e.g. after a rename) without referencing tui.
-    crate::session_list_cache::register_invalidator(
-        crate::tui::session_picker::invalidate_session_list_cache,
-    );
-
     // Invert the legacy tui -> cli dependency for shared-server spawning: the
     // CLI owns the provider-bootstrap spawn logic and registers it here, so the
     // TUI reconnect loop can request a replacement server via server_spawn
@@ -132,7 +125,6 @@ async fn run_with_args(args: Args) -> Result<()> {
         })
     }));
 
-    crate::tui::keybind::log_keybinding_default_warnings();
     crate::platform::raise_nofile_limit_best_effort(8_192);
     startup_profile::mark("nofile_limit");
 

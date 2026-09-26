@@ -1064,6 +1064,12 @@ async fn run_default_command(args: Args) -> Result<()> {
     }
 
     startup_profile::mark("pre_tui_client");
+    // These hooks serve the standalone terminal picker only; the desktop
+    // gateway never renders that UI.
+    crate::session_list_cache::register_invalidator(
+        crate::tui::session_picker::invalidate_session_list_cache,
+    );
+    crate::tui::keybind::log_keybinding_default_warnings();
     if std::env::var("JCODE_RESUMING").is_err() && server_running {
         output::stderr_info("Connecting to server...");
     }
