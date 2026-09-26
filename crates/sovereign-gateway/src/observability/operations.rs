@@ -1,4 +1,4 @@
-//! M10c monitors, budgets, alerts, approvals audit, promote/replay helpers.
+//! Monitoring, budgets, alert handling, approval audit, and run helpers.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -122,17 +122,17 @@ pub fn list_filtered(
     let lim = limit.min(200);
     let mut stmt = db.prepare(&sql)?;
     let rows = match binds.len() {
-        0 => stmt.query_map([lim], run_row_m10c)?.collect(),
-        1 => stmt.query_map(params![binds[0], lim], run_row_m10c)?.collect(),
-        2 => stmt.query_map(params![binds[0], binds[1], lim], run_row_m10c)?.collect(),
-        3 => stmt.query_map(params![binds[0], binds[1], binds[2], lim], run_row_m10c)?.collect(),
-        4 => stmt.query_map(params![binds[0], binds[1], binds[2], binds[3], lim], run_row_m10c)?.collect(),
+        0 => stmt.query_map([lim], run_row)?.collect(),
+        1 => stmt.query_map(params![binds[0], lim], run_row)?.collect(),
+        2 => stmt.query_map(params![binds[0], binds[1], lim], run_row)?.collect(),
+        3 => stmt.query_map(params![binds[0], binds[1], binds[2], lim], run_row)?.collect(),
+        4 => stmt.query_map(params![binds[0], binds[1], binds[2], binds[3], lim], run_row)?.collect(),
         _ => unreachable!(),
     };
     rows
 }
 
-pub fn run_row_m10c(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+pub fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let flags: i64 = r.get(18)?;
     Ok(json!({
         "id": r.get::<_, String>(0)?,
@@ -525,20 +525,15 @@ fn transition_notify(from: AlertState, to: AlertState) -> bool {
 
 fn fire_webhook(url: &str, payload: &Value) {
     let url = url.to_string();
-    let body = payload.to_string();
+    let payload = payload.clone();
     std::thread::spawn(move || {
-        let _ = std::process::Command::new("curl")
-            .args([
-                "-sfS",
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                &url,
-            ])
-            .status();
+        let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        else {
+            return;
+        };
+        let _ = client.post(url).json(&payload).send();
     });
 }
 

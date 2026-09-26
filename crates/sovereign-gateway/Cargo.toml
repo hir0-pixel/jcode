@@ -15,6 +15,7 @@ jcode-command-risk = { path = "../jcode-command-risk" }
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }
 sovereign-prime = { path = "../sovereign-prime" }
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 jcode-provider-core = { path = "../jcode-provider-core" }

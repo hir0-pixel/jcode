@@ -1,9 +1,9 @@
 //! Bounded, local run ledger. All SQLite work stays off the agent path.
 
-#[path = "observability_m10c.rs"]
-mod observability_m10c;
+#[path = "observability/operations.rs"]
+mod operations;
 
-use observability_m10c::{
+use operations::{
     apply_run_end_flags, budget_status, evaluate_alerts, list_alerts, list_approvals, list_filtered,
     monitors, promote_run, turn_index, window_ms, write_approval,
 };
@@ -829,7 +829,7 @@ impl Observer {
 
 pub(crate) fn detail_from_db(db: &Connection, id: &str) -> rusqlite::Result<Value> {
         let mut stmt = db.prepare("SELECT id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,title,unpriced_calls,flags,replay_of FROM obs_runs WHERE id=?1")?;
-        let run = stmt.query_row([id], observability_m10c::run_row_m10c)?;
+        let run = stmt.query_row([id], operations::run_row)?;
         let mut spans = db.prepare("SELECT s.id,s.run_id,s.parent_id,s.root_id,s.kind,s.name,s.status,s.started_at_ms,s.ended_at_ms,s.input_tokens,s.output_tokens,s.cache_read_tokens,s.cache_write_tokens,s.cost_usd,s.error,c.input,c.output,s.model,s.provider,s.attributes FROM obs_spans s LEFT JOIN obs_content c ON c.id=s.id WHERE s.run_id=?1 ORDER BY s.started_at_ms")?;
         let spans = spans.query_map([id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"parent_id":r.get::<_,String>(2)?,"root_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"name":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"started_at_ms":r.get::<_,i64>(7)?,"ended_at_ms":r.get::<_,Option<i64>>(8)?,"input_tokens":r.get::<_,i64>(9)?,"output_tokens":r.get::<_,i64>(10)?,"cache_read_tokens":r.get::<_,i64>(11)?,"cache_write_tokens":r.get::<_,i64>(12)?,"cost_usd":r.get::<_,Option<f64>>(13)?,"error":r.get::<_,Option<String>>(14)?,"input":r.get::<_,Option<String>>(15)?,"output":r.get::<_,Option<String>>(16)?,"model":r.get::<_,Option<String>>(17)?,"provider":r.get::<_,Option<String>>(18)?,"attributes":serde_json::from_str::<Value>(&r.get::<_,String>(19)?).unwrap_or_else(|_| json!({}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let content: Option<(Option<String>, Option<String>)> = db

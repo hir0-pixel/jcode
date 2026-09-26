@@ -118,6 +118,7 @@ pub(crate) struct Conn {
     pub(crate) observer: Arc<Observer>,
     run_kind: &'static str,
     run_title: Option<String>,
+    replay_of: Option<String>,
 }
 
 impl Conn {
@@ -1025,11 +1026,18 @@ impl Conn {
                 self.fresh.lock().await.remove(&id);
                 self.learn_state.lock().await.entry(id.clone()).or_default().0 += 1;
                 let run = self.observer.start_turn(&id, &text, self.run_kind, self.run_title.as_deref());
+                if let Some(original) = &self.replay_of {
+                    self.observer.link_replay(&run, original);
+                }
                 if let Err(err) = self.submit(&id, &text).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
                 }
-                Ok(json!({ "status": if busy { "queued" } else { "streaming" } }))
+                let mut response = json!({ "status": if busy { "queued" } else { "streaming" } });
+                if self.replay_of.is_some() {
+                    response["run_id"] = json!(run);
+                }
+                Ok(response)
             }
             "session.steer" => {
                 let id = sid()?;
@@ -1375,7 +1383,6 @@ pub async fn replay_run(
         to_ws: to_ws.clone(),
         sessions: Mutex::new(Default::default()),
     });
-    hub.add(client.clone()).await;
     let conn = Arc::new(Conn {
         config: config.clone(),
         to_ws,
@@ -1400,6 +1407,7 @@ pub async fn replay_run(
         observer: observer.clone(),
         run_kind: "invoke_agent",
         run_title: Some(format!("Replay {run_id}")),
+        replay_of: Some(run_id.clone()),
     });
     let control = conn.open_link().await.context("engine unavailable")?;
     *conn.control.lock().await = Some(control);
@@ -1446,20 +1454,30 @@ pub async fn replay_run(
         None => bail!("turn index {turn_index} not found in branched session"),
     }
 
-    let new_run = observer.start_turn(&child, &prompt, "invoke_agent", Some("Replay"));
-    observer.link_replay(&new_run, &run_id);
-    if let Err(err) = conn
+    let submitted = match conn
         .dispatch("prompt.submit", &json!({ "session_id": child, "text": prompt }))
         .await
     {
-        observer.failed_submit(&child, &new_run, &err.message);
-        return Err(anyhow!("{}", err.message));
-    }
-    drop(ws_out);
-    hub.remove(conn.client.id).await;
-    for task in conn.link_tasks.lock().await.drain(..) {
-        task.abort();
-    }
+        Ok(submitted) => submitted,
+        Err(err) => return Err(anyhow!("{}", err.message)),
+    };
+    let new_run = submitted["run_id"].as_str().ok_or_else(|| anyhow!("replay run did not start"))?.to_string();
+    let replay_session = child.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = ws_out.recv().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+            if frame["method"] == "event"
+                && frame["params"]["session_id"] == replay_session
+                && frame["params"]["type"] == "message.complete"
+            {
+                break;
+            }
+        }
+        for task in conn.link_tasks.lock().await.drain(..) {
+            task.abort();
+        }
+    });
     Ok(json!({
         "ok": true,
         "session_id": child,
@@ -1504,6 +1522,7 @@ pub(crate) async fn agent_run(
         observer,
         run_kind: "cron",
         run_title: title.map(str::to_string),
+        replay_of: None,
     });
 
     let control = conn.open_link().await.context("engine unavailable")?;
@@ -1604,6 +1623,7 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Obser
         observer,
         run_kind: "invoke_agent",
         run_title: None,
+        replay_of: None,
     });
 
     // Control link first: if the engine is unreachable, refuse the client.

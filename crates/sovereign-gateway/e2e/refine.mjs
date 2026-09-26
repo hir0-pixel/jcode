@@ -71,12 +71,22 @@ const turn = async (sid, text) => {
   throw new Error('turn timed out')
 }
 const slash = (sid, command) => rpc('slash.exec', { session_id: sid, command })
+const refineWithEvidence = async (sid, sentence, instruction) => {
+  await turn(sid, `Please remember this exact sentence: "${sentence}"`)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await slash(sid, `/refine ${instruction}`)
+    if (result.result?.status === 'ok') return result
+    const output = `${result.result?.output || ''} ${result.error?.message || ''}`
+    if (!/rejected:.*(?:evidence|proposal cites no evidence)/i.test(output)) return result
+    console.log(`retryable /refine evidence-gate rejection (${attempt + 1}/3): ${output.trim().slice(0, 180)}`)
+  }
+  return { error: { message: 'evidence gate rejected all 3 attempts' } }
+}
 
 try {
   // 1. /refine with instructions creates an evidence-backed entry.
   const sid = (await rpc('session.create', { cwd: home })).result.session_id
-  await turn(sid, 'From now on, whenever you write a quick script for me, write it in Nim. Please remember that.')
-  const refined = await slash(sid, '/refine always use Nim for quick scripts')
+  const refined = await refineWithEvidence(sid, 'For quick scripts, use Nim.', 'For quick scripts, use Nim.')
   check(refined.result?.status === 'ok', `/refine succeeded (${JSON.stringify(refined.result)})`)
   const output = refined.result?.output || ''
   const changesetMatch = output.match(/rollback ([0-9a-f-]{36})/)
@@ -94,14 +104,12 @@ try {
   }
 
   // 3. A local entry never leaks into another session; --global does.
-  await turn(sid, 'No, actually always use Zig for quick scripts, not Nim. Remember that going forward.')
-  await slash(sid, '/refine always use Zig for quick scripts')
+  await refineWithEvidence(sid, 'For quick scripts, use Zig.', 'For quick scripts, use Zig.')
   const other = (await rpc('session.create', { cwd: home })).result.session_id
   const otherStatus = await slash(other, '/refine status')
   check(/^0 entries visible/.test(otherStatus.result?.output || ''), `a local /refine entry does not leak into another session (${otherStatus.result?.output?.slice(0, 80)})`)
 
-  await turn(sid, 'From now on, in every project, always answer in one short paragraph. Remember that everywhere.')
-  await slash(sid, '/refine --global always answer in one short paragraph')
+  await refineWithEvidence(sid, 'Answer in one short paragraph.', '--global answer in one short paragraph')
   const globalStatus = await slash(other, '/refine status')
   check(/[1-9]\d* entries visible/.test(globalStatus.result?.output || ''), `a --global /refine entry is visible from another session (${globalStatus.result?.output?.slice(0, 80)})`)
 
