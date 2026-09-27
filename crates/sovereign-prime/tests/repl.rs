@@ -114,6 +114,38 @@ async fn llm_query_is_a_recursive_host_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn prime_skill_host_request_bridges_goal_and_refine() {
+    let h = host();
+    let extra = sovereign_prime::host::ExtraHostFns {
+        goal: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op).unwrap();
+                match op["op"].as_str().unwrap() {
+                    "get" => Ok(r#"{"goal":"ship parity"}"#.to_string()),
+                    "create" => Ok(format!(r#"{{"created":{}}}"#, op["text"])),
+                    other => anyhow::bail!("unexpected goal operation: {other}"),
+                }
+            })
+        }),
+        ..sovereign_prime::host::ExtraHostFns::default()
+    };
+    let out = h.run(
+        "prime-api",
+        "import rlm\ngoal = await rlm.host_request('goal.get')\ncreated = await rlm.host_request('goal.create', {'objective': 'ship parity'})\nrefine = await rlm.host_request('refine.status')\n(goal['goal'], created['created'], refine['scheduled'])",
+        None,
+        upper(),
+        no_refine(),
+        extra,
+        true,
+    ).await.unwrap();
+    assert_eq!(
+        out.value.as_deref(),
+        Some("('ship parity', 'ship parity', False)")
+    );
+    assert_eq!(out.host_calls, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn load_reads_workspace_files_into_variables() {
     let h = host();
     let dir = workdir();

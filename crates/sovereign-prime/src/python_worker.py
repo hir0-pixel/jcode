@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import traceback
+import types
 
 protocol_out = sys.stdout
 sys.path.extend(sys.argv[1:])
@@ -62,6 +63,30 @@ async def spawn_subagent(prompt, name="worker"):
 
 async def agent_message(action, message=None, target=None):
     return await host_call("agent_message", json.dumps({"action": action, "message": message, "target": target}))
+
+
+async def host_request(name, payload=None):
+    """Prime skill bridge for host operations already implemented by Rust."""
+    payload = payload or {}
+    if name.startswith("goal."):
+        op = name.removeprefix("goal.")
+        if op not in {"get", "create", "complete"}:
+            raise ValueError(f"unsupported Prime host request: {name}")
+        request = {"op": op}
+        if op == "create":
+            request["text"] = payload.get("objective", payload.get("text"))
+        return json.loads(await host_call("goal", json.dumps(request)))
+    if name.startswith("refine."):
+        op = name.removeprefix("refine.")
+        if op not in {"status", "run"}:
+            raise ValueError(f"unsupported Prime host request: {name}")
+        return json.loads(await host_call("refine", json.dumps({"op": op, **payload})))
+    raise ValueError(f"unsupported Prime host request: {name}")
+
+
+_rlm_module = types.ModuleType("rlm")
+_rlm_module.host_request = host_request
+sys.modules["rlm"] = _rlm_module
 
 
 namespace.update({

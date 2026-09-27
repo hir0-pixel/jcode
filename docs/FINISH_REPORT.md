@@ -213,15 +213,24 @@ voice/wake/TTS, and plugin install/capability checks remain open in
 
 The required read-only shallow clone was retried outside the network sandbox
 and succeeded. Prime's wrappers for `agent-observe`, `compact`,
-`rlm-heartbeat`, and `agent-message` import `rlm.host_request`. The current
-Python worker does not provide that module. Their contracts include
+`rlm-heartbeat`, and `agent-message` import `rlm.host_request`. The worker now
+provides that module for the already implemented goal and refine callbacks.
+The remaining package contracts include
 `agent_observe.list/get/recent`, `compact.status/run`,
 `rlm_heartbeat.list/create/update/delete`, and `rlm.collect(targets,
 timeout_ms)`. Rust has communication, compaction, session-heartbeat, and
 delegate components, but the REPL has no bridges for those operations, no
 Prime package bundle in the skill store, and no combined reattach or budget
 e2e. Item 4 remains incomplete; the source clone and API audit removed the
-earlier DNS uncertainty but did not implement or validate those bridges.
+earlier DNS uncertainty. Added the partial goal/refine mapping in this follow-up;
+the other operations remain unimplemented.
+
+The new `rlm.host_request` mapping supports `goal.get/create/complete` and
+`refine.status/run` by calling the existing Rust host callbacks. It rejects
+unknown request names instead of fabricating support. The goal budget/result
+shape and Prime's heartbeat, observe, compaction, role-based messaging, and
+`rlm.collect` remain gaps. The targeted host-request integration test and all
+10 REPL integration tests pass with the staged Hermes CPython runtime.
 
 ### Item 5: jcode TUI removal trial
 
