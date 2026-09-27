@@ -471,3 +471,18 @@ with `COLORTERM=truecolor TERM=xterm-256color`. Release binary build passed;
 HTTP routes; desktop `npx tsc --noEmit -p .` passed. The earlier pack and
 packaged e2e results remain the recorded desktop verification because this
 last change touched only the benchmark runner and report.
+
+### Item A continuation: dedicated-entrypoint sessions regression (2026-09-28)
+
+The sessions e2e still used the removed generic `--provider-profile` argument.
+Updated its isolated provider config to set `default_provider = "local"`, use
+the supported `--provider openai-compatible` serve argument, and give Hermes
+its own temporary home. This keeps the live test on local Ollama and preserves
+the no-forwarding assertion. The focused REST dispatch test passed (1/1),
+`python3 scripts/parity.py` reports 0 placeholder RPCs and 0 refused routes,
+and `node crates/sovereign-gateway/e2e/sessions.mjs` passed outside the
+restricted sandbox. It verified all eight REST routes with and without auth,
+the session RPCs, engine settings, and the final no-chat-RPC-forwarding check.
+GPT-6 Sol reviewed the diff and advised it was minimal and correct; its only
+caveat was that a host-inherited `JCODE_NAMED_PROVIDER_PROFILE` could override
+the test config, which did not occur in the verified run.
