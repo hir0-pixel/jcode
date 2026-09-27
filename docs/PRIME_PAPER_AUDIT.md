@@ -28,4 +28,24 @@ Source: [Prime Agent: A Self-Improving RLM Harness, arXiv:2608.23552v1](https://
 | Autonomous mode, goals, and heartbeats | Rust `/autonomous`, `/goal`, `/heartbeat` | Present; Prime-specific budget/result semantics and internal RLM heartbeat are incomplete |
 | Human Agents View | Hermes desktop session and activity views | Not audited here as a performance component; combined live continuity test is missing |
 
+## Follow-up audit result
+
+The paper names no numeric ablation deltas for the REPL, Continual Harness,
+subagents, messaging, refinement, or persistence. The strongest explicit
+component attributions are qualitative: persistent REPL use enabled extra
+out-of-loop experiments and lower token use at similar GPU-kernel performance;
+iterative refinement plus dedicated subagents supported Factorio progress and
+parallelism. The nanoGPT comparison says final records were within experiment
+noise. Treating any of these as an isolated percentage gain would overstate the
+paper.
+
+The three-arm harness is present in `scripts/bench/abeval.py` and exposes
+`--arm {hermes,sovereign,prime}` with the common task registry, local counting
+proxy, and isolated homes. `python3 scripts/bench/abeval.py --help` and
+`run --help` were checked in this pass. The Prime CLI is absent from `/tmp`, so
+no new three-arm run or new performance-budget measurements were possible.
+Akira's remaining component gaps are the ones listed as partial/gap in
+`docs/PRIME_PARITY.md`; the paper does not provide evidence to fill those gaps
+by inference.
+
 The paper's outcome numbers describe full-system runs and are not predictions for Akira. The Prime RPC benchmark arm is implemented in `scripts/bench/abeval.py`; a single local task passed through the shared counting proxy. The full nine-task arm has not been run.
