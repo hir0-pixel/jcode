@@ -214,7 +214,10 @@ fn parse_import_records(records: &[Value]) -> std::result::Result<Vec<jcode_base
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_import_records, valid_id};
+    use super::{parse_import_records, route, valid_id};
+    use crate::{Config, Request};
+    use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+    use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
 
     #[test]
     fn session_ids_cannot_escape_the_session_store() {
@@ -231,6 +234,59 @@ mod tests {
         assert_eq!(parse_import_records(std::slice::from_ref(&exported)).unwrap()[0].id, "s_roundtrip");
         let invalid = [exported, serde_json::json!({"session": {"id":"../unsafe"}})];
         assert!(parse_import_records(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_repaired_session_endpoint_reaches_its_engine_handler() {
+        let config = Config {
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: "test".into(),
+            version: "test".into(),
+            legacy_socket: std::env::temp_dir().join(format!(
+                "sovereign-session-rest-no-daemon-{}-{}.sock",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            )),
+            default_cwd: "/tmp".into(),
+            allow_non_loopback: false,
+            provider: "local".into(),
+            model: "test".into(),
+            home: "/tmp".into(),
+            complete: None,
+            approval_secret: "test".into(),
+            features: None,
+            learning: None,
+        };
+        let cases = [
+            ("GET", "/api/sessions/stats", "", "503"),
+            ("GET", "/api/sessions/empty/count", "", "503"),
+            ("DELETE", "/api/sessions/empty", "", "503"),
+            ("POST", "/api/sessions/bulk-delete", r#"{"ids":[]}"#, "200"),
+            ("POST", "/api/sessions/import", r#"{"sessions":[]}"#, "200"),
+            ("POST", "/api/sessions/prune", r#"{"dry_run":true}"#, "503"),
+            ("GET", "/api/sessions/missing/latest-descendant", "", "503"),
+            ("GET", "/api/sessions/missing/export", "", "404"),
+        ];
+
+        for (method, path, body, expected_status) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut server = accept.await.unwrap();
+            let req = Request {
+                method: method.into(),
+                path: path.into(),
+                query: None,
+                headers: vec![("content-length".into(), body.len().to_string())],
+                body_prefix: body.as_bytes().to_vec(),
+            };
+
+            assert!(route(&mut server, &req, &config).await.is_some(), "unmatched route: {method} {path}");
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {expected_status}")), "{method} {path}: {response}");
+        }
     }
 }
 
