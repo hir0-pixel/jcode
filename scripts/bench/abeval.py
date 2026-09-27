@@ -230,6 +230,9 @@ def start_sovereign(c, home, token):
     (jcode_home / "config.toml").write_text(
         "\n".join(
             [
+                "[provider]",
+                'default_provider = "bench"',
+                "",
                 "[providers.bench]",
                 'type = "openai-compatible"',
                 f'base_url = "http://{c["PROXY"]}{c["PROXY_PATH"]}"',
@@ -247,7 +250,7 @@ def start_sovereign(c, home, token):
     )
     env = {k: v for k, v in os.environ.items() if not any(s in k for s in ("API_KEY", "TOKEN", "SECRET")) and not k.startswith(("HERMES_", "JCODE_", "SOVEREIGN_"))}
     env.update({"HOME": str(home), "JCODE_HOME": str(jcode_home), "HERMES_DASHBOARD_SESSION_TOKEN": token, "SOVEREIGN_PRICE_TABLE": c["PRICE_TABLE"]})
-    args = [c["SOVEREIGN_BIN"], "--provider-profile", "bench", "--model", c["MODEL"], "serve", "--host", "127.0.0.1", "--port", "0"]
+    args = [c["SOVEREIGN_BIN"], "--provider", "openai-compatible", "--model", c["MODEL"], "serve", "--host", "127.0.0.1", "--port", "0"]
     proc = subprocess.Popen(args, env=env, cwd=str(home), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True, text=True)
     port = None
     deadline = time.time() + 180

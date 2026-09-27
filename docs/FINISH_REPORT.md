@@ -440,3 +440,22 @@ remains verified by the prior one-task/one-repetition three-arm run recorded
 above. A repeat attempt to inspect the full cross-target Cargo tree was
 sandbox/offline-limited because `android_system_properties v0.1.5` is not
 cached; the current-host dependency tree command above is complete and exact.
+
+### Follow-up item 7: final benchmark smoke and runner correction
+
+The repeat smoke initially made the Hermes arm appear hung: its configured
+localhost counting proxy was blocked by the sandbox (`httpx.ConnectError:
+[Errno 1] Operation not permitted`). Outside that restriction, all three arms
+completed successfully against the same local Ollama model. The Sovereign arm
+then exposed that the dedicated binary no longer accepts the generic
+`--provider-profile` flag (`unsupported sovereign argument: --provider-profile`).
+The bench runner now selects its throwaway `bench` provider from config and
+uses the supported `--provider openai-compatible` serve arguments.
+
+One task (`err_case_search`), one repetition, local model
+`sovereign/bench-hermes-64k:latest`: Hermes passed (3 model calls, 3 tool
+calls, 0 tool errors, 146.4 s); Sovereign passed (4 model calls, 6 tool calls,
+0 tool errors, 152.4 s); Prime passed (2 model calls, 1 tool call, 0 tool
+errors, 55.2 s). This is a one-task smoke only; the full benchmark suite is
+not claimed. The repeat was executed with local-only network escalation after
+the sandbox denial.
