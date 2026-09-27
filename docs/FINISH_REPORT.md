@@ -260,8 +260,21 @@ extracting the engine runtime boundary before retrying this deletion.
 
 ### Item 6: workspace test targets
 
-Skipped as directed: the latest full workspace run recorded above passed 8,056
-tests with 0 failures and 59 ignored across 212 targets.
+Fixed the full-run `sovereign` binary test compile error by importing
+`profile_home`, `Path`, and `PathBuf` in its test module; the binary target now
+passes 3/3 tests. Fixed stale `jcode-base` test assumptions exposed by the
+required temp-home environment: standalone MCP tests now temporarily clear
+`HERMES_HOME` and restore it via a guard, while the browser path test asserts
+that the browser directory is under the configured JCode home instead of
+requiring the home directory's literal name to contain `.jcode`. The
+`jcode-base` suite passes 1,494 tests with 6 ignored under local-only
+escalation.
+
+The restricted run's 96 socket-binding failures and loopback probe were
+`Operation not permitted`; the escalated crate run passed. The two raw ANSI
+wire tests failed when the parent shell set `NO_COLOR=1`; they pass with that
+variable unset. In the full workspace rerun, one reconnect assertion in
+`jcode-tui` failed once (`handle_post_connect_dispatches_reload_followup_even_if_history_snapshot_looks_busy`); the full `jcode-tui --lib` target then passed 2,389 tests with 17 ignored, and the exact test passed twice in isolation. This is recorded as a transient concurrency-sensitive test, not as a sandbox failure. A clean final full-workspace rerun is still required before claiming the gate green.
 
 ### Item 7: Prime benchmark arm
 

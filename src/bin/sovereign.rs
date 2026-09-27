@@ -207,7 +207,8 @@ fn install_ollama_signal_unload() {
 
 #[cfg(test)]
 mod tests {
-    use super::translate;
+    use super::{profile_home, translate};
+    use std::path::{Path, PathBuf};
 
     fn t(args: &[&str]) -> Vec<String> {
         translate(args.iter().map(|s| s.to_string()).collect())

@@ -38,8 +38,7 @@ fn test_paths() {
     let _guard = crate::storage::lock_test_env();
 
     let bdir = browser_dir();
-    assert!(bdir.to_string_lossy().contains(".jcode"));
-    assert!(bdir.to_string_lossy().ends_with("browser"));
+    assert_eq!(bdir, jcode_dir().join("browser"));
 
     let bin = browser_binary_path();
     assert!(bin.to_string_lossy().contains("browser"));

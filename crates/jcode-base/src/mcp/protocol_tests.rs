@@ -1,5 +1,25 @@
 use super::*;
 
+struct StandaloneMcpHome(Option<std::ffi::OsString>);
+
+impl StandaloneMcpHome {
+    fn clear_hermes_home() -> Self {
+        let previous = std::env::var_os("HERMES_HOME");
+        crate::env::remove_var("HERMES_HOME");
+        Self(previous)
+    }
+}
+
+impl Drop for StandaloneMcpHome {
+    fn drop(&mut self) {
+        if let Some(home) = self.0.take() {
+            crate::env::set_var("HERMES_HOME", home);
+        } else {
+            crate::env::remove_var("HERMES_HOME");
+        }
+    }
+}
+
 #[test]
 fn hermes_mcp_settings_are_loaded_for_engine_chats() {
     let _guard = crate::storage::lock_test_env();
@@ -48,6 +68,7 @@ fn hermes_mcp_settings_are_loaded_for_engine_chats() {
 #[test]
 fn issue_790_load_uses_process_cwd_while_unbound_load_for_dir_does_not() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let original_cwd = std::env::current_dir().expect("current cwd");
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
@@ -307,6 +328,7 @@ fn expansion_after_merge_ignores_shadowed_references() {
 #[test]
 fn load_for_dir_expands_the_winning_merged_definition() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let previous_value = std::env::var_os("JCODE_MCP_EXPANSION_TEST_VALUE");
     let home = tempfile::tempdir().expect("home tempdir");
@@ -646,6 +668,7 @@ fn claude_json_http_entry_does_not_displace_jcode_stdio_server() {
     // the merge and then be dropped by the non-stdio filter, so a working
     // server vanished with no indication it had been overwritten.
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let original_cwd = std::env::current_dir().expect("current cwd");
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
@@ -690,6 +713,7 @@ fn claude_json_http_entry_does_not_displace_jcode_stdio_server() {
 #[test]
 fn claude_is_live_while_codex_is_a_one_time_snapshot() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
@@ -759,6 +783,7 @@ env = { TOKEN = "codex-inline-secret" }
 #[test]
 fn codex_import_preserves_enabled_false() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
@@ -814,6 +839,7 @@ command = "active-bin"
 #[test]
 fn claude_only_config_never_creates_a_jcode_snapshot() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
@@ -846,6 +872,7 @@ fn claude_only_config_never_creates_a_jcode_snapshot() {
 #[test]
 fn legacy_claude_config_is_live_and_deletions_do_not_leave_a_snapshot() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let home = tempfile::tempdir().expect("home tempdir");
     crate::env::set_var("JCODE_HOME", home.path());
@@ -894,6 +921,7 @@ fn legacy_claude_config_is_live_and_deletions_do_not_leave_a_snapshot() {
 #[test]
 fn disabling_claude_mcp_skips_both_live_sources_but_preserves_jcode_sources() {
     let _guard = crate::storage::lock_test_env();
+    let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let previous_home = std::env::var_os("JCODE_HOME");
     let previous_disable = std::env::var_os("JCODE_DISABLE_CLAUDE_MCP");
     let home = tempfile::tempdir().expect("home tempdir");
