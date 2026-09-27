@@ -179,6 +179,9 @@ try {
   const imported = await http('POST', '/api/sessions/import', { sessions: [exported.body] })
   check(exported.status === 200 && imported.status === 200 && imported.body?.skipped === 1,
     'REST export envelope round-trips through the engine importer')
+  const child = (await rpc('session.branch', { session_id: a })).result.session_id
+  const sessionsBaseline = await http('GET', '/api/sessions')
+  const expectedMessages = sessionsBaseline.body?.sessions?.reduce((n, session) => n + (session.message_count || 0), 0)
   const found = await http('GET', `/api/sessions/search?q=three`)
   check(found.body?.results?.some(r => r.session_id === a), 'REST search finds the session by message text')
   const sessionRoutes = [
@@ -204,8 +207,66 @@ try {
     const missingToken = curl(method, route, body, false)
     const authenticated = curl(method, route, body, true)
     check(missingToken.status === 401, `${method} ${route} rejects a missing token`)
-    check(authenticated.status >= 200 && authenticated.status < 300, `${method} ${route} is served with a token (${authenticated.status})`)
+    const routeOk = route === '/api/sessions/stats'
+      ? authenticated.status === 200 && authenticated.body?.total === sessionsBaseline.body?.sessions?.length && authenticated.body?.messages === expectedMessages
+      : route === '/api/sessions/empty/count'
+        ? authenticated.status === 200 && Number.isInteger(authenticated.body?.count)
+        : route === '/api/sessions/empty'
+          ? authenticated.status === 200 && authenticated.body?.ok === true && Number.isInteger(authenticated.body?.deleted)
+          : route === '/api/sessions/bulk-delete'
+            ? authenticated.status === 200 && authenticated.body?.ok === true && authenticated.body?.deleted === 0
+            : route === '/api/sessions/import'
+              ? authenticated.status === 200 && authenticated.body?.ok === true && authenticated.body?.imported === 0 && authenticated.body?.skipped === 0
+              : route === '/api/sessions/prune'
+                ? authenticated.status === 200 && authenticated.body?.ok === true && authenticated.body?.dry_run === true && authenticated.body?.deleted === 0
+                : route.endsWith('/latest-descendant')
+                  ? authenticated.status === 200 && authenticated.body?.session_id === child && authenticated.body?.path?.[0] === a && authenticated.body?.path?.at(-1) === child
+                  : authenticated.status === 200 && authenticated.body?.session?.id === a
+    check(routeOk, `${method} ${route} returns the expected engine result (${authenticated.status}: ${JSON.stringify(authenticated.body)})`)
   }
+  const newId = prefix => `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+  const emptyId = newId('session_empty')
+  const emptyRecord = structuredClone(exported.body.session)
+  emptyRecord.id = emptyId
+  emptyRecord.parent_id = null
+  emptyRecord.messages = []
+  const emptyCountBefore = (await http('GET', '/api/sessions/empty/count')).body?.count
+  const emptyImport = await http('POST', '/api/sessions/import', { sessions: [{ session: emptyRecord }] })
+  const emptyBefore = await http('GET', '/api/sessions/empty/count')
+  check(emptyImport.status === 200 && emptyImport.body?.imported === 1 && emptyBefore.body?.count === emptyCountBefore + 1,
+    `empty-session import increments the engine count (${emptyCountBefore} -> ${emptyBefore.body?.count})`)
+  const deletedEmpty = await http('DELETE', '/api/sessions/empty')
+  check(deletedEmpty.body?.deleted >= 1 && !fs.existsSync(path.join(jcodeHome, 'sessions', `${emptyId}.json`)),
+    `empty-session deletion removes closed empty records (${deletedEmpty.body?.deleted})`)
+  const bulkId = newId('session_bulk')
+  const bulkRecord = structuredClone(exported.body.session)
+  bulkRecord.id = bulkId
+  bulkRecord.parent_id = null
+  const bulkImport = await http('POST', '/api/sessions/import', { sessions: [{ session: bulkRecord }] })
+  const bulk = await http('POST', '/api/sessions/bulk-delete', { ids: [bulkId] })
+  check(bulkImport.status === 200 && bulk.status === 200 && bulk.body?.deleted === 1 && !fs.existsSync(path.join(jcodeHome, 'sessions', `${bulkId}.json`)),
+    'bulk-delete removes the requested engine session')
+  const staleId = newId('session_stale')
+  const stale = structuredClone(exported.body.session)
+  stale.id = staleId
+  stale.parent_id = null
+  stale.messages = []
+  stale.created_at = new Date(Date.now() - 100 * 86_400_000).toISOString()
+  stale.updated_at = stale.created_at
+  const staleImport = await http('POST', '/api/sessions/import', { sessions: [{ session: stale }] })
+  const stalePath = path.join(jcodeHome, 'sessions', `${staleId}.json`)
+  const staleSnapshot = JSON.parse(fs.readFileSync(stalePath, 'utf8'))
+  staleSnapshot.created_at = stale.created_at
+  staleSnapshot.updated_at = stale.updated_at
+  fs.writeFileSync(stalePath, JSON.stringify(staleSnapshot))
+  fs.rmSync(path.join(jcodeHome, 'sessions', `${staleId}.journal.jsonl`), { force: true })
+  const pruneDryRun = await http('POST', '/api/sessions/prune', { older_than_days: 30, dry_run: true })
+  check(staleImport.status === 200 && pruneDryRun.body?.session_ids?.includes(staleId) && pruneDryRun.body?.deleted === 0,
+    'prune dry-run identifies an old imported session without deleting it')
+  const pruned = await http('POST', '/api/sessions/prune', { older_than_days: 30 })
+  check(pruned.body?.session_ids?.includes(staleId) && pruned.body?.deleted >= 1 &&
+    !fs.existsSync(path.join(jcodeHome, 'sessions', `${staleId}.json`)),
+    'prune deletes the old engine session selected by its filter')
   await http('PATCH', `/api/sessions/${a}`, { archived: true })
   check(!(await listIds()).includes(a), 'REST archive hides the session')
   await http('PATCH', `/api/sessions/${a}`, { archived: false })
