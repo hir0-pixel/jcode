@@ -3,9 +3,26 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn test_own_process_not_reading_stdin() {
-    let pid = std::process::id();
-    let state = is_waiting_for_stdin(pid);
-    assert_ne!(state, StdinState::Reading);
+    // The test runner inherits its parent's stdin, which may be a pipe or PTY
+    // in CI. Probe a child with an explicit null stdin so this assertion does
+    // not depend on how Cargo itself was launched.
+    #[cfg(unix)]
+    {
+        let mut child = Command::new("sleep")
+            .arg("10")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+
+        let state = is_waiting_for_stdin(child.id());
+        child.kill().ok();
+        child.wait().ok();
+
+        assert_ne!(state, StdinState::Reading);
+    }
+    #[cfg(windows)]
+    assert_eq!(is_waiting_for_stdin(std::process::id()), StdinState::NotReading);
 }
 
 #[test]
