@@ -36,6 +36,8 @@ remaining work is the Prime skill package bundle and complete host API
 (`rlm_heartbeat`, `agent_observe`, compaction, and exact goal semantics),
 subagent result/await support, combined reattach e2e, and a failing latency
 budget benchmark for dispatch, warm REPL, and cold start. No measurements are
-claimed for those budgets. The required shallow clone attempt failed because
-the sandbox could not resolve `github.com`; the Prime skill source bundle was
-therefore not ported in this pass.
+claimed for those budgets. A later read-only shallow clone succeeded outside
+the network sandbox. Prime's wrappers import `rlm.host_request`; the current
+worker does not provide that module or the missing typed operations. Their
+contracts are recorded in `docs/FINISH_REPORT.md`. The features remain
+incomplete until those bridges, packages, and their live tests are added.

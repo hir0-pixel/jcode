@@ -206,3 +206,37 @@ memory, and profile system prompt all reached the Rust chat. OAuth MCP, the
 browser-controller action, terminal/PTY pane, live
 voice/wake/TTS, and plugin install/capability checks remain open in
 `docs/HERMES_FEATURE_CHECK.md`.
+
+## Follow-up queue continuation
+
+### Item 4: Prime REPL parity
+
+The required read-only shallow clone was retried outside the network sandbox
+and succeeded. Prime's wrappers for `agent-observe`, `compact`,
+`rlm-heartbeat`, and `agent-message` import `rlm.host_request`. The current
+Python worker does not provide that module. Their contracts include
+`agent_observe.list/get/recent`, `compact.status/run`,
+`rlm_heartbeat.list/create/update/delete`, and `rlm.collect(targets,
+timeout_ms)`. Rust has communication, compaction, session-heartbeat, and
+delegate components, but the REPL has no bridges for those operations, no
+Prime package bundle in the skill store, and no combined reattach or budget
+e2e. Item 4 remains incomplete; the source clone and API audit removed the
+earlier DNS uncertainty but did not implement or validate those bridges.
+
+### Item 5: jcode TUI removal trial
+
+`cargo tree --offline -p jcode -e normal -i jcode-tui` shows the product's
+`jcode` package depends directly on `jcode-tui`. A compiler trial temporarily
+removed that dependency and its re-export, then ran
+`cargo check --offline --bin sovereign --no-default-features` with the shared
+target. It failed with 799 errors: `src/cli` imports `crate::tui` and app-core
+modules re-exported through `jcode-tui`, including server, session, provider,
+auth, storage, and memory. The trial changes were restored immediately. A
+dedicated engine entrypoint must first extract gateway startup and its minimal
+app-core dependencies from the generic CLI; simply unlinking the TUI is not
+safe. No production files were left changed by the trial.
+
+### Item 6: workspace test targets
+
+Skipped as directed: the latest full workspace run recorded above passed 8,056
+tests with 0 failures and 59 ignored across 212 targets.
