@@ -487,21 +487,47 @@ impl SkillRegistry {
             return Ok(());
         }
 
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Ok(skill) = Self::parse_skill(&skill_file)
-                {
-                    self.skills.insert(skill.name.clone(), skill);
-                }
+        for skill_file in Self::skill_files(dir)? {
+            if let Ok(skill) = Self::parse_skill(&skill_file) {
+                self.skills.insert(skill.name.clone(), skill);
             }
         }
 
         Ok(())
+    }
+
+    /// Hub installs may be grouped as `<skills>/<category>/<name>/SKILL.md`.
+    /// Keep normal `<skills>/<name>/SKILL.md` discovery and inspect one
+    /// category level without descending into a skill's support directories.
+    fn skill_files(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if !path.is_dir()
+                || path.is_symlink()
+                || path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
+            let direct = path.join("SKILL.md");
+            if direct.is_file() {
+                files.push(direct);
+                continue;
+            }
+            let Ok(nested_entries) = std::fs::read_dir(path) else {
+                continue;
+            };
+            for nested in nested_entries.flatten() {
+                let nested = nested.path();
+                if nested.is_dir() && !nested.is_symlink() {
+                    let skill_file = nested.join("SKILL.md");
+                    if skill_file.is_file() {
+                        files.push(skill_file);
+                    }
+                }
+            }
+        }
+        Ok(files)
     }
 
     /// Parse a SKILL.md file
@@ -695,18 +721,10 @@ impl SkillRegistry {
         }
 
         let mut count = 0;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Ok(skill) = Self::parse_skill(&skill_file)
-                {
-                    self.skills.insert(skill.name.clone(), skill);
-                    count += 1;
-                }
+        for skill_file in Self::skill_files(dir)? {
+            if let Ok(skill) = Self::parse_skill(&skill_file) {
+                self.skills.insert(skill.name.clone(), skill);
+                count += 1;
             }
         }
 
@@ -1292,6 +1310,23 @@ mod tests {
         assert_eq!(count, 1);
         assert!(counted_registry.contains("valid"));
         assert!(!counted_registry.contains("malformed"));
+    }
+
+    #[test]
+    fn loads_category_nested_hermes_hub_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = temp.path().join("skills");
+        let skill = skills_dir.join("autonomous-ai-agents").join("hub-skill");
+        std::fs::create_dir_all(&skill).expect("create categorized skill");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: hub-skill\ndescription: Installed from Hermes hub\n---\n\nUse it.\n",
+        )
+        .expect("write skill");
+
+        let mut registry = SkillRegistry::default();
+        assert_eq!(registry.load_from_dir_count(&skills_dir).expect("load"), 1);
+        assert_eq!(registry.get("hub-skill").expect("hub skill").description, "Installed from Hermes hub");
     }
 
     #[test]

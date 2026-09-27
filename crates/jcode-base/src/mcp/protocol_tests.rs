@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn hermes_mcp_settings_are_loaded_for_engine_chats() {
+    let _guard = crate::storage::lock_test_env();
+    let previous_hermes_home = std::env::var_os("HERMES_HOME");
+    let previous_jcode_home = std::env::var_os("JCODE_HOME");
+    let hermes_home = tempfile::tempdir().expect("Hermes home");
+    let jcode_home = tempfile::tempdir().expect("jcode home");
+    crate::env::set_var("HERMES_HOME", hermes_home.path());
+    crate::env::set_var("JCODE_HOME", jcode_home.path());
+    std::fs::write(
+        jcode_home.path().join("mcp.json"),
+        r#"{"servers":{"removed-in-hermes":{"command":"/tmp/stale-mcp"}}}"#,
+    )
+    .expect("write old jcode config");
+    std::fs::write(
+        hermes_home.path().join("config.yaml"),
+        "mcp_servers:\n  hermes-api-server:\n    command: /tmp/hermes-mcp\n    args: [--from-settings]\n    enabled: true\n",
+    )
+    .expect("write Hermes config");
+
+    let result = std::panic::catch_unwind(|| {
+        let config = McpConfig::load_for_dir(None);
+        let server = config
+            .servers
+            .get("hermes-api-server")
+            .expect("server loaded");
+        assert_eq!(server.command, "/tmp/hermes-mcp");
+        assert_eq!(server.args, ["--from-settings"]);
+        assert!(server.is_enabled());
+        assert!(!config.servers.contains_key("removed-in-hermes"));
+    });
+
+    if let Some(value) = previous_hermes_home {
+        crate::env::set_var("HERMES_HOME", value);
+    } else {
+        crate::env::remove_var("HERMES_HOME");
+    }
+    if let Some(value) = previous_jcode_home {
+        crate::env::set_var("JCODE_HOME", value);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    result.expect("Hermes MCP settings load");
+}
+
+#[test]
 fn issue_790_load_uses_process_cwd_while_unbound_load_for_dir_does_not() {
     let _guard = crate::storage::lock_test_env();
     let original_cwd = std::env::current_dir().expect("current cwd");

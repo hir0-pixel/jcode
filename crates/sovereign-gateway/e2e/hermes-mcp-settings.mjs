@@ -1,0 +1,246 @@
+#!/usr/bin/env node
+// Proves a server added through Hermes's local dashboard API becomes callable
+// from a new Rust-engine chat. Requires Hermes's checkout/.venv and local Ollama.
+import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+const engineBin = process.env.SOVEREIGN_BIN || path.resolve('target/release/sovereign')
+const hermesRoot = process.env.HERMES_REPO || path.resolve('../hermes-agent')
+const python = process.env.HERMES_PYTHON || path.join(hermesRoot, '.venv/bin/python')
+const model = process.env.E2E_MODEL || 'sovereign/bench-hermes-64k:latest'
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sovereign-hermes-mcp-'))
+const home = path.join(root, 'home')
+const hermesHome = path.join(root, '.hermes')
+const jcodeHome = path.join(root, '.jcode')
+fs.mkdirSync(home, { recursive: true })
+fs.mkdirSync(hermesHome, { recursive: true })
+fs.mkdirSync(jcodeHome, { recursive: true })
+const token = crypto.randomBytes(24).toString('hex')
+fs.writeFileSync(
+  path.join(jcodeHome, 'config.toml'),
+  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`,
+)
+const env = {
+  ...process.env,
+  HOME: home,
+  HERMES_HOME: hermesHome,
+  JCODE_HOME: jcodeHome,
+  HERMES_DASHBOARD_SESSION_TOKEN: token,
+  // Hermes's skills hub uses this signal to put installs in the shared engine store.
+  SOVEREIGN_ENGINE_URL: 'http://127.0.0.1:1',
+  SOVEREIGN_PROVIDER: 'local',
+  SOVEREIGN_MODEL: model,
+  PYTHONDONTWRITEBYTECODE: '1',
+}
+const children = []
+const stop = child => {
+  if (child && child.exitCode === null) child.kill('SIGTERM')
+}
+const start = (command, args, cwd, childEnv) => {
+  const child = spawn(command, args, { cwd, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  children.push(child)
+  let output = ''
+  child.stdout.on('data', chunk => { output += chunk })
+  child.stderr.on('data', chunk => { output += chunk })
+  return { child, output: () => output }
+}
+const waitPort = async (proc, marker) => {
+  const until = Date.now() + 120_000
+  while (Date.now() < until) {
+    const match = proc.output().match(new RegExp(`${marker} port=(\\d+)`))
+    if (match) return Number(match[1])
+    if (proc.child.exitCode !== null) throw new Error(`${marker} process exited: ${proc.output()}`)
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  throw new Error(`timed out waiting for ${marker}: ${proc.output()}`)
+}
+
+let ws
+try {
+  const fakeMcp = path.join(root, 'mcp-server.mjs')
+  fs.writeFileSync(fakeMcp, `
+    import readline from 'node:readline'
+    const rl = readline.createInterface({ input: process.stdin })
+    for await (const line of rl) {
+      let request
+      try { request = JSON.parse(line) } catch { continue }
+      if (request.id === undefined) continue
+      let result = {}
+      if (request.method === 'initialize') result = {
+        protocolVersion: '2024-11-05', capabilities: { tools: {} },
+        serverInfo: { name: 'hermes-settings-test', version: '1' }
+      }
+      if (request.method === 'tools/list') result = { tools: [{
+        name: 'prove_settings', description: 'Return the exact supplied text.',
+        inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
+      }] }
+      if (request.method === 'tools/call') result = {
+        content: [{ type: 'text', text: 'HERMES_MCP_SETTINGS_OK:' + request.params.arguments.text }],
+        isError: false
+      }
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n')
+    }
+  `)
+
+  const hermes = start(python, ['-m', 'hermes_cli.main', 'serve', '--host', '127.0.0.1', '--port', '0', '--skip-build'], hermesRoot, env)
+  const hermesPort = await waitPort(hermes, 'HERMES_BACKEND_READY')
+  const base = `http://127.0.0.1:${hermesPort}`
+  const added = await fetch(`${base}/api/mcp/servers`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ name: 'settings-test', command: process.execPath, args: [fakeMcp] }),
+  })
+  if (!added.ok) throw new Error(`Hermes MCP add API returned ${added.status}: ${await added.text()}`)
+  const persisted = await fetch(`${base}/api/mcp/servers`, {
+    headers: { 'X-Hermes-Session-Token': token },
+  }).then(response => response.json())
+  if (!persisted.servers?.some(server => server.name === 'settings-test')) {
+    throw new Error(`Hermes API did not list the saved server: ${JSON.stringify(persisted)}`)
+  }
+
+  const skillName = 'agent-merge-conflict-arbiter'
+  const skillInstall = await fetch(`${base}/api/skills/hub/install`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ identifier: 'official/autonomous-ai-agents/agent-merge-conflict-arbiter' }),
+  })
+  if (!skillInstall.ok) throw new Error(`Hermes skill hub install returned ${skillInstall.status}: ${await skillInstall.text()}`)
+  const skillPath = path.join(jcodeHome, 'skills', 'autonomous-ai-agents', skillName, 'SKILL.md')
+  const skillDeadline = Date.now() + 30_000
+  while (Date.now() < skillDeadline && !fs.existsSync(skillPath)) await new Promise(resolve => setTimeout(resolve, 100))
+  if (!fs.existsSync(skillPath)) throw new Error(`Hermes skills hub did not install into the shared engine store: ${skillPath}`)
+
+  const terminalToggle = await fetch(`${base}/api/tools/toolsets/terminal`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ enabled: false }),
+  })
+  if (!terminalToggle.ok) throw new Error(`Hermes terminal toolset toggle returned ${terminalToggle.status}: ${await terminalToggle.text()}`)
+  const toolsets = await fetch(`${base}/api/tools/toolsets`, {
+    headers: { 'X-Hermes-Session-Token': token },
+  }).then(response => response.json())
+  if (toolsets.find(toolset => toolset.name === 'terminal')?.enabled !== false) {
+    throw new Error(`Hermes API did not persist the terminal toolset toggle: ${JSON.stringify(toolsets)}`)
+  }
+  const memorySetting = await fetch(`${base}/api/config`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ config: { memory: { memory_enabled: false } } }),
+  })
+  if (!memorySetting.ok) throw new Error(`Hermes memory setting returned ${memorySetting.status}: ${await memorySetting.text()}`)
+  const savedMemorySetting = await fetch(`${base}/api/config?include_defaults=false`, {
+    headers: { 'X-Hermes-Session-Token': token },
+  }).then(response => response.json())
+  if (savedMemorySetting.memory?.memory_enabled !== false) {
+    throw new Error(`Hermes API did not persist the memory setting: ${JSON.stringify(savedMemorySetting.memory)}`)
+  }
+
+  const engine = start(engineBin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], home, env)
+  const port = await waitPort(engine, 'HERMES_BACKEND_READY')
+  const engineSkills = await fetch(`http://127.0.0.1:${port}/api/skills`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).then(response => response.json())
+  if (!engineSkills.some(skill => skill.name === skillName)) {
+    throw new Error(`installed hub skill is absent from the engine skill list: ${JSON.stringify(engineSkills)}`)
+  }
+  ws = new WebSocket(`ws://127.0.0.1:${port}/api/ws?token=${token}`)
+  const events = []
+  const pending = new Map()
+  let next = 0
+  ws.addEventListener('message', message => {
+    const frame = JSON.parse(String(message.data))
+    if (frame.method === 'event') events.push(frame.params)
+    else if (frame.id !== undefined && pending.has(frame.id)) {
+      pending.get(frame.id)(frame)
+      pending.delete(frame.id)
+    } else if (frame.method === 'approval') {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { choice: 'once' } }))
+    }
+  })
+  await new Promise((resolve, reject) => {
+    ws.addEventListener('open', resolve, { once: true })
+    ws.addEventListener('error', reject, { once: true })
+  })
+  const rpc = (method, params = {}) => {
+    const id = `m${++next}`
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+    return new Promise(resolve => pending.set(id, resolve))
+  }
+  const created = await rpc('session.create', {
+    cwd: home,
+    model,
+    provider: 'local',
+    reasoning_effort: 'low',
+    system_prompt: 'When asked for the settings marker, respond with exactly SYSTEM_PROMPT_APPLIED.',
+  })
+  const sid = created.result?.session_id
+  if (!sid) throw new Error(`session.create failed: ${JSON.stringify(created)}`)
+  if (created.result.info?.model !== model || created.result.info?.provider !== 'local' ||
+    created.result.info?.reasoning_effort !== 'low' || created.result.info?.memory_enabled !== false) {
+    throw new Error(`Hermes model/provider/reasoning/memory settings did not reach the engine session: ${JSON.stringify(created.result.info)}`)
+  }
+  const changedModel = await rpc('config.set', { session_id: sid, key: 'model', value: `${model} --provider local` })
+  if (changedModel.error || changedModel.result?.value !== `${model} --provider local`) {
+    throw new Error(`model/provider setting failed: ${JSON.stringify(changedModel)}`)
+  }
+  const changedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'high' })
+  if (changedEffort.error || changedEffort.result?.value !== 'high') {
+    throw new Error(`reasoning setting failed: ${JSON.stringify(changedEffort)}`)
+  }
+  // Verify the chosen setting reaches the engine, then use low effort for the
+  // live tool-use turns so this regression test remains bounded on Ollama.
+  const boundedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'low' })
+  if (boundedEffort.error || boundedEffort.result?.value !== 'low') {
+    throw new Error(`reasoning effort could not be reset for bounded e2e turns: ${JSON.stringify(boundedEffort)}`)
+  }
+  const sendTurn = async (text, targetSid = sid, timeoutMs = 180_000) => {
+    const from = events.length
+    const result = await rpc('prompt.submit', { session_id: targetSid, text })
+    if (result.error) throw new Error(`prompt.submit failed: ${JSON.stringify(result)}`)
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && !events.slice(from).some(event => event.session_id === targetSid && ['message.complete', 'error'].includes(event.type))) {
+      await new Promise(resolve => setTimeout(resolve, 150))
+    }
+    if (!events.slice(from).some(event => event.session_id === targetSid && event.type === 'message.complete')) {
+      throw new Error(`chat did not complete: ${JSON.stringify(events.slice(from))}\n${engine.output()}`)
+    }
+  }
+  // Agent/MCP startup is lazy. Reload through the engine's management tool
+  // before the second turn so its model-facing registry contains the server tool.
+  await sendTurn('Use the mcp management tool with action reload to connect the configured MCP server. Then reply with exactly READY.')
+  await new Promise(resolve => setTimeout(resolve, 1000))
+  await sendTurn('Call mcp__settings_test__prove_settings with text exactly: api-added-tool. Do not use another tool. After it returns, reply with the settings marker.')
+  const history = await rpc('session.history', { session_id: sid })
+  const transcript = JSON.stringify(history.result?.messages || [])
+  if (!transcript.includes('HERMES_MCP_SETTINGS_OK:api-added-tool')) {
+    throw new Error(`chat transcript did not contain the MCP result: ${transcript}\n${engine.output()}`)
+  }
+  if (!transcript.includes('SYSTEM_PROMPT_APPLIED')) {
+    throw new Error(`chat did not follow the Hermes profile system prompt: ${transcript}`)
+  }
+  const restricted = (await rpc('session.create', { cwd: home, reasoning_effort: 'low' })).result
+  await sendTurn('Use bash to print TOOL_TOGGLE_FAILED. If bash is unavailable, reply exactly TOOL_TOGGLE_APPLIED and do not use any other tool.', restricted.session_id, 60_000)
+  const restrictedHistory = await rpc('session.history', { session_id: restricted.session_id })
+  const messages = restrictedHistory.result?.messages || []
+  const bashCalled = messages.some(message => message.name === 'bash' || message.tool_name === 'bash' ||
+    message.tool_calls?.some(call => (call.name || call.function?.name) === 'bash'))
+  if (bashCalled) throw new Error(`disabled Hermes terminal toolset remained visible to chat: ${JSON.stringify(messages)}`)
+  if (!JSON.stringify(messages).includes('TOOL_TOGGLE_APPLIED')) {
+    throw new Error(`chat did not respond that the disabled terminal tool was unavailable: ${JSON.stringify(messages)}`)
+  }
+  console.log('PASS Hermes API added MCP server; Rust engine chat called it and received its result')
+  console.log('PASS Hermes skills hub installed into JCODE_HOME/skills and the Rust engine lists it')
+  console.log('PASS Hermes terminal toolset toggle is persisted by Python and enforced by Rust chat')
+} finally {
+  if (ws && ws.readyState < WebSocket.CLOSING) ws.close()
+  for (const child of [...children].reverse()) stop(child)
+  await Promise.all(children.map(child => new Promise(resolve => {
+    if (child.exitCode !== null) return resolve()
+    child.once('exit', resolve)
+    setTimeout(() => { stop(child); resolve() }, 5000)
+  })))
+  fs.rmSync(root, { recursive: true, force: true })
+}

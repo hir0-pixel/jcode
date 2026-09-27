@@ -686,6 +686,43 @@ fn tool_config_explicit_enabled_and_disabled_lists_compose() {
 }
 
 #[test]
+fn hermes_cli_toolset_toggles_filter_engine_tools() {
+    let _env_lock = crate::storage::lock_test_env();
+    let previous = std::env::var_os("HERMES_HOME");
+    let home = tempfile::tempdir().expect("temporary Hermes home");
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "platform_toolsets:\n  cli:\n    - terminal\n",
+    )
+    .expect("write Hermes toolset setting");
+    crate::env::set_var("HERMES_HOME", home.path());
+
+    let selection = ToolConfig::default().selection();
+    assert!(selection.disabled_tools.contains("read"));
+    assert!(selection.disabled_tools.contains("write"));
+    assert!(!selection.disabled_tools.contains("bash"));
+
+    restore_env_var("HERMES_HOME", previous);
+}
+
+#[test]
+fn hermes_memory_setting_is_the_engine_chat_source_of_truth() {
+    let _env_lock = crate::storage::lock_test_env();
+    let previous = std::env::var_os("HERMES_HOME");
+    let home = tempfile::tempdir().expect("temporary Hermes home");
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "memory:\n  memory_enabled: false\n",
+    )
+    .expect("write Hermes memory setting");
+    crate::env::set_var("HERMES_HOME", home.path());
+
+    let enabled = super::memory_enabled();
+    restore_env_var("HERMES_HOME", previous);
+    assert!(!enabled, "Hermes desktop memory off setting must disable chat memory");
+}
+
+#[test]
 fn tool_config_none_profile_disables_all_tools() {
     let cfg = ToolConfig {
         profile: "none".to_string(),

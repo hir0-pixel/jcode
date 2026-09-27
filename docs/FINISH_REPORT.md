@@ -160,3 +160,23 @@ The required shallow clone command was attempted: `git clone --depth 1 https://g
 **Status: implementation is committed at the base revision; the strengthened live session e2e passes.** The base checkout is `f0ba1ff573cc087310005e2ba3887722fe4537cd`. Re-ran `python3 scripts/parity.py`: 0 placeholder RPCs and 0 refused routes. Re-ran `crates/sovereign-gateway/e2e/sessions.mjs` using isolated temporary homes and local Ollama. The sandbox attempt failed before gateway startup with `system-configuration` panic `Attempted to create a NULL object`; the same command passed outside the restricted sandbox. The live script checks all eight REST paths via `curl`: each rejects missing auth with 401, and each authenticated response is checked against its expected JSON contract. It also verifies latest-descendant against a real branch, deletes an imported empty session and a nonempty bulk-delete target, and prunes an imported old record in dry-run and live modes. The engine RPCs and export/import round trip are exercised too. Its forwarding assertion excludes the deliberately Hermes-forwarded `handoff.request` and passed. The earlier “incomplete” row above described a different checkout state and is superseded.
 
 The existing `sessions_rest.rs` unit tests cover safe session IDs and validated import/export envelopes; the live e2e covers route dispatch, authorization, and behavior. No claim is made that every route has an isolated handler-level unit test. Review found the stats and empty-count assertions needed exact baselines, so the test now compares against the current session listing and requires the empty import to increment the count by one.
+
+## Hermes feature walkthrough progress (2026-09-27)
+
+This supersedes the earlier Item 3 paragraph that said no bridge or e2e had been
+added. The Rust engine now reads Hermes `config.yaml` as the source of truth for
+MCP servers, toolset enablement, and memory enablement; the engine continues to
+own per-session model/provider/reasoning/system-prompt state. Categorized
+skills-hub installs under `JCODE_HOME/skills/<category>/<name>` are discovered
+by the engine skill loader. The new isolated live e2e
+`hermes-mcp-settings.mjs` passed: an API-added local stdio MCP tool was called
+by chat; the hub skill appeared in `/api/skills`; tool disablement removed bash
+from chat; and model/provider/reasoning/memory/system-prompt settings reached
+the engine. Its first sandbox run was denied localhost bind; the local-only
+escalated run passed. A standalone Ollama `think:false` probe returned `OK`.
+
+The CLI-driven Kanban test passes board creation, task claim/completion, and
+persisted result checks. The Activity/star-map e2e passes completed-run details
+and star-map graph/node list, edit, and delete checks. These tests use isolated
+homes. Remaining rows in `docs/HERMES_FEATURE_CHECK.md` are still open; this
+progress record does not claim the entire walkthrough is complete.

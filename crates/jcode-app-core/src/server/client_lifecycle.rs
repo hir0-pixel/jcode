@@ -611,7 +611,7 @@ pub(super) async fn handle_client(
         .await;
     let agent_new_ms = t0.elapsed().as_millis();
 
-    new_agent.set_memory_enabled(crate::config::config().features.memory);
+    new_agent.set_memory_enabled(crate::config::memory_enabled());
     let prewarm_start = std::time::Instant::now();
     new_agent.prewarm_provider_idle().await;
     let prewarm_ms = prewarm_start.elapsed().as_millis();

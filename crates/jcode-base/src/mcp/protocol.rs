@@ -621,12 +621,15 @@ impl McpConfig {
         let mut merged = Self::default();
         let claude_mcp_enabled = std::env::var_os("JCODE_DISABLE_CLAUDE_MCP").is_none();
 
-        // Load jcode's own global config (~/.jcode/mcp.json)
-        if let Ok(jcode_dir) = crate::storage::jcode_dir() {
-            let jcode_mcp = jcode_dir.join("mcp.json");
-            if jcode_mcp.exists() {
-                if let Ok(config) = Self::load_from_file(&jcode_mcp) {
-                    merged.servers.extend(config.servers);
+        // On the desktop Hermes owns MCP settings. Outside that integration,
+        // standalone engine users keep using ~/.jcode/mcp.json.
+        if std::env::var_os("HERMES_HOME").is_none() {
+            if let Ok(jcode_dir) = crate::storage::jcode_dir() {
+                let jcode_mcp = jcode_dir.join("mcp.json");
+                if jcode_mcp.exists() {
+                    if let Ok(config) = Self::load_from_file(&jcode_mcp) {
+                        merged.servers.extend(config.servers);
+                    }
                 }
             }
         }
@@ -674,6 +677,23 @@ impl McpConfig {
                 &mut merged.servers,
                 Self::load_project_locals(project_root).servers,
             );
+        }
+
+        // The desktop's MCP settings API is owned by Hermes and persists to
+        // HERMES_HOME/config.yaml. Read that same source for engine chats so
+        // adding/removing a server in Settings affects the next session without
+        // routing model tool calls through the Python backend.
+        if let Some(hermes_home) = std::env::var_os("HERMES_HOME") {
+            let path = std::path::PathBuf::from(hermes_home).join("config.yaml");
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&contents)
+                && let Some(servers) = root.get("mcp_servers")
+                && let Ok(servers) = serde_yaml::from_value::<
+                    std::collections::HashMap<String, McpServerConfig>,
+                >(servers.clone())
+            {
+                merged.servers.extend(servers);
+            }
         }
 
         // Claude Code expands environment references after source precedence is

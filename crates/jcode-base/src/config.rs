@@ -688,6 +688,8 @@ impl ToolConfig {
             .map(|name| normalize_tool_name(name))
             .filter(|name| !name.is_empty())
             .collect();
+        let mut disabled_tools = disabled_tools;
+        disabled_tools.extend(hermes_disabled_engine_tools());
 
         if let Some(allowed) = allowed_tools.as_mut() {
             for name in &disabled_tools {
@@ -783,6 +785,58 @@ impl ToolConfig {
 
         (enabled, enables_all_tools)
     }
+}
+
+/// Hermes owns the desktop memory switch in `memory.memory_enabled`. Standalone
+/// engine runs continue to use the native config setting.
+pub fn memory_enabled() -> bool {
+    hermes_memory_enabled().unwrap_or_else(|| config().features.memory)
+}
+
+fn hermes_memory_enabled() -> Option<bool> {
+    let home = std::env::var_os("HERMES_HOME")?;
+    let contents = std::fs::read_to_string(PathBuf::from(home).join("config.yaml")).ok()?;
+    let config = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
+    config
+        .get("memory")
+        .and_then(|value| value.get("memory_enabled"))
+        .and_then(serde_yaml::Value::as_bool)
+}
+
+/// Apply Hermes desktop's canonical `platform_toolsets.cli` choices to the
+/// engine tools that have direct equivalents. Hermes remains the sole owner
+/// of this setting; unrelated Rust-only tools keep the engine's own defaults.
+fn hermes_disabled_engine_tools() -> HashSet<String> {
+    let Some(home) = std::env::var_os("HERMES_HOME") else {
+        return HashSet::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(PathBuf::from(home).join("config.yaml")) else {
+        return HashSet::new();
+    };
+    let Ok(config) = serde_yaml::from_str::<serde_yaml::Value>(&contents) else {
+        return HashSet::new();
+    };
+    let Some(enabled) = config
+        .get("platform_toolsets")
+        .and_then(|value| value.get("cli"))
+        .and_then(serde_yaml::Value::as_sequence)
+    else {
+        return HashSet::new();
+    };
+    let enabled: HashSet<&str> = enabled.iter().filter_map(serde_yaml::Value::as_str).collect();
+    [
+        ("terminal", ["bash", "bg"].as_slice()),
+        ("file", ["read", "write", "edit", "replace", "ls", "open"].as_slice()),
+        ("todo", ["todo"].as_slice()),
+        ("memory", ["memory"].as_slice()),
+        ("browser", ["browser"].as_slice()),
+        ("code_execution", ["repl"].as_slice()),
+        ("delegation", ["delegate"].as_slice()),
+    ]
+    .into_iter()
+    .filter(|(toolset, _)| !enabled.contains(toolset))
+    .flat_map(|(_, tools)| tools.iter().map(|tool| (*tool).to_string()))
+    .collect()
 }
 
 fn normalize_tool_name(name: &str) -> String {

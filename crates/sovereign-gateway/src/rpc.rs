@@ -909,6 +909,7 @@ impl Conn {
                 if let Some(provider) = p["provider"].as_str().filter(|provider| !provider.trim().is_empty()) {
                     info["provider"] = json!(provider);
                 }
+                info["memory_enabled"] = json!(jcode_base::config::memory_enabled());
                 if let Some(effort) = p["reasoning_effort"].as_str().filter(|effort| !effort.trim().is_empty()) {
                     info["reasoning_effort"] = json!(effort);
                 }
