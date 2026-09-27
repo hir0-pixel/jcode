@@ -240,3 +240,33 @@ safe. No production files were left changed by the trial.
 
 Skipped as directed: the latest full workspace run recorded above passed 8,056
 tests with 0 failures and 59 ignored across 212 targets.
+
+### Item 7: Prime benchmark arm
+
+Fixed Prime's zero-request failure in `scripts/bench/abeval.py`: Prime's model
+reference is canonical `provider/model-id`, but the harness passed only the
+Ollama model ID while separately selecting provider `bench`. That selected no
+configured benchmark model; the RPC process emitted a provider connection error
+and the counting proxy saw zero requests. Passing `bench/<model-id>` made the
+configured model resolve and the counting proxy receive requests. The explicit
+daemon socket was not the cause and remains in place.
+
+Built the required reference CLI in the shallow `/tmp/prime-agent` clone. The
+clone's full build path could not fetch Prime's full hosted model catalog and
+its four-model fixture failed the source catalog's 42-transport validation;
+the compiled CLI was therefore bundled directly using Prime's own
+`scripts/bundle.mjs`. Its only extra missing package, `@opentelemetry/api`, was
+fetched into the throwaway clone. No installer or global install was used.
+
+The same `err_case_search` task passed once for all three arms against local
+`sovereign/bench-hermes-64k:latest` through the shared counting proxy:
+
+| Arm | Result | Model calls | Tool calls | Tool errors | Wall time |
+|---|---:|---:|---:|---:|---:|
+| Hermes | Pass | 3 | 2 | 0 | 172.8 s |
+| Sovereign | Pass | 5 | 4 | 0 | 124.3 s |
+| Prime | Pass | 4 | 3 | 0 | 93.8 s |
+
+All isolated run homes and outputs were under `/tmp`. The reference clone was
+removed after the benchmark. This verifies one task and one repetition only;
+the full nine-task comparison is not claimed.

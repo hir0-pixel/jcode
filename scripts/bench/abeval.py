@@ -446,7 +446,7 @@ def run_prime_task(c, proxy, work, run_id, task_name, timeout_s):
     started = time.time()
     try:
         proc = subprocess.run(
-            ["node", str(cli), "--mode", "rpc", "--provider", "bench", "--model", c["MODEL"],
+            ["node", str(cli), "--mode", "rpc", "--provider", "bench", "--model", f'bench/{c["MODEL"]}',
              "--cwd", str(work), "--daemon-socket", str(work / "prime-daemon.sock"),
              "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-context-files"],
             input=json.dumps({"type": "prompt", "message": prompt}) + "\n",
