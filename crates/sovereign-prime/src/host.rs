@@ -40,6 +40,7 @@ pub struct ExtraHostFns {
     pub heartbeat: HostFn,
     pub spawn_subagent: HostFn,
     pub agent_message: HostFn,
+    pub websearch: HostFn,
 }
 
 impl Default for ExtraHostFns {
@@ -55,6 +56,7 @@ impl Default for ExtraHostFns {
             heartbeat: unavailable("heartbeat"),
             spawn_subagent: unavailable("spawn_subagent"),
             agent_message: unavailable("agent_message"),
+            websearch: unavailable("websearch"),
         }
     }
 }
@@ -513,6 +515,7 @@ async fn drive(
                     Some("agent_message") => {
                         (extra.agent_message)(truncate(arg, MAX_QUERY_CHARS)).await
                     }
+                    Some("websearch") => (extra.websearch)(truncate(arg, MAX_QUERY_CHARS)).await,
                     _ => Err(anyhow!("unknown host function")),
                 };
                 let reply = match reply {

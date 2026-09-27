@@ -81,6 +81,8 @@ async def host_request(name, payload=None):
         if op not in {"status", "run"}:
             raise ValueError(f"unsupported Prime host request: {name}")
         return json.loads(await host_call("refine", json.dumps({"op": op, **payload})))
+    if name == "websearch.run":
+        return {"results": await host_call("websearch", json.dumps(payload))}
     raise ValueError(f"unsupported Prime host request: {name}")
 
 

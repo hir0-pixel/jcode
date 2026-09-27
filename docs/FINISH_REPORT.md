@@ -225,12 +225,14 @@ e2e. Item 4 remains incomplete; the source clone and API audit removed the
 earlier DNS uncertainty. Added the partial goal/refine mapping in this follow-up;
 the other operations remain unimplemented.
 
-The new `rlm.host_request` mapping supports `goal.get/create/complete` and
-`refine.status/run` by calling the existing Rust host callbacks. It rejects
-unknown request names instead of fabricating support. The goal budget/result
-shape and Prime's heartbeat, observe, compaction, role-based messaging, and
-`rlm.collect` remain gaps. The targeted host-request integration test and all
-10 REPL integration tests pass with the staged Hermes CPython runtime.
+The new `rlm.host_request` mapping supports `goal.get/create/complete`,
+`refine.status/run`, and `websearch.run` by calling existing Rust features.
+Web search forces DuckDuckGo, avoiding Prime's Serper key requirement. Unknown
+requests fail explicitly. The goal budget/result shape and Prime's heartbeat,
+observe, compaction, role-based messaging, and `rlm.collect` remain gaps; the
+Prime-compatible package bundle also remains missing. The targeted host-request
+integration test and all 10 REPL integration tests pass with the staged Hermes
+CPython runtime.
 
 ### Item 5: jcode TUI removal trial
 

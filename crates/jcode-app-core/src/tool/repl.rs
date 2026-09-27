@@ -227,6 +227,26 @@ impl Tool for ReplTool {
                     })
                 })
             },
+            websearch: {
+                let context = ctx.clone();
+                Arc::new(move |op_json| {
+                    let context = context.clone();
+                    Box::pin(async move {
+                        let op: Value = serde_json::from_str(&op_json).unwrap_or_default();
+                        let output = super::websearch::WebSearchTool::new()
+                            .execute(
+                                json!({
+                                    "query": op["query"],
+                                    "num_results": op["num_results"],
+                                    "engine": "duckduckgo"
+                                }),
+                                context,
+                            )
+                            .await?;
+                        Ok(output.output)
+                    })
+                })
+            },
             ..sovereign_prime::host::ExtraHostFns::default()
         };
         #[cfg(target_os = "macos")]

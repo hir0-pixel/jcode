@@ -127,11 +127,19 @@ async fn prime_skill_host_request_bridges_goal_and_refine() {
                 }
             })
         }),
+        websearch: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op).unwrap();
+                anyhow::ensure!(op["query"] == "local", "query was not forwarded");
+                anyhow::ensure!(op["num_results"] == 2, "result limit was not forwarded");
+                Ok("safe local results".to_string())
+            })
+        }),
         ..sovereign_prime::host::ExtraHostFns::default()
     };
     let out = h.run(
         "prime-api",
-        "import rlm\ngoal = await rlm.host_request('goal.get')\ncreated = await rlm.host_request('goal.create', {'objective': 'ship parity'})\nrefine = await rlm.host_request('refine.status')\n(goal['goal'], created['created'], refine['scheduled'])",
+        "import rlm\ngoal = await rlm.host_request('goal.get')\ncreated = await rlm.host_request('goal.create', {'objective': 'ship parity'})\nrefine = await rlm.host_request('refine.status')\nsearch = await rlm.host_request('websearch.run', {'query': 'local', 'num_results': 2})\n(goal['goal'], created['created'], refine['scheduled'], search['results'])",
         None,
         upper(),
         no_refine(),
@@ -140,9 +148,9 @@ async fn prime_skill_host_request_bridges_goal_and_refine() {
     ).await.unwrap();
     assert_eq!(
         out.value.as_deref(),
-        Some("('ship parity', 'ship parity', False)")
+        Some("('ship parity', 'ship parity', False, 'safe local results')")
     );
-    assert_eq!(out.host_calls, 3);
+    assert_eq!(out.host_calls, 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]

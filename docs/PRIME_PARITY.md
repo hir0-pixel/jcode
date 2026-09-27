@@ -22,7 +22,7 @@ agent loop.
 | Refine / continual harness | Local/global CRUD, rollback, evidence and rationale | Rust `sovereign-prime` entries/harness/refine; REPL `rlm.host_request` maps `refine.status/run` to the existing callback | Rust feature and host request mapping work; Prime Python skill package is missing |
 | Executable Python skills | `SKILL.md` plus importable package | Existing store imports user-provided package paths; skill creation currently creates instructions only | Partial; package authoring and bundled Prime wrappers are missing |
 | Prime skill packages | goal, refine, heartbeat, messages, observe, compact, websearch, skill creator | Equivalent Rust features exist for several jobs; no Prime-compatible package bundle/bridge for all listed APIs | Gap |
-| Web search | Prime Serper integration | Existing Rust `websearch` tool uses its key-free configured backend | Rust tool works; Python skill wrapper missing |
+| Web search | Prime Serper integration | REPL `rlm.host_request("websearch.run")` calls the existing Rust tool with DuckDuckGo explicitly selected | Host bridge works and uses the key-free backend; Prime-compatible Python package is not bundled |
 | Compaction | Check and schedule host compaction | Engine compaction is available to chat and desktop | Rust path exists; REPL skill bridge is missing |
 | RLM static prompt | Prompt-as-variable and programmatic subcalls | Concise static section added to `crates/jcode-base/src/prompt/system_prompt.md` | Done |
 | Detach / reattach | Long-running session survives client disconnect | Gateway persists sessions and control state | Partial; combined session/goal/heartbeat/subagent reattach e2e is missing |
