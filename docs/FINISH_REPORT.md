@@ -180,3 +180,29 @@ persisted result checks. The Activity/star-map e2e passes completed-run details
 and star-map graph/node list, edit, and delete checks. These tests use isolated
 homes. Remaining rows in `docs/HERMES_FEATURE_CHECK.md` are still open; this
 progress record does not claim the entire walkthrough is complete.
+
+## Hermes walkthrough continuation
+
+The shared skill registry now refreshes from disk before returning a snapshot,
+so a hub removal is visible to an already-running engine. The new
+`hermes-skill-hub.mjs` passed install and uninstall checks against that live
+engine. `hermes-messaging-loopback.mjs`, `hermes-kanban-cli.mjs`, and
+`activity-learning.mjs` also passed. A profile e2e launches `sovereign
+--profile research serve` with temporary Hermes/JCode homes and confirms the
+selected profile model, provider, and `SOUL.md` prompt in a real Ollama chat.
+The first profile launch collided with another process's runtime socket; an
+isolated short `XDG_RUNTIME_DIR` fixed it. Its first configuration also asked
+the Ollama profile for unsupported reasoning effort; the profile fixture now
+tests settings supported by that provider, while reasoning-setting behavior
+remains covered by `hermes-mcp-settings.mjs`.
+
+The local Ollama daemon was already listening outside the sandbox. Sandbox
+localhost access failed, and `ollama serve` could not bind from inside the
+sandbox (`operation not permitted`); the escalated local-only `/api/tags`
+request verified the benchmark model was available and was used for the live
+tests. The final independent MCP-settings rerun passed: MCP server add/use,
+skill hub install/list, terminal tool disablement, model/provider/reasoning,
+memory, and profile system prompt all reached the Rust chat. OAuth MCP, the
+browser-controller action, terminal/PTY pane, live
+voice/wake/TTS, and plugin install/capability checks remain open in
+`docs/HERMES_FEATURE_CHECK.md`.

@@ -12,10 +12,11 @@ pub mod auth;
 pub mod cron_wake;
 pub mod features;
 pub mod learn;
+mod learning_rest;
 pub mod map;
 pub mod observability;
+pub mod profile;
 mod rpc;
-mod learning_rest;
 mod sessions_rest;
 
 use anyhow::{Context, Result, bail};
@@ -37,12 +38,19 @@ pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Method names in the vendored Hermes gateway contract (parsed once).
 pub(crate) fn contract_methods() -> &'static std::collections::HashSet<String> {
-    static METHODS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    static METHODS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
     METHODS.get_or_init(|| {
-        let contract: Value = serde_json::from_str(include_str!("../contract/gateway-contract.openrpc.json")).unwrap_or_default();
+        let contract: Value =
+            serde_json::from_str(include_str!("../contract/gateway-contract.openrpc.json"))
+                .unwrap_or_default();
         contract["methods"]
             .as_array()
-            .map(|list| list.iter().filter_map(|m| m["name"].as_str().map(str::to_owned)).collect())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|m| m["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default()
     })
 }
@@ -50,11 +58,18 @@ pub(crate) fn contract_methods() -> &'static std::collections::HashSet<String> {
 /// Log each unsupported method/route once per process (stderr), so parity
 /// gaps show up in the engine log without flooding it.
 pub(crate) fn note_unsupported(kind: &str, what: &str) {
-    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
     let key = format!("{kind} {what}");
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.get_or_insert_with(Default::default).insert(key.clone()) {
-        eprintln!("sovereign-gateway: unsupported {}", key.chars().take(200).collect::<String>());
+    if seen
+        .get_or_insert_with(Default::default)
+        .insert(key.clone())
+    {
+        eprintln!(
+            "sovereign-gateway: unsupported {}",
+            key.chars().take(200).collect::<String>()
+        );
     }
 }
 
@@ -84,7 +99,16 @@ pub struct Config {
 }
 
 pub type Complete = std::sync::Arc<
-    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<jcode_provider_core::SimpleCompletion>> + Send>> + Send + Sync,
+    dyn Fn(
+            String,
+            String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<jcode_provider_core::SimpleCompletion>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
 >;
 
 struct AlertLoop(tokio::task::JoinHandle<()>);
@@ -112,7 +136,9 @@ impl Gateway {
         if config.token.len() < 32 {
             bail!("gateway token must be at least 32 characters");
         }
-        let listener = TcpListener::bind(config.bind).await.context("binding gateway")?;
+        let listener = TcpListener::bind(config.bind)
+            .await
+            .context("binding gateway")?;
         let local = listener.local_addr()?;
         let (alert_tx, alert_rx) = std::sync::mpsc::sync_channel::<Value>(64);
         let observer = observability::Observer::open(
@@ -159,7 +185,10 @@ impl Gateway {
         if let Some(features) = self.config.features.clone() {
             let idle = features.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(features::idle_stop_after().clamp(Duration::from_secs(1), Duration::from_secs(60)));
+                let mut tick = tokio::time::interval(
+                    features::idle_stop_after()
+                        .clamp(Duration::from_secs(1), Duration::from_secs(60)),
+                );
                 loop {
                     tick.tick().await;
                     idle.stop_if_idle().await;
@@ -197,7 +226,10 @@ struct Request {
 
 impl Request {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -235,7 +267,12 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
         headers: req
             .headers
             .iter()
-            .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned()))
+            .map(|h| {
+                (
+                    h.name.to_string(),
+                    String::from_utf8_lossy(h.value).into_owned(),
+                )
+            })
             .collect(),
         body_prefix: buf[header_len..].to_vec(),
     })
@@ -244,7 +281,10 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 async fn read_body(stream: &mut TcpStream, req: &Request) -> Result<Vec<u8>> {
-    let len: usize = req.header("content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    let len: usize = req
+        .header("content-length")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     if len > MAX_BODY_BYTES {
         bail!("body too large");
     }
@@ -276,7 +316,12 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<(
 /// Reverse-proxy one request (or WebSocket upgrade) to the Hermes feature
 /// backend. The client's credential is replaced by the backend's private
 /// token; bytes then flow both ways untouched.
-async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::Features, upgrade: bool) -> Result<()> {
+async fn proxy_http(
+    mut client: TcpStream,
+    req: &Request,
+    features: &features::Features,
+    upgrade: bool,
+) -> Result<()> {
     if std::env::var_os("SOVEREIGN_TRACE_FORWARD").is_some() {
         eprintln!("sovereign: forward HTTP {} {}", req.method, req.path);
     }
@@ -289,21 +334,34 @@ async fn proxy_http(mut client: TcpStream, req: &Request, features: &features::F
         .split('&')
         .filter(|kv| !kv.is_empty() && !kv.starts_with("token=") && !kv.starts_with("ticket="))
         .collect();
-    let target = if query.is_empty() { req.path.clone() } else { format!("{}?{}", req.path, query.join("&")) };
+    let target = if query.is_empty() {
+        req.path.clone()
+    } else {
+        format!("{}?{}", req.path, query.join("&"))
+    };
     let mut head = format!("{} {} HTTP/1.1\r\n", req.method, target);
     for (name, value) in &req.headers {
         let lower = name.to_ascii_lowercase();
-        let dropped = matches!(lower.as_str(), "host" | "x-hermes-session-token" | "authorization" | "origin")
-            || (!upgrade && lower == "connection");
+        let dropped = matches!(
+            lower.as_str(),
+            "host" | "x-hermes-session-token" | "authorization" | "origin"
+        ) || (!upgrade && lower == "connection");
         if !dropped {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
     }
-    head.push_str(&format!("Host: 127.0.0.1:{port}\r\nX-Hermes-Session-Token: {}\r\n", features.token));
+    head.push_str(&format!(
+        "Host: 127.0.0.1:{port}\r\nX-Hermes-Session-Token: {}\r\n",
+        features.token
+    ));
     if upgrade {
         // WebSocket routes authenticate by query token on the backend.
         let sep = if target.contains('?') { '&' } else { '?' };
-        head = head.replacen(&target, &format!("{target}{sep}token={}", features.token), 1);
+        head = head.replacen(
+            &target,
+            &format!("{target}{sep}token={}", features.token),
+            1,
+        );
     } else {
         head.push_str("Connection: close\r\n");
     }
@@ -321,7 +379,8 @@ fn query_u64(req: &Request, key: &str) -> Option<u64> {
 
 fn bundled_startup_request(req: &Request) -> bool {
     std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_some()
-        && auth::query_param(req.query.as_deref().unwrap_or_default(), "feature").as_deref() != Some("1")
+        && auth::query_param(req.query.as_deref().unwrap_or_default(), "feature").as_deref()
+            != Some("1")
 }
 
 fn bundled_defaults() -> Value {
@@ -374,7 +433,9 @@ async fn harness_requests(legacy_socket: &std::path::Path, requests: &[Value]) -
         }
         Ok(last)
     };
-    let result = tokio::time::timeout(Duration::from_secs(20), result).await.context("engine timed out")?;
+    let result = tokio::time::timeout(Duration::from_secs(20), result)
+        .await
+        .context("engine timed out")?;
     bridge.abort();
     result
 }
@@ -396,20 +457,42 @@ async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> R
         .unwrap_or_default())
 }
 
-async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, hub: Arc<approvals::Hub>, observer: Arc<observability::Observer>) -> Result<()> {
+async fn handle(
+    mut stream: TcpStream,
+    local: SocketAddr,
+    config: Arc<Config>,
+    hub: Arc<approvals::Hub>,
+    observer: Arc<observability::Observer>,
+) -> Result<()> {
     let req = tokio::time::timeout(HEADER_TIMEOUT, read_request(&mut stream)).await??;
     let bound_ip = local.ip().to_string();
-    let host_reason = auth::host_origin_reason(req.header("host"), req.header("origin"), local.port(), &bound_ip);
+    let host_reason = auth::host_origin_reason(
+        req.header("host"),
+        req.header("origin"),
+        local.port(),
+        &bound_ip,
+    );
     let token_ok = auth::token_matches(
         &config.token,
-        auth::presented_token(req.query.as_deref(), req.header("authorization"), req.header("x-hermes-session-token"))
-            .as_deref(),
+        auth::presented_token(
+            req.query.as_deref(),
+            req.header("authorization"),
+            req.header("x-hermes-session-token"),
+        )
+        .as_deref(),
     );
-    let wants_ws = req.header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let wants_ws = req
+        .header("upgrade")
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if wants_ws && req.path != "/api/ws" {
         if host_reason.is_some() || !token_ok {
-            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+            return respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await;
         }
         // Packaged: only wake Python for explicit feature=1 (Cron UI, etc.).
         if config.features.is_some() && bundled_startup_request(&req) {
@@ -423,12 +506,24 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         }
         return match config.features.clone() {
             Some(features) => proxy_http(stream, &req, &features, true).await,
-            None => respond(&mut stream, "404 Not Found", &json!({"detail": "not supported by engine"})).await,
+            None => {
+                respond(
+                    &mut stream,
+                    "404 Not Found",
+                    &json!({"detail": "not supported by engine"}),
+                )
+                .await
+            }
         };
     }
     if wants_ws && req.path == "/api/ws" {
         let Some(key) = req.header("sec-websocket-key") else {
-            return respond(&mut stream, "400 Bad Request", &json!({"detail": "missing websocket key"})).await;
+            return respond(
+                &mut stream,
+                "400 Bad Request",
+                &json!({"detail": "missing websocket key"}),
+            )
+            .await;
         };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
         let head = format!(
@@ -451,16 +546,34 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
     }
 
     if host_reason.is_some() {
-        return respond(&mut stream, "403 Forbidden", &json!({"detail": "host not allowed"})).await;
+        return respond(
+            &mut stream,
+            "403 Forbidden",
+            &json!({"detail": "host not allowed"}),
+        )
+        .await;
     }
     if req.method == "POST" && req.path == "/api/sovereign/approve" {
-        let secret_ok = auth::token_matches(&config.approval_secret, req.header("x-sovereign-approval-secret"));
+        let secret_ok = auth::token_matches(
+            &config.approval_secret,
+            req.header("x-sovereign-approval-secret"),
+        );
         if !secret_ok {
-            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+            return respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await;
         }
         let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
         let Some((session, tool, command, reason)) = approvals::parse_request(&body) else {
-            return respond(&mut stream, "400 Bad Request", &json!({"detail": "bad approval request"})).await;
+            return respond(
+                &mut stream,
+                "400 Bad Request",
+                &json!({"detail": "bad approval request"}),
+            )
+            .await;
         };
         let choice = hub.decide(&session, &tool, &command, &reason).await;
         return respond(&mut stream, "200 OK", &json!({"choice": choice})).await;
@@ -475,7 +588,12 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         && req.path != "/api/sessions/owner-backfill"
     {
         if !token_ok {
-            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+            return respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await;
         }
         if let Some(result) = sessions_rest::route(&mut stream, &req, &config).await {
             return result;
@@ -483,7 +601,12 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
     }
     if req.path.starts_with("/api/learning") {
         if !token_ok {
-            return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
+            return respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await;
         }
         if let Some(result) = learning_rest::route(&mut stream, &req, &config).await {
             return result;
@@ -501,12 +624,24 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             });
             respond(&mut stream, "200 OK", &body).await
         }
-        _ if !token_ok => respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await,
+        _ if !token_ok => {
+            respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await
+        }
         ("POST", "/api/agent/run") => {
             let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let Some(prompt) = body["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail": "prompt is required"})).await;
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail": "prompt is required"}),
+                )
+                .await;
             };
             let timeout_s = body["timeout_s"].as_u64().unwrap_or(600).clamp(1, 3600);
             let result = rpc::agent_run(
@@ -521,71 +656,133 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             .await;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"ok": false, "error": err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"ok": false, "error": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/model/info") => {
-            let body = json!({"model": config.model, "provider": config.provider, "capabilities": {}});
+            let body =
+                json!({"model": config.model, "provider": config.provider, "capabilities": {}});
             respond(&mut stream, "200 OK", &body).await
         }
         ("GET", "/api/config" | "/api/config/defaults") if bundled_startup_request(&req) => {
-            let body = if auth::query_param(req.query.as_deref().unwrap_or_default(), "include_defaults").as_deref() == Some("false") {
-                json!({})
-            } else {
-                bundled_defaults()
-            };
+            let body =
+                if auth::query_param(req.query.as_deref().unwrap_or_default(), "include_defaults")
+                    .as_deref()
+                    == Some("false")
+                {
+                    json!({})
+                } else {
+                    bundled_defaults()
+                };
             respond(&mut stream, "200 OK", &body).await
         }
         ("GET", "/api/local-models/status") if bundled_startup_request(&req) => {
-            respond(&mut stream, "200 OK", &json!({
-                "enabled": false, "runtime_installed": false, "server_running": false,
-                "update_available": false, "loaded_models": {}, "loading": {}, "models": []
-            })).await
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "enabled": false, "runtime_installed": false, "server_running": false,
+                    "update_available": false, "loaded_models": {}, "loading": {}, "models": []
+                }),
+            )
+            .await
         }
         ("GET", "/api/local-models/jobs") if bundled_startup_request(&req) => {
             respond(&mut stream, "200 OK", &json!({"jobs": []})).await
         }
         ("GET", "/api/tools/terminal/backends") if bundled_startup_request(&req) => {
-            respond(&mut stream, "200 OK", &json!({"active": "local", "backends": [{
-                "name": "local", "label": "Local", "description": "Run on this computer",
-                "active": true, "status": "ready", "detail": null
-            }]})).await
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"active": "local", "backends": [{
+                    "name": "local", "label": "Local", "description": "Run on this computer",
+                    "active": true, "status": "ready", "detail": null
+                }]}),
+            )
+            .await
         }
         ("POST", "/api/sessions/owner-backfill") if bundled_startup_request(&req) => {
-            respond(&mut stream, "200 OK", &json!({"ok": true, "stamped": 0, "profile": "default"})).await
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"ok": true, "stamped": 0, "profile": "default"}),
+            )
+            .await
         }
         ("GET", "/api/profiles") => {
-            let skill_count = jcode_base::skill::SkillRegistry::shared_snapshot().list().len();
+            let skill_count = jcode_base::skill::SkillRegistry::shared_snapshot()
+                .list()
+                .len();
+            let selected = profile::current();
+            let name = selected.name.as_deref().unwrap_or("default");
+            let path = selected
+                .home
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| config.home.clone());
             let body = json!({"profiles": [{
-                "name": "default", "display_name": "Default", "path": config.home, "is_default": true,
+                "name": name, "display_name": name, "path": path, "is_default": name == "default",
                 "has_env": false, "model": config.model, "provider": config.provider, "skill_count": skill_count,
             }]});
             respond(&mut stream, "200 OK", &body).await
         }
         ("GET", "/api/profiles/active") => {
-            respond(&mut stream, "200 OK", &json!({"active": "default", "default": "default"})).await
+            let selected = profile::current();
+            let name = selected.name.as_deref().unwrap_or("default");
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"active": name, "default": name}),
+            )
+            .await
         }
         ("GET", "/api/profiles/sessions") => {
             let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 1000);
-            let archived = auth::query_param(req.query.as_deref().unwrap_or_default(), "archived").as_deref() == Some("true");
+            let archived = auth::query_param(req.query.as_deref().unwrap_or_default(), "archived")
+                .as_deref()
+                == Some("true");
             match session_infos(&config, limit, archived).await {
                 Ok(sessions) => {
                     let total = sessions.len();
-                    let body = json!({"sessions": sessions, "total": total, "limit": limit, "offset": 0});
+                    let body =
+                        json!({"sessions": sessions, "total": total, "limit": limit, "offset": 0});
                     respond(&mut stream, "200 OK", &body).await
                 }
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/profiles/sessions/sidebar") => {
-            let limit = query_u64(&req, "recents_limit").unwrap_or(50).clamp(1, 1000);
+            let limit = query_u64(&req, "recents_limit")
+                .unwrap_or(50)
+                .clamp(1, 1000);
             match session_infos(&config, limit, false).await {
                 Ok(sessions) => {
                     let empty = json!({"sessions": []});
                     let body = json!({"recents": {"sessions": sessions}, "cron": empty, "messaging": empty});
                     respond(&mut stream, "200 OK", &body).await
                 }
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/hermes/update/check") => {
@@ -597,10 +794,19 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             respond(&mut stream, "200 OK", &body).await
         }
         ("GET", "/api/fs/default-cwd") => {
-            respond(&mut stream, "200 OK", &json!({"cwd": config.default_cwd, "branch": null})).await
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"cwd": config.default_cwd, "branch": null}),
+            )
+            .await
         }
-        ("GET", "/api/cron/jobs") if bundled_startup_request(&req) => respond(&mut stream, "200 OK", &json!([])).await,
-        ("GET", "/api/cron/delivery-targets" | "/api/cron/blueprints") if bundled_startup_request(&req) => {
+        ("GET", "/api/cron/jobs") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!([])).await
+        }
+        ("GET", "/api/cron/delivery-targets" | "/api/cron/blueprints")
+            if bundled_startup_request(&req) =>
+        {
             respond(&mut stream, "200 OK", &json!([])).await
         }
         // The engine owns skills end-to-end: real list/view/enable-disable
@@ -612,24 +818,33 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let skills: Vec<Value> = registry
                 .list()
                 .iter()
-                .map(|skill| json!({
-                    "name": skill.name,
-                    "description": skill.description,
-                    "category": "general",
-                    "enabled": skill.enabled,
-                    "provenance": "agent",
-                }))
+                .map(|skill| {
+                    json!({
+                        "name": skill.name,
+                        "description": skill.description,
+                        "category": "general",
+                        "enabled": skill.enabled,
+                        "provenance": "agent",
+                    })
+                })
                 .collect();
             respond(&mut stream, "200 OK", &json!(skills)).await
         }
         ("GET", "/api/skills/content") => {
-            let Some(name) = auth::query_param(req.query.as_deref().unwrap_or_default(), "name") else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail": "name is required"})).await;
+            let Some(name) = auth::query_param(req.query.as_deref().unwrap_or_default(), "name")
+            else {
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail": "name is required"}),
+                )
+                .await;
             };
             let registry = jcode_base::skill::SkillRegistry::shared_snapshot();
             match registry.get(&name) {
                 Some(skill) => {
-                    let content = std::fs::read_to_string(&skill.path).unwrap_or_else(|_| skill.content.clone());
+                    let content = std::fs::read_to_string(&skill.path)
+                        .unwrap_or_else(|_| skill.content.clone());
                     let body = json!({
                         "content": content,
                         "name": skill.name,
@@ -637,21 +852,55 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
                     });
                     respond(&mut stream, "200 OK", &body).await
                 }
-                None => respond(&mut stream, "404 Not Found", &json!({"detail": "skill not found"})).await,
+                None => {
+                    respond(
+                        &mut stream,
+                        "404 Not Found",
+                        &json!({"detail": "skill not found"}),
+                    )
+                    .await
+                }
             }
         }
         ("PUT", "/api/skills/toggle") => {
             let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let (Some(name), Some(enabled)) = (body["name"].as_str(), body["enabled"].as_bool()) else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail": "name and enabled are required"})).await;
+            let (Some(name), Some(enabled)) = (body["name"].as_str(), body["enabled"].as_bool())
+            else {
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail": "name and enabled are required"}),
+                )
+                .await;
             };
             let registry = jcode_base::skill::SkillRegistry::shared_registry();
             let mut registry = registry.write().await;
             match registry.set_enabled(name, enabled) {
-                Ok(true) => respond(&mut stream, "200 OK", &json!({"ok": true, "name": name, "enabled": enabled})).await,
-                Ok(false) => respond(&mut stream, "404 Not Found", &json!({"detail": "skill not found"})).await,
-                Err(err) => respond(&mut stream, "500 Internal Server Error", &json!({"detail": err.to_string()})).await,
+                Ok(true) => {
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        &json!({"ok": true, "name": name, "enabled": enabled}),
+                    )
+                    .await
+                }
+                Ok(false) => {
+                    respond(
+                        &mut stream,
+                        "404 Not Found",
+                        &json!({"detail": "skill not found"}),
+                    )
+                    .await
+                }
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        &json!({"detail": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/skills/hub/official" | "/api/skills/hub/sources") => {
@@ -679,7 +928,14 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let days = query_u64(&req, "days").unwrap_or(30).clamp(1, 3650);
             match tokio::task::spawn_blocking(move || observer.analytics(days)).await? {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/sovereign/observability/runs") => {
@@ -695,7 +951,14 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             .await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail":err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/sovereign/observability/monitors") => {
@@ -711,7 +974,14 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let result = tokio::task::spawn_blocking(move || observer.budget()).await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail":err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/sovereign/observability/approvals") => {
@@ -719,30 +989,59 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let result = tokio::task::spawn_blocking(move || observer.approvals(limit)).await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail":err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("POST", "/api/sovereign/observability/promote") => {
             let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let Some(run_id) = body["run_id"].as_str().filter(|s| !s.is_empty()) else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail":"run_id is required"})).await;
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail":"run_id is required"}),
+                )
+                .await;
             };
             let run_id = run_id.to_string();
             let result = tokio::task::spawn_blocking(move || observer.promote(&run_id)).await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    respond(&mut stream, "404 Not Found", &json!({"detail":"run not found"})).await
+                    respond(
+                        &mut stream,
+                        "404 Not Found",
+                        &json!({"detail":"run not found"}),
+                    )
+                    .await
                 }
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail":err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("POST", "/api/sovereign/observability/replay") => {
             let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let Some(run_id) = body["run_id"].as_str().filter(|s| !s.is_empty()) else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail":"run_id is required"})).await;
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail":"run_id is required"}),
+                )
+                .await;
             };
             let run_id = run_id.to_string();
             let config = config.clone();
@@ -750,18 +1049,44 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
             let observer = observer.clone();
             match rpc::replay_run(config, hub, observer, &run_id).await {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail": err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         ("GET", "/api/sovereign/observability/run") => {
             let Some(id) = auth::query_param(req.query.as_deref().unwrap_or_default(), "id") else {
-                return respond(&mut stream, "400 Bad Request", &json!({"detail":"id is required"})).await;
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    &json!({"detail":"id is required"}),
+                )
+                .await;
             };
             let result = tokio::task::spawn_blocking(move || observer.detail(&id)).await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
-                Err(rusqlite::Error::QueryReturnedNoRows) => respond(&mut stream, "404 Not Found", &json!({"detail":"run not found"})).await,
-                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    respond(
+                        &mut stream,
+                        "404 Not Found",
+                        &json!({"detail":"run not found"}),
+                    )
+                    .await
+                }
+                Err(err) => {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        &json!({"detail":err.to_string()}),
+                    )
+                    .await
+                }
             }
         }
         (_, path) if path.starts_with("/api/") && config.features.is_some() => {
@@ -781,7 +1106,8 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
         }
         (method, path) => {
             note_unsupported("http", &format!("{method} {path}"));
-            let body = json!({"detail": "not supported by engine", "reason": "not_supported_by_engine"});
+            let body =
+                json!({"detail": "not supported by engine", "reason": "not_supported_by_engine"});
             respond(&mut stream, "404 Not Found", &body).await
         }
     }

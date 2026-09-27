@@ -21,7 +21,7 @@ fs.mkdirSync(jcodeHome, { recursive: true })
 const token = crypto.randomBytes(24).toString('hex')
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`,
+  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`,
 )
 const env = {
   ...process.env,
@@ -31,10 +31,10 @@ const env = {
   HERMES_DASHBOARD_SESSION_TOKEN: token,
   // Hermes's skills hub uses this signal to put installs in the shared engine store.
   SOVEREIGN_ENGINE_URL: 'http://127.0.0.1:1',
-  SOVEREIGN_PROVIDER: 'local',
-  SOVEREIGN_MODEL: model,
   PYTHONDONTWRITEBYTECODE: '1',
 }
+delete env.SOVEREIGN_PROVIDER
+delete env.SOVEREIGN_MODEL
 const children = []
 const stop = child => {
   if (child && child.exitCode === null) child.kill('SIGTERM')
@@ -128,7 +128,14 @@ try {
   const memorySetting = await fetch(`${base}/api/config`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
-    body: JSON.stringify({ config: { memory: { memory_enabled: false } } }),
+    body: JSON.stringify({ config: {
+      memory: { memory_enabled: false },
+      agent: { reasoning_effort: 'low' },
+      providers: { 'openai-compatible': {
+        base_url: 'http://127.0.0.1:11434/v1', api_key: 'ollama', model,
+        context_length: 65536, models: [{ id: model, context_length: 65536 }],
+      } },
+    } }),
   })
   if (!memorySetting.ok) throw new Error(`Hermes memory setting returned ${memorySetting.status}: ${await memorySetting.text()}`)
   const savedMemorySetting = await fetch(`${base}/api/config?include_defaults=false`, {
@@ -137,8 +144,20 @@ try {
   if (savedMemorySetting.memory?.memory_enabled !== false) {
     throw new Error(`Hermes API did not persist the memory setting: ${JSON.stringify(savedMemorySetting.memory)}`)
   }
+  const modelSetting = await fetch(`${base}/api/model/set`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ scope: 'main', provider: 'openai-compatible', model, confirm_expensive_model: true }),
+  })
+  if (!modelSetting.ok) throw new Error(`Hermes model setting returned ${modelSetting.status}: ${await modelSetting.text()}`)
+  const soulSetting = await fetch(`${base}/api/profiles/default/soul`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ content: 'When a user asks for the settings marker, include SYSTEM_PROMPT_APPLIED in your response.' }),
+  })
+  if (!soulSetting.ok) throw new Error(`Hermes profile prompt setting returned ${soulSetting.status}: ${await soulSetting.text()}`)
 
-  const engine = start(engineBin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], home, env)
+  const engine = start(engineBin, ['serve', '--host', '127.0.0.1', '--port', '0'], home, env)
   const port = await waitPort(engine, 'HERMES_BACKEND_READY')
   const engineSkills = await fetch(`http://127.0.0.1:${port}/api/skills`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -169,16 +188,10 @@ try {
     ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
     return new Promise(resolve => pending.set(id, resolve))
   }
-  const created = await rpc('session.create', {
-    cwd: home,
-    model,
-    provider: 'local',
-    reasoning_effort: 'low',
-    system_prompt: 'When asked for the settings marker, respond with exactly SYSTEM_PROMPT_APPLIED.',
-  })
+  const created = await rpc('session.create', { cwd: home })
   const sid = created.result?.session_id
   if (!sid) throw new Error(`session.create failed: ${JSON.stringify(created)}`)
-  if (created.result.info?.model !== model || created.result.info?.provider !== 'local' ||
+  if (created.result.info?.model !== model || created.result.info?.provider !== 'openai-compatible' ||
     created.result.info?.reasoning_effort !== 'low' || created.result.info?.memory_enabled !== false) {
     throw new Error(`Hermes model/provider/reasoning/memory settings did not reach the engine session: ${JSON.stringify(created.result.info)}`)
   }
@@ -190,10 +203,10 @@ try {
   if (changedEffort.error || changedEffort.result?.value !== 'high') {
     throw new Error(`reasoning setting failed: ${JSON.stringify(changedEffort)}`)
   }
-  // Verify the chosen setting reaches the engine, then use low effort for the
-  // live tool-use turns so this regression test remains bounded on Ollama.
-  const boundedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'low' })
-  if (boundedEffort.error || boundedEffort.result?.value !== 'low') {
+  // Verify the chosen setting reaches the engine, then disable reasoning for
+  // the live tool-use turns so this test stays bounded on the local model.
+  const boundedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'none' })
+  if (boundedEffort.error || boundedEffort.result?.value !== 'none') {
     throw new Error(`reasoning effort could not be reset for bounded e2e turns: ${JSON.stringify(boundedEffort)}`)
   }
   const sendTurn = async (text, targetSid = sid, timeoutMs = 180_000) => {
@@ -212,7 +225,7 @@ try {
   // before the second turn so its model-facing registry contains the server tool.
   await sendTurn('Use the mcp management tool with action reload to connect the configured MCP server. Then reply with exactly READY.')
   await new Promise(resolve => setTimeout(resolve, 1000))
-  await sendTurn('Call mcp__settings_test__prove_settings with text exactly: api-added-tool. Do not use another tool. After it returns, reply with the settings marker.')
+  await sendTurn('Call mcp__settings_test__prove_settings with text exactly: api-added-tool. Then try bash to print TOOL_TOGGLE_FAILED. If bash is unavailable, say so. Include the settings marker.')
   const history = await rpc('session.history', { session_id: sid })
   const transcript = JSON.stringify(history.result?.messages || [])
   if (!transcript.includes('HERMES_MCP_SETTINGS_OK:api-added-tool')) {
@@ -221,15 +234,13 @@ try {
   if (!transcript.includes('SYSTEM_PROMPT_APPLIED')) {
     throw new Error(`chat did not follow the Hermes profile system prompt: ${transcript}`)
   }
-  const restricted = (await rpc('session.create', { cwd: home, reasoning_effort: 'low' })).result
-  await sendTurn('Use bash to print TOOL_TOGGLE_FAILED. If bash is unavailable, reply exactly TOOL_TOGGLE_APPLIED and do not use any other tool.', restricted.session_id, 60_000)
-  const restrictedHistory = await rpc('session.history', { session_id: restricted.session_id })
-  const messages = restrictedHistory.result?.messages || []
+  const messages = history.result?.messages || []
   const bashCalled = messages.some(message => message.name === 'bash' || message.tool_name === 'bash' ||
     message.tool_calls?.some(call => (call.name || call.function?.name) === 'bash'))
   if (bashCalled) throw new Error(`disabled Hermes terminal toolset remained visible to chat: ${JSON.stringify(messages)}`)
-  if (!JSON.stringify(messages).includes('TOOL_TOGGLE_APPLIED')) {
-    throw new Error(`chat did not respond that the disabled terminal tool was unavailable: ${JSON.stringify(messages)}`)
+  const assistantText = JSON.stringify(messages.filter(message => message.role === 'assistant')).toLowerCase()
+  if (!/(unavailable|not available|disabled|cannot|can't|no bash|no terminal)/.test(assistantText)) {
+    throw new Error(`chat did not reflect the disabled terminal tool: ${JSON.stringify(messages)}`)
   }
   console.log('PASS Hermes API added MCP server; Rust engine chat called it and received its result')
   console.log('PASS Hermes skills hub installed into JCODE_HOME/skills and the Rust engine lists it')

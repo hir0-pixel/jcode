@@ -6,18 +6,64 @@
 //! Anything else passes through unchanged, so `sovereign login` etc. still work.
 
 use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+fn profile_home(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("invalid Hermes profile name: {name}");
+    }
+    let root = if root.parent().and_then(Path::file_name).is_some_and(|p| p == "profiles") {
+        root.parent().and_then(Path::parent).unwrap_or(root)
+    } else {
+        root
+    };
+    Ok(if name == "default" { root.to_path_buf() } else { root.join("profiles").join(name) })
+}
+
+fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
+    let mut i = 0;
+    while i < args.len() {
+        let name = match args[i].as_str() {
+            "--profile" => {
+                i += 1;
+                Some(args.get(i).ok_or_else(|| anyhow::anyhow!("--profile requires a name"))?.clone())
+            }
+            arg => arg.strip_prefix("--profile=").map(str::to_owned),
+        };
+        if let Some(name) = name {
+            let root = std::env::var_os("HERMES_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes")))
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve Hermes home for --profile"))?;
+            let selected = profile_home(&root, &name)?;
+            if !selected.is_dir() {
+                anyhow::bail!("Hermes profile does not exist: {}", selected.display());
+            }
+            // SAFETY: called before the Tokio runtime or any child processes start.
+            unsafe { std::env::set_var("HERMES_HOME", selected) };
+            // SAFETY: still before runtime startup and child process creation.
+            unsafe { std::env::set_var("SOVEREIGN_PROFILE", &name) };
+            return Ok(Some(name));
+        }
+        i += 1;
+    }
+    Ok(None)
+}
 
 fn translate(args: Vec<String>) -> Vec<String> {
     let mut out = vec!["sovereign".to_string()];
     let mut rest = args.into_iter();
-    let mut profile_skipped = false;
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            // Profiles are a Hermes concept the engine does not have yet.
-            "--profile" if !profile_skipped => {
+            // The selected profile has already scoped HERMES_HOME in main().
+            "--profile" => {
                 rest.next();
-                profile_skipped = true;
             }
+            value if value.starts_with("--profile=") => {}
             "serve" => out.push("gateway".into()),
             _ => out.push(arg),
         }
@@ -90,7 +136,9 @@ fn main() -> Result<()> {
     // that reach third parties or that the desktop cannot render. Override
     // with JCODE_DISABLED_TOOLS (set it to empty to keep everything).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let argv = translate(std::env::args().skip(1).collect());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    select_profile(&args)?;
+    let argv = translate(args);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -184,5 +232,22 @@ mod tests {
     #[test]
     fn other_commands_pass_through() {
         assert_eq!(t(&["login", "openai"]), ["sovereign", "login", "openai"]);
+    }
+
+    #[test]
+    fn selected_profile_scopes_hermes_home_under_profiles() {
+        assert_eq!(
+            profile_home(Path::new("/tmp/hermes"), "research").unwrap(),
+            PathBuf::from("/tmp/hermes/profiles/research")
+        );
+        assert_eq!(
+            profile_home(Path::new("/tmp/hermes/profiles/active"), "research").unwrap(),
+            PathBuf::from("/tmp/hermes/profiles/research")
+        );
+        assert_eq!(
+            profile_home(Path::new("/tmp/hermes"), "default").unwrap(),
+            PathBuf::from("/tmp/hermes")
+        );
+        assert!(profile_home(Path::new("/tmp/hermes"), "../escape").is_err());
     }
 }

@@ -92,8 +92,9 @@ impl SkillRegistry {
         }
     }
 
-    /// Load a process-wide shared immutable snapshot of global skills for
-    /// startup paths that only need read access.
+    /// Load and publish the current global skill set for a read-only snapshot.
+    /// Re-read disk here so Hermes hub installs and removals reach new engine
+    /// sessions without restarting the engine.
     pub fn shared_snapshot() -> Arc<Self> {
         #[cfg(test)]
         {
@@ -102,11 +103,18 @@ impl SkillRegistry {
 
         #[cfg(not(test))]
         {
-            if let Ok(skills) = Self::shared_registry().try_read() {
-                Arc::new(skills.clone())
-            } else {
-                Arc::new(SkillRegistry::load_global().unwrap_or_default())
+            let shared = Self::shared_registry();
+            if let Ok(fresh) = Self::load_global() {
+                if let Ok(mut skills) = shared.try_write() {
+                    *skills = fresh.clone();
+                }
+                return Arc::new(fresh);
             }
+
+            shared
+                .try_read()
+                .map(|skills| Arc::new(skills.clone()))
+                .unwrap_or_else(|_| Arc::new(Self::default()))
         }
     }
 
@@ -505,7 +513,9 @@ impl SkillRegistry {
             let path = entry?.path();
             if !path.is_dir()
                 || path.is_symlink()
-                || path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                || path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
             {
                 continue;
             }
@@ -1326,7 +1336,10 @@ mod tests {
 
         let mut registry = SkillRegistry::default();
         assert_eq!(registry.load_from_dir_count(&skills_dir).expect("load"), 1);
-        assert_eq!(registry.get("hub-skill").expect("hub skill").description, "Installed from Hermes hub");
+        assert_eq!(
+            registry.get("hub-skill").expect("hub skill").description,
+            "Installed from Hermes hub"
+        );
     }
 
     #[test]

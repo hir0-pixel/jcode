@@ -21,6 +21,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 jcode-provider-core = { path = "../jcode-provider-core" }
 serde_json = "1"
+serde_yaml = "0.9"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 subtle = "2"

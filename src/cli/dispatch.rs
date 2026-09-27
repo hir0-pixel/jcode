@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use anyhow::Result;
+use clap::ValueEnum;
 use std::io::IsTerminal;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
@@ -168,7 +169,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             allow_remote,
         }) => {
             crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
-            run_gateway(&args.provider, args.model.as_deref(), &host, port, allow_remote).await?;
+            run_gateway(
+                &args.provider,
+                args.model.as_deref(),
+                &host,
+                port,
+                allow_remote,
+            )
+            .await?;
         }
         Some(Command::Acp) => {
             acp::run_acp_command(
@@ -1350,7 +1358,33 @@ async fn run_gateway(
     port: u16,
     allow_remote: bool,
 ) -> Result<()> {
-    let socket = crate::storage::runtime_dir().join(format!("sovereign-{}.sock", std::process::id()));
+    let profile_defaults = sovereign_gateway::profile::current();
+    let mut effective_provider = *provider_choice;
+    if let Some(provider) = profile_defaults.provider.as_deref() {
+        effective_provider = match ProviderChoice::from_str(provider, true) {
+            Ok(choice) => choice,
+            Err(_) if crate::config::config().providers.contains_key(provider) => {
+                crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", provider);
+                ProviderChoice::OpenaiCompatible
+            }
+            Err(_) => anyhow::bail!("Hermes profile selects unsupported engine provider `{provider}`"),
+        };
+    }
+    if matches!(effective_provider, ProviderChoice::OpenaiCompatible)
+        && std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_none()
+        && let Some(provider) = crate::config::config()
+            .provider
+            .default_provider
+            .as_deref()
+            .filter(|name| crate::config::config().providers.contains_key(*name))
+    {
+        // Hermes owns provider selection; JCode's named profile owns endpoint
+        // details and credentials for the selected OpenAI-compatible transport.
+        crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", provider);
+    }
+    let effective_model = profile_defaults.model.as_deref().or(model);
+    let socket =
+        crate::storage::runtime_dir().join(format!("sovereign-{}.sock", std::process::id()));
     server::set_socket_path(&socket.to_string_lossy());
 
     let launch = sovereign_gateway::auth::launch_token()
@@ -1376,11 +1410,11 @@ async fn run_gateway(
     // the base model at its trained window (262k here), wiping a warm load.
     // Pin num_ctx on a local alias (`sovereign/…`) so warm-up and chat share
     // one serving size, then load it for the life of this process.
-    let mut serve_model = model.map(str::to_owned);
-    if matches!(provider_choice, ProviderChoice::Ollama)
+    let mut serve_model = effective_model.map(str::to_owned);
+    if matches!(effective_provider, ProviderChoice::Ollama)
         || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
     {
-        let base = model.unwrap_or("qwen3.8:27b");
+        let base = effective_model.unwrap_or("qwen3.8:27b");
         match warm_ollama_serving_context(base).await {
             Some(alias) => {
                 serve_model = Some(alias);
@@ -1391,11 +1425,11 @@ async fn run_gateway(
         }
     }
     let provider =
-        provider_init::init_provider_for_serve(provider_choice, serve_model.as_deref()).await?;
+        provider_init::init_provider_for_serve(&effective_provider, serve_model.as_deref()).await?;
     // Catalog enrichment (GET /api/ps) only runs on fetch_models. Until then
     // Ollama's context_window() hard-falls back to 4096 and every tool-heavy
     // turn emergency-compacts. Refresh now that the model is warm.
-    if matches!(provider_choice, ProviderChoice::Ollama)
+    if matches!(effective_provider, ProviderChoice::Ollama)
         || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
     {
         match provider.refresh_model_catalog().await {
@@ -1406,17 +1440,20 @@ async fn run_gateway(
                 );
             }
             Err(err) => {
-                eprintln!("sovereign: Ollama catalog refresh failed ({err}); context may stay at 4k");
+                eprintln!(
+                    "sovereign: Ollama catalog refresh failed ({err}); context may stay at 4k"
+                );
             }
         }
     }
     let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
     let refine_provider = provider.clone();
-    let complete: sovereign_gateway::Complete = std::sync::Arc::new(move |system: String, user: String| {
-        let provider = refine_provider.clone();
-        Box::pin(async move { provider.complete_simple_with_usage(&user, &system).await })
-    });
-    let learning = sovereign_learning(&provider_choice);
+    let complete: sovereign_gateway::Complete =
+        std::sync::Arc::new(move |system: String, user: String| {
+            let provider = refine_provider.clone();
+            Box::pin(async move { provider.complete_simple_with_usage(&user, &system).await })
+        });
+    let learning = sovereign_learning(&effective_provider);
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let default_cwd = std::env::var("HERMES_DESKTOP_CWD")
@@ -1428,11 +1465,12 @@ async fn run_gateway(
         });
 
     let ollama_unload = serve_model.clone().filter(|_| {
-        matches!(provider_choice, ProviderChoice::Ollama)
+        matches!(effective_provider, ProviderChoice::Ollama)
             || std::env::var("SOVEREIGN_PROVIDER").ok().as_deref() == Some("ollama")
     });
 
-    let features = hermes_feature_command().map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd)));
+    let features = hermes_feature_command()
+        .map(|cmd| std::sync::Arc::new(sovereign_gateway::features::Features::new(cmd)));
 
     let gateway = async {
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1461,13 +1499,22 @@ async fn run_gateway(
         let port = gateway.local_addr().port();
         if let Some(features) = &features {
             features.set_engine_env(format!("http://127.0.0.1:{port}"), token.clone());
-            crate::tool::set_browser_bridge(format!("http://127.0.0.1:{port}/api/browser/act"), token.clone());
+            crate::tool::set_browser_bridge(
+                format!("http://127.0.0.1:{port}/api/browser/act"),
+                token.clone(),
+            );
         }
         // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval.
         let approval = serde_json::json!({ "addr": gateway.local_addr().to_string(), "secret": approval_secret });
-        write_private_file(&crate::storage::jcode_dir()?.join("sovereign-approval.json"), &approval.to_string())?;
+        write_private_file(
+            &crate::storage::jcode_dir()?.join("sovereign-approval.json"),
+            &approval.to_string(),
+        )?;
         if let Ok(ready_file) = std::env::var("HERMES_DESKTOP_READY_FILE") {
-            write_private_file(std::path::Path::new(&ready_file), &format!("{{\"port\":{port}}}"))?;
+            write_private_file(
+                std::path::Path::new(&ready_file),
+                &format!("{{\"port\":{port}}}"),
+            )?;
         }
         // The exact line the Hermes desktop waits for.
         println!("HERMES_BACKEND_READY port={port}");
@@ -1491,14 +1538,14 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = ctrl_c.await;
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = ctrl_c.await;
+                    return;
+                }
+            };
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}
@@ -1582,10 +1629,14 @@ async fn warm_ollama_serving_context(base_model: &str) -> Option<String> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            eprintln!("sovereign: warmed Ollama {alias} (from {base_model}) with num_ctx={num_ctx}, keep_alive=-1");
+            eprintln!(
+                "sovereign: warmed Ollama {alias} (from {base_model}) with num_ctx={num_ctx}, keep_alive=-1"
+            );
             if let Ok(home) = crate::storage::jcode_dir() {
-                let meta = serde_json::json!({ "model": alias, "base": base_model, "num_ctx": num_ctx });
-                let _ = write_private_file(&home.join("sovereign-ollama-warm.json"), &meta.to_string());
+                let meta =
+                    serde_json::json!({ "model": alias, "base": base_model, "num_ctx": num_ctx });
+                let _ =
+                    write_private_file(&home.join("sovereign-ollama-warm.json"), &meta.to_string());
             }
             Some(alias)
         }
@@ -1869,50 +1920,94 @@ mod dispatch_tests;
 /// The default (`local-idle`) learns automatically only on a local model, so
 /// a paid API never gets extra calls unless the user turns learning on.
 fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::learn::Learning> {
-    let loopback = |base: &str| ["://127.0.0.1", "://localhost", "://[::1]"].iter().any(|host| base.contains(host));
+    let loopback = |base: &str| {
+        ["://127.0.0.1", "://localhost", "://[::1]"]
+            .iter()
+            .any(|host| base.contains(host))
+    };
     // The active named profile's base URL lives in config.toml, not the env.
     let profile_base = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
         .ok()
-        .and_then(|name| crate::config::config().providers.get(&name).map(|p| p.base_url.clone()));
+        .and_then(|name| {
+            crate::config::config()
+                .providers
+                .get(&name)
+                .map(|p| p.base_url.clone())
+        });
     let local = matches!(provider, ProviderChoice::Ollama | ProviderChoice::Lmstudio)
         || profile_base.as_deref().is_some_and(loopback)
-        || ["JCODE_OPENROUTER_API_BASE", "JCODE_OPENAI_COMPAT_API_BASE", "JCODE_ANTHROPIC_API_BASE"]
-            .iter()
-            .filter_map(|key| std::env::var(key).ok())
-            .any(|base| loopback(&base));
-    let on = match std::env::var("SOVEREIGN_LEARNING").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        || [
+            "JCODE_OPENROUTER_API_BASE",
+            "JCODE_OPENAI_COMPAT_API_BASE",
+            "JCODE_ANTHROPIC_API_BASE",
+        ]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .any(|base| loopback(&base));
+    let on = match std::env::var("SOVEREIGN_LEARNING")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "off" => false,
         "on" => true,
         _ => local,
     };
-    eprintln!("sovereign: learning {} (local model: {local})", if on { "on" } else { "off" });
+    eprintln!(
+        "sovereign: learning {} (local model: {local})",
+        if on { "on" } else { "off" }
+    );
     if !on {
         return None;
     }
-    let idle_ms = std::env::var("SOVEREIGN_LEARN_IDLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120_000);
-    let remember: sovereign_gateway::learn::Remember = std::sync::Arc::new(|memories, cwd: Option<String>| {
-        use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
-        // Learned lessons are about the user and how they work: global scope,
-        // with the chat's project attached so project scope can be added later.
-        let manager = match cwd {
-            Some(dir) => MemoryManager::new().with_project_dir(dir),
-            None => MemoryManager::new(),
-        };
-        let before = manager.load_global_graph()?.memories.len();
-        for m in memories {
-            let category = match m.kind.as_str() {
-                "preference" => MemoryCategory::Preference,
-                "correction" => MemoryCategory::Correction,
-                _ => MemoryCategory::Fact,
+    let idle_ms = std::env::var("SOVEREIGN_LEARN_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120_000);
+    let remember: sovereign_gateway::learn::Remember =
+        std::sync::Arc::new(|memories, cwd: Option<String>| {
+            use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
+            // Learned lessons are about the user and how they work: global scope,
+            // with the chat's project attached so project scope can be added later.
+            let manager = match cwd {
+                Some(dir) => MemoryManager::new().with_project_dir(dir),
+                None => MemoryManager::new(),
             };
-            let mut entry = MemoryEntry::new(category, m.text);
-            entry.trust = if m.user_stated { TrustLevel::High } else { TrustLevel::Medium };
-            entry.source = Some("prime-learning".to_string());
-            manager.remember_global(entry)?;
-        }
-        Ok(manager.load_global_graph()?.memories.len().saturating_sub(before))
-    });
+            let before = manager.load_global_graph()?.memories.len();
+            for m in memories {
+                let category = match m.kind.as_str() {
+                    "preference" => MemoryCategory::Preference,
+                    "correction" => MemoryCategory::Correction,
+                    _ => MemoryCategory::Fact,
+                };
+                let mut entry = MemoryEntry::new(category, m.text);
+                entry.trust = if m.user_stated {
+                    TrustLevel::High
+                } else {
+                    TrustLevel::Medium
+                };
+                entry.source = Some("prime-learning".to_string());
+                manager.remember_global(entry)?;
+            }
+            Ok(manager
+                .load_global_graph()?
+                .memories
+                .len()
+                .saturating_sub(before))
+        });
     // Prime's auto-refine review, off by default: `SOVEREIGN_LEARN_REVIEW=on`.
-    let review = matches!(std::env::var("SOVEREIGN_LEARN_REVIEW").unwrap_or_default().trim().to_ascii_lowercase().as_str(), "on" | "true" | "1");
-    Some(sovereign_gateway::learn::Learning { idle: std::time::Duration::from_millis(idle_ms), remember, review })
+    let review = matches!(
+        std::env::var("SOVEREIGN_LEARN_REVIEW")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "on" | "true" | "1"
+    );
+    Some(sovereign_gateway::learn::Learning {
+        idle: std::time::Duration::from_millis(idle_ms),
+        remember,
+        review,
+    })
 }
