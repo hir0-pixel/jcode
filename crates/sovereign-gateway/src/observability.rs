@@ -626,6 +626,8 @@ impl Observer {
         })
     }
 
+    pub fn replay_epoch(&self) -> &str { &self.replay_epoch }
+
     pub fn metered_usage(&self) -> rusqlite::Result<(f64, u64)> {
         let db = self.read_db.lock().unwrap();
         db.query_row("SELECT COALESCE(SUM(cost_usd), 0), COUNT(cost_usd) FROM obs_runs", [], |row| {

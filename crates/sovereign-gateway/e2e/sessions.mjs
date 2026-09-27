@@ -6,6 +6,7 @@
 //   node crates/sovereign-gateway/e2e/sessions.mjs
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -67,18 +68,48 @@ const turn = async (sid, text) => {
   }
   throw new Error('turn timed out')
 }
+const waitTurn = async (sid, from) => {
+  const t0 = Date.now()
+  while (Date.now() - t0 < 600_000) {
+    if (events.slice(from).some(e => e.session_id === sid && (e.type === 'message.complete' || e.type === 'error'))) return
+    await new Promise(r => setTimeout(r, 200))
+  }
+  throw new Error('turn timed out')
+}
 const listIds = async () => ((await rpc('session.list', {})).result?.sessions || []).map(s => s.id)
 const history = async sid => (await rpc('session.history', { session_id: sid })).result?.messages || []
 
 try {
   const a = (await rpc('session.create', { cwd: home })).result.session_id
-  await turn(a, 'Reply with exactly the word ONE.')
+  const firstFrom = events.length
+  await rpc('prompt.submit', { session_id: a, text: 'Use the bash tool to run `sleep 3`, then reply with exactly the word ONE.' })
+  let active
+  for (let i = 0; i < 100; i++) {
+    active = (await rpc('session.active_list', { current_session_id: a })).result
+    if (active?.sessions?.some(s => s.id === a && s.current)) break
+    await new Promise(r => setTimeout(r, 150))
+  }
+  check(active?.sessions?.some(s => s.id === a && s.current), `session.active_list reads live engine sessions (${JSON.stringify(active)})`)
+  await waitTurn(a, firstFrom)
   await turn(a, 'Reply with exactly the word TWO.')
   const h0 = await history(a)
   check(h0.filter(m => m.role === 'user').length === 2, `two user turns stored (${h0.length} messages)`)
 
   const status = (await rpc('session.status', { session_id: a })).result
   check(status?.output?.includes(a), 'session.status reports the session')
+  const context = (await rpc('session.context_breakdown', { session_id: a })).result
+  check(context?.context_estimated === true && context.context_used >= 0, 'session.context_breakdown reports an explicit engine transcript estimate')
+  const replay = (await rpc('session.events.since', { session_id: a, last_seen: 0 })).result
+  check(typeof replay?.latest_seq === 'number' && replay.epoch, 'session.events.since returns a cursor and stable gateway epoch')
+  const replayStats = (await rpc('session.events.stats', {})).result
+  check(typeof replayStats?.sessions === 'number' && typeof replayStats?.events === 'number', 'session.events.stats reports the replay ledger')
+  const expectedCwd = fs.realpathSync(home)
+  const changedCwd = (await rpc('session.cwd.set', { session_id: a, cwd: home })).result
+  check(changedCwd?.cwd === expectedCwd, `session.cwd.set persists the session working directory (${JSON.stringify(changedCwd)})`)
+  const moved = (await rpc('session.workspace.move', { session_key: a, cwd: home })).result
+  check(moved?.cwd === expectedCwd, `session.workspace.move updates the engine session cwd (${JSON.stringify(moved)})`)
+  const foreign = (await rpc('session.foreign.list', { source: 'claude', limit: 10 })).result
+  check(Array.isArray(foreign?.sessions), 'session.foreign.list uses the engine importer')
 
   const saved = (await rpc('session.save', { session_id: a })).result
   check(saved?.file && fs.readFileSync(saved.file, 'utf8').includes('TWO'), 'session.save writes the transcript to a file')
@@ -129,10 +160,10 @@ try {
   check(!JSON.stringify(th).includes('FOUR') && th.filter(m => m.role === 'user').length === 1, `undo after a tool turn removes only the last turn (removed ${tu?.removed}, ${th.length} left)`)
 
   // REST surface the desktop sidebar uses (/api/sessions/*).
-  const http = (method, p, body) =>
+  const http = (method, p, body, withToken = true) =>
     fetch(`http://127.0.0.1:${port}${p}`, {
       method,
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: { ...(withToken ? { authorization: `Bearer ${token}` } : {}), 'content-type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
     }).then(async r => ({ status: r.status, body: await r.json().catch(() => null) }))
   await turn(a, 'Reply with exactly the word THREE.')
@@ -144,8 +175,37 @@ try {
   check(renamed.status === 200, 'REST rename accepted')
   const got = await http('GET', `/api/sessions/${a}`)
   check(got.body?.title === 'Renamed via REST', `REST get shows the new title (${got.body?.title})`)
+  const exported = await http('GET', `/api/sessions/${a}/export`)
+  const imported = await http('POST', '/api/sessions/import', { sessions: [exported.body] })
+  check(exported.status === 200 && imported.status === 200 && imported.body?.skipped === 1,
+    'REST export envelope round-trips through the engine importer')
   const found = await http('GET', `/api/sessions/search?q=three`)
   check(found.body?.results?.some(r => r.session_id === a), 'REST search finds the session by message text')
+  const sessionRoutes = [
+    ['GET', '/api/sessions/stats'],
+    ['GET', '/api/sessions/empty/count'],
+    ['DELETE', '/api/sessions/empty'],
+    ['POST', '/api/sessions/bulk-delete', { ids: [] }],
+    ['POST', '/api/sessions/import', { sessions: [] }],
+    ['POST', '/api/sessions/prune', { dry_run: true }],
+    ['GET', `/api/sessions/${a}/latest-descendant`],
+    ['GET', `/api/sessions/${a}/export`],
+  ]
+  const curl = (method, route, body, withToken) => {
+    const args = ['-sS', '-X', method, '-H', 'content-type: application/json', '-w', '\n%{http_code}']
+    if (withToken) args.push('-H', `authorization: Bearer ${token}`)
+    if (body) args.push('--data-binary', JSON.stringify(body))
+    args.push(`http://127.0.0.1:${port}${route}`)
+    const result = execFileSync('curl', args, { encoding: 'utf8' })
+    const split = result.lastIndexOf('\n')
+    return { status: Number(result.slice(split + 1)), body: JSON.parse(result.slice(0, split) || 'null') }
+  }
+  for (const [method, route, body] of sessionRoutes) {
+    const missingToken = curl(method, route, body, false)
+    const authenticated = curl(method, route, body, true)
+    check(missingToken.status === 401, `${method} ${route} rejects a missing token`)
+    check(authenticated.status >= 200 && authenticated.status < 300, `${method} ${route} is served with a token (${authenticated.status})`)
+  }
   await http('PATCH', `/api/sessions/${a}`, { archived: true })
   check(!(await listIds()).includes(a), 'REST archive hides the session')
   await http('PATCH', `/api/sessions/${a}`, { archived: false })
@@ -160,10 +220,7 @@ try {
   check(bars?.available === false, 'usage.bars answers unavailable without Python')
   const handoff = await rpc('handoff.request', { session_id: a, platform: 'telegram' })
   check(Boolean(handoff.error), 'handoff is refused until messaging runs on the engine')
-  const other = await http('POST', `/api/sessions/bulk-delete`, { ids: [] })
-  check(other.status === 404 && other.body?.reason === 'not_supported_by_engine', 'unbuilt /api/sessions routes are refused, not proxied')
-
-  check(!/forward RPC (session|insights|usage|handoff)\./.test(stderr), 'no chat-bound method was forwarded to Python')
+  check(!/forward RPC (session|insights|usage)\./.test(stderr), 'no chat-bound method was forwarded to Python')
 } catch (err) {
   failures++
   console.error('FAIL', err.message)

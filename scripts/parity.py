@@ -23,13 +23,6 @@ HERMES = Path(sys.argv[1] if len(sys.argv) > 1 else ENGINE.parent / "hermes-agen
 
 # Answered honestly as "off / empty" until the named module is built.
 PLACEHOLDER = {
-    "session.events.since", "session.events.stats",
-    # Chat-bound but not built yet: refused by the engine, never forwarded
-    # (Python's store has never seen these sessions).
-    "session.cwd.set", "session.workspace.move", "session.context_breakdown",
-    "session.foreign.import", "session.foreign.list", "session.foreign.preview",
-    # Hosted-subscription bars (not applicable) and messaging handoff (M4).
-    "usage.bars", "handoff.request", "handoff.state", "handoff.fail",
 }
 # Where each missing namespace gets built (docs/SOVEREIGN_PLAN.md modules).
 PLAN = {
@@ -62,6 +55,11 @@ SESSIONS_REST = {
     ("GET", "/api/sessions/{session_id}/messages"), ("GET", "/api/sessions/{session_id}/messages/around"),
     ("GET", "/api/sessions/{session_id}/timeline"), ("DELETE", "/api/sessions/{session_id}"),
     ("PATCH", "/api/sessions/{session_id}"),
+    ("POST", "/api/sessions/bulk-delete"), ("POST", "/api/sessions/import"),
+    ("GET", "/api/sessions/empty/count"), ("DELETE", "/api/sessions/empty"),
+    ("GET", "/api/sessions/stats"),
+    ("GET", "/api/sessions/{session_id}/latest-descendant"),
+    ("GET", "/api/sessions/{session_id}/export"), ("POST", "/api/sessions/prune"),
 }
 
 

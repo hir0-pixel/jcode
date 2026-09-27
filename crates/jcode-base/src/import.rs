@@ -269,6 +269,12 @@ pub fn list_claude_code_sessions() -> Result<Vec<ClaudeCodeSessionInfo>> {
     Ok(all_sessions)
 }
 
+/// Read Codex session metadata and text without importing or persisting it.
+pub fn load_codex_external_session(path: &Path) -> Result<Option<jcode_import_core::ExternalSessionRecord>> {
+    jcode_import_core::load_codex_external_session(path, false)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
 pub fn list_claude_code_sessions_lazy(scan_limit: usize) -> Result<Vec<ClaudeCodeSessionInfo>> {
     let mut all_sessions = Vec::new();
     let mut seen_session_ids = HashSet::new();
@@ -755,6 +761,23 @@ fn import_session_from_file_with_target(
     jcode_session_id: String,
     require_source_identity: bool,
 ) -> Result<Session> {
+    let session = parse_session_from_file_with_target(path, session_id, jcode_session_id, require_source_identity)?;
+    let created_at = session.created_at;
+    finalize_imported_session(session, created_at, None)
+}
+
+/// Parse a Claude Code transcript into the engine's session shape without
+/// writing it. Used by the desktop's bounded foreign-session preview.
+pub fn preview_claude_code_session_from_file(path: &Path, session_id: &str) -> Result<Session> {
+    parse_session_from_file_with_target(path, session_id, imported_claude_code_session_id(session_id), false)
+}
+
+fn parse_session_from_file_with_target(
+    path: &Path,
+    session_id: &str,
+    jcode_session_id: String,
+    require_source_identity: bool,
+) -> Result<Session> {
     let entries = load_claude_code_entries(path)?;
     if require_source_identity {
         let mut saw_expected_session = false;
@@ -862,7 +885,7 @@ fn import_session_from_file_with_target(
         session.append_stored_message(message);
     }
 
-    finalize_imported_session(session, created_at, None)
+    Ok(session)
 }
 
 fn remove_prepared_takeover_session(session_id: &str) {

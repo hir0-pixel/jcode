@@ -11,10 +11,21 @@ use tokio::net::TcpStream;
 /// Returns `None` when the path is not under `/api/sessions`.
 pub(super) async fn route(stream: &mut TcpStream, req: &Request, config: &Config) -> Option<Result<()>> {
     let rest = req.path.strip_prefix("/api/sessions")?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
     let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     Some(match (req.method.as_str(), segments.as_slice()) {
         ("GET", []) => list(stream, req, config).await,
+        ("GET", ["stats"]) => stats(stream, config).await,
+        ("GET", ["empty", "count"]) => empty_count(stream, config).await,
+        ("DELETE", ["empty"]) => delete_empty(stream, config).await,
+        ("POST", ["bulk-delete"]) => bulk_delete(stream, req, config).await,
+        ("POST", ["import"]) => import(stream, req, config).await,
+        ("POST", ["prune"]) => prune(stream, req, config).await,
         ("GET", ["search"]) => search(stream, req, config).await,
+        ("GET", [id, "export"]) => export(stream, config, id).await,
+        ("GET", [id, "latest-descendant"]) => latest_descendant(stream, config, id).await,
         ("GET", [id]) => get(stream, config, id).await,
         ("GET", [id, "messages"]) => messages(stream, req, config, id).await,
         ("GET", [id, "messages", "around"]) => messages(stream, req, config, id).await,
@@ -31,6 +42,198 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request, config: &Config
     })
 }
 
+async fn stats(stream: &mut TcpStream, config: &Config) -> Result<()> {
+    match session_infos(config, u64::MAX, true).await {
+        Ok(sessions) => {
+            let total = sessions.len();
+            let archived = sessions.iter().filter(|s| s["archived"] == true).count();
+            let messages = sessions.iter().map(|s| s["message_count"].as_u64().unwrap_or(0)).sum::<u64>();
+            respond(stream, "200 OK", &json!({"total": total, "active_store": total - archived, "archived": archived, "messages": messages, "by_source": {"desktop": total}})).await
+        }
+        Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+    }
+}
+
+async fn empty_count(stream: &mut TcpStream, config: &Config) -> Result<()> {
+    let sessions = match session_infos(config, u64::MAX, false).await {
+        Ok(sessions) => sessions,
+        Err(err) => return respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+    };
+    let mut count = 0usize;
+    for session in sessions {
+        if session["is_active"] == true || session["archived"] == true { continue; }
+        if let Some(id) = session["id"].as_str() {
+            if transcript(config, id).await.is_ok_and(|m| m.is_empty()) { count += 1; }
+        }
+    }
+    respond(stream, "200 OK", &json!({"count": count})).await
+}
+
+async fn delete_empty(stream: &mut TcpStream, config: &Config) -> Result<()> {
+    let sessions = match session_infos(config, u64::MAX, false).await {
+        Ok(sessions) => sessions,
+        Err(err) => return respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+    };
+    let mut deleted = 0usize;
+    for session in sessions {
+        if session["is_active"] == true || session["archived"] == true { continue; }
+        let Some(id) = session["id"].as_str() else { continue };
+        if transcript(config, id).await.is_ok_and(|m| m.is_empty()) {
+            if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session", "session_id":id})).await {
+                return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "deleted":deleted})).await;
+            }
+            deleted += 1;
+        }
+    }
+    respond(stream, "200 OK", &json!({"ok": true, "deleted": deleted})).await
+}
+
+async fn bulk_delete(stream: &mut TcpStream, req: &Request, config: &Config) -> Result<()> {
+    let body: Value = serde_json::from_slice(&read_body(stream, req).await?).unwrap_or(Value::Null);
+    let Some(ids) = body["ids"].as_array() else { return respond(stream, "400 Bad Request", &json!({"detail":"ids must be an array"})).await; };
+    if ids.len() > 500 || ids.iter().any(|id| id.as_str().is_none_or(|s| !valid_id(s))) {
+        return respond(stream, "400 Bad Request", &json!({"detail":"ids must contain at most 500 valid session ids"})).await;
+    }
+    let mut deleted = 0usize;
+    for id in ids.iter().filter_map(Value::as_str) {
+        match find(config, id).await {
+            Ok(Some(info)) if info["is_active"] != true => {
+                if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session", "session_id":id})).await {
+                    return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "deleted":deleted})).await;
+                }
+                deleted += 1;
+            }
+            Ok(_) => {}
+            Err(err) => return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "deleted":deleted})).await,
+        }
+    }
+    respond(stream, "200 OK", &json!({"ok": true, "deleted": deleted})).await
+}
+
+async fn import(stream: &mut TcpStream, req: &Request, _config: &Config) -> Result<()> {
+    let body: Value = serde_json::from_slice(&read_body(stream, req).await?).unwrap_or(Value::Null);
+    let Some(records) = body["sessions"].as_array() else {
+        return respond(stream, "400 Bad Request", &json!({"detail":"sessions must be an array of engine session records"})).await;
+    };
+    if records.len() > 500 { return respond(stream, "400 Bad Request", &json!({"detail":"at most 500 sessions may be imported"})).await; }
+    let parsed = match parse_import_records(records) {
+        Ok(parsed) => parsed,
+        Err(err) => return respond(stream, "400 Bad Request", &json!({"detail":err})).await,
+    };
+    let mut imported = 0usize;
+    for mut session in parsed {
+        if !jcode_base::session::session_exists(&session.id) {
+            if let Err(err) = session.save_prepared() {
+                return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "imported":imported})).await;
+            }
+            imported += 1;
+        }
+    }
+    respond(stream, "200 OK", &json!({"ok":true,"imported":imported,"skipped":records.len()-imported})).await
+}
+
+async fn prune(stream: &mut TcpStream, req: &Request, config: &Config) -> Result<()> {
+    let body: Value = serde_json::from_slice(&read_body(stream, req).await?).unwrap_or(Value::Null);
+    let days = body["older_than_days"].as_f64().unwrap_or(90.0);
+    let cutoff = chrono::Utc::now().timestamp() as f64 - days * 86_400.0;
+    let dry_run = body["dry_run"] == true;
+    let include_archived = body["include_archived"] == true;
+    if !days.is_finite() || days < 0.0 {
+        return respond(stream, "400 Bad Request", &json!({"detail":"older_than_days must be a non-negative finite number"})).await;
+    }
+    let sessions = match session_infos(config, u64::MAX, include_archived).await {
+        Ok(sessions) => sessions,
+        Err(err) => return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+    };
+    let mut ids = Vec::new();
+    for session in sessions {
+        if session["is_active"] == true || (!include_archived && session["archived"] == true) { continue; }
+        if session["last_active"].as_f64().unwrap_or(f64::INFINITY) < cutoff {
+            if let Some(id) = session["id"].as_str() { ids.push(id.to_string()); }
+        }
+    }
+    let mut deleted = 0usize;
+    if !dry_run {
+        for id in &ids {
+            if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session","session_id":id})).await {
+                return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(),"matched":ids.len(),"deleted":deleted,"session_ids":ids})).await;
+            }
+            deleted += 1;
+        }
+    }
+    respond(stream, "200 OK", &json!({"ok":true,"matched":ids.len(),"deleted":deleted,"dry_run":dry_run,"session_ids":ids})).await
+}
+
+async fn export(stream: &mut TcpStream, _config: &Config, id: &str) -> Result<()> {
+    match jcode_base::session::Session::load(id) {
+        Ok(session) => respond(stream, "200 OK", &json!({"session": session})).await,
+        Err(_err) if !jcode_base::session::session_exists(id) => respond(stream, "404 Not Found", &json!({"detail":"session not found"})).await,
+        Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+    }
+}
+
+async fn latest_descendant(stream: &mut TcpStream, config: &Config, id: &str) -> Result<()> {
+    match session_infos(config, u64::MAX, true).await {
+        Ok(sessions) => {
+            if !sessions.iter().any(|s| s["id"] == id) {
+                return respond(stream, "404 Not Found", &json!({"detail":"session not found"})).await;
+            }
+            let mut parent = id.to_string();
+            let mut path = vec![id.to_string()];
+            let mut seen = std::collections::HashSet::from([parent.clone()]);
+            loop {
+                let next = sessions.iter().filter(|s| {
+                    jcode_base::session::Session::load(s["id"].as_str().unwrap_or_default())
+                        .ok().is_some_and(|record| record.parent_id.as_deref() == Some(&parent))
+                })
+                    .max_by(|a, b| a["last_active"].as_f64().unwrap_or_default().total_cmp(&b["last_active"].as_f64().unwrap_or_default()));
+                let Some(next) = next else { break };
+                let Some(next_id) = next["id"].as_str() else { break };
+                if !seen.insert(next_id.to_string()) { break; }
+                parent = next_id.to_string(); path.push(parent.clone());
+            }
+            respond(stream, "200 OK", &json!({"requested_session_id":id,"session_id":parent,"path":path,"changed":parent != id})).await
+        }
+        Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn parse_import_records(records: &[Value]) -> std::result::Result<Vec<jcode_base::session::Session>, String> {
+    records.iter().map(|value| {
+        let record = value.get("record").or_else(|| value.get("session")).unwrap_or(value);
+        let session: jcode_base::session::Session = serde_json::from_value(record.clone())
+            .map_err(|_| "each session must contain a valid engine session record".to_string())?;
+        if !valid_id(&session.id) { return Err("each session must contain a valid engine session record".into()); }
+        Ok(session)
+    }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_import_records, valid_id};
+
+    #[test]
+    fn session_ids_cannot_escape_the_session_store() {
+        assert!(valid_id("s_123-a"));
+        for id in ["", "../secret", "a/b", "a\\b", &"x".repeat(129)] {
+            assert!(!valid_id(id), "accepted unsafe id: {id}");
+        }
+    }
+
+    #[test]
+    fn exported_session_envelope_is_importable_and_batches_validate_before_writes() {
+        let session = jcode_base::session::Session::create_with_id("s_roundtrip".into(), None, Some("test".into()));
+        let exported = serde_json::json!({"session": session});
+        assert_eq!(parse_import_records(std::slice::from_ref(&exported)).unwrap()[0].id, "s_roundtrip");
+        let invalid = [exported, serde_json::json!({"session": {"id":"../unsafe"}})];
+        assert!(parse_import_records(&invalid).is_err());
+    }
+}
+
 async fn list(stream: &mut TcpStream, req: &Request, config: &Config) -> Result<()> {
     let limit = query_u64(req, "limit").unwrap_or(50).clamp(1, 1000);
     match session_infos(config, limit, false).await {
@@ -44,7 +247,23 @@ async fn list(stream: &mut TcpStream, req: &Request, config: &Config) -> Result<
 
 /// Stored record for one session, archived ones included.
 async fn find(config: &Config, id: &str) -> Result<Option<Value>> {
-    Ok(session_infos(config, 1000, true).await?.into_iter().find(|s| s["id"] == id))
+    if !valid_id(id) || !jcode_base::session::session_exists(id) { return Ok(None); }
+    let session = jcode_base::session::Session::load(id)?;
+    let runtime = harness_request(&config.legacy_socket, json!({"req":"list_sessions"})).await?;
+    let active = runtime["sessions"].as_array().into_iter().flatten()
+        .find(|info| info["session_id"] == id)
+        .is_some_and(|info| matches!(info["status"].as_str(), Some("running" | "processing")));
+    Ok(Some(json!({
+        "id": session.id, "title": session.display_title_or_name(),
+        "preview": session.messages.iter().rev().find_map(|m| m.content.iter().find_map(|b| match b {
+            jcode_base::message::ContentBlock::Text { text, .. } => Some(text.clone()), _ => None,
+        })).unwrap_or_default(),
+        "source":"desktop", "started_at":session.created_at.timestamp() as f64,
+        "last_active":session.updated_at.timestamp() as f64, "ended_at":session.updated_at.timestamp() as f64,
+        "is_active":active,
+        "message_count":session.messages.len(), "archived":false, "cwd":session.working_dir,
+        "model":session.model, "parent_session_id":session.parent_id,
+    })))
 }
 
 async fn get(stream: &mut TcpStream, config: &Config, id: &str) -> Result<()> {
@@ -56,12 +275,14 @@ async fn get(stream: &mut TcpStream, config: &Config, id: &str) -> Result<()> {
 }
 
 /// The whole conversation (snapshot plus journal), oldest first.
-async fn transcript(config: &Config, id: &str) -> Result<Vec<Value>> {
-    let reply = harness_request(&config.legacy_socket, json!({"req": "peek_session", "session_id": id, "limit": 100_000})).await?;
-    Ok(reply["messages"]
-        .as_array()
-        .map(|list| list.iter().map(|m| json!({"role": m["role"], "content": m["content"], "text": m["content"]})).collect())
-        .unwrap_or_default())
+async fn transcript(_config: &Config, id: &str) -> Result<Vec<Value>> {
+    let session = jcode_base::session::Session::load(id)?;
+    Ok(session.messages.into_iter().map(|m| {
+        let content = m.content.into_iter().filter_map(|b| match b {
+            jcode_base::message::ContentBlock::Text { text, .. } => Some(text), _ => None,
+        }).collect::<Vec<_>>().join("\n");
+        json!({"role":serde_json::to_value(m.role).unwrap_or(Value::Null), "content":content, "text":content})
+    }).collect())
 }
 
 async fn messages(stream: &mut TcpStream, req: &Request, config: &Config, id: &str) -> Result<()> {
@@ -95,7 +316,7 @@ async fn search(stream: &mut TcpStream, req: &Request, config: &Config) -> Resul
     if q.trim().is_empty() {
         return respond(stream, "200 OK", &json!({"results": []})).await;
     }
-    let sessions = match session_infos(config, 500, false).await {
+    let sessions = match session_infos(config, u64::MAX, false).await {
         Ok(sessions) => sessions,
         Err(err) => return respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
     };

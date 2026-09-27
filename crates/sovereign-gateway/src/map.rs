@@ -263,18 +263,19 @@ pub fn approval_decision(choice: &str) -> &'static str {
 /// jcode `SessionInfo` → Hermes `SessionListRow`.
 pub fn session_row(info: &Value) -> Value {
     let id = info["session_id"].as_str().unwrap_or_default();
+    let stored = jcode_base::session::Session::load(id).ok();
     let title = info["title"]
         .as_str()
         .or_else(|| info["display_title"].as_str())
         .unwrap_or("New chat");
-    let ms = info["last_active_at_ms"].as_i64().or_else(|| info["updated_at_ms"].as_i64()).unwrap_or(0);
+    let ms = info["last_active_at_ms"].as_i64().or_else(|| info["updated_at_ms"].as_i64()).unwrap_or_else(|| stored.as_ref().map(|s| s.updated_at.timestamp_millis()).unwrap_or(0));
     json!({
         "id": id,
         "resolved_id": id,
         "title": title,
         "preview": "",
         "started_at": ms as f64 / 1000.0,
-        "message_count": 0,
+        "message_count": stored.as_ref().map(|s| s.messages.iter().filter(|m| matches!(m.role, jcode_base::message::Role::User | jcode_base::message::Role::Assistant)).count()).unwrap_or(0),
         "source": "desktop",
     })
 }
@@ -282,21 +283,30 @@ pub fn session_row(info: &Value) -> Value {
 /// jcode `SessionInfo` → desktop REST `SessionInfo` (`types/hermes.ts`).
 pub fn session_info(info: &Value) -> Value {
     let row = session_row(info);
-    let secs = row["started_at"].clone();
+    let id = info["session_id"].as_str().unwrap_or_default();
+    let stored = jcode_base::session::Session::load(id).ok();
+    let secs = stored.as_ref().map(|s| s.created_at.timestamp() as f64).unwrap_or_else(|| row["started_at"].as_f64().unwrap_or_default());
+    let last_active = stored.as_ref().map(|s| s.updated_at.timestamp() as f64).unwrap_or_else(|| row["started_at"].as_f64().unwrap_or_default());
+    let message_count = row["message_count"].clone();
+    let usage = stored.as_ref().map(|s| s.token_usage_totals());
+    let preview = stored.as_ref().and_then(|s| s.messages.iter().rev().find_map(|m| {
+        m.content.iter().find_map(|b| match b { jcode_base::message::ContentBlock::Text { text, .. } => Some(text.clone()), _ => None })
+    })).unwrap_or_default();
     json!({
         "id": row["id"],
         "title": row["title"],
         "preview": "",
         "source": "desktop",
         "started_at": secs,
-        "last_active": secs,
-        "ended_at": null,
+        "last_active": last_active,
+        "ended_at": if info["status"] == "running" || info["status"] == "processing" { Value::Null } else { json!(last_active) },
         "is_active": info["status"] == "running" || info["status"] == "processing",
-        "message_count": 0,
-        "tool_call_count": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "model": null,
+        "message_count": message_count,
+        "tool_call_count": stored.as_ref().map(|s| s.messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, jcode_base::message::ContentBlock::ToolUse { .. })).count()),
+        "input_tokens": usage.map(|u| u.input_tokens),
+        "output_tokens": stored.as_ref().map(|s| s.token_usage_totals().output_tokens),
+        "model": stored.as_ref().and_then(|s| s.model.clone()),
+        "preview": preview.chars().take(200).collect::<String>(),
         "cwd": info["working_dir"],
         "parent_session_id": info["parent_session_id"],
         "archived": info["archived"].as_bool().unwrap_or(false),
@@ -399,6 +409,14 @@ pub fn git_branch(cwd: &str) -> Option<String> {
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+pub fn git_repo_root(cwd: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(cwd).to_path_buf();
+    loop {
+        if dir.join(".git").exists() { return Some(dir.to_string_lossy().into_owned()); }
+        if !dir.pop() { return None; }
     }
 }
 

@@ -389,7 +389,6 @@ async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> R
         .as_array()
         .map(|list| {
             list.iter()
-                .filter(|s| s["parent_session_id"].is_null())
                 .filter(|s| include_archived || s["archived"] != true)
                 .map(map::session_info)
                 .collect()
@@ -472,7 +471,9 @@ async fn handle(mut stream: TcpStream, local: SocketAddr, config: Arc<Config>, h
     // early-dispatch path must carry its own token check: it runs before the
     // `!token_ok` catch-all below, which only guards the arms of the match
     // that follows.
-    if req.path != "/api/sessions/owner-backfill" && req.path.starts_with("/api/sessions") {
+    if (req.path == "/api/sessions" || req.path.starts_with("/api/sessions/"))
+        && req.path != "/api/sessions/owner-backfill"
+    {
         if !token_ok {
             return respond(&mut stream, "401 Unauthorized", &json!({"detail": "unauthorized"})).await;
         }

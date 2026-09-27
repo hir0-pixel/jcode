@@ -8,6 +8,7 @@ use crate::{Config, MAX_FRAME_BYTES};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +33,75 @@ const PARSE_ERROR: i64 = -32700;
 const INTERNAL: i64 = -32603;
 
 type Ws = WebSocketStream<TcpStream>;
+
+fn foreign_handle(source: &str, path: &str) -> String {
+    format!("{:x}", Sha256::digest(format!("{source}:{path}").as_bytes()))
+}
+
+struct ForeignCandidate {
+    source: &'static str,
+    path: std::path::PathBuf,
+    external_id: String,
+    title: String,
+    cwd: Option<String>,
+    mtime: f64,
+    turn_count: usize,
+    excerpt: String,
+}
+
+fn foreign_candidates(source: Option<&str>) -> Result<Vec<ForeignCandidate>> {
+    let mut out = Vec::new();
+    let home = std::env::var_os("HOME").map(|h| Path::new(&h).to_path_buf()).unwrap_or_else(|| Path::new("/nonexistent").to_path_buf());
+    let max_log_bytes = 32 * 1024 * 1024;
+    if source.is_none_or(|s| s == "claude") {
+        let root = home.join(".claude/projects").canonicalize().ok();
+        for s in jcode_base::import::list_claude_code_sessions()? {
+            let Ok(path) = Path::new(&s.full_path).canonicalize() else { continue };
+            let Ok(meta) = path.metadata() else { continue };
+            if meta.len() > max_log_bytes || root.as_ref().is_none_or(|root| !path.starts_with(root)) { continue; }
+            out.push(ForeignCandidate {
+                source: "claude", path, external_id: s.session_id,
+                title: s.summary.unwrap_or_else(|| s.first_prompt.clone()), cwd: s.project_path,
+                mtime: s.modified.or(s.created).map(|t| t.timestamp() as f64).unwrap_or_default(),
+                turn_count: s.message_count as usize, excerpt: s.first_prompt,
+            });
+        }
+    }
+    if source.is_none_or(|s| s == "codex") {
+        let root = home.join(".codex/sessions").canonicalize().ok();
+        let mut pending = root.iter().cloned().collect::<Vec<_>>();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else { continue };
+                if kind.is_dir() { pending.push(path); continue; }
+                if !kind.is_file() || path.extension().is_none_or(|e| e != "jsonl") { continue; }
+                let Ok(path) = path.canonicalize() else { continue };
+                let Ok(meta) = path.metadata() else { continue };
+                if meta.len() > max_log_bytes || root.as_ref().is_none_or(|root| !path.starts_with(root)) { continue; }
+                let Ok(Some(record)) = jcode_base::import::load_codex_external_session(&path) else { continue };
+                let first = record.messages.iter().find(|m| m.role == "user").map(|m| m.text.as_str()).unwrap_or_default();
+                out.push(ForeignCandidate { source: "codex", path, external_id: record.session_id,
+                    title: record.title.unwrap_or_else(|| first.lines().next().unwrap_or_default().chars().take(180).collect()),
+                    cwd: record.working_dir, mtime: record.updated_at.timestamp() as f64,
+                    turn_count: record.messages.len(), excerpt: first.chars().take(200).collect() });
+            }
+        }
+    }
+    out.sort_by(|a,b| b.mtime.total_cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+    Ok(out)
+}
+
+fn foreign_turns(candidate: &ForeignCandidate) -> Result<Vec<Value>> {
+    if candidate.source == "claude" {
+        let session = jcode_base::import::preview_claude_code_session_from_file(&candidate.path, &candidate.external_id)?;
+        return Ok(session.messages.into_iter().map(|m| json!({"role":serde_json::to_value(m.role).unwrap_or(Value::Null),"content":m.content.into_iter().filter_map(|b| match b { jcode_base::message::ContentBlock::Text{text,..} => Some(text), _=>None }).collect::<Vec<_>>().join("\n")})).collect());
+    }
+    let record = jcode_base::import::load_codex_external_session(&candidate.path)?
+        .ok_or_else(|| anyhow!("unreadable Codex session"))?;
+    Ok(record.messages.into_iter().map(|m| json!({"role":m.role,"content":m.text})).collect())
+}
 
 pub async fn close(mut ws: Ws, code: u16, reason: &str) -> Result<()> {
     let frame = CloseFrame { code: CloseCode::from(code), reason: reason.chars().take(120).collect::<String>().into() };
@@ -566,19 +636,31 @@ impl Conn {
                 "provider": self.config.provider,
             })),
             "session.active_list" => {
-                let sessions = self.sessions.lock().await;
+                let stored = super::session_infos(&self.config, 1000, false).await.map_err(RpcError::internal)?;
                 let current = p["current_session_id"].as_str().unwrap_or_default();
-                let known = self.known.lock().await;
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                let items: Vec<Value> = sessions
-                    .iter()
-                    .filter(|(_, s)| s.turn_active())
-                    .map(|(id, s)| json!({
-                        "current": id == current, "id": id, "session_key": id, "last_active": now, "started_at": now,
-                        "message_count": 0, "model": s.model.clone().unwrap_or_else(|| self.config.model.clone()), "preview": "",
-                        "status": "streaming", "title": known.get(id).and_then(|v| v["title"].as_str()).unwrap_or("Untitled"),
-                    }))
+                let mut active: HashMap<String, (bool, Option<String>)> = stored.iter()
+                    .filter(|s| s["is_active"] == true)
+                    .filter_map(|s| s["id"].as_str().map(|id| (id.to_string(), (false, s["model"].as_str().map(str::to_owned)))))
                     .collect();
+                for (id, state) in self.sessions.lock().await.iter().filter(|(_, state)| state.turn_active()) {
+                    active.insert(id.clone(), (true, state.model.clone()));
+                }
+                if !current.is_empty() && self.observer.has_active_run(current) {
+                    active.insert(current.to_string(), (true, None));
+                }
+                let rows: HashMap<&str, &Value> = stored.iter().filter_map(|s| s["id"].as_str().map(|id| (id, s))).collect();
+                let known = self.known.lock().await;
+                let items: Vec<Value> = active.into_iter().map(|(id, (streaming, model))| {
+                    let row = rows.get(id.as_str()).copied();
+                    let title = row.and_then(|s| s["title"].as_str()).or_else(|| known.get(&id).and_then(|s| s["title"].as_str())).unwrap_or("Untitled");
+                    let started = row.map(|s| s["started_at"].clone()).unwrap_or(Value::Null);
+                    let last = row.map(|s| s["last_active"].clone()).unwrap_or(Value::Null);
+                    json!({"current":id == current,"id":id,"session_key":id,"last_active":last,"started_at":started,
+                        "message_count":row.map(|s|s["message_count"].clone()).unwrap_or(json!(0)),
+                        "model":model.or_else(||row.and_then(|s|s["model"].as_str().map(str::to_owned))).unwrap_or_else(||self.config.model.clone()),
+                        "preview":row.map(|s|s["preview"].clone()).unwrap_or_else(||json!("")),
+                        "status":if streaming {"streaming"} else {"running"},"title":title})
+                }).collect();
                 Ok(json!({ "sessions": items }))
             }
             "commands.catalog" => {
@@ -1015,7 +1097,8 @@ impl Conn {
                 let id = p["session_key"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| RpcError::params("session_key is required"))?;
                 let cwd = p["cwd"].as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| RpcError::params("cwd is required"))?;
                 let result = self.set_session_cwd(id, cwd).await?;
-                Ok(json!({ "cwd": result["cwd"], "branch": Value::Null, "git_repo_root": Value::Null }))
+                let cwd = result["cwd"].as_str().unwrap_or_default();
+                Ok(json!({ "cwd": cwd, "branch": map::git_branch(cwd), "git_repo_root": map::git_repo_root(cwd) }))
             }
             "insights.get" => {
                 let days = p["days"].as_u64().unwrap_or(30).clamp(1, 3650);
@@ -1027,22 +1110,47 @@ impl Conn {
             }
             "usage.bars" => {
                 let (spent, priced_calls) = self.observer.metered_usage().map_err(|e| RpcError::internal(anyhow!(e)))?;
-                if priced_calls == 0 {
-                    Ok(json!({ "available": false, "status": "no_priced_usage" }))
-                } else {
-                    let spent = format!("${spent:.4}");
-                    Ok(json!({
-                        "ok": true, "available": true, "status": "engine_metered", "plan_name": "Engine usage",
-                        "subscription_remaining_display": "uncapped", "total_spendable_display": "uncapped", "has_topup": false,
-                        "plan_bar": { "kind": "plan", "remaining_display": "uncapped", "total_display": "uncapped",
-                            "spent_display": spent, "pct_used": null, "fill_fraction": 0.0 },
-                        "topup_bar": null,
-                    }))
-                }
+                Ok(json!({"ok":true,"available":false,"status":"no_subscription_entitlement_source",
+                    "metered_spend_usd":format!("{spent:.4}"),"priced_calls":priced_calls}))
             }
-            "session.foreign.import" | "session.foreign.list" | "session.foreign.preview" => {
-                crate::note_unsupported("rpc", method);
-                Err(RpcError::unsupported(method))
+            "session.foreign.list" => {
+                let source = p["source"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                if source.as_deref().is_some_and(|s| !matches!(s, "claude" | "codex")) { return Err(RpcError::params("source must be claude or codex")); }
+                let offset = p["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
+                let limit = p["limit"].as_u64().unwrap_or(25).clamp(1, 50) as usize;
+                let rows = tokio::task::spawn_blocking(move || foreign_candidates(source.as_deref()).map(|all| {
+                    let total = all.len();
+                    let rows = all.into_iter().skip(offset).take(limit).map(|s| {
+                        json!({"id":foreign_handle(s.source, &s.path.to_string_lossy()),"source":s.source,
+                            "label":if s.source=="claude" {"Claude Code"} else {"Codex"},"title":s.title,
+                            "cwd":s.cwd,"mtime":s.mtime,"turn_count":s.turn_count,"excerpt":s.excerpt})
+                    }).collect::<Vec<_>>();
+                    (rows, (offset + limit < total).then_some(offset + limit))
+                })).await.map_err(|e| RpcError::internal(anyhow!(e)))?.map_err(RpcError::internal)?;
+                Ok(json!({"sessions":rows.0,"next_offset":rows.1,"host":std::env::var("HOSTNAME").unwrap_or_else(|_|"local".into()),"unreadable":0}))
+            }
+            "session.foreign.preview" | "session.foreign.import" => {
+                let handle = p["id"].as_str().filter(|s| s.len() == 64).ok_or_else(|| RpcError::params("id must be a foreign-session handle"))?.to_string();
+                let importer = if method == "session.foreign.import" { "import" } else { "preview" };
+                tokio::task::spawn_blocking(move || {
+                    let source = foreign_candidates(None)?.into_iter().find(|s| foreign_handle(s.source, &s.path.to_string_lossy()) == handle)
+                        .ok_or_else(|| anyhow!("session no longer available; refresh the list"))?;
+                    if importer == "import" {
+                        let imported_id = if source.source=="claude" { jcode_base::import::imported_claude_code_session_id(&source.external_id) } else { jcode_base::import::imported_codex_session_id(&source.external_id) };
+                        let already = jcode_base::session::Session::load(&imported_id).is_ok();
+                        let session = if source.source=="claude" { jcode_base::import::import_session_from_file(&source.path, &source.external_id)? }
+                            else { jcode_base::import::import_codex_session_from_path(&source.path, Some(&source.external_id))? };
+                        return Ok(json!({"session_id":session.id,"already_imported":already}));
+                    }
+                    let turns = foreign_turns(&source)?;
+                    let total = turns.len();
+                    let messages = turns.into_iter().rev().take(40).collect::<Vec<_>>().into_iter().rev().map(|mut m| {
+                        if let Some(text)=m["content"].as_str() { m["content"] = json!(text.chars().take(8000).collect::<String>()); }
+                        m
+                    }).collect::<Vec<_>>();
+                    let imported_id = if source.source=="claude" { jcode_base::import::imported_claude_code_session_id(&source.external_id) } else { jcode_base::import::imported_codex_session_id(&source.external_id) };
+                    Ok(json!({"messages":messages,"total":total,"truncated":total>40,"already_imported":if jcode_base::session::Session::load(&imported_id).is_ok(){json!(imported_id)}else{Value::Null},"cwd":source.cwd}))
+                }).await.map_err(|e| RpcError::internal(anyhow!(e)))?.map_err(RpcError::internal)
             }
             "prompt.submit" => {
                 let id = sid()?.to_string();
@@ -1685,8 +1793,7 @@ pub async fn run(ws: Ws, config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Obser
         }
     });
 
-    let epoch = crate::auth::generate_token()[..16].to_string();
-    conn.emit("gateway.ready", None, json!({ "skin": {}, "change_events": false, "replay_epoch": epoch })).await;
+    conn.emit("gateway.ready", None, json!({ "skin": {}, "change_events": false, "replay_epoch": conn.observer.replay_epoch() })).await;
 
     while let Some(msg) = ws_rx.next().await {
         let text = match msg {
