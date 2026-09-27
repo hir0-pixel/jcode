@@ -188,8 +188,7 @@ pub struct ResourceContent {
 /// MCP server configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
-    /// Command for stdio servers. Empty for HTTP/SSE servers, which jcode does
-    /// not yet support (such entries are skipped at load time).
+    /// Command for stdio servers. Empty for remote servers.
     #[serde(default)]
     pub command: String,
     #[serde(default)]
@@ -201,15 +200,13 @@ pub struct McpServerConfig {
     /// Stateful servers (Playwright browser) should not be shared.
     #[serde(default = "default_shared")]
     pub shared: bool,
-    /// Transport type from Claude Code configs ("stdio", "http", "sse"). Used
-    /// only to recognize and skip non-stdio servers; defaults to stdio.
+    /// Transport type from MCP configs ("stdio", "http", "sse").
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    /// URL for HTTP/SSE servers (Claude Code compat). Unused by jcode today.
+    /// URL for streamable HTTP servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Headers for HTTP/SSE servers (Claude Code compat). Unused by jcode today,
-    /// but retained so environment expansion is ready when those transports are.
+    /// Additional headers for streamable HTTP servers.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub headers: std::collections::HashMap<String, String>,
     /// Whether this server is enabled (default: true). Disabled servers stay
@@ -230,8 +227,7 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    /// jcode currently only supports stdio (command-based) MCP servers. A config
-    /// entry is stdio when it has a command and is not explicitly an http/sse
+    /// A config entry is stdio when it has a command and is not a remote
     /// transport.
     pub fn is_stdio(&self) -> bool {
         if let Some(t) = &self.transport {
@@ -241,6 +237,14 @@ impl McpServerConfig {
             }
         }
         !self.command.trim().is_empty()
+    }
+
+    pub fn is_http(&self) -> bool {
+        self.url.as_deref().is_some_and(|url| !url.is_empty())
+            && !self
+                .transport
+                .as_deref()
+                .is_some_and(|transport| transport.eq_ignore_ascii_case("sse"))
     }
 
     /// Whether this server should be spawned/connected automatically.
@@ -696,19 +700,16 @@ impl McpConfig {
             }
         }
 
-        // Claude Code expands environment references after source precedence is
-        // resolved. Keep this before transport filtering so future HTTP/SSE
-        // support receives already-expanded URLs and headers as well.
+        // Expand environment references after source precedence is resolved.
         merged.expand_environment_variables();
 
-        // jcode only supports stdio servers today. Drop HTTP/SSE entries (common
-        // in Claude Code configs) so they don't fail to spawn, but log them so
-        // the omission is visible.
+        // Keep supported stdio and streamable HTTP servers. Legacy SSE uses a
+        // different transport and is not supported here.
         merged.servers.retain(|name, cfg| {
-            let keep = cfg.is_stdio();
+            let keep = cfg.is_stdio() || cfg.is_http();
             if !keep {
                 crate::logging::info(&format!(
-                    "MCP: Skipping non-stdio server '{}' ({}); HTTP/SSE transports are not yet supported",
+                    "MCP: Skipping MCP server '{}' ({}); no stdio command or HTTP URL is configured",
                     name,
                     cfg.transport.as_deref().unwrap_or("http")
                 ));
@@ -719,8 +720,8 @@ impl McpConfig {
         merged
     }
 
-    /// Merge `incoming` over `existing`, except that an entry jcode cannot run
-    /// (HTTP/SSE) never displaces a working stdio entry for the same name.
+    /// Merge `incoming` over `existing`, except that a remote entry never
+    /// displaces a working stdio entry with the same name.
     ///
     /// Without this, a `type: http` entry in `~/.claude.json` would overwrite a
     /// working stdio server from `~/.jcode/mcp.json` and then be dropped by the

@@ -361,9 +361,31 @@ The selected live checks ran sequentially because they share the local model and
 
 ### Remaining incomplete work
 
-- Item 3 still has the documented gaps: remote/OAuth MCP transport is filtered by Rust configuration and the OAuth token refresh/store remains owned by Hermes Python; no live browser CDP target or audio device was available for those hardware-bound checks. Local stdio MCP, skills hub, tool/model/provider/reasoning/system-prompt/memory settings, PTY, plugins, and the other listed feature checks pass.
+- Item 3 still has browser-controller and live voice/wake/TTS checks open because no CDP target or audio device was available. Local stdio/OAuth MCP, skills hub, tool/model/provider/reasoning/system-prompt/memory settings, PTY, plugins, and the other listed feature checks pass.
 - Item 4 remains partial: Prime Python wrappers for RLM heartbeat CRUD, observation, compaction, richer goal semantics, subagent await/collect, and the compatible skill package bundle are not complete. No p50/p95 dispatch, warm REPL, or cold-start budget bench was added. The stated latency budgets are therefore unverified.
 - Item 5 remains blocked after the compiler trial recorded above: the generic `jcode` CLI owns the only gateway bootstrap path and unlinking `jcode-tui` produced 799 compiler errors. The minimum TUI-linked runtime dependency remains in the product until gateway/runtime startup is extracted.
 - Item 7's one-task, one-repetition Prime/Hermes/Sovereign benchmark passed as recorded above; the full benchmark suite is not claimed.
 
 Verified code SHAs used for release and desktop packaging: engine `ad9a4456feb87c6995507b67aa22a5f05222233c`; Hermes `8f0412fc4289822d17abe7587e7da27ef1f98e6c`. The final report commit is recorded separately in the response because a commit cannot contain its own SHA.
+
+### Follow-up item 3: OAuth MCP chat bridge
+
+Added streamable HTTP MCP support to the Rust MCP client. Hermes remains the
+source of truth for MCP server definitions and OAuth tokens: the engine reads
+the `mcp_servers` entry and its existing `HERMES_HOME/mcp-tokens/<name>.json`
+cache, sends the cached bearer token, and dispatches discovered tools directly
+from Rust. The client now uses the server-negotiated protocol version, parses
+multiline SSE data, and removes timed-out requests from its pending map. Legacy
+SSE transport remains unsupported. Expired tokens return a Settings
+reauthentication error; token refresh remains owned by Hermes.
+
+Verification: all 62 `jcode-base` MCP tests passed outside the sandbox. Inside
+the sandbox the sole failure was the test listener bind (`Operation not
+permitted`); the identical full filtered suite passed outside. The live
+`hermes-mcp-settings.mjs` test passed against local Ollama and proved an API-
+added OAuth server's cached token was used for an actual Rust chat tool call.
+The same run verified the existing stdio MCP call, skill-hub install
+visibility, terminal-tool disablement, and Hermes model/provider/reasoning,
+memory, and system-prompt settings. The release binary rebuilt successfully.
+This closes the OAuth-call coverage gap; browser-controller and hardware-bound
+voice/wake/TTS checks remain open as recorded above.

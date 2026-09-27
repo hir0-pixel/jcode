@@ -592,9 +592,8 @@ fn test_initialize_result() {
 
 #[test]
 fn http_entry_does_not_displace_a_working_stdio_server_of_the_same_name() {
-    // A `type: http` entry from a lower-precedence config used to overwrite the
-    // stdio definition and then get dropped by the non-stdio filter, silently
-    // losing a working server (issue #653).
+    // Keep a working stdio definition when a lower-precedence HTTP definition
+    // has the same name (issue #653).
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path();
     std::fs::create_dir_all(project.join(".jcode")).unwrap();
@@ -664,9 +663,8 @@ fn stdio_entry_of_same_transport_still_overrides_by_precedence() {
 #[test]
 fn claude_json_http_entry_does_not_displace_jcode_stdio_server() {
     // The exact configuration from issue #653: `github` is stdio in
-    // ~/.jcode/mcp.json and http in ~/.claude.json. The http entry used to win
-    // the merge and then be dropped by the non-stdio filter, so a working
-    // server vanished with no indication it had been overwritten.
+    // ~/.jcode/mcp.json and HTTP in ~/.claude.json. The working stdio entry
+    // retains precedence when both sources use the same name.
     let _guard = crate::storage::lock_test_env();
     let _hermes_home = StandaloneMcpHome::clear_hermes_home();
     let original_cwd = std::env::current_dir().expect("current cwd");

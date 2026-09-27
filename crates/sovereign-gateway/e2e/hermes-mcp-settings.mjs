@@ -3,6 +3,7 @@
 // from a new Rust-engine chat. Requires Hermes's checkout/.venv and local Ollama.
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
+import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,6 +19,12 @@ const jcodeHome = path.join(root, '.jcode')
 fs.mkdirSync(home, { recursive: true })
 fs.mkdirSync(hermesHome, { recursive: true })
 fs.mkdirSync(jcodeHome, { recursive: true })
+const oauthAccessToken = crypto.randomBytes(24).toString('hex')
+fs.mkdirSync(path.join(hermesHome, 'mcp-tokens'), { recursive: true })
+fs.writeFileSync(path.join(hermesHome, 'mcp-tokens/settings-oauth.json'), JSON.stringify({
+  access_token: oauthAccessToken,
+  expires_at: Date.now() / 1000 + 3600,
+}), { mode: 0o600 })
 const token = crypto.randomBytes(24).toString('hex')
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
@@ -36,6 +43,44 @@ const env = {
 delete env.SOVEREIGN_PROVIDER
 delete env.SOVEREIGN_MODEL
 const children = []
+const oauthCalls = []
+const oauthMcp = http.createServer(async (request, response) => {
+  const chunks = []
+  for await (const chunk of request) chunks.push(chunk)
+  const body = Buffer.concat(chunks).toString('utf8')
+  if (request.headers.authorization !== `Bearer ${oauthAccessToken}`) {
+    response.writeHead(401).end('OAuth bearer token missing')
+    return
+  }
+  let message
+  try { message = JSON.parse(body) } catch {
+    response.writeHead(400).end()
+    return
+  }
+  oauthCalls.push(message.method)
+  if (message.id === undefined) {
+    response.writeHead(202, { 'mcp-session-id': 'hermes-oauth-session' }).end()
+    return
+  }
+  let result = {}
+  if (message.method === 'initialize') result = {
+    protocolVersion: '2024-11-05', capabilities: { tools: {} },
+    serverInfo: { name: 'hermes-oauth-settings-test', version: '1' },
+  }
+  if (message.method === 'tools/list') result = { tools: [{
+    name: 'oauth_probe', description: 'Return the exact supplied text over OAuth.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+  }] }
+  if (message.method === 'tools/call') result = {
+    content: [{ type: 'text', text: 'HERMES_MCP_OAUTH_OK:' + message.params.arguments.text }],
+    isError: false,
+  }
+  const encoded = JSON.stringify({ jsonrpc: '2.0', id: message.id, result })
+  response.writeHead(200, {
+    'content-type': 'application/json', 'mcp-session-id': 'hermes-oauth-session',
+    'content-length': Buffer.byteLength(encoded),
+  }).end(encoded)
+})
 const stop = child => {
   if (child && child.exitCode === null) child.kill('SIGTERM')
 }
@@ -60,6 +105,11 @@ const waitPort = async (proc, marker) => {
 
 let ws
 try {
+  await new Promise((resolve, reject) => {
+    oauthMcp.once('error', reject)
+    oauthMcp.listen(0, '127.0.0.1', resolve)
+  })
+  const oauthMcpUrl = `http://127.0.0.1:${oauthMcp.address().port}/mcp`
   const fakeMcp = path.join(root, 'mcp-server.mjs')
   fs.writeFileSync(fakeMcp, `
     import readline from 'node:readline'
@@ -100,6 +150,12 @@ try {
   if (!persisted.servers?.some(server => server.name === 'settings-test')) {
     throw new Error(`Hermes API did not list the saved server: ${JSON.stringify(persisted)}`)
   }
+  const oauthAdded = await fetch(`${base}/api/mcp/servers`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ name: 'settings-oauth', url: oauthMcpUrl, auth: 'oauth' }),
+  })
+  if (!oauthAdded.ok) throw new Error(`Hermes OAuth MCP add API returned ${oauthAdded.status}: ${await oauthAdded.text()}`)
 
   const skillName = 'agent-merge-conflict-arbiter'
   const skillInstall = await fetch(`${base}/api/skills/hub/install`, {
@@ -231,6 +287,13 @@ try {
   if (!transcript.includes('HERMES_MCP_SETTINGS_OK:api-added-tool')) {
     throw new Error(`chat transcript did not contain the MCP result: ${transcript}\n${engine.output()}`)
   }
+  await sendTurn('Call mcp__settings_oauth__oauth_probe with text exactly: oauth-api-added-tool. Report the result marker it returns.')
+  const oauthHistory = await rpc('session.history', { session_id: sid })
+  const oauthTranscript = JSON.stringify(oauthHistory.result?.messages || [])
+  if (!oauthTranscript.includes('HERMES_MCP_OAUTH_OK:oauth-api-added-tool')) {
+    throw new Error(`chat did not call the Hermes OAuth MCP tool with its cached bearer token: ${oauthTranscript}\n${engine.output()}`)
+  }
+  if (!oauthCalls.includes('tools/call')) throw new Error(`OAuth MCP server got no tool call: ${JSON.stringify(oauthCalls)}`)
   if (!transcript.includes('SYSTEM_PROMPT_APPLIED')) {
     throw new Error(`chat did not follow the Hermes profile system prompt: ${transcript}`)
   }
@@ -243,6 +306,7 @@ try {
     throw new Error(`chat did not reflect the disabled terminal tool: ${JSON.stringify(messages)}`)
   }
   console.log('PASS Hermes API added MCP server; Rust engine chat called it and received its result')
+  console.log('PASS Hermes API added OAuth MCP server; Rust engine chat used the cached OAuth bearer token')
   console.log('PASS Hermes skills hub installed into JCODE_HOME/skills and the Rust engine lists it')
   console.log('PASS Hermes terminal toolset toggle is persisted by Python and enforced by Rust chat')
 } finally {
@@ -254,4 +318,5 @@ try {
     setTimeout(() => { stop(child); resolve() }, 5000)
   })))
   fs.rmSync(root, { recursive: true, force: true })
+  oauthMcp.close()
 }

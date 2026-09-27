@@ -2,6 +2,7 @@
 
 use super::protocol::*;
 use anyhow::{Context, Result};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -23,6 +24,7 @@ pub struct McpHandle {
     server_info: Arc<std::sync::RwLock<Option<ServerInfo>>>,
     capabilities: Arc<std::sync::RwLock<ServerCapabilities>>,
     tools: Arc<std::sync::RwLock<Vec<McpToolDef>>>,
+    http_protocol_version: Option<Arc<std::sync::RwLock<String>>>,
     /// Reply timeout applied to every request on this server.
     request_timeout: std::time::Duration,
 }
@@ -52,21 +54,26 @@ impl McpHandle {
         }
 
         let msg = serde_json::to_string(&request)? + "\n";
-        self.writer_tx
-            .send(msg)
-            .await
-            .context("Failed to send request")?;
+        if let Err(error) = self.writer_tx.send(msg).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error).context("Failed to send request");
+        }
 
-        let response = tokio::time::timeout(self.request_timeout, rx)
-            .await
-            .with_context(|| {
-                format!(
+        let response = match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(error).context("Channel closed");
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!(
                     "Request timeout after {}s (raise `timeout_secs` for MCP server '{}' if its tools legitimately run longer)",
                     self.request_timeout.as_secs(),
                     self.name
-                )
-            })?
-            .context("Channel closed")?;
+                );
+            }
+        };
 
         if let Some(err) = &response.error {
             anyhow::bail!("MCP error {}: {}", err.code, err.message);
@@ -139,7 +146,7 @@ impl McpHandle {
 /// clones can be distributed to different sessions.
 pub struct McpClient {
     handle: McpHandle,
-    child: Child,
+    child: Option<Child>,
 }
 
 impl McpClient {
@@ -157,6 +164,9 @@ impl McpClient {
         config: &McpServerConfig,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
+        if !config.is_stdio() {
+            return Self::connect_http(name, config).await;
+        }
         let working_dir = working_dir.filter(|dir| dir.is_dir());
         crate::logging::info(&format!(
             "MCP: Connecting to '{}' ({} {:?}) cwd={:?}",
@@ -276,10 +286,14 @@ impl McpClient {
             server_info: Arc::new(std::sync::RwLock::new(None)),
             capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
             tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            http_protocol_version: None,
             request_timeout: request_timeout_for(config),
         };
 
-        let mut client = Self { handle, child };
+        let mut client = Self {
+            handle,
+            child: Some(child),
+        };
 
         client
             .initialize()
@@ -298,6 +312,156 @@ impl McpClient {
             client.handle.tools().len()
         ));
 
+        Ok(client)
+    }
+
+    async fn connect_http(name: String, config: &McpServerConfig) -> Result<Self> {
+        let url = config
+            .url
+            .as_deref()
+            .context("remote MCP server URL is missing")?;
+        let client = reqwest::Client::builder()
+            .timeout(request_timeout_for(config))
+            .build()?;
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let pending_writer = Arc::clone(&pending);
+        let name_for_writer = name.clone();
+        let url = url.to_string();
+        let headers = config.headers.clone();
+        let hermes_home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
+        let oauth = hermes_mcp_is_oauth(hermes_home.as_deref(), &name);
+        let protocol_version = Arc::new(std::sync::RwLock::new("2024-11-05".to_string()));
+        let protocol_version_writer = Arc::clone(&protocol_version);
+        tokio::spawn(async move {
+            let mut session_id: Option<String> = None;
+            while let Some(message) = writer_rx.recv().await {
+                let request: Value = match serde_json::from_str(message.trim()) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                let id = request["id"].as_u64();
+                let mut builder = client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json, text/event-stream");
+                if request["method"] != "initialize"
+                    && let Ok(version) = protocol_version_writer.read()
+                {
+                    builder = builder.header("mcp-protocol-version", version.as_str());
+                }
+                if let Some(session_id) = &session_id {
+                    builder = builder.header("mcp-session-id", session_id);
+                }
+                let mut invalid_header = None;
+                for (key, value) in &headers {
+                    match (
+                        HeaderName::from_bytes(key.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        (Ok(key), Ok(value)) => builder = builder.header(key, value),
+                        _ => invalid_header = Some(key.clone()),
+                    }
+                }
+                if let Some(key) = invalid_header {
+                    deliver_mcp_error(
+                        &pending_writer,
+                        id,
+                        -32600,
+                        &format!("invalid MCP header: {key}"),
+                    )
+                    .await;
+                    continue;
+                }
+                if oauth {
+                    match hermes_mcp_access_token(hermes_home.as_deref(), &name_for_writer) {
+                        Ok(token) => builder = builder.bearer_auth(token),
+                        Err(error) => {
+                            deliver_mcp_error(&pending_writer, id, -32001, &error.to_string())
+                                .await;
+                            continue;
+                        }
+                    }
+                }
+                let response = match builder.body(message.trim().to_string()).send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        deliver_mcp_error(&pending_writer, id, -32000, &error.to_string()).await;
+                        continue;
+                    }
+                };
+                if let Some(value) = response.headers().get("mcp-session-id")
+                    && let Ok(value) = value.to_str()
+                {
+                    session_id = Some(value.to_string());
+                }
+                let status = response.status();
+                let body = match response.text().await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        deliver_mcp_error(&pending_writer, id, -32000, &error.to_string()).await;
+                        continue;
+                    }
+                };
+                if !status.is_success() {
+                    deliver_mcp_error(
+                        &pending_writer,
+                        id,
+                        -32000,
+                        &format!(
+                            "HTTP {status}: {}",
+                            body.chars().take(512).collect::<String>()
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(id) = id {
+                    match parse_mcp_http_response(&body) {
+                        Ok(response) => {
+                            if let Some(tx) = pending_writer.lock().await.remove(&id) {
+                                let _ = tx.send(response);
+                            }
+                        }
+                        Err(error) => {
+                            deliver_mcp_error(&pending_writer, Some(id), -32700, &error.to_string())
+                                .await
+                        }
+                    }
+                }
+            }
+        });
+
+        let handle = McpHandle {
+            name: name.clone(),
+            request_id: Arc::new(AtomicU64::new(1)),
+            pending,
+            writer_tx,
+            server_info: Arc::new(std::sync::RwLock::new(None)),
+            capabilities: Arc::new(std::sync::RwLock::new(ServerCapabilities::default())),
+            tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+            http_protocol_version: Some(protocol_version),
+            request_timeout: request_timeout_for(config),
+        };
+        let mut client = Self {
+            handle,
+            child: None,
+        };
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to initialize"))?;
+        client
+            .handle
+            .refresh_tools()
+            .await
+            .with_context(|| format!("MCP server '{name}' failed to list tools"))?;
+        crate::logging::info(&format!(
+            "MCP: Connected to remote '{}' with {} tools",
+            name,
+            client.handle.tools().len()
+        ));
         Ok(client)
     }
 
@@ -324,6 +488,11 @@ impl McpClient {
 
         if let Some(result) = response.result {
             let init_result: InitializeResult = serde_json::from_value(result)?;
+            if let Some(version) = &self.handle.http_protocol_version
+                && let Ok(mut version) = version.write()
+            {
+                *version = init_result.protocol_version.clone();
+            }
             *self
                 .handle
                 .server_info
@@ -346,7 +515,10 @@ impl McpClient {
 
     /// Check if server is still running
     pub fn is_running(&mut self) -> bool {
-        match self.child.try_wait() {
+        let Some(child) = &mut self.child else {
+            return !self.handle.writer_tx.is_closed();
+        };
+        match child.try_wait() {
             Ok(None) => true,
             Ok(Some(_)) => false,
             Err(_) => false,
@@ -363,7 +535,9 @@ impl McpClient {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let _ = self.child.kill().await;
+        if let Some(child) = &mut self.child {
+            let _ = child.kill().await;
+        }
     }
 
     // === Legacy compatibility methods that delegate to handle ===
@@ -419,15 +593,133 @@ fn mcp_child_env(
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
     }
+}
+
+async fn deliver_mcp_error(
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    id: Option<u64>,
+    code: i64,
+    message: &str,
+) {
+    let Some(id) = id else { return };
+    if let Some(tx) = pending.lock().await.remove(&id) {
+        if let Ok(response) = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": code, "message": message }
+        })) {
+            let _ = tx.send(response);
+        }
+    }
+}
+
+fn parse_mcp_http_response(body: &str) -> Result<JsonRpcResponse> {
+    if let Ok(response) = serde_json::from_str(body) {
+        return Ok(response);
+    }
+    for event in body.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(response) = serde_json::from_str(&data) {
+            return Ok(response);
+        }
+    }
+    anyhow::bail!("remote MCP response was neither JSON nor an MCP event stream")
+}
+
+fn hermes_mcp_access_token(home: Option<&std::path::Path>, server: &str) -> Result<String> {
+    let home = home.context("HERMES_HOME is required for OAuth MCP")?;
+    let safe_name: String = server
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    let tokens: Value = serde_json::from_slice(
+        &std::fs::read(home.join("mcp-tokens").join(format!("{safe_name}.json")))
+            .context("Hermes OAuth token is missing; authenticate this MCP server in Settings")?,
+    )?;
+    if let Some(expiry) = tokens["expires_at"].as_f64()
+        && expiry
+            <= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs_f64()
+    {
+        anyhow::bail!("Hermes OAuth token expired; reauthenticate this MCP server in Settings");
+    }
+    tokens["access_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .context("Hermes OAuth token has no access token")
+}
+
+fn hermes_mcp_is_oauth(home: Option<&std::path::Path>, server: &str) -> bool {
+    let Some(home) = home else { return false };
+    let Ok(contents) = std::fs::read_to_string(home.join("config.yaml")) else {
+        return false;
+    };
+    let Ok(config) = serde_yaml::from_str::<Value>(&contents) else {
+        return false;
+    };
+    config["mcp_servers"][server]["auth"].as_str() == Some("oauth")
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{McpClient, is_sensitive_inherited_env_key, mcp_child_env};
+    use super::{
+        McpClient, McpHandle, is_sensitive_inherited_env_key, mcp_child_env,
+        parse_mcp_http_response,
+    };
     use crate::mcp::protocol::McpServerConfig;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    #[test]
+    fn streamable_http_parses_multiline_sse_data() {
+        let response = parse_mcp_http_response(
+            "event: message\ndata: {\ndata: \"jsonrpc\":\"2.0\",\ndata: \"id\":1,\ndata: \"result\":{}}\n\n",
+        )
+        .expect("parse SSE JSON split across data lines");
+        assert_eq!(response.id, Some(1));
+        assert!(response.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn timed_out_mcp_request_removes_pending_sender() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let pending =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let handle = McpHandle {
+            name: "timeout-test".into(),
+            request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            pending: std::sync::Arc::clone(&pending),
+            writer_tx,
+            server_info: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            capabilities: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::mcp::protocol::ServerCapabilities::default(),
+            )),
+            tools: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            http_protocol_version: None,
+            request_timeout: std::time::Duration::from_millis(1),
+        };
+
+        assert!(handle.request("tools/list", None).await.is_err());
+        assert!(pending.lock().await.is_empty());
+    }
 
     #[test]
     fn inherited_mcp_env_scrubs_provider_credentials() {
@@ -529,5 +821,129 @@ done
 
         let reported = client.server_info().expect("server info").name;
         assert!(!reported.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamable_http_uses_hermes_oauth_token_for_discovery_and_calls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test MCP");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().expect("accept MCP request");
+                let mut reader = BufReader::new(stream);
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                let mut headers = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    headers.push_str(&line);
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                methods.push(request["method"].as_str().unwrap().to_string());
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer probe-token")
+                );
+                if request["method"] == "initialize" {
+                    assert!(
+                        !headers
+                            .to_ascii_lowercase()
+                            .contains("mcp-protocol-version:")
+                    );
+                } else if request["method"] != "notifications/initialized" {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("mcp-protocol-version: 2025-03-26")
+                    );
+                }
+                let response = match request["method"].as_str().unwrap() {
+                    "initialize" => Some(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"test-http","version":"1"}}}),
+                    ),
+                    "tools/list" => Some(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"tools":[{"name":"probe","description":"OAuth probe","inputSchema":{"type":"object"}}]}}),
+                    ),
+                    "tools/call" => Some(
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":{"content":[{"type":"text","text":"oauth-ok"}],"isError":false}}),
+                    ),
+                    "notifications/initialized" => None,
+                    method => panic!("unexpected MCP method: {method}"),
+                };
+                let mut stream = reader.into_inner();
+                if let Some(response) = response {
+                    let body = response.to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            }
+            methods
+        });
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("mcp-tokens")).unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mcp_servers:\n  oauth-probe:\n    auth: oauth\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("mcp-tokens/oauth-probe.json"), json!({"access_token":"probe-token","expires_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600}).to_string()).unwrap();
+        let previous = std::env::var_os("HERMES_HOME");
+        unsafe {
+            std::env::set_var("HERMES_HOME", home.path());
+        }
+        let config = McpServerConfig {
+            command: String::new(),
+            args: vec![],
+            env: HashMap::new(),
+            shared: false,
+            transport: Some("http".into()),
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+            enabled: None,
+            disabled: None,
+            timeout_secs: None,
+        };
+        let result = async {
+            let client = McpClient::connect("oauth-probe".into(), &config).await?;
+            assert_eq!(client.tools()[0].name, "probe");
+            let result = client.call_tool("probe", json!({})).await?;
+            assert!(matches!(result.content.first(), Some(crate::mcp::protocol::ContentBlock::Text { text }) if text == "oauth-ok"));
+            anyhow::Ok(())
+        }.await;
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("HERMES_HOME", previous);
+            } else {
+                std::env::remove_var("HERMES_HOME");
+            }
+        }
+        result.expect("OAuth MCP HTTP transport");
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
     }
 }
