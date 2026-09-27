@@ -108,8 +108,23 @@ try {
   check(changedCwd?.cwd === expectedCwd, `session.cwd.set persists the session working directory (${JSON.stringify(changedCwd)})`)
   const moved = (await rpc('session.workspace.move', { session_key: a, cwd: home })).result
   check(moved?.cwd === expectedCwd, `session.workspace.move updates the engine session cwd (${JSON.stringify(moved)})`)
-  const foreign = (await rpc('session.foreign.list', { source: 'claude', limit: 10 })).result
-  check(Array.isArray(foreign?.sessions), 'session.foreign.list uses the engine importer')
+  const foreignFile = path.join(home, '.codex/sessions/2026/09/27/foreign-e2e.jsonl')
+  fs.mkdirSync(path.dirname(foreignFile), { recursive: true })
+  fs.writeFileSync(foreignFile, [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'foreign-e2e-session', cwd: home, timestamp: '2026-09-27T00:00:00Z' } }),
+    JSON.stringify({ type: 'message', role: 'user', content: 'foreign importer e2e prompt' }),
+    JSON.stringify({ type: 'message', role: 'assistant', content: 'foreign importer e2e reply' }),
+  ].join('\n') + '\n')
+  const foreign = (await rpc('session.foreign.list', { source: 'codex', limit: 10 })).result
+  const foreignRow = foreign?.sessions?.find(s => s.excerpt?.includes('foreign importer e2e prompt'))
+  check(Boolean(foreignRow?.id), 'session.foreign.list finds a Codex session through the engine importer')
+  if (foreignRow?.id) {
+    const preview = (await rpc('session.foreign.preview', { id: foreignRow.id })).result
+    check(preview?.messages?.length === 2 && preview.messages[0]?.content === 'foreign importer e2e prompt',
+      'session.foreign.preview reads external transcript through the engine importer')
+    const imported = (await rpc('session.foreign.import', { id: foreignRow.id })).result
+    check(Boolean(imported?.session_id), 'session.foreign.import creates an engine session')
+  }
 
   const saved = (await rpc('session.save', { session_id: a })).result
   check(saved?.file && fs.readFileSync(saved.file, 'utf8').includes('TWO'), 'session.save writes the transcript to a file')
