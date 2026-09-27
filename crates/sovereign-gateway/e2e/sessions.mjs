@@ -18,7 +18,7 @@ const jcodeHome = path.join(home, '.jcode')
 fs.mkdirSync(jcodeHome, { recursive: true })
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
+  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
 )
 const token = crypto.randomBytes(24).toString('hex')
 let failures = 0
@@ -279,6 +279,32 @@ try {
   check(insights?.sessions >= 1 && insights?.messages >= 2, `insights.get counts engine chats (${insights?.sessions} sessions, ${insights?.messages} messages)`)
   const bars = (await rpc('usage.bars', {})).result
   check(bars?.available === false, 'usage.bars answers unavailable without Python')
+  const settingSession = (await rpc('session.create', {
+    cwd: home,
+    model: MODEL,
+    provider: 'local',
+    reasoning_effort: 'low',
+    system_prompt: "When asked for the settings marker, respond with exactly SETTING-REACHED.",
+  })).result
+  check(settingSession?.info?.model === MODEL && settingSession?.info?.provider === 'local' &&
+    settingSession?.info?.reasoning_effort === 'low', 'session.create applies model/provider/effort overrides to engine session info')
+  const selectedModel = await rpc('config.set', {
+    session_id: settingSession.session_id,
+    key: 'model',
+    value: `${MODEL} --provider local --session`
+  })
+  check(!selectedModel.error, `config.set model changes the active engine session (${JSON.stringify(selectedModel.result)})`)
+  const selectedEffort = await rpc('config.set', {
+    session_id: settingSession.session_id,
+    key: 'reasoning',
+    value: 'high'
+  })
+  check(!selectedEffort.error, `config.set reasoning changes the active engine session (${JSON.stringify(selectedEffort.result)})`)
+  const settingTurn = events.length
+  await rpc('prompt.submit', { session_id: settingSession.session_id, text: 'Output the settings marker.' })
+  await waitTurn(settingSession.session_id, settingTurn)
+  const settingHistory = await history(settingSession.session_id)
+  check(JSON.stringify(settingHistory).includes('SETTING-REACHED'), 'session.create system prompt changes the live engine chat response')
   const handoff = await rpc('handoff.request', { session_id: a, platform: 'telegram' })
   check(Boolean(handoff.error), 'handoff is refused until messaging runs on the engine')
   check(!/forward RPC (session|insights|usage)\./.test(stderr), 'no chat-bound method was forwarded to Python')

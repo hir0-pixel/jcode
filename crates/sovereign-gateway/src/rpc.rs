@@ -866,8 +866,12 @@ impl Conn {
             "session.create" => {
                 let cwd = p["cwd"].as_str().unwrap_or(&self.config.default_cwd).to_string();
                 let link = self.open_link().await.map_err(RpcError::internal)?;
+                let mut create = json!({ "req": "create_session", "working_dir": cwd });
+                if let Some(prompt) = p["system_prompt"].as_str() {
+                    create["system_prompt"] = json!(prompt);
+                }
                 let reply = self
-                    .call_on(&link, json!({ "req": "create_session", "working_dir": cwd }))
+                    .call_on(&link, create)
                     .await
                     .map_err(RpcError::internal)?;
                 let id = reply["session"]["session_id"].as_str().unwrap_or_default().to_string();
@@ -875,16 +879,45 @@ impl Conn {
                 self.client.sessions.lock().await.insert(id.clone());
                 self.known.lock().await.insert(id.clone(), reply["session"].clone());
                 self.fresh.lock().await.insert(id.clone());
+                if let Some(model) = p["model"].as_str().filter(|model| !model.trim().is_empty()) {
+                    let route_model = jcode_base::provider::MultiProvider::model_switch_request_for_session_route(
+                        model,
+                        p["provider"].as_str(),
+                        p["route_api_method"].as_str(),
+                    );
+                    let session_link = self.links.lock().await.get(&id).cloned()
+                        .ok_or_else(|| RpcError::internal(anyhow!("new session link was lost")))?;
+                    self.call_on(&session_link, json!({
+                        "req": "set_model", "session_id": id.clone(), "model": route_model,
+                    })).await.map_err(RpcError::internal)?;
+                }
+                if let Some(effort) = p["reasoning_effort"].as_str().filter(|effort| !effort.trim().is_empty()) {
+                    let session_link = self.links.lock().await.get(&id).cloned()
+                        .ok_or_else(|| RpcError::internal(anyhow!("new session link was lost")))?;
+                    self.call_on(&session_link, json!({
+                        "req": "set_reasoning_effort", "session_id": id.clone(), "effort": effort,
+                    })).await.map_err(RpcError::internal)?;
+                }
                 if let Some(title) = p["title"].as_str().filter(|t| !t.is_empty()) {
                     let _ = self.call(json!({ "req": "rename_session", "session_id": id, "title": title })).await;
                 }
                 let sessions = self.sessions.lock().await;
+                let mut info = map::live_info(&id, sessions.get(&id), &cwd, &self.config.version, &self.config.model, &self.config.provider);
+                if let Some(model) = p["model"].as_str().filter(|model| !model.trim().is_empty()) {
+                    info["model"] = json!(model);
+                }
+                if let Some(provider) = p["provider"].as_str().filter(|provider| !provider.trim().is_empty()) {
+                    info["provider"] = json!(provider);
+                }
+                if let Some(effort) = p["reasoning_effort"].as_str().filter(|effort| !effort.trim().is_empty()) {
+                    info["reasoning_effort"] = json!(effort);
+                }
                 Ok(json!({
                     "session_id": id,
                     "stored_session_id": id,
                     "message_count": 0,
                     "messages": [],
-                    "info": map::live_info(&id, sessions.get(&id), &cwd, &self.config.version, &self.config.model, &self.config.provider),
+                    "info": info,
                 }))
             }
             "session.resume" | "session.activate" => {
@@ -1242,6 +1275,42 @@ impl Conn {
                     })),
                     _ => Ok(json!({ "value": null })),
                 }
+            }
+            "config.set" if p["session_id"].as_str().is_some_and(|id| !id.is_empty()) &&
+                (p["key"] == "model" ||
+                    (p["key"] == "reasoning" && p["scope"] != "global" &&
+                        p["value"].as_str().is_some_and(|value|
+                            jcode_provider_core::canonical_reasoning_effort(value).is_some() ||
+                                jcode_base::prompt::is_swarm_effort(value)))) =>
+            {
+                let id = sid()?;
+                self.ensure_attached(id).await.map_err(RpcError::internal)?;
+                let value = p["value"].as_str().unwrap_or_default();
+                let request = match p["key"].as_str().unwrap_or_default() {
+                    "reasoning" => json!({
+                        "req": "set_reasoning_effort", "session_id": id, "effort": value,
+                    }),
+                    "model" => {
+                        let mut words = value.split_whitespace();
+                        let model = words.next().filter(|model| !model.starts_with('-'))
+                            .ok_or_else(|| RpcError::params("model value must start with a model name"))?;
+                        let mut provider = None;
+                        while let Some(option) = words.next() {
+                            if option == "--provider" {
+                                provider = words.next();
+                            }
+                        }
+                        let model = jcode_base::provider::MultiProvider::model_switch_request_for_session_route(
+                            model,
+                            provider,
+                            p["route_api_method"].as_str(),
+                        );
+                        json!({ "req": "set_model", "session_id": id, "model": model })
+                    }
+                    _ => unreachable!(),
+                };
+                call(request).await?;
+                Ok(json!({ "value": value }))
             }
             "approval.received" => {
                 sid()?;
