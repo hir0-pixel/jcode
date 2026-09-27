@@ -1,0 +1,6 @@
+{"label":"hermes|plain|run1","phase":"idle-before-chat","backend_kb":167920,"backend_procs":["Python"],"python_kb":167920,"ollama_kb":27479296}
+{"label":"hermes|plain|run1","phase":"idle-after-session-1","backend_kb":281776,"backend_procs":["Python"],"python_kb":281776,"ollama_kb":27472976}
+{"label":"hermes|plain|run1","phase":"peak","backend_kb":287232,"ollama_kb":29100048,"python_kb":287232}
+{"label":"sovereign|plain|run1","phase":"idle-before-chat","backend_kb":36736,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":27472976}
+{"label":"sovereign|plain|run1","phase":"idle-after-session-1","backend_kb":45328,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":27473056}
+{"label":"sovereign|plain|run1","phase":"peak","backend_kb":47920,"ollama_kb":27473056,"python_kb":0}

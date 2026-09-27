@@ -1,0 +1,4 @@
+{"label":"hermes|plain|run1","product":"hermes","task":"plain","run":1,"session":1,"turn":1,"ok":true,"ms":143095,"reply":"The capital of Australia is Canberra.","error":null}
+{"label":"hermes|plain|run1","product":"hermes","task":"plain","run":1,"session":1,"turn":2,"ok":true,"ms":237782,"reply":"Canberra has a population of roughly 530,000 people.","error":null}
+{"label":"sovereign|plain|run1","product":"sovereign","task":"plain","run":1,"session":1,"turn":1,"ok":true,"ms":10070,"reply":"The capital of Australia is Canberra.","error":null}
+{"label":"sovereign|plain|run1","product":"sovereign","task":"plain","run":1,"session":1,"turn":2,"ok":true,"ms":6038,"reply":"Canberra has a population of roughly 480,000–500,000 residents as of the mid-2020s.","error":null}
