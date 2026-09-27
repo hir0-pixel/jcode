@@ -338,3 +338,32 @@ the local-Ollama-only constraint. The feature-by-feature results are in
 Item 3 therefore remains incomplete on OAuth MCP and the unavailable
 browser/audio live targets. The two new packaged tests passed; there were no
 product-code changes in this follow-up. Continuing to item 4 as instructed.
+
+## Final verification rerun (2026-09-28)
+
+Ollama was unreachable inside the restricted shell (`curl: (7) Failed to connect`); starting it there returned `Operation not permitted`. The authorized outside-sandbox start attempt returned `address already in use`, and an outside-sandbox request confirmed the server was already available. The required `sovereign/bench-hermes-64k:latest` model was installed and loaded. All live model checks below used that local endpoint.
+
+| Gate | Result |
+|---|---|
+| Workspace tests | Pass: `cargo test --workspace --offline -j1 -- --test-threads=1`: 8,071 passed, 0 failed, 59 ignored, 1,254 filtered across 212 suites (rerun from the preceding verification). |
+| Release binary | Pass: `cargo build --release --bin sovereign --offline`, 600 crates, 0 errors, 4 existing warnings. |
+| Gateway live e2e | Pass: sessions, learning, refine, agent-loop, agent-run, accounting, replay. Includes session routes with and without tokens, foreign session import, and non-empty `agent.run` response. |
+| Desktop TypeScript | Pass: `npm run typecheck` (renderer, Electron, and e2e projects). |
+| Python stage | Pass using the already bundled runtime and packages via `SOVEREIGN_PYTHON_RUNTIME` and `SOVEREIGN_PYTHON_PACKAGES`; no runtime/package download. The first default attempt was sandbox-blocked when `uv` tried to open `/Users/rameelmalik/.cache/uv`; the explicit existing runtime paths avoided that access. |
+| Desktop package | Pass: `npm run pack` generated the mac-arm64 unpacked app. Code signing/notarization were skipped because no Apple identity/credentials are configured. |
+| Packaged install-launch | Pass against the fresh release binary. |
+| Packaged chat-approval | Pass; output contains `sovereign-packaged-ok`. |
+| Packaged cron-due | Pass 3 consecutive runs with `SOVEREIGN_CRON_AGENT=1`; each job returned `sovereign-cron-agent-ok` and the final process listing contained no packaged Hermes Python process. |
+| Parity generator | Pass: 235 RPC methods, 0 placeholders; 264 HTTP routes, 0 refused. 174 RPC methods and remaining HTTP routes forward to Hermes Python. |
+| Plain-task schema | Pass, one run: 7,675 estimated tool-schema tokens per call (baseline 7,744; delta -69, under the +300 cap). Output was kept in `/private/tmp/sov-bench-final`. |
+
+The selected live checks ran sequentially because they share the local model and the session/cron tests use isolated homes. The workspace test result above was completed before this rerun; it was not rerun after packaging because packaging does not change tracked engine sources.
+
+### Remaining incomplete work
+
+- Item 3 still has the documented gaps: remote/OAuth MCP transport is filtered by Rust configuration and the OAuth token refresh/store remains owned by Hermes Python; no live browser CDP target or audio device was available for those hardware-bound checks. Local stdio MCP, skills hub, tool/model/provider/reasoning/system-prompt/memory settings, PTY, plugins, and the other listed feature checks pass.
+- Item 4 remains partial: Prime Python wrappers for RLM heartbeat CRUD, observation, compaction, richer goal semantics, subagent await/collect, and the compatible skill package bundle are not complete. No p50/p95 dispatch, warm REPL, or cold-start budget bench was added. The stated latency budgets are therefore unverified.
+- Item 5 remains blocked after the compiler trial recorded above: the generic `jcode` CLI owns the only gateway bootstrap path and unlinking `jcode-tui` produced 799 compiler errors. The minimum TUI-linked runtime dependency remains in the product until gateway/runtime startup is extracted.
+- Item 7's one-task, one-repetition Prime/Hermes/Sovereign benchmark passed as recorded above; the full benchmark suite is not claimed.
+
+Verified code SHAs used for release and desktop packaging: engine `ad9a4456feb87c6995507b67aa22a5f05222233c`; Hermes `8f0412fc4289822d17abe7587e7da27ef1f98e6c`. The final report commit is recorded separately in the response because a commit cannot contain its own SHA.
