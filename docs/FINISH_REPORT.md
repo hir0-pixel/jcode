@@ -459,3 +459,15 @@ calls, 0 tool errors, 146.4 s); Sovereign passed (4 model calls, 6 tool calls,
 errors, 55.2 s). This is a one-task smoke only; the full benchmark suite is
 not claimed. The repeat was executed with local-only network escalation after
 the sandbox denial.
+
+Final regression checks after the runner correction: full `cargo test
+--workspace --offline -- --test-threads=1` passed with isolated homes,
+`SOVEREIGN_HERMES_PYTHON` set to Hermes's bundled venv Python, and
+`NO_COLOR` removed (`8,071 passed, 0 failed, 59 ignored, 1,254 filtered in
+212 suites`). The first attempt's two glyph-color failures came from `rtk`
+exporting `NO_COLOR=1` and `TERM=dumb`; the focused tests and full rerun pass
+with `COLORTERM=truecolor TERM=xterm-256color`. Release binary build passed;
+`python3 scripts/parity.py` reports 0 placeholder RPC methods and 0 refused
+HTTP routes; desktop `npx tsc --noEmit -p .` passed. The earlier pack and
+packaged e2e results remain the recorded desktop verification because this
+last change touched only the benchmark runner and report.
