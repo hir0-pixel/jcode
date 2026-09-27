@@ -270,3 +270,34 @@ The same `err_case_search` task passed once for all three arms against local
 All isolated run homes and outputs were under `/tmp`. The reference clone was
 removed after the benchmark. This verifies one task and one repetition only;
 the full nine-task comparison is not claimed.
+
+### Item 3: Hermes settings and feature walkthrough follow-up
+
+Settings e2es from `f4569da` and `6014a73` already prove the local stdio MCP
+server, skill-hub install/removal, tool disablement, model/provider,
+reasoning-effort, memory flag, profile, and system prompt behavior against a
+live engine chat. Item 3 is still incomplete: OAuth-authenticated MCP was not
+proved. Source inspection found the actual product gap: `McpServerConfig` keeps
+HTTP/SSE URL and header fields but documents them as unused, and
+`McpConfig::load_all` filters all non-stdio entries before the engine can
+connect them. The Hermes OAuth API stores the authorization flow in Python;
+there is no Rust HTTP/SSE MCP transport or OAuth token handoff. Thus the local
+stdio e2e cannot prove OAuth MCP behavior, and the chat currently cannot call
+those servers.
+
+Added packaged Electron e2es in Hermes commit `8f0412f`. The plugin test first
+failed because it guessed the install directory; it now uses the path returned
+by the install IPC. The packaged rerun passed: a temporary Git plugin installed
+into the isolated Hermes home and rendered its registered status-bar
+capability. The new packaged PTY test passed by spawning zsh, sending a command,
+observing its marker in the PTY stream, and disposing the process. Browser
+controller navigation remains open: the host has no Chrome, Chromium, Brave,
+or Edge executable at the supported macOS app paths and no live CDP target was
+available. Voice/wake/TTS live checks remain open because no microphone or
+audio endpoint was available to the CLI run; paid speech services are outside
+the local-Ollama-only constraint. The feature-by-feature results are in
+`docs/HERMES_FEATURE_CHECK.md`.
+
+Item 3 therefore remains incomplete on OAuth MCP and the unavailable
+browser/audio live targets. The two new packaged tests passed; there were no
+product-code changes in this follow-up. Continuing to item 4 as instructed.
