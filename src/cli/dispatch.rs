@@ -1351,7 +1351,7 @@ async fn detect_bootstrap_credentials() -> BootstrapCredentialState {
 
 /// Server + Hermes-compatible gateway in one process. The daemon listens on a
 /// private per-process socket so it never collides with a user's own jcode.
-async fn run_gateway(
+pub async fn run_gateway(
     provider_choice: &ProviderChoice,
     model: Option<&str>,
     host: &str,
@@ -1367,7 +1367,9 @@ async fn run_gateway(
                 crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", provider);
                 ProviderChoice::OpenaiCompatible
             }
-            Err(_) => anyhow::bail!("Hermes profile selects unsupported engine provider `{provider}`"),
+            Err(_) => {
+                anyhow::bail!("Hermes profile selects unsupported engine provider `{provider}`")
+            }
         };
     }
     if matches!(effective_provider, ProviderChoice::OpenaiCompatible)

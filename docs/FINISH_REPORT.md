@@ -414,3 +414,29 @@ and p50/p95 latency budget benches. Compact directs the model to the existing
 `/compact` operation because no in-turn compaction host API exists. These
 limitations are reflected in `docs/PRIME_PARITY.md`; no parity claim is made
 for them.
+
+### Follow-up item 5: dedicated Sovereign entrypoint and TUI unlink attempt
+
+`src/bin/sovereign.rs` now parses only the desktop gateway arguments and calls
+the gateway runner directly; it no longer routes `serve` through generic CLI
+startup/dispatch. Its `__pre-tool` entry remains. The focused binary tests pass
+(2/2), and `cargo check --bin sovereign --offline` passes with the same four
+pre-existing warnings from `sovereign-gateway` and generic login code.
+
+The requested unlink still fails the dependency proof: `cargo tree --offline
+-e normal -p jcode -i jcode-tui` returns `jcode-tui -> jcode`; root `jcode`
+re-exports `jcode-tui` to preserve the generic CLI's `crate::tui` namespace.
+The earlier removal trial in this report produced 799 compile errors from
+those shared CLI references. The direct entrypoint change does not remove that
+root-library edge, and the compiler check itself compiled `jcode-tui` plus its
+support crates. Removing the re-export requires separating the root CLI
+library or moving gateway bootstrap/provider setup into a TUI-free crate; that
+is the remaining blocker for deleting the TUI and generic install/self-update/
+self-dev/pairing paths. No such code was deleted speculatively.
+
+Item 6 is skipped: after the last full workspace run no test target has a
+reported failure; the latest Prime crate run is also green (48 tests). Item 7
+remains verified by the prior one-task/one-repetition three-arm run recorded
+above. A repeat attempt to inspect the full cross-target Cargo tree was
+sandbox/offline-limited because `android_system_properties v0.1.5` is not
+cached; the current-host dependency tree command above is complete and exact.

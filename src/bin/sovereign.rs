@@ -8,6 +8,14 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+struct GatewayArgs {
+    provider: jcode::cli::provider_init::ProviderChoice,
+    model: Option<String>,
+    host: String,
+    port: u16,
+    allow_remote: bool,
+}
+
 fn profile_home(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     if name.is_empty()
         || !name
@@ -16,12 +24,20 @@ fn profile_home(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     {
         anyhow::bail!("invalid Hermes profile name: {name}");
     }
-    let root = if root.parent().and_then(Path::file_name).is_some_and(|p| p == "profiles") {
+    let root = if root
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|p| p == "profiles")
+    {
         root.parent().and_then(Path::parent).unwrap_or(root)
     } else {
         root
     };
-    Ok(if name == "default" { root.to_path_buf() } else { root.join("profiles").join(name) })
+    Ok(if name == "default" {
+        root.to_path_buf()
+    } else {
+        root.join("profiles").join(name)
+    })
 }
 
 fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
@@ -30,14 +46,20 @@ fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
         let name = match args[i].as_str() {
             "--profile" => {
                 i += 1;
-                Some(args.get(i).ok_or_else(|| anyhow::anyhow!("--profile requires a name"))?.clone())
+                Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--profile requires a name"))?
+                        .clone(),
+                )
             }
             arg => arg.strip_prefix("--profile=").map(str::to_owned),
         };
         if let Some(name) = name {
             let root = std::env::var_os("HERMES_HOME")
                 .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes")))
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes"))
+                })
                 .ok_or_else(|| anyhow::anyhow!("cannot resolve Hermes home for --profile"))?;
             let selected = profile_home(&root, &name)?;
             if !selected.is_dir() {
@@ -54,21 +76,48 @@ fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-fn translate(args: Vec<String>) -> Vec<String> {
-    let mut out = vec!["sovereign".to_string()];
-    let mut rest = args.into_iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            // The selected profile has already scoped HERMES_HOME in main().
-            "--profile" => {
-                rest.next();
+fn parse_gateway_args(args: &[String]) -> anyhow::Result<GatewayArgs> {
+    use clap::ValueEnum;
+    let mut provider = jcode::cli::provider_init::ProviderChoice::YoloAuto;
+    let mut model = None;
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 8000;
+    let mut allow_remote = false;
+    let mut i = 0;
+    while i < args.len() {
+        let value = args[i].as_str();
+        let take = |i: &mut usize, option: &str| -> anyhow::Result<&str> {
+            *i += 1;
+            args.get(*i)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{option} requires a value"))
+        };
+        match value {
+            "serve" | "gateway" | "--profile" => {
+                if value == "--profile" {
+                    i += 1;
+                }
             }
-            value if value.starts_with("--profile=") => {}
-            "serve" => out.push("gateway".into()),
-            _ => out.push(arg),
+            v if v.starts_with("--profile=") => {}
+            "--provider" | "-p" => {
+                provider = ValueEnum::from_str(take(&mut i, value)?, true)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+            "--model" | "-m" => model = Some(take(&mut i, value)?.to_string()),
+            "--host" => host = take(&mut i, value)?.to_string(),
+            "--port" => port = take(&mut i, value)?.parse()?,
+            "--allow-remote" => allow_remote = true,
+            other => anyhow::bail!("unsupported sovereign argument: {other}"),
         }
+        i += 1;
     }
-    out
+    Ok(GatewayArgs {
+        provider,
+        model,
+        host,
+        port,
+        allow_remote,
+    })
 }
 
 fn main() -> Result<()> {
@@ -138,11 +187,19 @@ fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args: Vec<String> = std::env::args().skip(1).collect();
     select_profile(&args)?;
-    let argv = translate(args);
+    let args = parse_gateway_args(&args)?;
+    // SAFETY: startup is single-threaded until the runtime is built.
+    unsafe { std::env::set_var("JCODE_NON_INTERACTIVE", "1") };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(jcode::cli::startup::run_from(argv))
+        .block_on(jcode::cli::dispatch::run_gateway(
+            &args.provider,
+            args.model.as_deref(),
+            &args.host,
+            args.port,
+            args.allow_remote,
+        ))
 }
 
 /// Best-effort Ollama unload when the process exits for any reason other than
@@ -207,32 +264,25 @@ fn install_ollama_signal_unload() {
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_home, translate};
+    use super::{parse_gateway_args, profile_home};
     use std::path::{Path, PathBuf};
 
-    fn t(args: &[&str]) -> Vec<String> {
-        translate(args.iter().map(|s| s.to_string()).collect())
-    }
-
     #[test]
-    fn hermes_serve_becomes_gateway() {
-        assert_eq!(
-            t(&[
-                "--profile",
-                "work",
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "0"
-            ]),
-            ["sovereign", "gateway", "--host", "127.0.0.1", "--port", "0"]
-        );
-    }
-
-    #[test]
-    fn other_commands_pass_through() {
-        assert_eq!(t(&["login", "openai"]), ["sovereign", "login", "openai"]);
+    fn desktop_gateway_arguments_parse_without_cli_dispatch() {
+        let args = [
+            "--profile",
+            "work",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ]
+        .map(str::to_string);
+        let args = parse_gateway_args(&args).unwrap();
+        assert_eq!(args.host, "127.0.0.1");
+        assert_eq!(args.port, 0);
+        assert!(!args.allow_remote);
     }
 
     #[test]
