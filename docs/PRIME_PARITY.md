@@ -18,26 +18,24 @@ agent loop.
 | Agent messaging | Send, read, list family agents | Python `agent_message` uses swarm internals; model-facing `agent_message` tool routes send/read/list through `CommunicateTool` | Partial; compact schema stays below 200 estimated tokens and reads now target agent context, but Prime role-addressed family observation is not fully ported |
 | Goals | Get/create/complete persistent objective | Rust `ControlStore`, `/goal`, session goal tool, and REPL host callback | Partial; REPL `rlm.host_request` now maps get/create/complete to the existing callback; Prime token budget and richer result shape remain absent |
 | User heartbeat | Schedule prompts for a session | `/heartbeat`, `ControlStore`, and Python host callback | Done for user heartbeats |
-| RLM internal heartbeat | Kernel-managed recurring callbacks | No distinct internal RLM heartbeat storage or API | Gap |
-| Refine / continual harness | Local/global CRUD, rollback, evidence and rationale | Rust `sovereign-prime` entries/harness/refine; REPL `rlm.host_request` maps `refine.status/run` to the existing callback | Rust feature and host request mapping work; Prime Python skill package is missing |
-| Executable Python skills | `SKILL.md` plus importable package | Existing store imports user-provided package paths; skill creation currently creates instructions only | Partial; package authoring and bundled Prime wrappers are missing |
-| Prime skill packages | goal, refine, heartbeat, messages, observe, compact, websearch, skill creator | Equivalent Rust features exist for several jobs; no Prime-compatible package bundle/bridge for all listed APIs | Gap |
-| Web search | Prime Serper integration | REPL `rlm.host_request("websearch.run")` calls the existing Rust tool with DuckDuckGo explicitly selected | Host bridge works and uses the key-free backend; Prime-compatible Python package is not bundled |
-| Compaction | Check and schedule host compaction | Engine compaction is available to chat and desktop | Rust path exists; REPL skill bridge is missing |
+| RLM internal heartbeat | Kernel-managed recurring callbacks | `agent_loop_host::heartbeat_host` persists `source=rlm` records in the shared heartbeat table; Python wrapper bridges CRUD | Partial; scheduling shares the engine scheduler, but Prime delivery modes are not represented |
+| Refine / continual harness | Local/global CRUD, rollback, evidence and rationale | Rust `sovereign-prime` entries/harness/refine; bundled Python `prime-refine` wrapper | Rust feature, package, and host request mapping work |
+| Executable Python skills | `SKILL.md` plus importable package | Bundled wrappers installed lazily under `~/.jcode/skills`; the worker adds each package `src` to `sys.path`; user directories are preserved | Partial; `/skill create` still authors markdown only |
+| Prime skill packages | goal, refine, heartbeat, messages, observe, compact, websearch, skill creator | Bundled package set under `crates/sovereign-prime/src/skills`, installed by `bundled_skills.rs` | Partial; goal/refine/heartbeat/websearch and basic child messaging/observation bridge; role-addressing and full observe schemas are not equivalent |
+| Web search | Prime Serper integration | Bundled `prime-websearch` calls the existing Rust DuckDuckGo tool | Done with the key-free backend; no Serper key or second implementation |
+| Compaction | Check and schedule host compaction | Engine compaction is available to chat and desktop; `prime-compact` package is shipped | Partial; REPL bridge directs users to `/compact` because no in-turn compaction host API exists |
 | RLM static prompt | Prompt-as-variable and programmatic subcalls | Concise static section added to `crates/jcode-base/src/prompt/system_prompt.md` | Done |
 | Detach / reattach | Long-running session survives client disconnect | Gateway persists sessions and control state | Partial; combined session/goal/heartbeat/subagent reattach e2e is missing |
 | Prime terminal, installer, hosted services | Prime-specific UI, deployment, and paid/hosted services | Not included in Hermes desktop product | Intentionally out of scope |
 
 ## Remaining Part 3 work
 
-The Monty runtime and dependency were already removed; real CPython runs lazily
-behind the existing engine-owned framed pipe. Part 3 is not complete. The
-remaining work is the Prime skill package bundle and complete host API
-(`rlm_heartbeat`, `agent_observe`, compaction, and exact goal semantics),
-subagent result/await support, combined reattach e2e, and a failing latency
-budget benchmark for dispatch, warm REPL, and cold start. No measurements are
-claimed for those budgets. A later read-only shallow clone succeeded outside
-the network sandbox. Prime's wrappers import `rlm.host_request`; the current
-worker does not provide that module or the missing typed operations. Their
-contracts are recorded in `docs/FINISH_REPORT.md`. The features remain
-incomplete until those bridges, packages, and their live tests are added.
+Monty is removed; real CPython runs lazily behind the engine-owned framed pipe.
+The bundled Prime packages now include goal, refine, RLM heartbeat, messaging,
+observation, compact, websearch, and skill-creator. RLM heartbeats are stored
+separately from user heartbeats and covered by Rust plus real-worker tests. The
+remaining gaps are exact role-addressed messaging/observation, REPL compaction,
+Python package creation from `/skill create`, delegate await/result, the
+combined reattach e2e, and latency budget benchmarks. No measurements are
+claimed for those budgets; Part 3 is incomplete. A shallow read-only Prime
+clone was used as reference and is removed before this task ends.

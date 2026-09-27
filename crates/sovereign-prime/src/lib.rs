@@ -4,6 +4,7 @@
 
 pub mod agent_loop;
 pub mod agent_loop_host;
+mod bundled_skills;
 pub mod entries;
 pub mod harness;
 pub mod host;

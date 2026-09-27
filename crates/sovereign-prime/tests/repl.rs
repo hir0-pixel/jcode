@@ -105,6 +105,74 @@ async fn stdlib_imports_and_python_package_skills_work() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
+    let skills = PathBuf::from(std::env::var("JCODE_HOME").unwrap()).join("skills");
+    let h = host();
+    let extra = sovereign_prime::host::ExtraHostFns {
+        goal: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op)?;
+                Ok(serde_json::json!({"created": op["text"]}).to_string())
+            })
+        }),
+        ..sovereign_prime::host::ExtraHostFns::default()
+    };
+    let out = h
+        .run(
+            "bundled-prime-skills",
+            "import goal\nresult = await goal.create('prove package bridge')\nresult['created']",
+            None,
+            upper(),
+            no_refine(),
+            extra,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.value.as_deref(), Some("'prove package bridge'"));
+    assert!(skills.join("prime-goal/SKILL.md").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundled_rlm_heartbeat_skill_uses_separate_persisted_records() {
+    let home = std::env::temp_dir().join(format!("rlm-heartbeat-{}", rand_suffix()));
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Arc::new(sovereign_prime::agent_loop::ControlStore::open(&home).unwrap());
+    let user = sovereign_prime::agent_loop::Heartbeat::new("rlm-skills", "user reminder", 60);
+    store.upsert_heartbeat(&user).unwrap();
+    let store_for_host = store.clone();
+    let extra = sovereign_prime::host::ExtraHostFns {
+        heartbeat: Arc::new(move |op| {
+            let store = store_for_host.clone();
+            Box::pin(async move {
+                sovereign_prime::agent_loop_host::heartbeat_host(&store, "rlm-skills", &op)
+            })
+        }),
+        ..sovereign_prime::host::ExtraHostFns::default()
+    };
+    let out = host()
+        .run(
+            "rlm-heartbeat-skill",
+            "import rlm_heartbeat\ncreated = await rlm_heartbeat.create('check queue', interval='5m')\nawait rlm_heartbeat.update(created['id'], status='pause')\nitems = await rlm_heartbeat.list(include_inactive=True)\nitems['heartbeats'][0]['status']",
+            None,
+            upper(),
+            no_refine(),
+            extra,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.value.as_deref(), Some("'paused'"), "{:?}", out.error);
+    assert_eq!(
+        store.user_heartbeat("rlm-skills").unwrap().unwrap().id,
+        user.id
+    );
+    assert_eq!(store.list_heartbeats("rlm-skills").unwrap().len(), 2);
+    drop(store);
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn llm_query_is_a_recursive_host_call() {
     let h = host();
     let out = h.run("s", "parts = ['a', 'b']\nr = []\nfor p in parts:\n    r.append(await llm_query(p))\nprint(r)\n''.join(r)", None, upper(), no_refine(), sovereign_prime::host::ExtraHostFns::default(), true).await.unwrap();

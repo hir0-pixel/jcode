@@ -68,6 +68,33 @@ async def agent_message(action, message=None, target=None):
 async def host_request(name, payload=None):
     """Prime skill bridge for host operations already implemented by Rust."""
     payload = payload or {}
+    if name.startswith("agent_message."):
+        if name != "agent_message.send":
+            raise ValueError(f"unsupported Prime host request: {name}")
+        role = payload.get("receiver_role")
+        if role != "child":
+            raise ValueError("Akira direct messages currently target a child session")
+        result = await host_call("agent_message", json.dumps({
+            "action": "send", "message": payload.get("message"),
+            "target": payload.get("receiver_name"),
+        }))
+        return {"text": result}
+    if name == "agent_observe.list":
+        result = await host_call("agent_message", json.dumps({"action": "list"}))
+        return {"text": result}
+    if name in {"agent_observe.get", "agent_observe.recent"}:
+        result = await host_call("agent_message", json.dumps({
+            "action": "read", "target": payload.get("target"),
+        }))
+        return {"text": result}
+    if name.startswith("rlm_heartbeat."):
+        op = name.removeprefix("rlm_heartbeat.")
+        if op not in {"list", "create", "update", "delete"}:
+            raise ValueError(f"unsupported Prime host request: {name}")
+        request = {"op": "rlm_" + op, **payload}
+        return json.loads(await host_call("heartbeat", json.dumps(request)))
+    if name.startswith("compact."):
+        raise ValueError("REPL compaction is unavailable; use the chat /compact command")
     if name.startswith("goal."):
         op = name.removeprefix("goal.")
         if op not in {"get", "create", "complete"}:

@@ -177,6 +177,7 @@ impl ReplHost {
             let session_tmp = std::fs::canonicalize(session_tmp)?;
             let skills = jcode_storage::jcode_dir()?.join("skills");
             std::fs::create_dir_all(&skills)?;
+            crate::bundled_skills::install(&skills)?;
             let skills = std::fs::canonicalize(skills)?;
             let python = std::fs::canonicalize(&self.python)
                 .context("resolving the Hermes CPython executable")?;
@@ -241,6 +242,7 @@ impl ReplHost {
         std::fs::create_dir_all(&session_tmp)?;
         let skills = jcode_storage::jcode_dir()?.join("skills");
         std::fs::create_dir_all(&skills)?;
+        crate::bundled_skills::install(&skills)?;
         let mut child = Command::new(&self.python)
             .args(["-I", "-S", "-u", "-c", crate::worker::PYTHON_WORKER])
             .arg(&project)

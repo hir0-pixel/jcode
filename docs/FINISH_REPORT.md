@@ -389,3 +389,28 @@ visibility, terminal-tool disablement, and Hermes model/provider/reasoning,
 memory, and system-prompt settings. The release binary rebuilt successfully.
 This closes the OAuth-call coverage gap; browser-controller and hardware-bound
 voice/wake/TTS checks remain open as recorded above.
+
+### Follow-up item 4: Prime Python skills
+
+Bundled Prime's goal, refine, RLM-heartbeat, agent-message, agent-observe,
+compact, websearch, and skill-creator packages under
+`crates/sovereign-prime/src/skills`, with Prime's MIT notice. The packages
+install on first kernel start without replacing an existing user skill folder.
+The REPL now imports the real goal package and routes goal operations to the
+Rust host. RLM heartbeats have separate `source=rlm` rows in the existing
+`session_heartbeats` store and full list/create/update/delete bridge operations;
+they share the engine scheduler and do not overwrite the user's heartbeat.
+Websearch uses Akira's existing DuckDuckGo tool without a paid key.
+
+Verification: `cargo test -p sovereign-prime --offline -- --test-threads=1`
+passed 36 unit tests and 12 real-worker integration tests with an isolated
+temporary JCODE_HOME and the staged Hermes CPython. The sandboxed test command
+requires local process access because this environment blocks macOS
+`sandbox-exec`; the same tests passed outside that restriction. Remaining gaps
+after trying the existing host interfaces: role-addressed parent/sibling
+messaging, complete observe response shapes, REPL compaction, `/skill create`
+Python package authoring, subagent await/collect, combined reattach coverage,
+and p50/p95 latency budget benches. Compact directs the model to the existing
+`/compact` operation because no in-turn compaction host API exists. These
+limitations are reflected in `docs/PRIME_PARITY.md`; no parity claim is made
+for them.
