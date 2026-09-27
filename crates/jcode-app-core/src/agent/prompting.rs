@@ -199,7 +199,7 @@ impl Agent {
             split.static_part.push_str("\n\n");
         }
         split.static_part.push_str(
-            "# Recursive REPL\nTreat large context as a variable: load it, inspect it programmatically, and call llm_query only on focused chunks. Keep useful state in variables and use host functions for goals, refinement, subagents, messages, and heartbeat.\n",
+            "# Recursive REPL\nKeep large context in persistent variables: `text = await load(path)`, inspect it with Python, then `await llm_query(focused_chunk)`. Use `await refine('run', instructions)` / `await refine('status')`; `await goal(op, objective)`, `await heartbeat(op, ...)`, `await spawn_subagent(prompt, name)`, and `await agent_message(action, message, target)` call engine-owned features. Save handles and query results for later turns.\n",
         );
     }
 

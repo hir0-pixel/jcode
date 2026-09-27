@@ -49,10 +49,10 @@ async def refine(op="run", instructions=None, global_=False):
 
 
 async def goal(op="get", objective=None):
-    return await host_call("goal", json.dumps({"op": op, "objective": objective}))
+    return await host_call("goal", json.dumps({"op": op, "text": objective}))
 
 
-async def heartbeat(op="status", **options):
+async def heartbeat(op="list", **options):
     return await host_call("heartbeat", json.dumps({"op": op, **options}))
 
 

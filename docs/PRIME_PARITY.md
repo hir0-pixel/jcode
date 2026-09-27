@@ -15,7 +15,7 @@ agent loop.
 | Kernel lifecycle and limits | Lazy worker, timeout, memory cap, recovery | 20 s run timeout, 128 MiB RSS watchdog, 10 min idle reap, lazy restart; macOS RSS via `proc_pidinfo` | Implemented; cold/warm latency budgets lack a bench gate |
 | Kernel isolation | Restricted Python side effects | macOS `sandbox-exec` denies network and limits file writes to project/session temp; other platforms require approval per cell and headless sessions deny | Implemented; macOS sandbox tests pass outside restricted test sandbox |
 | Spawn a subagent from REPL | Spawn and obtain child lifecycle/result | `spawn_subagent` calls the existing `delegate`/swarm path | Partial; spawn is bridged, but await/result lifecycle is not exposed |
-| Agent messaging | Send, read, list family agents | Python `agent_message` uses swarm internals; model-facing `agent_message` tool routes send/read/list through `CommunicateTool` | Partial; roster and message actions exist, but Prime role-addressed family observation is not fully ported |
+| Agent messaging | Send, read, list family agents | Python `agent_message` uses swarm internals; model-facing `agent_message` tool routes send/read/list through `CommunicateTool` | Partial; compact schema stays below 200 estimated tokens and reads now target agent context, but Prime role-addressed family observation is not fully ported |
 | Goals | Get/create/complete persistent objective | Rust `ControlStore`, `/goal`, session goal tool, and REPL host callback | Partial; basic operations work, Prime token budget and result shape are absent |
 | User heartbeat | Schedule prompts for a session | `/heartbeat`, `ControlStore`, and Python host callback | Done for user heartbeats |
 | RLM internal heartbeat | Kernel-managed recurring callbacks | No distinct internal RLM heartbeat storage or API | Gap |
@@ -36,5 +36,6 @@ remaining work is the Prime skill package bundle and complete host API
 (`rlm_heartbeat`, `agent_observe`, compaction, and exact goal semantics),
 subagent result/await support, combined reattach e2e, and a failing latency
 budget benchmark for dispatch, warm REPL, and cold start. No measurements are
-claimed for those budgets. The compact `agent_message` tool added in this pass
-reuses `CommunicateTool` and its schema stays below 200 estimated tokens.
+claimed for those budgets. The required shallow clone attempt failed because
+the sandbox could not resolve `github.com`; the Prime skill source bundle was
+therefore not ported in this pass.

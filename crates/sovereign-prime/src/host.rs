@@ -20,6 +20,7 @@ const IDLE_REAP_AFTER: Duration = Duration::from_secs(10 * 60);
 const MAX_KERNEL_RSS_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LOAD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_QUERY_CHARS: usize = 200_000;
+const MAX_HOST_CALLS: usize = 16;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// Recursive model call used by `llm_query(prompt)`.
@@ -491,6 +492,14 @@ async fn drive(
             }
             Some("call") => {
                 host_calls += 1;
+                if host_calls > MAX_HOST_CALLS {
+                    send(
+                        worker,
+                        json!({"op":"reply", "error":"host call budget (16) exhausted"}),
+                    )
+                    .await?;
+                    continue;
+                }
                 let arg = msg["args"][0].as_str().unwrap_or_default().to_string();
                 let reply = match msg["fn"].as_str() {
                     Some("llm_query") => llm_query(truncate(arg.clone(), MAX_QUERY_CHARS)).await,
