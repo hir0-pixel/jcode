@@ -247,6 +247,17 @@ dedicated engine entrypoint must first extract gateway startup and its minimal
 app-core dependencies from the generic CLI; simply unlinking the TUI is not
 safe. No production files were left changed by the trial.
 
+The requested dedicated-entrypoint pass is still blocked by the same ownership
+boundary: `src/bin/sovereign.rs` currently prepares process hooks and then calls
+`jcode::cli::startup::run_from`; the actual gateway bootstrap is private inside
+`src/cli/dispatch.rs` and also reaches the CLI's provider initialization,
+feature-process, profile, socket, and Ollama lifecycle helpers. A new binary
+cannot call only the product paths without first extracting that runtime into
+a TUI-free crate. The trial compile after unlinking the TUI produced 799 errors
+across those imports. I restored it and kept the minimum dependency; deleting
+the TUI now would break the only working `sovereign` entrypoint. Continue by
+extracting the engine runtime boundary before retrying this deletion.
+
 ### Item 6: workspace test targets
 
 Skipped as directed: the latest full workspace run recorded above passed 8,056
