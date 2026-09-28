@@ -405,6 +405,87 @@ tool errors (Hermes from its NeMo Relay ATOF trace; Sovereign from
 min for 9 tasks x 3 reps x 1 arm on a fast local model; scales with model
 latency, not with this harness.
 
+Also measures `rss_peak_mib`/`rss_mean_mib`: peak and mean resident memory
+(MiB) of the arm's own process tree (the product process plus every
+descendant it spawns), sampled every ~200ms for the duration of the task via
+`ps -o pid=,ppid=,rss= -A` (stdlib only, no new dependency). Attribution walks
+down from the arm's own root pid only, so the counting proxy and Ollama are
+excluded by construction rather than by denylist. The sovereign arm also
+records `rss_idle_mib`, the gateway's tree right after it reports ready and
+before the task prompt is sent. Run `python3 scripts/bench/abeval.py
+--selfcheck` to self-test the process-tree walk against a fake `ps` table.
+
+#### `abeval.py learn` — self-improvement (does the product learn from session A?)
+
+A fourth mode, orthogonal to the 9 toolperf tasks above: instead of asking
+"is arm X good at a single task", it asks "does arm X get *better* at the same
+task after its own background learning has had a chance to run". Each of the
+three arms is measured the same way:
+
+```bash
+python3 scripts/bench/abeval.py learn --arm hermes    --reps 5
+python3 scripts/bench/abeval.py learn --arm sovereign --reps 5
+python3 scripts/bench/abeval.py learn --arm prime     --reps 5
+python3 scripts/bench/abeval.py report --learn
+```
+
+Per repetition (fresh product home, fresh sandbox repos, never touching real
+`~/.hermes`/`~/.jcode`/`~/.prime`):
+
+1. **Session A (cold)**, a fresh copy of the same trap repo as
+   `crates/sovereign-gateway/e2e/prime-trap.mjs`'s `makeTrapRepo` (ported to
+   Python here so this file has no runtime dependency on that script): `npm
+   test` is a stub that fails and names the real command
+   (`./scripts/check.sh --fast`). Prompt: "Run this project's test suite and
+   tell me whether it passes."
+2. **An idle window** (`--idle-s`, default `$BENCH_LEARN_IDLE_S` or 15s)
+   during which each arm's own background learning mechanism gets a chance to
+   run, with no flag added to disable it:
+   - **hermes**: its post-turn memory/skill background review
+     (`agent/turn_finalizer.py`'s `_spawn_background_review`), or the model
+     proactively calling the memory tool.
+   - **sovereign**: the engine's own idle-triggered learning pass
+     (`SOVEREIGN_LEARNING=local-idle`, the default for a loopback model,
+     `crates/sovereign-gateway/src/learn.rs`) over the harness rooted at the
+     whole `JCODE_HOME` - inherently global (shared by every session in that
+     home), or the model calling the `refine` tool.
+   - **prime**: its continual-harness auto-refine
+     (`src/core/refinement/refinement.ts`), or the model calling the `refine`
+     skill's `await refine.run()` (optionally `global_=True`).
+   Proxy calls during this window are tagged and attributed to the arm
+   separately from A/B (the `idle` column below) so background-learning token
+   cost is counted, not hidden.
+3. **Session B**, a brand-new chat/session, a fresh copy of the trap repo,
+   the identical prompt - but the **same product home** as session A, so
+   anything the arm persisted (memory file, harness entry, skill) is still on
+   disk.
+
+Recorded per session: success (`SUCCESS`-style text match on "all checks
+passed"), model calls, tool calls, failed tool calls, prompt/cached/completion
+tokens, dummy cost, wall time, and RSS peak (sovereign additionally keeps one
+gateway process alive across A + idle + B per repetition, like
+`prime-trap.mjs`'s `withEngine`, since its idle-triggered learning pass needs
+a live process to run in; hermes and prime are one-shot CLI invocations per
+session, so their background review only has as long as that one process
+keeps running).
+
+`report --learn` prints, per arm: A/B median failed tool calls, how many of
+the *n* repetitions B avoided the trap entirely (never failed a tool call
+whose error/output mentions "broken stub"/"npm test"), and the pass
+criterion - **B's median failed tool calls below A's, and B avoids the trap
+in >= 3 of the repetitions** - plus median model calls/tokens/cost for A, B,
+and the idle window.
+
+One important asymmetry this surfaces rather than hides: a single-turn
+session is far too short to trip hermes's turn-count-gated review (every 10
+user turns) or Prime's turn-interval auto-refine (default 25 assistant
+turns) - so for a one-shot trap task, the only realistic path to learning for
+those two arms is the model *itself* proactively calling its memory/refine
+tool (which their system prompts do nudge it to do), while Sovereign's
+learning pass is wall-clock/idle-triggered and fires regardless of turn
+count. This is a genuine product difference, not a benchmark bug, and is
+exactly the kind of gap this mode is meant to expose.
+
 ### `scripts/bench/polyglot.mjs` — Aider polyglot-benchmark driver
 
 Drives a fixed-seed selection of 40 exercises from
