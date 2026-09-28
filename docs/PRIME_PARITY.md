@@ -137,6 +137,43 @@ carries a bounded attempt log and a required completion verification
   still shows what was tried and verified. Test:
   `budget_exhaustion_report_carries_the_attempt_log`.
 
+### AVO ratchet (NVIDIA arXiv 2603.24517, sec. 3)
+
+Goal runs follow AVO's committed-lineage loop on top of the attempt log
+(`crates/sovereign-prime/src/goal_ratchet.rs`, wired in `after_turn_in`):
+
+- **Vector score from real execution.** `observe_tool` records, per
+  verification bash command (test/build/check/lint/clippy/pytest/tsc), the
+  outcome the engine already sees: exit code, plus pass/fail counts parsed
+  from cargo `test result:`, pytest, jest and vitest summaries. The goal keeps
+  the best `command -> (passed, failed)` map. A non-zero exit never scores as
+  passing. Test: `runner_output_becomes_a_score_vector`.
+- **Ratchet checkpoints.** A turn that matches or improves every re-run
+  command with no new failures AND changed files is snapshotted to a hidden
+  ref `refs/akira/goals/<session>/<n>` (throwaway index + `commit-tree`, so
+  untracked files are included and the user's branch, HEAD and index are never
+  touched). `(ref, score, attempt line)` goes into a 20-entry lineage; older
+  refs are deleted as entries roll off. Failed attempts stay only in the
+  attempt log. Non-git workspaces record `no-vcs`.
+- **Regression.** If a tracked command gets more failures than its best, the
+  continuation prompt names the last good ref and the commands to inspect or
+  restore it (`git diff <ref>`, `git checkout <ref> -- <paths>`). Nothing is
+  reset automatically. Test: `ratchet_checkpoints_hidden_ref_and_regression_points_at_it`.
+- **Supervisor.** When the plateau detector fires, the driver makes ONE cheap
+  aux call (`complete`, recorded with `observer.record_aux`) with the
+  objective, best score, last 6 checkpoints and the attempt log (capped at
+  4.5k chars), asking for 2-3 distinct strategies, injected once into the next
+  continuation prompt (never the cached prefix). At most once per plateau
+  episode and never within 5 turns of the last call; on failure the existing
+  text steer is used. Test: `supervisor_is_once_per_plateau_and_rate_limited`.
+- **Completion.** `session_goal op=complete` / `goal.complete()` append the
+  best score to the recorded verification and the completion report carries
+  `best_score` and `lineage`. Test: `completion_cites_best_score_and_lineage`.
+- **Token cost.** Per turn ~0 extra model tokens: parsing and git are local; the
+  prompt gains at most a best-score line and 3 checkpoint lines (plus the
+  regression note when applicable). The only model spend is the rare
+  supervisor call.
+
 ## Automatic learning (auto-refine)
 
 One data flow, all Prime's design (`refinement.ts` `reviewAutoRefine`,

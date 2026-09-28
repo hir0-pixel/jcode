@@ -5,6 +5,7 @@
 //! disconnect/reattach. The desktop reads `session.control.read`; autonomous
 //! mode is projected into the `loop` field (`mode=self_paced`).
 
+use crate::goal_ratchet::{Checkpoint, Score, command_key, score_from_json, score_of, score_to_json};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -238,6 +239,14 @@ pub struct SessionGoal {
     /// budget-exhaustion report so a paused/expired goal still shows what
     /// was verified so far.
     pub completion_verification: Option<String>,
+    /// AVO ratchet (see `goal_ratchet`): best score per test command,
+    /// checkpoint lineage (cap 20), regression note, supervisor rate limits.
+    pub best: Score,
+    pub lineage: Vec<Checkpoint>,
+    pub checkpoint_seq: u32,
+    pub regressed: Option<String>,
+    pub sup_turn: Option<i64>,
+    pub sup_episode: bool,
 }
 
 /// Attempt-log bounds (NVIDIA AVO long-horizon harness: a small, bounded
@@ -256,6 +265,7 @@ struct TurnObs {
     files_changed: bool,
     verified: bool,
     first_err: Option<String>,
+    scores: Score,
 }
 
 fn turn_obs() -> &'static Mutex<HashMap<String, TurnObs>> {
@@ -289,9 +299,15 @@ pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
         l.rsplit_once("xit code: ").is_some_and(|(_, code)| code.trim() != "0")
     });
     let failed = result.starts_with("Error:") || nonzero_exit;
+    let cmd = args["command"].as_str().unwrap_or("").to_lowercase();
+    let verify_cmd = name == "bash"
+        && ["test", "build", "check", "lint", "clippy", "pytest", "tsc"].iter().any(|k| cmd.contains(k));
     let mut map = turn_obs().lock().unwrap();
     let obs = map.entry(session_id.to_string()).or_default();
     obs.tools += 1;
+    if verify_cmd {
+        obs.scores.insert(command_key(&cmd), score_of(!failed, result));
+    }
     if failed {
         obs.failed += 1;
         obs.first_err.get_or_insert_with(|| normalize_error(result));
@@ -300,14 +316,8 @@ pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
     if matches!(name, "edit" | "write" | "patch" | "apply_patch" | "multiedit") {
         obs.files_changed = true;
     }
-    if name == "bash" {
-        let cmd = args["command"].as_str().unwrap_or("").to_lowercase();
-        if ["test", "build", "check", "lint", "clippy", "pytest", "tsc"]
-            .iter()
-            .any(|k| cmd.contains(k))
-        {
-            obs.verified = true;
-        }
+    if verify_cmd {
+        obs.verified = true;
     }
 }
 
@@ -334,6 +344,12 @@ impl SessionGoal {
             waiting_on_subagents: false,
             attempt_log: Vec::new(),
             completion_verification: None,
+            best: Score::new(),
+            lineage: Vec::new(),
+            checkpoint_seq: 0,
+            regressed: None,
+            sup_turn: None,
+            sup_episode: false,
         }
     }
 
@@ -462,6 +478,12 @@ impl SessionGoal {
             "waiting_on_subagents": self.waiting_on_subagents,
             "attempt_log": self.attempt_log,
             "completion_verification": self.completion_verification,
+            "best": score_to_json(&self.best),
+            "lineage": self.lineage.iter().map(Checkpoint::to_json).collect::<Vec<_>>(),
+            "checkpoint_seq": self.checkpoint_seq,
+            "regressed": self.regressed,
+            "sup_turn": self.sup_turn,
+            "sup_episode": self.sup_episode,
         })
     }
 
@@ -509,6 +531,12 @@ impl SessionGoal {
             completion_verification: v["completion_verification"]
                 .as_str()
                 .map(str::to_string),
+            best: score_from_json(&v["best"]),
+            lineage: v["lineage"].as_array().map(|a| a.iter().filter_map(Checkpoint::from_json).collect()).unwrap_or_default(),
+            checkpoint_seq: v["checkpoint_seq"].as_u64().unwrap_or(0) as u32,
+            regressed: v["regressed"].as_str().map(str::to_string),
+            sup_turn: v["sup_turn"].as_i64(),
+            sup_episode: v["sup_episode"].as_bool().unwrap_or(false),
         })
     }
 
@@ -542,6 +570,12 @@ impl SessionGoal {
     }
 
     pub fn continuation_prompt(&self) -> String {
+        self.continuation_prompt_with(None)
+    }
+
+    /// `supervisor`: alternative strategies from the one rare supervisor call,
+    /// injected once into this prompt (never the cached static prefix).
+    pub fn continuation_prompt_with(&self, supervisor: Option<&str>) -> String {
         let mut log_block = String::new();
         if !self.attempt_log.is_empty() {
             log_block.push_str("\n\nRecent attempts (most recent last):\n");
@@ -551,12 +585,15 @@ impl SessionGoal {
                 log_block.push('\n');
             }
         }
-        let steer = if self.plateaued() {
+        log_block.push_str(&self.ratchet_block());
+        let steer = if let Some(alt) = supervisor {
+            format!("\n[Supervisor: alternative directions]\n{}", alt.chars().take(600).collect::<String>())
+        } else if self.plateaued() {
             "\n[Plateau detected] The last few turns made no new verified progress \
              (same result repeated). Abandon the current approach and try a genuinely \
-             different strategy instead of repeating what already failed above."
+             different strategy instead of repeating what already failed above.".to_string()
         } else {
-            ""
+            String::new()
         };
         format!(
             "[Continuing toward your standing goal]\nGoal: {}{log_block}{steer}\n\n\
@@ -569,6 +606,16 @@ impl SessionGoal {
             self.title
         )
     }
+}
+
+/// Record the (possibly failed) supervisor call for this plateau episode and
+/// return the continuation prompt with its alternatives injected once.
+pub fn apply_supervisor(store: &ControlStore, session_id: &str, alternatives: Option<&str>) -> Result<String> {
+    let mut goal = store.get_goal(session_id)?.context("no goal")?;
+    goal.sup_turn = Some(goal.turns_used);
+    goal.sup_episode = true;
+    store.set_goal(session_id, Some(&goal))?;
+    Ok(goal.continuation_prompt_with(alternatives.filter(|a| !a.trim().is_empty())))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1212,6 +1259,18 @@ pub fn after_turn(
     subagents_running: bool,
     user_interrupted: bool,
 ) -> Result<Option<Continuation>> {
+    after_turn_in(store, session_id, tokens_this_turn, subagents_running, user_interrupted, None)
+}
+
+/// `after_turn` with the session workspace, so ratchet checkpoints can be taken.
+pub fn after_turn_in(
+    store: &ControlStore,
+    session_id: &str,
+    tokens_this_turn: i64,
+    subagents_running: bool,
+    user_interrupted: bool,
+    cwd: Option<&Path>,
+) -> Result<Option<Continuation>> {
     let obs = turn_obs().lock().unwrap().remove(session_id);
     if user_interrupted {
         if let Some(mut goal) = store.get_goal(session_id)? {
@@ -1247,6 +1306,11 @@ pub fn after_turn(
                 if o.verified { "pass" } else { "none" },
                 o.first_err.unwrap_or_default()
             ));
+            let line = goal.attempt_log.last().cloned().unwrap_or_default();
+            goal.ratchet(&o.scores, o.files_changed, cwd, session_id, &line);
+            if !goal.plateaued() {
+                goal.sup_episode = false;
+            }
             goal.updated_at_ms = now_ms();
             if subagents_running {
                 goal.waiting_on_subagents = true;
@@ -2108,5 +2172,91 @@ mod tests {
             .find(|h| h.id == follow_up.id)
             .unwrap();
         assert_eq!(stored_follow_up.fire_count, 0);
+    }
+
+    #[test]
+    fn runner_output_becomes_a_score_vector() {
+        use crate::goal_ratchet::*;
+        assert_eq!(parse_counts("test result: ok. 5 passed; 1 failed; 0 ignored\ntest result: ok. 2 passed; 0 failed"), Some((7, 1)));
+        assert_eq!(parse_counts("=== 2 failed, 5 passed in 0.3s ==="), Some((5, 2)));
+        assert_eq!(parse_counts("Tests:       1 failed, 5 passed, 6 total"), Some((5, 1)));
+        assert_eq!(score_of(true, "tsc ok"), (1, 0));
+        assert_eq!(score_of(false, "boom"), (0, 1));
+        assert_eq!(score_of(false, "test result: FAILED. 3 passed; 0 failed"), (3, 1));
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn test_run(store: &ControlStore, cwd: &Path, out: &str, exit: i32) {
+        let res = format!("{out}\n\nExit code: {exit}");
+        observe_tool("rt", "edit", &json!({}), "ok");
+        observe_tool("rt", "bash", &json!({"command": "cargo test"}), &res);
+        after_turn_in(store, "rt", 0, false, false, Some(cwd)).unwrap();
+    }
+
+    #[test]
+    fn ratchet_checkpoints_hidden_ref_and_regression_points_at_it() {
+        let dir = std::env::temp_dir().join(format!("ratchet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        git_ok(&dir, &["add", "a.txt"]);
+        git_ok(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        let head = git_ok(&dir, &["rev-parse", "HEAD"]);
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("rt", Some(&SessionGoal::new("x"))).unwrap();
+        std::fs::write(dir.join("new.txt"), "untracked").unwrap();
+        test_run(&store, &dir, "test result: FAILED. 0 passed; 2 failed", 101);
+        assert!(store.get_goal("rt").unwrap().unwrap().lineage.is_empty(), "a failing run never commits");
+        test_run(&store, &dir, "test result: ok. 3 passed; 0 failed", 0);
+        let g = store.get_goal("rt").unwrap().unwrap();
+        let r = g.lineage[0].git_ref.clone();
+        assert!(r.starts_with("refs/akira/goals/rt/"), "{r}");
+        assert!(git_ok(&dir, &["ls-tree", "-r", "--name-only", &r]).contains("new.txt"), "untracked files are snapshotted");
+        assert_eq!(git_ok(&dir, &["rev-parse", "HEAD"]), head, "HEAD untouched");
+        assert_eq!(git_ok(&dir, &["status", "--porcelain"]), "?? new.txt", "index and worktree untouched");
+        test_run(&store, &dir, "test result: FAILED. 2 passed; 1 failed", 101);
+        let p = store.get_goal("rt").unwrap().unwrap().continuation_prompt();
+        assert!(p.contains("[Regression]") && p.contains(&format!("git diff {r}")) && p.contains(&format!("git checkout {r} -- ")), "{p}");
+        // non-git workspaces record no-vcs
+        let plain = std::env::temp_dir().join(format!("plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        store.set_goal("rt", Some(&SessionGoal::new("y"))).unwrap();
+        test_run(&store, &plain, "test result: ok. 1 passed; 0 failed", 0);
+        assert_eq!(store.get_goal("rt").unwrap().unwrap().lineage[0].git_ref, "no-vcs");
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(plain).ok();
+    }
+
+    #[test]
+    fn supervisor_is_once_per_plateau_and_rate_limited() {
+        let store = ControlStore::memory().unwrap();
+        let mut g = SessionGoal::new("port the parser");
+        for _ in 0..PLATEAU_TURNS {
+            g.record_attempt("auto t1 f1 | files=no | ver=none | err=boom");
+        }
+        g.turns_used = 3;
+        assert!(g.supervisor_due());
+        assert!(g.supervisor_request().1.contains("port the parser"));
+        store.set_goal("s", Some(&g)).unwrap();
+        let p = apply_supervisor(&store, "s", Some("1. rewrite\n2. bisect")).unwrap();
+        assert!(p.contains("[Supervisor: alternative directions]") && p.contains("bisect"));
+        let after = store.get_goal("s").unwrap().unwrap();
+        assert!(!after.supervisor_due(), "same plateau episode");
+        assert!(!after.continuation_prompt().contains("Supervisor"), "injected once");
+        let mut g2 = after.clone();
+        g2.sup_episode = false;
+        g2.turns_used = 5;
+        assert!(!g2.supervisor_due(), "needs 5 turns since the last call");
+        g2.turns_used = 8;
+        assert!(g2.supervisor_due());
+        // A failed call still consumes the episode and falls back to the text steer.
+        store.set_goal("s", Some(&g2)).unwrap();
+        assert!(apply_supervisor(&store, "s", None).unwrap().contains("Plateau detected"));
     }
 }

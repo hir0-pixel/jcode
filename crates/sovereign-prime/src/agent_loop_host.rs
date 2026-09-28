@@ -57,10 +57,15 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
                         )
                     })?,
             };
-            let verification = verification.as_str();
+            // AVO: completion cites the best committed score.
+            let verification = if goal.best.is_empty() {
+                verification
+            } else {
+                format!("{verification} | best score: {}", crate::goal_ratchet::fmt_score(&goal.best))
+            };
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
-            goal.completion_verification = Some(verification.to_string());
+            goal.completion_verification = Some(verification);
             goal.updated_at_ms = now_ms();
             store.set_goal(session_id, Some(&goal))?;
             Ok(goal_result(Some(goal)).to_string())
@@ -113,6 +118,8 @@ fn goal_result(goal: Option<SessionGoal>) -> Value {
             // rides along in the report so a paused/expired goal still
             // shows what was tried and verified so far.
             "attempt_log": goal.attempt_log,
+            "best_score": crate::goal_ratchet::score_to_json(&goal.best),
+            "lineage": goal.lineage.iter().map(crate::goal_ratchet::Checkpoint::to_json).collect::<Vec<_>>(),
         })
     });
     let goal = goal.map(|goal| {
@@ -498,5 +505,17 @@ mod tests {
             done["goal"]["completion_verification"],
             "auto t2 f0 | files=yes | ver=pass | err="
         );
+    }
+
+    #[test]
+    fn completion_cites_best_score_and_lineage() {
+        let store = ControlStore::memory().unwrap();
+        let mut goal = SessionGoal::new("g");
+        goal.best.insert("cargo test".into(), (7, 0));
+        goal.lineage.push(crate::goal_ratchet::Checkpoint { n: 1, git_ref: "refs/akira/goals/s/1".into(), score: "cargo test: 7p/0f".into(), line: "l".into() });
+        store.set_goal("s", Some(&goal)).unwrap();
+        let out: Value = serde_json::from_str(&goal_host(&store, "s", r#"{"op":"complete","verification":"ran tests"}"#).unwrap()).unwrap();
+        assert!(out["goal"]["completion_verification"].as_str().unwrap().contains("best score: cargo test: 7p/0f"));
+        assert_eq!(out["completion_budget_report"]["lineage"][0]["ref"], "refs/akira/goals/s/1");
     }
 }

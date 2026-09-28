@@ -5,6 +5,7 @@
 pub mod agent_loop;
 pub mod agent_loop_host;
 mod bundled_skills;
+pub mod goal_ratchet;
 pub mod entries;
 pub mod host;
 pub mod refine;

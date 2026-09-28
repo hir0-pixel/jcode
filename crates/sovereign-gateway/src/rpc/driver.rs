@@ -13,7 +13,7 @@
 //! for a poke (a finished turn, `/goal`, `/heartbeat`, `session.control`).
 
 use super::*;
-use sovereign_prime::agent_loop::{Continuation, ControlStore, after_turn, due_heartbeat};
+use sovereign_prime::agent_loop::{Continuation, ControlStore, after_turn, after_turn_in, apply_supervisor, due_heartbeat};
 use std::sync::OnceLock;
 use tokio::sync::Notify;
 
@@ -154,6 +154,27 @@ impl Driver {
     }
 }
 
+/// AVO self-supervisor: at most one cheap aux call per plateau episode (and
+/// never within 5 turns of the last), asking for 2-3 alternative strategies
+/// injected once into this continuation. Any failure keeps the text steer.
+async fn supervise(conn: &Arc<Conn>, store: &ControlStore, sid: &str, fallback: String) -> String {
+    let Ok(Some(goal)) = store.get_goal(sid) else { return fallback };
+    if !goal.supervisor_due() {
+        return fallback;
+    }
+    let (system, user) = goal.supervisor_request();
+    let started = crate::observability::now();
+    let reply = match conn.config.complete.clone() {
+        Some(complete) => complete(system, user).await,
+        None => Err(anyhow::anyhow!("no model available")),
+    };
+    conn.observer.record_aux(
+        sid, "other", Some("Goal supervisor"), None, None, started,
+        reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
+    );
+    apply_supervisor(store, sid, reply.ok().as_ref().map(|d| d.text.as_str())).unwrap_or(fallback)
+}
+
 /// After a completed turn on `conn`: maybe inject the goal / loop / heartbeat
 /// continuation through that connection, then poke the driver so it watches
 /// (or stops watching) the session.
@@ -169,10 +190,15 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
         let interrupted = payload["status"].as_str() == Some("interrupted");
         let busy = || async { conn.sessions.lock().await.get(&session_id).is_some_and(SessionState::turn_active) };
         let subagents_running = conn.child_sessions_running(&session_id).await;
-        let continuation = match after_turn(&store, &session_id, tokens, subagents_running, interrupted) {
+        let cwd = conn.session_cwd(&session_id).await;
+        let continuation = match after_turn_in(&store, &session_id, tokens, subagents_running, interrupted, cwd.as_deref().map(Path::new)) {
             Ok(None) if !interrupted && !busy().await => due_heartbeat(&store, &session_id).ok().flatten(),
             Ok(next) => next,
             Err(err) => return eprintln!("sovereign: after_turn for {session_id}: {err:#}"),
+        };
+        let continuation = match continuation {
+            Some(Continuation::Goal(p)) => Some(Continuation::Goal(supervise(&conn, &store, &session_id, p).await)),
+            other => other,
         };
         if let Some(cont) = continuation {
             tokio::time::sleep(Duration::from_millis(400)).await;
