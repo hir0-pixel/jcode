@@ -833,53 +833,47 @@ fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::le
     if !on {
         return None;
     }
-    let idle_ms = std::env::var("SOVEREIGN_LEARN_IDLE_MS")
+    // Prime's `settings.autoRefine.turnInterval` / `.cooldownMs` (defaults
+    // 25 turns / 20 minutes); no idle wait.
+    let turn_interval = std::env::var("SOVEREIGN_LEARN_TURN_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(120_000);
-    let remember: sovereign_gateway::learn::Remember =
-        std::sync::Arc::new(|memories, cwd: Option<String>| {
+        .unwrap_or(25);
+    let cooldown_ms = std::env::var("SOVEREIGN_LEARN_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20 * 60_000);
+    let remember: sovereign_gateway::learn::Remember = std::sync::Arc::new(
+        |text: &str, category: &str, user_stated: bool, cwd: Option<&str>| {
             use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
             // Learned lessons are about the user and how they work: global scope,
             // with the chat's project attached so project scope can be added later.
             let manager = match cwd {
-                Some(dir) => MemoryManager::new().with_project_dir(dir),
+                Some(dir) => MemoryManager::new().with_project_dir(dir.to_string()),
                 None => MemoryManager::new(),
             };
-            let before = manager.load_global_graph()?.memories.len();
-            for m in memories {
-                let category = match m.kind.as_str() {
-                    "preference" => MemoryCategory::Preference,
-                    "correction" => MemoryCategory::Correction,
-                    _ => MemoryCategory::Fact,
-                };
-                let mut entry = MemoryEntry::new(category, m.text);
-                entry.trust = if m.user_stated {
-                    TrustLevel::High
-                } else {
-                    TrustLevel::Medium
-                };
-                entry.source = Some("prime-learning".to_string());
-                manager.remember_global(entry)?;
-            }
-            Ok(manager
-                .load_global_graph()?
-                .memories
-                .len()
-                .saturating_sub(before))
-        });
-    // Prime's auto-refine review, off by default: `SOVEREIGN_LEARN_REVIEW=on`.
-    let review = matches!(
-        std::env::var("SOVEREIGN_LEARN_REVIEW")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "on" | "true" | "1"
+            let category = match category {
+                "preference" => MemoryCategory::Preference,
+                "correction" => MemoryCategory::Correction,
+                _ => MemoryCategory::Fact,
+            };
+            let mut entry = MemoryEntry::new(category, text.to_string());
+            entry.trust = if user_stated {
+                TrustLevel::High
+            } else {
+                TrustLevel::Medium
+            };
+            entry.source = Some("prime-learning".to_string());
+            manager.remember_global(entry)
+        },
     );
+    let forget: sovereign_gateway::learn::Forget = std::sync::Arc::new(|id: &str| {
+        let _ = crate::memory::MemoryManager::new().forget(id);
+    });
     Some(sovereign_gateway::learn::Learning {
-        idle: std::time::Duration::from_millis(idle_ms),
+        turn_interval,
+        cooldown: std::time::Duration::from_millis(cooldown_ms),
         remember,
-        review,
+        forget,
     })
 }

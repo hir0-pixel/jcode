@@ -2,7 +2,7 @@
 
 Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; every other Hermes method and route is forwarded to Hermes's own Python backend, which starts only when one of them is first used and stops after 10 idle minutes.
 
-**JSON-RPC methods (235):** 61 working, 0 placeholder, 174 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
+**JSON-RPC methods (235):** 64 working, 0 placeholder, 171 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
 
 | Namespace | Rust (working) | Rust (placeholder) | Forwarded to Hermes (Python) |
 |---|---|---|---|
@@ -44,12 +44,12 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | pet | – | – | `pet.cancel`, `pet.cells`, `pet.disable`, `pet.export`, `pet.gallery`, `pet.generate`, `pet.generate.status`, `pet.hatch`, `pet.info`, `pet.info.meta`, `pet.remove`, `pet.rename`, `pet.scale`, `pet.select`, `pet.thumb` |
 | ping | `ping` | – | – |
 | plugins | – | – | `plugins.list`, `plugins.manage` |
-| preview | – | – | `preview.restart` |
+| preview | `preview.restart` | – | – |
 | process | – | – | `process.kill`, `process.list`, `process.stop` |
 | profiles | – | – | `profiles.configure`, `profiles.create`, `profiles.describe`, `profiles.get_asset`, `profiles.list`, `profiles.remember_onboarding`, `profiles.set_asset` |
 | project | – | – | `project.facts` |
 | projects | – | – | `projects.add_folder`, `projects.archive`, `projects.create`, `projects.delete`, `projects.discover_repos`, `projects.for_cwd`, `projects.get`, `projects.list`, `projects.project_sessions`, `projects.record_repos`, `projects.remove_folder`, `projects.set_active`, `projects.set_primary`, `projects.tree`, `projects.update` |
-| prompt | `prompt.submit` | – | `prompt.background`, `prompt.btw` |
+| prompt | `prompt.background`, `prompt.btw`, `prompt.submit` | – | – |
 | reload | – | – | `reload.env`, `reload.mcp` |
 | request | – | – | `request.answer` |
 | rollback | – | – | `rollback.diff`, `rollback.list`, `rollback.restore` |

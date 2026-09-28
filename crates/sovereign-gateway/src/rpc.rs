@@ -22,6 +22,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
+mod side_agents;
+
 const HARNESS_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `prompt.submit` waits for jcode to acknowledge the message. The
 /// turn itself streams afterwards and may run for minutes.
@@ -244,9 +246,12 @@ pub(crate) struct Conn {
     /// Sessions created here that have not had a turn yet, so jcode has not
     /// persisted them; only these are merged into `session.list` from `known`.
     fresh: Mutex<std::collections::HashSet<String>>,
-    /// Per chat: (turn generation, turns since the last learning pass). A
-    /// learning timer only fires if its generation is still current.
-    learn_state: Mutex<HashMap<String, (u64, usize)>>,
+    /// Per chat: assistant turns since the last auto-refine gate call
+    /// (Prime's `_assistantTurnsSinceAutoRefine`; no idle wait).
+    learn_state: Mutex<HashMap<String, usize>>,
+    /// Per chat: when the gate was last asked (ms), for the cooldown
+    /// (Prime's `_lastAutoRefineReviewAt` / `settings.autoRefine.cooldownMs`).
+    learn_last_review: Mutex<HashMap<String, i64>>,
     learning_now: Mutex<std::collections::HashSet<String>>,
     next_id: AtomicU64,
     next_server_request: AtomicU64,
@@ -478,6 +483,21 @@ impl Conn {
                 } => {
                     self.observer.event(&session_id, ty, &payload);
                     let completed = ty == "message.complete";
+                    // Tool-call boundaries are the only natural checkpoint
+                    // inside a busy, possibly long, multi-tool-call turn:
+                    // `message.complete` only fires once at the very end.
+                    // Check for a due RLM "steer" heartbeat there so it can
+                    // reach the session at its next turn boundary instead of
+                    // waiting for the whole turn to finish.
+                    if ty == "tool.complete" {
+                        sovereign_prime::agent_loop::observe_tool(
+                            &session_id,
+                            payload["name"].as_str().unwrap_or(""),
+                            &payload["args"],
+                            payload["result_text"].as_str().unwrap_or(""),
+                        );
+                        self.clone().maybe_steer_heartbeat(session_id.clone());
+                    }
                     let payload_for_loop = completed.then(|| payload.clone());
                     self.emit(ty, Some(&session_id), payload).await;
                     if let Some(loop_payload) = payload_for_loop {
@@ -593,28 +613,42 @@ impl Conn {
         Ok(result)
     }
 
-    /// Start the learning timer for `session` after a completed turn.
+    /// Check, right after a completed turn, whether this chat is due an
+    /// auto-refine gate call (Prime's `_maybeAutoRefine`, `turn_interval`
+    /// reason: no idle wait, just a turn counter and a cooldown). Runs as a
+    /// spawned task only so it never blocks the turn's own response; the
+    /// check itself happens immediately, not after a delay.
     fn schedule_learning(self: &Arc<Self>, session: String) {
         let Some(learning) = self.config.learning.clone() else {
             return;
         };
         let conn = self.clone();
         tokio::spawn(async move {
-            let (generation, delay) = {
+            // The model-callable `refine` tool / REPL `refine` schedule a
+            // request that runs at the end of the turn, independent of the
+            // checkpoint counter (Prime runs those immediately, too).
+            let scheduled = sovereign_prime::entries::EntryStore::open_cached(Path::new(&conn.config.home))
+                .ok()
+                .and_then(|store| store.refine_pending(&session).ok())
+                .unwrap_or(false);
+            let gate_due = {
                 let mut state = conn.learn_state.lock().await;
-                let entry = state.entry(session.clone()).or_default();
-                entry.0 += 1;
-                entry.1 += 1;
-                let delay = if entry.1 >= crate::learn::CADENCE_TURNS {
-                    crate::learn::CADENCE_IDLE.min(learning.idle)
+                let turns = state.entry(session.clone()).or_default();
+                *turns += 1;
+                let now = crate::observability::now();
+                let mut last = conn.learn_last_review.lock().await;
+                let cooldown_ms = learning.cooldown.as_millis() as i64;
+                let cooled = !last.get(&session).is_some_and(|&at| now - at < cooldown_ms);
+                if *turns >= learning.turn_interval && cooled {
+                    let due = *turns;
+                    *turns = 0;
+                    last.insert(session.clone(), now);
+                    Some(due)
                 } else {
-                    learning.idle
-                };
-                (entry.0, delay)
+                    None
+                }
             };
-            tokio::time::sleep(delay).await;
-            // A newer turn started or finished: its own timer takes over.
-            if conn.learn_state.lock().await.get(&session).map(|e| e.0) != Some(generation) {
+            if gate_due.is_none() && !scheduled {
                 return;
             }
             if conn
@@ -629,11 +663,8 @@ impl Conn {
             if !conn.learning_now.lock().await.insert(session.clone()) {
                 return;
             }
-            let result = crate::learn::pass(&conn, &session, &learning).await;
+            let result = crate::learn::pass(&conn, &session, &learning, gate_due).await;
             conn.learning_now.lock().await.remove(&session);
-            if let Some(entry) = conn.learn_state.lock().await.get_mut(&session) {
-                entry.1 = 0;
-            }
             match result {
                 Ok(Some(text)) => {
                     conn.emit(
@@ -719,6 +750,40 @@ impl Conn {
             };
             if let Err(err) = conn.submit(&session_id, &prompt).await {
                 eprintln!("sovereign: agent loop submit for {session_id}: {err:#}");
+            }
+        });
+    }
+
+    /// Deliver a due RLM "steer" heartbeat to a busy session right now, via
+    /// the same soft-interrupt primitive `session.steer` uses — not a hard
+    /// cancel, and not a wait for the turn to end. Plain `follow_up`
+    /// heartbeats are unaffected: they stay on the idle-only path in
+    /// `schedule_agent_loop`. A cheap local SQLite read per tool-call
+    /// boundary; a no-op unless this session has a due steer-mode heartbeat.
+    fn maybe_steer_heartbeat(self: Arc<Self>, session_id: String) {
+        tokio::spawn(async move {
+            let home = Path::new(&self.config.home);
+            let store = match sovereign_prime::agent_loop::ControlStore::open_cached(home) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!("sovereign: steer heartbeat store for {session_id}: {err:#}");
+                    return;
+                }
+            };
+            let due = sovereign_prime::agent_loop::due_steer_heartbeat(&store, &session_id);
+            let Ok(Some(sovereign_prime::agent_loop::Continuation::Heartbeat { prompt, .. })) = due
+            else {
+                return;
+            };
+            if let Err(err) = self
+                .call(json!({
+                    "req": "soft_interrupt",
+                    "session_id": session_id,
+                    "content": prompt,
+                }))
+                .await
+            {
+                eprintln!("sovereign: steer heartbeat delivery for {session_id}: {err:#}");
             }
         });
     }
@@ -1778,12 +1843,6 @@ impl Conn {
                     }
                 }
                 self.fresh.lock().await.remove(&id);
-                self.learn_state
-                    .lock()
-                    .await
-                    .entry(id.clone())
-                    .or_default()
-                    .0 += 1;
                 let run =
                     self.observer
                         .start_turn(&id, &text, self.run_kind, self.run_title.as_deref());
@@ -1800,6 +1859,9 @@ impl Conn {
                 }
                 Ok(response)
             }
+            "prompt.background" => self.prompt_background(p).await,
+            "prompt.btw" => self.prompt_btw(p).await,
+            "preview.restart" => self.preview_restart(p).await,
             "session.steer" => {
                 let id = sid()?;
                 let text = map::prompt_text(&p["text"]);
@@ -1959,24 +2021,20 @@ impl Conn {
         session_id: Option<&str>,
     ) -> Option<String> {
         use sovereign_prime::entries::EntryStore;
-        use sovereign_prime::harness::Harness;
-        let legacy = Harness::new(std::path::Path::new(&self.config.home));
         let result: anyhow::Result<String> = match words {
             ["harness", ..] => {
-                let mut text = match legacy.current() {
-                    t if t.trim().is_empty() => "No learned instructions yet. Run /refine after a session worth learning from.".to_string(),
-                    t => format!("Learned instructions (applied to new sessions):\n\n{}", t.trim()),
-                };
+                let mut text =
+                    "No learned instructions yet. Run /refine after a session worth learning from.".to_string();
                 if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
                     if let Ok(store) =
                         EntryStore::open_cached(std::path::Path::new(&self.config.home))
                     {
                         let addenda = store.render_prompt(sid).unwrap_or_default();
                         if !addenda.trim().is_empty() {
-                            text.push_str(
-                                "\n\nContinual Harness prompt entries for this session:\n\n",
+                            text = format!(
+                                "Learned instructions (applied to new sessions):\n\n{}",
+                                addenda.trim()
                             );
-                            text.push_str(addenda.trim());
                         }
                     }
                 }
@@ -1995,7 +2053,9 @@ impl Conn {
                     .ok_or_else(|| anyhow!("/refine needs an open session"))?;
                 let id = rest.iter().find(|w| **w != "--global").copied();
                 let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
-                sovereign_prime::refine::rollback(&store, sid, id)
+                crate::learn::with_sink(self.config.learning.as_ref(), None, |sink| {
+                    sovereign_prime::refine::rollback(&store, sid, id, sink)
+                })
             })(),
             ["goal", rest @ ..] => (|| -> anyhow::Result<String> {
                 let sid = session_id
@@ -2042,11 +2102,11 @@ impl Conn {
                     let history = self
                         .call(json!({ "req": "get_history", "session_id": sid }))
                         .await?;
-                    let turns: Vec<sovereign_prime::harness::Turn> = history["messages"]
+                    let turns: Vec<sovereign_prime::refine::Turn> = history["messages"]
                         .as_array()
                         .map(|list| {
                             list.iter()
-                                .map(|m| sovereign_prime::harness::Turn {
+                                .map(|m| sovereign_prime::refine::Turn {
                                     role: m["role"].as_str().unwrap_or_default().to_string(),
                                     text: m["content"].as_str().unwrap_or_default().to_string(),
                                 })
@@ -2079,9 +2139,10 @@ impl Conn {
                         reply.as_ref().err().map(|err| err.to_string()).as_deref(),
                     );
                     let reply = reply?.text;
-                    match sovereign_prime::refine::apply(
-                        &store, sid, &reply, &turns, global, "refine",
-                    ) {
+                    let cwd = self.session_cwd(sid).await;
+                    match crate::learn::with_sink(self.config.learning.as_ref(), cwd, |sink| {
+                        sovereign_prime::refine::apply(&store, sid, &reply, &turns, global, "refine", sink)
+                    }) {
                         Ok(outcome) => {
                             let mut text = format!(
                                 "Refined ({}): {}\n",
@@ -2311,6 +2372,7 @@ pub async fn replay_run(
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
         learn_state: Mutex::new(HashMap::new()),
+        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
@@ -2443,6 +2505,7 @@ pub(crate) async fn agent_run(
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
         learn_state: Mutex::new(HashMap::new()),
+        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
@@ -2579,6 +2642,7 @@ pub async fn run(
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
         learn_state: Mutex::new(HashMap::new()),
+        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
