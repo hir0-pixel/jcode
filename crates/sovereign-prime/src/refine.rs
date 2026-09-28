@@ -161,8 +161,9 @@ pub fn build_request(
 /// Python) and returns its id. `category` is `fact`|`preference`|`correction`;
 /// the bool is whether the evidence was quoted from the user (trust level).
 pub type Remember<'a> = dyn Fn(&str, &str, bool) -> Result<String> + 'a;
-/// Removes a memory previously stored through [`Remember`].
-pub type Forget<'a> = dyn Fn(&str) + 'a;
+/// Removes a memory previously stored through [`Remember`], returning its
+/// `(text, category)` so a rolled-back refine delete can restore it.
+pub type Forget<'a> = dyn Fn(&str) -> Option<(String, String)> + 'a;
 
 /// The bridge to jcode's memory store. A `memory`-kind entry keeps only a
 /// short label plus `reference.memory_id`; the text itself exists once, in
@@ -391,6 +392,7 @@ pub fn apply(
                     if let (Some(sink), Some(id)) = (memory, op.after.as_ref().and_then(memory_id)) {
                         (sink.forget)(id);
                     }
+                    undo_skill_file(None, op.after.as_ref());
                 }
                 Action::Delete => {
                     if let Some(before) = &op.before {
@@ -408,6 +410,7 @@ pub fn apply(
                 }
                 Action::Update => {
                     if let Some(before) = &op.before {
+                        undo_skill_file(Some(before), op.after.as_ref());
                         let _ = store.update(
                             &op.id,
                             EntryPatch {
@@ -424,9 +427,12 @@ pub fn apply(
         return Err(err);
     }
     if let Some(sink) = memory {
-        for op in applied_ops.iter().filter(|op| op.action == Action::Delete) {
-            if let Some(id) = op.before.as_ref().and_then(memory_id) {
-                (sink.forget)(id);
+        for op in applied_ops.iter_mut().filter(|op| op.action == Action::Delete) {
+            let Some(before) = op.before.as_mut() else { continue };
+            let Some(id) = memory_id(before).map(str::to_string) else { continue };
+            // Keep the text in the changeset so a rollback can put it back.
+            if let Some((text, category)) = (sink.forget)(&id) {
+                before.metadata["memory"] = json!({ "text": text, "category": category });
             }
         }
     }
@@ -463,6 +469,22 @@ pub fn apply(
     })
 }
 
+/// Undo the `SKILL.md` an applied skill edit wrote: restore `before`'s file
+/// (an update) or remove the new one (a create). No-op for other kinds.
+fn undo_skill_file(before: Option<&crate::entries::HarnessEntry>, after: Option<&crate::entries::HarnessEntry>) {
+    let (Some(dir), Some(after)) = (crate::skill_files::skills_dir(), after) else { return };
+    if after.kind != EntryKind::Skill {
+        return;
+    }
+    let slug = crate::skill_files::slugify(&after.title);
+    if !slug.is_empty() {
+        let _ = std::fs::remove_dir_all(dir.join(&slug));
+    }
+    if let Some(b) = before {
+        let _ = crate::skill_files::write(&dir, &crate::skill_files::slugify(&b.title), &b.title, &truncate(&b.content, 200), &b.content, &b.reference);
+    }
+}
+
 /// `/refine rollback [id]` (and the `refine.status()`-adjacent host call):
 /// undoes the given changeset, or the most recent one for `session`. Memories
 /// that changeset created are forgotten from jcode's store too.
@@ -473,10 +495,27 @@ pub fn rollback(
     memory: Option<&MemorySink<'_>>,
 ) -> Result<String> {
     let done = store.rollback(id, Some(session))?;
-    if let (Some(sink), Some(target)) = (memory, done.rollback_of.as_deref().and_then(|t| store.changeset(t).ok().flatten())) {
-        for edit in target.edits.iter().filter(|e| e.action == Action::Create) {
-            if let Some(id) = edit.after.as_ref().and_then(memory_id) {
-                (sink.forget)(id);
+    if let Some(target) = done.rollback_of.as_deref().and_then(|t| store.changeset(t).ok().flatten()) {
+        for edit in &target.edits {
+            match (&edit.action, memory) {
+                (Action::Create, Some(sink)) => {
+                    if let Some(id) = edit.after.as_ref().and_then(memory_id) {
+                        (sink.forget)(id);
+                    }
+                }
+                // A rolled-back delete: the entry row is back, so put the memory back too.
+                (Action::Delete, Some(sink)) => {
+                    let Some(before) = &edit.before else { continue };
+                    let saved = &before.metadata["memory"];
+                    if let Some(text) = saved["text"].as_str() {
+                        let restored = (sink.remember)(text, saved["category"].as_str().unwrap_or("fact"), true)?;
+                        store.update(&before.id, EntryPatch { reference: Some(json!({ "memory_id": restored })), ..Default::default() })?;
+                    }
+                }
+                _ => {}
+            }
+            if edit.action != Action::Delete {
+                undo_skill_file(edit.before.as_ref(), edit.after.as_ref());
             }
         }
     }
@@ -596,7 +635,10 @@ mod tests {
             calls.borrow_mut().push((text.to_string(), category.to_string(), user_stated));
             Ok("mem-1".to_string())
         };
-        let forget = |id: &str| forgotten.borrow_mut().push(id.to_string());
+        let forget = |id: &str| {
+            forgotten.borrow_mut().push(id.to_string());
+            Some(("Prefers Nim for quick scripts".to_string(), "preference".to_string()))
+        };
         let sink = MemorySink { remember: &remember, forget: &forget };
         let outcome = apply(&store, "s1", &reply, &turns(), false, "refine", Some(&sink)).unwrap();
         assert_eq!(calls.borrow().len(), 1);
@@ -607,6 +649,48 @@ mod tests {
         assert_eq!(entry.content, "Nim for scripts", "the text is not duplicated in the entry");
         rollback(&store, "s1", None, Some(&sink)).unwrap();
         assert_eq!(*forgotten.borrow(), vec!["mem-1".to_string()]);
+    }
+
+    #[test]
+    fn rolling_back_a_memory_delete_restores_the_memory() {
+        let store = EntryStore::memory().unwrap();
+        let entry = store
+            .create(NewEntry::new(EntryKind::Memory, Scope::Local, "Nim", "Nim").with_session("s1").with_path("m/nim"))
+            .unwrap();
+        store.update(&entry.id, EntryPatch { reference: Some(json!({ "memory_id": "old" })), ..Default::default() }).unwrap();
+        let reply = json!({ "summary": "drop", "edits": [{ "action": "delete", "id": entry.id }] }).to_string();
+        let restored = std::cell::RefCell::new(Vec::new());
+        let remember = |text: &str, category: &str, _: bool| {
+            restored.borrow_mut().push((text.to_string(), category.to_string()));
+            Ok("new".to_string())
+        };
+        let forget = |id: &str| (id == "old").then(|| ("Prefers Nim".to_string(), "preference".to_string()));
+        let sink = MemorySink { remember: &remember, forget: &forget };
+        apply(&store, "s1", &reply, &turns(), false, "refine", Some(&sink)).unwrap();
+        assert!(store.get(&entry.id).unwrap().is_none());
+        rollback(&store, "s1", None, Some(&sink)).unwrap();
+        assert_eq!(*restored.borrow(), vec![("Prefers Nim".to_string(), "preference".to_string())]);
+        assert_eq!(store.get(&entry.id).unwrap().unwrap().reference["memory_id"], "new");
+    }
+
+    #[test]
+    fn rollback_removes_the_skill_file_apply_wrote() {
+        let home = std::env::temp_dir().join(format!("skill-rollback-{}", uuid::Uuid::new_v4()));
+        // SAFETY: only this test in the crate reads JCODE_HOME through skills_dir.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        let store = EntryStore::memory().unwrap();
+        let reply = json!({
+            "summary": "s", "rationale": "r", "expectedOutcome": "e",
+            "edits": [{"action": "create", "kind": "skill", "title": "Do Thing", "content": "steps",
+                       "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}}],
+        })
+        .to_string();
+        apply(&store, "s1", &reply, &turns(), false, "refine", None).unwrap();
+        let file = home.join("skills/do-thing/SKILL.md");
+        assert!(file.exists());
+        rollback(&store, "s1", None, None).unwrap();
+        assert!(!file.exists() && store.list_visible("s1", None).unwrap().is_empty());
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

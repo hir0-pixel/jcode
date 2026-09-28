@@ -467,7 +467,7 @@ swarm_max_concurrent_agents = 32
 #
 # Memory recall is local: an indexed full-text search over stored memories,
 # no model call and nothing sent anywhere. Learning from chats is the Prime
-# learning loop (SOVEREIGN_LEARNING=off|on|local-idle).
+# learning loop (on by default; the `learning.enabled` engine setting).
 
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.

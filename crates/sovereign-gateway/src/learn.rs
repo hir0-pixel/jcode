@@ -20,8 +20,9 @@ use std::time::Duration;
 /// Stores a proposed memory's text in jcode's own memory store and returns
 /// its id; `cwd` is the chat's working directory. Never runs in Python.
 pub type Remember = Arc<dyn Fn(&str, &str, bool, Option<&str>) -> anyhow::Result<String> + Send + Sync>;
-/// Removes a memory stored through [`Remember`] (rollback / refine delete).
-pub type Forget = Arc<dyn Fn(&str) + Send + Sync>;
+/// Removes a memory stored through [`Remember`] (rollback / refine delete),
+/// returning its `(text, category)` so a rolled-back delete can restore it.
+pub type Forget = Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Learning {
@@ -33,6 +34,21 @@ pub struct Learning {
     pub cooldown: Duration,
     pub remember: Remember,
     pub forget: Forget,
+}
+
+/// `config.get learning.enabled`: Prime's auto-refine switch (on by default).
+pub(crate) fn learning_enabled(home: &str) -> bool {
+    sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(home)).map(|s| s.learning_enabled()).unwrap_or(true)
+}
+
+/// `config.set learning.enabled`: persist the switch (bool or "on"/"off"/"true"/"false").
+pub(crate) fn set_learning_enabled(home: &str, value: &serde_json::Value) -> anyhow::Result<bool> {
+    let on = value.as_bool().unwrap_or_else(|| {
+        !matches!(value.as_str().unwrap_or("true").trim().to_ascii_lowercase().as_str(), "false" | "off" | "0" | "no")
+    });
+    sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(home))?
+        .set_setting("learning.enabled", if on { "true" } else { "false" })?;
+    Ok(on)
 }
 
 /// Runs `f` with the bridge to jcode's memory store (`None` when learning is
@@ -184,6 +200,18 @@ pub(crate) async fn pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learning_is_on_by_default_and_config_set_persists_it() {
+        let home = std::env::temp_dir().join(format!("learning-setting-{}", std::process::id()));
+        let home = home.to_str().unwrap();
+        assert!(learning_enabled(home));
+        assert!(!set_learning_enabled(home, &serde_json::json!("off")).unwrap());
+        assert!(!learning_enabled(home));
+        assert!(set_learning_enabled(home, &serde_json::json!(true)).unwrap());
+        assert!(learning_enabled(home));
+        std::fs::remove_dir_all(home).ok();
+    }
 
     #[test]
     fn gate_reply_parsing_defaults_to_no() {

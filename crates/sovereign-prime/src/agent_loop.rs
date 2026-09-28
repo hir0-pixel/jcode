@@ -1125,6 +1125,23 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Sessions with an active goal, autonomous loop or heartbeat: the
+    /// gateway driver's work list (empty means it has nothing to wake for).
+    pub fn active_sessions(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids = std::collections::BTreeSet::new();
+        for table in ["session_goals", "session_autonomous", "session_heartbeats"] {
+            let mut stmt = conn.prepare(&format!("SELECT session_id, state FROM {table}"))?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (id, state) = row?;
+                if serde_json::from_str::<Value>(&state).is_ok_and(|v| v["status"] == "active") {
+                    ids.insert(id);
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     /// Full `session.control.read` snapshot the desktop parser accepts.
     pub fn control_snapshot(&self, session_id: &str) -> Result<Value> {
         let goal = self.get_goal(session_id)?;
@@ -1764,6 +1781,21 @@ pub fn control_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_sessions_lists_only_active_goals_loops_and_heartbeats() {
+        let store = ControlStore::memory().unwrap();
+        assert!(store.active_sessions().unwrap().is_empty());
+        store.set_goal("g", Some(&SessionGoal::new("ship"))).unwrap();
+        let mut paused = SessionGoal::new("later");
+        paused.status = GoalStatus::Paused;
+        store.set_goal("paused", Some(&paused)).unwrap();
+        store.upsert_heartbeat(&Heartbeat::new("h", "check", 600)).unwrap();
+        let mut off = Heartbeat::new("off", "check", 600);
+        off.status = HeartbeatStatus::Paused;
+        store.upsert_heartbeat(&off).unwrap();
+        assert_eq!(store.active_sessions().unwrap(), ["g", "h"]);
+    }
 
     #[test]
     fn goal_stops_at_turn_budget() {

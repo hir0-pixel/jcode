@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_CONTENT_CHARS: usize = 4_000;
 pub const MAX_PATH_CHARS: usize = 200;
+/// Total budget for rendered prompt addenda (the cached static prefix).
+pub const MAX_PROMPT_CHARS: usize = 6_000;
 
 const SCHEMA: &str = "
     PRAGMA journal_mode=WAL;
@@ -60,6 +62,12 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS harness_changesets_recent ON harness_changesets(session, created_at_ms DESC);
     CREATE TABLE IF NOT EXISTS harness_seq(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS harness_watermark(session TEXT PRIMARY KEY, seen INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS engine_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS harness_learn_state(
+        session TEXT PRIMARY KEY,
+        turns INTEGER NOT NULL,
+        last_review_ms INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS harness_pending_refine(
         session TEXT PRIMARY KEY,
         instructions TEXT,
@@ -445,16 +453,25 @@ impl EntryStore {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Prompt-kind entries rendered for `session`, newest-appended order,
-    /// joined with blank lines: the stable, cacheable addendum text.
+    /// Prompt-kind entries rendered for `session`, joined with blank lines:
+    /// the stable, cacheable addendum text. Capped at `MAX_PROMPT_CHARS`
+    /// total: newest entries (highest `seq`) win the budget, then the kept
+    /// ones are emitted oldest-first so the prefix is identical turn to turn.
     pub fn render_prompt(&self, session: &str) -> Result<String> {
         let entries = self.list_visible(session, Some(EntryKind::Prompt))?;
-        Ok(entries
+        let mut used = 0;
+        let mut kept: Vec<&str> = entries
             .iter()
+            .rev()
             .map(|e| e.content.trim())
             .filter(|c| !c.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"))
+            .filter(|c| {
+                let cost = c.chars().count() + 2;
+                (used + cost <= MAX_PROMPT_CHARS).then(|| used += cost).is_some()
+            })
+            .collect();
+        kept.reverse();
+        Ok(kept.join("\n\n"))
     }
 
     fn insert_entry(
@@ -813,6 +830,52 @@ impl EntryStore {
         Ok(())
     }
 
+    /// The engine's persisted settings (`config.get`/`config.set`); `None` when unset.
+    pub fn setting(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row("SELECT value FROM engine_settings WHERE key = ?1", [key], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO engine_settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Whether Prime's auto-refine runs: on unless the user turned it off.
+    pub fn learning_enabled(&self) -> bool {
+        self.setting("learning.enabled").is_none_or(|v| v != "false")
+    }
+
+    /// Count one finished assistant turn for `session` and say whether the
+    /// auto-refine gate is due (`interval` turns and `cooldown_ms` since the
+    /// last gate call). Due resets the counter and stamps `now`. Persisted, so
+    /// a reconnect or restart keeps counting (Prime's per-session counters).
+    pub fn learn_checkpoint(&self, session: &str, interval: usize, cooldown_ms: i64, now: i64) -> Result<Option<usize>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO harness_learn_state(session, turns, last_review_ms) VALUES (?1, 1, 0) \
+             ON CONFLICT(session) DO UPDATE SET turns = turns + 1",
+            [session],
+        )?;
+        let (turns, last): (i64, i64) = conn.query_row(
+            "SELECT turns, last_review_ms FROM harness_learn_state WHERE session = ?1",
+            [session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if (turns as usize) < interval || now - last < cooldown_ms {
+            return Ok(None);
+        }
+        conn.execute(
+            "UPDATE harness_learn_state SET turns = 0, last_review_ms = ?2 WHERE session = ?1",
+            params![session, now],
+        )?;
+        Ok(Some(turns as usize))
+    }
+
     /// `refine.status()`: whether a refinement is scheduled for `session`.
     pub fn refine_pending(&self, session: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -931,6 +994,47 @@ mod tests {
             store.render_prompt("s1").unwrap(),
             "first\n\nsecond\n\nthird"
         );
+    }
+
+    #[test]
+    fn render_prompt_is_capped_newest_first_and_stable() {
+        let store = EntryStore::memory().unwrap();
+        for i in 0..5 {
+            let mut e = entry(EntryKind::Prompt, Scope::Local, Some("s1"));
+            e.path = format!("topic/{i}");
+            e.content = format!("{i}{}", "x".repeat(2_499));
+            store.create(e).unwrap();
+        }
+        let out = store.render_prompt("s1").unwrap();
+        assert!(out.chars().count() <= MAX_PROMPT_CHARS);
+        // Budget fits two 2,500-char entries: the newest two, oldest-first.
+        assert!(out.starts_with('3') && out.contains("\n\n4") && !out.contains("2x"));
+        assert_eq!(out, store.render_prompt("s1").unwrap());
+    }
+
+    #[test]
+    fn learn_counters_persist_across_reopen() {
+        let dir = std::env::temp_dir().join(format!("learn-state-{}", uuid::Uuid::new_v4()));
+        let due = |store: &EntryStore, now| store.learn_checkpoint("s1", 3, 1_000, now).unwrap();
+        let store = EntryStore::open(&dir).unwrap();
+        assert_eq!((due(&store, 5_000), due(&store, 5_001)), (None, None));
+        drop(store);
+        // A restart keeps the count: the third turn trips the gate, then cooldown holds.
+        let store = EntryStore::open(&dir).unwrap();
+        assert_eq!(due(&store, 5_002), Some(3));
+        assert_eq!((due(&store, 5_003), due(&store, 5_004), due(&store, 5_005)), (None, None, None));
+        assert_eq!(due(&store, 9_000), Some(4));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn learning_is_on_by_default_and_the_setting_persists() {
+        let store = EntryStore::memory().unwrap();
+        assert!(store.learning_enabled());
+        store.set_setting("learning.enabled", "false").unwrap();
+        assert!(!store.learning_enabled());
+        store.set_setting("learning.enabled", "true").unwrap();
+        assert!(store.learning_enabled());
     }
 
     #[test]

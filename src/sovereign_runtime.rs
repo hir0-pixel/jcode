@@ -511,7 +511,7 @@ pub async fn run_gateway(
             let provider = refine_provider.clone();
             Box::pin(async move { provider.complete_simple_with_usage(&user, &system).await })
         });
-    let learning = sovereign_learning(&effective_provider);
+    let learning = Some(sovereign_learning());
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let default_cwd = std::env::var("HERMES_DESKTOP_CWD")
@@ -791,48 +791,7 @@ fn write_private_file(path: &std::path::Path, contents: &str) -> Result<()> {
 
 
 
-fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::learn::Learning> {
-    let loopback = |base: &str| {
-        ["://127.0.0.1", "://localhost", "://[::1]"]
-            .iter()
-            .any(|host| base.contains(host))
-    };
-    // The active named profile's base URL lives in config.toml, not the env.
-    let profile_base = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
-        .ok()
-        .and_then(|name| {
-            crate::config::config()
-                .providers
-                .get(&name)
-                .map(|p| p.base_url.clone())
-        });
-    let local = matches!(provider, ProviderChoice::Ollama | ProviderChoice::Lmstudio)
-        || profile_base.as_deref().is_some_and(loopback)
-        || [
-            "JCODE_OPENROUTER_API_BASE",
-            "JCODE_OPENAI_COMPAT_API_BASE",
-            "JCODE_ANTHROPIC_API_BASE",
-        ]
-        .iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .any(|base| loopback(&base));
-    let on = match std::env::var("SOVEREIGN_LEARNING")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "off" => false,
-        "on" => true,
-        _ => local,
-    };
-    eprintln!(
-        "sovereign: learning {} (local model: {local})",
-        if on { "on" } else { "off" }
-    );
-    if !on {
-        return None;
-    }
+fn sovereign_learning() -> sovereign_gateway::learn::Learning {
     // Prime's `settings.autoRefine.turnInterval` / `.cooldownMs` (defaults
     // 25 turns / 20 minutes); no idle wait.
     let turn_interval = std::env::var("SOVEREIGN_LEARN_TURN_INTERVAL")
@@ -868,12 +827,24 @@ fn sovereign_learning(provider: &ProviderChoice) -> Option<sovereign_gateway::le
         },
     );
     let forget: sovereign_gateway::learn::Forget = std::sync::Arc::new(|id: &str| {
-        let _ = crate::memory::MemoryManager::new().forget(id);
+        use crate::memory::{MemoryCategory, MemoryManager};
+        let manager = MemoryManager::new();
+        // Hand the text back so a rolled-back refine delete can restore it.
+        let saved = manager.list_all().ok().and_then(|all| all.into_iter().find(|m| m.id == id));
+        let _ = manager.forget(id);
+        saved.map(|m| {
+            let category = match m.category {
+                MemoryCategory::Preference => "preference",
+                MemoryCategory::Correction => "correction",
+                _ => "fact",
+            };
+            (m.content, category.to_string())
+        })
     });
-    Some(sovereign_gateway::learn::Learning {
+    sovereign_gateway::learn::Learning {
         turn_interval,
         cooldown: std::time::Duration::from_millis(cooldown_ms),
         remember,
         forget,
-    })
+    }
 }

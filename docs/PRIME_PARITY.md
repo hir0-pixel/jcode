@@ -67,6 +67,17 @@ Prime vs Akira, how a goal is driven to completion (Prime source: `core/goals.ts
   tokens used/budget/remaining, "audit every requirement before completing") after
   each idle turn while `status=active`; Akira's `after_turn` returns
   `Continuation::Goal` and the gateway sends `SessionGoal::continuation_prompt`.
+- Driver (`sovereign-gateway/src/rpc/driver.rs`): one engine-level task owns
+  continuations, not a desktop window. It holds its own engine link, watches only
+  sessions with an active goal, loop or heartbeat (`ControlStore::active_sessions`),
+  and yields to any window that has the session open. With no window, goals keep
+  going; after an engine restart active goals and loops resume once at startup
+  (that resume counts as one turn against the budget); due heartbeats fire from a
+  15 s tick that exists only while something is active (otherwise the task parks
+  on a poke: finished turn, `/goal`, `/heartbeat`, `session.control`). Continuations
+  go through `prompt.submit`, so tracing and learning see them. With no window,
+  tool approvals are denied like any headless run. Test:
+  `driver_resumes_goals_once_and_fires_due_heartbeats_only_when_idle`.
 - Completion: Prime completes via `goal.complete()` in the REPL and builds a
   `completion_budget_report`; Akira uses `session_goal op=complete` (now
   requiring a cited verification) with the same report.
@@ -132,8 +143,13 @@ One data flow, all Prime's design (`refinement.ts` `reviewAutoRefine`,
 `agent-session.ts` `_maybeAutoRefine`):
 
 1. **Trigger** (`sovereign-gateway/src/rpc.rs` `schedule_learning`): a per-chat
-   assistant-turn counter; due at `turnInterval` (25) turns and `cooldownMs`
-   (20 min) since the last gate call. A `refine` scheduled by the model-callable
+   assistant-turn counter, persisted per session in `sovereign.db`
+   (`harness_learn_state`, so a reconnect or restart keeps counting); due at
+   `turnInterval` (25) turns and `cooldownMs` (20 min) since the last gate call.
+   On by default for every provider (local or cloud); the one switch is the
+   persisted engine setting `learning.enabled` (`config.get` / `config.set` RPC,
+   stored in `sovereign.db` `engine_settings`; the old `SOVEREIGN_LEARNING` env
+   var is gone). A `refine` scheduled by the model-callable
    tool or the REPL runs at the end of the turn regardless. No idle timer, no
    keyword pre-filter.
 2. **Gate** (`learn.rs`): one cheap model call over the unexamined messages
@@ -146,7 +162,9 @@ One data flow, all Prime's design (`refinement.ts` `reviewAutoRefine`,
    for the existing Python worker import path. There is no evidence-substring
    gate (Prime has none).
 4. **Storage and recall**: prompt entries are appended to the cached static
-   prefix of new sessions; a memory's text is stored once in jcode's Rust memory
+   prefix of new sessions, capped at 6,000 chars in total (newest entries win the
+   budget, emitted oldest-first so the prefix is stable turn to turn), and no
+   longer depend on Python being present (only the REPL guidance does); a memory's text is stored once in jcode's Rust memory
    store (its `EntryStore` row is a label plus `reference.memory_id`), and is
    recalled and injected once, capped, by jcode's own recall.
 
@@ -162,3 +180,12 @@ served by the engine (`sovereign-gateway/src/rpc/side_agents.rs`), so no Python
 `AIAgent` runs and Hermes's Python background review and curator never start.
 Background and preview runs are hidden headless sessions (approvals denied);
 `/btw` is one tool-less model call over a transcript snapshot.
+
+Rollback safety: a refine delete of a memory keeps the memory's text and category
+in the changeset, so `/refine rollback` restores it to jcode's memory store
+(`Forget` returns the text); rolling back a skill create or update removes or
+restores the `SKILL.md` it wrote (also on an all-or-nothing apply failure).
+Side-agent runs (`prompt.background`, `preview.restart`) are labeled
+`background` / `preview` in observability instead of `cron`.
+`spawn_tree.list/load/save` are derived from the engine's child sessions
+(`sovereign-gateway/src/rpc/spawn_tree.rs`; virtual path `spawn-tree:<parent>`).

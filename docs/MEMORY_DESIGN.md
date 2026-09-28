@@ -34,8 +34,8 @@ this proposal:
   A learned memory's text is stored once, in jcode's memory store (recalled and injected once by
   jcode's own recall); its `EntryStore` row keeps a label and `reference.memory_id`. Skill
   entries carry Prime's mandatory `reference{type,import,callable}` + `arguments` and are written
-  as `~/.jcode/skills/<slug>/SKILL.md`. `SOVEREIGN_LEARNING=off|on|local-idle` (default: learns
-  only on a local model); `SOVEREIGN_LEARN_TURN_INTERVAL` / `SOVEREIGN_LEARN_COOLDOWN_MS` override.
+  as `~/.jcode/skills/<slug>/SKILL.md`. The `learning.enabled` engine setting (default on, all providers)
+  switches auto-refine; `SOVEREIGN_LEARN_TURN_INTERVAL` / `SOVEREIGN_LEARN_COOLDOWN_MS` override.
 - **No `memory_injections` table:** jcode already records each injection in the session
   (persisted) and restores the inject-once set when a session is resumed; a table would
   store the same fact twice.
@@ -339,8 +339,8 @@ and latency for stock Hermes vs Sovereign. Every later phase reports against it.
   by tests.
 
 **M6 Observability on the store (Evestack-style)**
-- Runs, spans and opt-in content live in `sovereign.db` as `obs_runs`, `obs_spans`
-  and `obs_content`. A previous `observability.sqlite3` is imported once.
+- Runs, spans and opt-in content live in `sovereign.db` as `fact_turn`, `spans`
+  and `span_content`. A previous `observability.sqlite3` is imported once.
 - Model spans carry OpenTelemetry GenAI attributes and token counts. The Activity
   ledger includes chat, tool follow-ups, idle learning and cron calls. Local model
   prices are optional; unpriced calls remain visible without a fabricated cost.
@@ -362,8 +362,8 @@ Manual 50k-span ledger benchmark (2026-09-25, debug test build, local SQLite):
 | Database + WAL + SHM | 32,505,224 bytes |
 | Dropped events | 0 |
 
-`EXPLAIN QUERY PLAN` used `obs_runs_recent` for list, `obs_runs_recent` plus
-the correlated `obs_spans_run` subquery for analytics, and `obs_spans_run` for
+`EXPLAIN QUERY PLAN` used `fact_turn_recent` for list, `fact_turn_recent` plus
+the correlated `spans_run` subquery for analytics, and `spans_run` for
 detail. The analytics query is still the slowest read and is a future target
 if Activity latency becomes noticeable.
 
@@ -414,7 +414,7 @@ test stand-in, so llama.cpp bundling, KV-cache compression and warm-up are out o
 
 **M10c EveStack observability parity** (built)
 - Silent-failure `no_model_call` flag; monitors (p50/p95/p99, error rate, silent failures);
-  soft daily USD budget; transition-deduped `obs_alerts`; `obs_approvals` audit; Activity
+  soft daily USD budget; transition-deduped `alert_state`; `approvals` audit; Activity
   filters/search; promote → `JCODE_HOME/evals/<id>.json`; replay via session branch.
 - Routes under `/api/sovereign/observability/{monitors,budget,approvals,promote,replay}`.
 - See `docs/M10c_DECISIONS.md`, `docs/eval-case-format.md`.
