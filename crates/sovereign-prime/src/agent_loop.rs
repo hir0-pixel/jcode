@@ -282,7 +282,13 @@ fn normalize_error(err: &str) -> String {
 /// Record one completed tool call for `session_id`'s current turn. Called by
 /// the gateway at `tool.complete`; drained by `after_turn`.
 pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
-    let failed = result.starts_with("Error:");
+    // jcode's bash tool reports a non-zero exit as a trailing "Exit code: N"
+    // (or "finished with exit code: N" for detached runs), not an "Error:" prefix.
+    let nonzero_exit = result.lines().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| {
+        let l = l.trim().trim_end_matches(" ---");
+        l.rsplit_once("xit code: ").is_some_and(|(_, code)| code.trim() != "0")
+    });
+    let failed = result.starts_with("Error:") || nonzero_exit;
     let mut map = turn_obs().lock().unwrap();
     let obs = map.entry(session_id.to_string()).or_default();
     obs.tools += 1;
@@ -2018,6 +2024,17 @@ mod tests {
         let g = store.get_goal("auto2").unwrap().unwrap();
         assert!(g.plateaued(), "{:?}", g.attempt_log);
         assert!(g.continuation_prompt().contains("Plateau detected"));
+    }
+
+    #[test]
+    fn nonzero_bash_exit_is_a_failed_verification() {
+        let sid = "nonzero-exit-test";
+        observe_tool(sid, "bash", &serde_json::json!({"command": "cargo test"}), "1 failed\n\nExit code: 101");
+        observe_tool(sid, "bash", &serde_json::json!({"command": "npm test"}), "ok\n--- Command finished with exit code: 0 ---");
+        let map = turn_obs().lock().unwrap();
+        let obs = &map[sid];
+        assert_eq!((obs.tools, obs.failed), (2, 1));
+        assert!(obs.verified, "the exit-0 test run still counts as a passing verification");
     }
 
     #[test]
