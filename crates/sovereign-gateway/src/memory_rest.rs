@@ -121,7 +121,7 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request) -> Option<Resul
         ("POST" | "PUT", ["entries", ..]) => {
             return Some(respond(stream, "400 Bad Request", &json!({"detail": "content is required"})).await);
         }
-        (_, ["providers", ..]) => {
+        (_, ["providers", ..]) | ("PUT", ["provider"]) => {
             return Some(respond(stream, "404 Not Found", &json!({"detail": "not supported by engine: it has one memory"})).await);
         }
         _ => return None,

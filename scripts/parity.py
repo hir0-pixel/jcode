@@ -63,10 +63,19 @@ SESSIONS_REST = {
 }
 
 
+# Served by crates/sovereign-gateway/src/memory_rest.rs over jcode's memory graph;
+# memory-provider routes are refused there (one memory store), never forwarded.
+MEMORY_REST = {
+    ("GET", "/api/memory"), ("POST", "/api/memory/reset"), ("PUT", "/api/memory/provider"),
+    ("GET", "/api/memory/providers/{name}/config"), ("POST", "/api/memory/providers/{name}/setup"),
+    ("PUT", "/api/memory/providers/{name}/config"),
+}
+
+
 def rest_routes_handled() -> set[tuple[str, str]]:
     src = (ENGINE / "crates/sovereign-gateway/src/lib.rs").read_text()
     inline = set(re.findall(r'\("(GET|POST|PUT|DELETE|PATCH)", "(/api/[^"]+)"\)', src))
-    return inline | SESSIONS_REST | {("GET", "/api/ws")}
+    return inline | SESSIONS_REST | MEMORY_REST | {("GET", "/api/ws")}
 
 
 def rest_route_refused(path: str) -> bool:
