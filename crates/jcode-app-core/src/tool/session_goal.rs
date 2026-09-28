@@ -14,7 +14,7 @@ impl Tool for SessionGoalTool {
     }
 
     fn description(&self) -> &str {
-        "Get, set, log progress on, or complete the unattended session goal (persists across turns; the gateway continues the session until done or budget hit). Record each continuation's outcome with op=progress; op=complete requires citing a verification you actually ran."
+        "Get, set, log progress on, or complete the unattended session goal (persists across turns; the gateway continues the session until done or budget hit). Record each continuation's outcome with op=progress; op=complete must cite a verification you actually ran unless a passing test/build/check already ran this goal."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -25,7 +25,7 @@ impl Tool for SessionGoalTool {
                 "op": { "type": "string", "enum": ["get", "create", "progress", "complete"], "description": "get status, create/replace goal text, log a one-line progress note, or mark complete" },
                 "text": { "type": "string", "description": "Goal text when op=create" },
                 "note": { "type": "string", "description": "op=progress: one short line — what you tried this turn" },
-                "verification": { "type": "string", "description": "op=progress: pass/fail/none result of what you ran; op=complete: what you ran and its result (required)" },
+                "verification": { "type": "string", "description": "op=progress: pass/fail/none result of what you ran; op=complete: what you ran and its result" },
                 "error": { "type": "string", "description": "op=progress: the key error, if any" }
             },
             "required": ["op"]

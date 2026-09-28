@@ -183,7 +183,7 @@ async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
     let out = h
         .run(
             "bundled-prime-skills",
-            "import goal\ncreated = await goal.create('prove package bridge', token_budget=42)\ncurrent = await goal.get()\ncompleted = await goal.complete()\n(created['goal']['token_budget'], current['remaining_tokens'], completed['goal']['status'], completed['completion_budget_report']['token_budget'])",
+            "import goal\ncreated = await goal.create('prove package bridge', token_budget=42)\ncurrent = await goal.get()\nprogressed = await goal.progress('probed the bridge', 'pass')\ncompleted = await goal.complete('ran the bridge probe: ok')\n(created['goal']['token_budget'], current['remaining_tokens'], completed['goal']['status'], completed['completion_budget_report']['token_budget'], progressed['goal']['attempt_log'][-1], completed['goal']['completion_verification'])",
             None,
             upper(),
             no_refine(),
@@ -194,7 +194,7 @@ async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
         .unwrap();
     assert_eq!(
         out.value.as_deref(),
-        Some("(42, 42, 'done', 42)"),
+        Some("(42, 42, 'done', 42, 'pass: probed the bridge', 'ran the bridge probe: ok')"),
         "{:?}",
         out.error
     );

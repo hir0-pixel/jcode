@@ -41,12 +41,23 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
             let mut goal = store
                 .get_goal(session_id)?
                 .ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
-            let verification = op["verification"].as_str().unwrap_or("").trim();
-            if verification.is_empty() {
-                anyhow::bail!(
-                    "goal complete requires verification: describe the test/build/command you ran and its result"
-                );
-            }
+            // Prime's `goal.complete()` takes no arguments; accept that when the
+            // engine itself already recorded a passing verification for this goal.
+            let verification = match op["verification"].as_str().map(str::trim) {
+                Some(v) if !v.is_empty() => v.to_string(),
+                _ => goal
+                    .attempt_log
+                    .iter()
+                    .rev()
+                    .find(|line| line.contains("ver=pass"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "goal complete requires verification: run a test/build/check first, or describe what you ran and its result"
+                        )
+                    })?,
+            };
+            let verification = verification.as_str();
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
             goal.completion_verification = Some(verification.to_string());
@@ -470,6 +481,22 @@ mod tests {
         assert_eq!(
             done["goal"]["completion_verification"],
             "ran `cargo test`, all green"
+        );
+    }
+
+    #[test]
+    fn prime_style_bare_complete_uses_the_engine_recorded_passing_verification() {
+        let store = ControlStore::memory().unwrap();
+        goal_host(&store, "s", r#"{"op":"create","text":"ship it"}"#).unwrap();
+        let mut goal = store.get_goal("s").unwrap().unwrap();
+        goal.record_attempt("auto t2 f0 | files=yes | ver=pass | err=");
+        store.set_goal("s", Some(&goal)).unwrap();
+        let done: Value =
+            serde_json::from_str(&goal_host(&store, "s", r#"{"op":"complete"}"#).unwrap()).unwrap();
+        assert_eq!(done["goal"]["status"], "done");
+        assert_eq!(
+            done["goal"]["completion_verification"],
+            "auto t2 f0 | files=yes | ver=pass | err="
         );
     }
 }

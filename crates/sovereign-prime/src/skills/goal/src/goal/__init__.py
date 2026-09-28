@@ -64,16 +64,17 @@ async def progress(note: str, verification: str = "none", error: str = "") -> di
     return await host_request("goal.progress", payload)
 
 
-async def complete(verification: str) -> dict[str, Any]:
+async def complete(verification: str = "") -> dict[str, Any]:
     """Mark the existing thread goal achieved.
 
     Use only when the objective has actually been achieved and no required
     work remains — not because the budget is nearly exhausted or because you
-    are stopping work. `verification` is required: describe the test, build,
-    or command you actually ran and its result (e.g. "ran `pytest`, 42
-    passed"). Pause, resume, and budget-limit transitions are controlled by
-    the user and the host.
+    are stopping work. Pass `verification` (the test, build, or command you
+    ran and its result, e.g. "ran `pytest`, 42 passed"); it may be omitted
+    only if a passing test/build/check already ran for this goal. Pause,
+    resume, and budget-limit transitions are controlled by the user and the
+    host.
     """
-    if not isinstance(verification, str) or not verification.strip():
-        raise ValueError("verification must be a non-empty str describing what you ran and its result")
-    return await host_request("goal.complete", {"verification": verification})
+    if not isinstance(verification, str):
+        raise TypeError(f"verification must be str, got {type(verification).__name__}")
+    return await host_request("goal.complete", {"verification": verification} if verification.strip() else None)

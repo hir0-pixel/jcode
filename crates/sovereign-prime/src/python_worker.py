@@ -96,13 +96,16 @@ async def host_request(name, payload=None):
         return json.loads(await host_call("compact", json.dumps({"op": op, **payload})))
     if name.startswith("goal."):
         op = name.removeprefix("goal.")
-        if op not in {"get", "create", "complete"}:
+        if op not in {"get", "create", "progress", "complete"}:
             raise ValueError(f"unsupported Prime host request: {name}")
         request = {"op": op}
         if op == "create":
             request["text"] = payload.get("objective", payload.get("text"))
             if "token_budget" in payload:
                 request["token_budget"] = payload["token_budget"]
+        for key in ("note", "verification", "error"):
+            if key in payload:
+                request[key] = payload[key]
         return json.loads(await host_call("goal", json.dumps(request)))
     if name.startswith("refine."):
         op = name.removeprefix("refine.")
