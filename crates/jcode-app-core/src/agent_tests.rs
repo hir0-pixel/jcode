@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[path = "agent_tests/tool_schema_budget.rs"]
+mod tool_schema_budget;
+
 #[path = "agent_tests/tool_streaming.rs"]
 mod tool_streaming;
 

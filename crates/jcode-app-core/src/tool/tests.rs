@@ -718,10 +718,15 @@ async fn tool_parameter_descriptions_stay_under_token_cap() {
     // The feedback-loop relevance rubric defines every enum state inline
     // (abb0baabc, d21916db5) and todo::tests pins each concept, so it is
     // deliberately longer than the cap.
-    const EXEMPT: &[(&str, &str)] = &[(
-        "todo",
-        "$.properties.goals.items.properties.feedback_loop_relevance",
-    )];
+    // load_tools carries the catalog of every deferred tool (name plus purpose);
+    // that catalog is the price of not sending their full schemas (tool::deferred).
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "todo",
+            "$.properties.goals.items.properties.feedback_loop_relevance",
+        ),
+        ("load_tools", "$.properties.names"),
+    ];
 
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;

@@ -434,6 +434,14 @@ impl Agent {
         // prompt-cache miss (the turn MCP tools first appear). The
         // `mcp_late_register_resolved` flag makes this a one-shot check so we do
         // not rescan the registry on every subsequent turn.
+        let loaded = self.loaded_deferred_tools();
+        if self.locked_tools.is_some() && loaded != self.locked_deferred {
+            // A `load_tools` call (or a direct call to a deferred tool) grew the
+            // loaded set: rebuild once so its schema is sent from now on.
+            logging::info("Deferred tool loaded — rebuilding tool list (one prompt-cache miss)");
+            self.locked_tools = None;
+            self.cache_tracker.reset();
+        }
         let locked_uses_fixed_mcp_surface = self.locked_tools.as_ref().is_some_and(|locked| {
             locked
                 .iter()
@@ -485,7 +493,25 @@ impl Agent {
             tools.len()
         ));
         self.locked_tools = Some(tools.clone());
+        self.locked_deferred = loaded;
         tools
+    }
+
+    /// Deferred tools the model has loaded (`load_tools`) or called directly,
+    /// read off the transcript so the set is monotonic and resume-proof.
+    fn loaded_deferred_tools(&self) -> std::collections::BTreeSet<String> {
+        use crate::tool::deferred::{LOAD_TOOLS, is_deferred, requested_names};
+        let mut loaded = std::collections::BTreeSet::new();
+        for block in self.session.messages.iter().flat_map(|m| &m.content) {
+            if let ContentBlock::ToolUse { name, input, .. } = block {
+                if name == LOAD_TOOLS {
+                    loaded.extend(requested_names(input).into_iter().filter(|n| is_deferred(n)));
+                } else if is_deferred(name) {
+                    loaded.insert(name.clone());
+                }
+            }
+        }
+        loaded
     }
 
     /// Build the agent's tool definitions from the registry, applying the
@@ -511,7 +537,23 @@ impl Agent {
             let disabled = config.disabled.iter().cloned().collect();
             tools.retain(|tool| !self.registry.tool_is_disabled(&disabled, &tool.name));
         }
+        self.defer_tools(&mut tools, enabled.is_none() && self.allowed_tools.is_none());
         tools
+    }
+
+    /// Withhold the schemas of not-yet-loaded deferred tools (see `tool::deferred`).
+    /// Sessions with an explicit tool allowlist keep exactly what they asked for.
+    fn defer_tools(&self, tools: &mut Vec<ToolDefinition>, active: bool) {
+        use crate::tool::deferred::{LOAD_TOOLS, is_deferred};
+        let before = tools.len();
+        if active {
+            let loaded = self.loaded_deferred_tools();
+            tools.retain(|t| !is_deferred(&t.name) || loaded.contains(&t.name));
+        }
+        // `load_tools` is only useful while something is still withheld.
+        if !active || tools.len() == before {
+            tools.retain(|t| t.name != LOAD_TOOLS);
+        }
     }
 
     /// Replace per-server MCP definitions with the fixed search/call surface

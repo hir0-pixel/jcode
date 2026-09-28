@@ -228,6 +228,8 @@ pub struct Agent {
     /// to avoid cache invalidation when MCP tools arrive asynchronously.
     /// Cleared on compaction/reset.
     locked_tools: Option<Vec<ToolDefinition>>,
+    /// Deferred tools already loaded when `locked_tools` was built; a bigger set unlocks it.
+    locked_deferred: std::collections::BTreeSet<String>,
     /// One-shot guard for the async MCP-registration race (#206).
     ///
     /// MCP servers connect on a background task and register `mcp__*` tools
@@ -323,6 +325,7 @@ impl Agent {
             cache_tracker: CacheTracker::new(),
             last_usage: TokenUsage::default(),
             locked_tools: None,
+            locked_deferred: Default::default(),
             mcp_late_register_resolved: false,
             agents_md_snapshot,
             memory_enabled: crate::config::memory_enabled(),

@@ -15,6 +15,7 @@ mod edit_stats;
 mod file_diff;
 pub(crate) mod file_lock;
 mod delegate;
+pub(crate) mod deferred;
 pub mod inflight;
 mod invalid;
 mod ls;
@@ -566,6 +567,8 @@ impl Registry {
         let session_tools_ms = session_tools_start.elapsed().as_millis();
 
         let write_start = std::time::Instant::now();
+        let load_tools = deferred::LoadToolsTool::new(|name| tools_map.contains_key(name));
+        Self::insert_tool(&mut tools_map, deferred::LOAD_TOOLS, load_tools);
         *registry.tools.write().await = tools_map;
         let write_ms = write_start.elapsed().as_millis();
         crate::logging::info(&format!(
