@@ -97,6 +97,10 @@ async fn observability_routes_require_token() {
         "/api/sovereign/observability/monitors?window=24h",
         "/api/sovereign/observability/budget",
         "/api/sovereign/observability/approvals",
+        "/api/sovereign/observability/sessions",
+        "/api/sovereign/observability/facts?days=7",
+        "/api/sovereign/observability/alerts",
+        "/api/sovereign/observability/memory-audit",
     ];
     for path in routes {
         let (status, _) = http_get(port, path, None).await;

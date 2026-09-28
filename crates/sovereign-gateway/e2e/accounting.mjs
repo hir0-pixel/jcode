@@ -35,7 +35,7 @@ try {
   if (!proxyError.includes('listening on')) throw new Error(`proxy did not start: ${proxyError}`)
   engine = spawn(bin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
     cwd: home,
-    env: { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_IDLE_MS: '4000' },
+    env: { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let stderr = ''
