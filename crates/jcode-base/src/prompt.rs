@@ -201,13 +201,6 @@ pub fn append_swarm_effort_directive(split: &mut SplitSystemPrompt, effort: Opti
     }
     split.dynamic_part.push_str(directive);
 }
-/// Mission-continuation template (embedded at compile time). Consumed by the
-/// `mission` module in the upper `jcode-app-core` layer; the asset lives here
-/// alongside the other prompt templates.
-pub const MISSION_CONTINUATION_TEMPLATE: &str = include_str!("prompt/mission_continuation.md");
-const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
-const DESKTOP_SELFDEV_MODE_PROMPT: &str = include_str!("prompt/desktop_selfdev_mode.txt");
-const SELFDEV_FOCUS_TUI_PROMPT: &str = include_str!("prompt/selfdev_focus_tui.txt");
 /// Split system prompt for efficient caching
 /// Static content is cached, dynamic content is not
 #[derive(Debug, Clone, Default)]
@@ -298,8 +291,6 @@ pub struct ContextInfo {
     pub global_agents_md_chars: usize,
     /// Skills section size (chars)
     pub skills_chars: usize,
-    /// Self-dev section size (chars)
-    pub selfdev_chars: usize,
     /// Memory section size (chars)
     pub memory_chars: usize,
     /// Prompt overlay section size (chars)
@@ -344,7 +335,6 @@ impl ContextInfo {
             + self.project_agents_md_chars
             + self.global_agents_md_chars
             + self.skills_chars
-            + self.selfdev_chars
             + self.memory_chars
             + self.prompt_overlay_chars
             + self.preferred_tools_chars
@@ -373,9 +363,6 @@ impl ContextInfo {
         }
         if self.skills_chars > 0 {
             parts.push(("skills", self.skills_chars, "🔧"));
-        }
-        if self.selfdev_chars > 0 {
-            parts.push(("dev", self.selfdev_chars, "🛠"));
         }
         if self.memory_chars > 0 {
             parts.push(("mem", self.memory_chars, "🧠"));
@@ -451,7 +438,7 @@ pub fn build_system_prompt_full(
 pub fn build_system_prompt_full_with_capabilities(
     skill_prompt: Option<&str>,
     available_skills: &[SkillInfo],
-    is_selfdev: bool,
+    _is_selfdev: bool,
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
     capabilities: PromptCapabilities,
@@ -461,16 +448,6 @@ pub fn build_system_prompt_full_with_capabilities(
         system_prompt_chars: parts.join("\n\n").len(),
         ..Default::default()
     };
-
-    // Desktop checkout identity takes precedence over the CLI self-dev flag.
-    if is_desktop_working_dir(working_dir) {
-        info.selfdev_chars = DESKTOP_SELFDEV_MODE_PROMPT.len();
-        parts.push(DESKTOP_SELFDEV_MODE_PROMPT.to_string());
-    } else if is_selfdev {
-        let selfdev_prompt = build_selfdev_prompt_for_working_dir(working_dir);
-        info.selfdev_chars = selfdev_prompt.len();
-        parts.push(selfdev_prompt);
-    }
 
     // Add AGENTS.md instructions with tracking (from working_dir or cwd)
     let (md_content, md_info) = load_agents_md_files_from_dir(working_dir);
@@ -586,7 +563,7 @@ pub fn build_system_prompt_split_with_agents_md(
 fn build_system_prompt_split_with_capabilities_and_agents_md(
     skill_prompt: Option<&str>,
     available_skills: &[SkillInfo],
-    is_selfdev: bool,
+    _is_selfdev: bool,
     memory_prompt: Option<&str>,
     working_dir: Option<&Path>,
     capabilities: PromptCapabilities,
@@ -600,16 +577,6 @@ fn build_system_prompt_split_with_capabilities_and_agents_md(
     };
 
     // === STATIC CONTENT (cacheable) ===
-
-    // Keep Desktop guidance cacheable and separate from CLI self-development.
-    if is_desktop_working_dir(working_dir) {
-        info.selfdev_chars = DESKTOP_SELFDEV_MODE_PROMPT.len();
-        static_parts.push(DESKTOP_SELFDEV_MODE_PROMPT.to_string());
-    } else if is_selfdev {
-        let selfdev_prompt = build_selfdev_prompt_static_for_working_dir(working_dir);
-        info.selfdev_chars = selfdev_prompt.len();
-        static_parts.push(selfdev_prompt);
-    }
 
     // Add AGENTS.md instructions (static per project)
     let (md_content, md_info) = agents_md;
@@ -668,66 +635,9 @@ fn build_system_prompt_split_with_capabilities_and_agents_md(
     )
 }
 
-/// Detect Desktop independently of the CLI self-development flag.
-fn is_desktop_working_dir(working_dir: Option<&Path>) -> bool {
-    working_dir
-        .and_then(jcode_selfdev_types::desktop_repo_root)
-        .is_some()
-}
-
-/// Build self-dev tools prompt section (static version without dynamic socket path)
-#[cfg(test)]
-fn build_selfdev_prompt_static() -> String {
-    build_selfdev_prompt_static_for_context(SelfDevProductContext::Tui)
-}
-
-/// Build self-dev tools prompt section
-#[cfg(test)]
-fn build_selfdev_prompt() -> String {
-    build_selfdev_prompt_for_context(SelfDevProductContext::Tui)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelfDevProductContext {
-    Tui,
-}
-
-impl SelfDevProductContext {
-    fn from_working_dir(working_dir: Option<&Path>) -> Self {
-        let _ = working_dir;
-        Self::Tui
-    }
-
-    fn prompt_block(self) -> &'static str {
-        match self {
-            Self::Tui => SELFDEV_FOCUS_TUI_PROMPT,
-        }
-    }
-}
-
-fn build_selfdev_prompt_static_for_working_dir(working_dir: Option<&Path>) -> String {
-    build_selfdev_prompt_static_for_context(SelfDevProductContext::from_working_dir(working_dir))
-}
-
-fn build_selfdev_prompt_for_working_dir(working_dir: Option<&Path>) -> String {
-    build_selfdev_prompt_for_context(SelfDevProductContext::from_working_dir(working_dir))
-}
-
-fn build_selfdev_prompt_static_for_context(context: SelfDevProductContext) -> String {
-    build_selfdev_prompt_for_context(context).replace("__DEBUG_SOCKET_BLOCK__\n\n", "")
-}
-
-fn build_selfdev_prompt_for_context(context: SelfDevProductContext) -> String {
-    SELFDEV_MODE_PROMPT.replace("__SELFDEV_PRODUCT_FOCUS__", context.prompt_block())
-}
-
 /// Build immutable session context captured once per session.
 pub fn build_session_context(working_dir: Option<&Path>) -> String {
     let mut lines = vec!["# Session Context".to_string()];
-
-    if is_desktop_working_dir(working_dir) {
-        lines.push("Self-development mode: desktop".to_string());
-    }
 
     lines.extend(session_datetime_lines());
     lines.push(format!("OS: {}", std::env::consts::OS));
