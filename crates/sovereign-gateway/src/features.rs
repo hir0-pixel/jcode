@@ -181,6 +181,11 @@ impl Features {
                 return;
             }
         }
+        if let Ok(home) = std::env::var("HERMES_HOME") {
+            if messaging_enabled(std::path::Path::new(&home)) {
+                return; // inbound bot traffic never touches the proxy; stopping now would deafen the bots
+            }
+        }
         if self.idle_for() < idle_stop_after() {
             if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=keep idle_ms={} threshold_ms={}", self.idle_for().as_millis(), idle_stop_after().as_millis()); }
             return;
@@ -196,6 +201,22 @@ impl Features {
             kill_backend(&mut r.child).await;
         }
     }
+}
+
+/// True when the config the desktop's messaging page writes (`platforms.<id>.enabled`
+/// in `config.yaml`, for the home or any profile) has a platform switched on.
+pub fn messaging_enabled(home: &std::path::Path) -> bool {
+    let mut files = vec![home.join("config.yaml")];
+    if let Ok(entries) = std::fs::read_dir(home.join("profiles")) {
+        files.extend(entries.flatten().map(|e| e.path().join("config.yaml")));
+    }
+    files.iter().any(|f| {
+        std::fs::read_to_string(f)
+            .ok()
+            .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+            .and_then(|cfg| cfg["platforms"].as_mapping().cloned())
+            .is_some_and(|m| m.values().any(|p| p["enabled"].as_bool() == Some(true)))
+    })
 }
 
 async fn kill_backend(child: &mut Child) {
@@ -241,6 +262,18 @@ mod tests {
         let f2 = Features { epoch: Instant::now() - IDLE_STOP_AFTER - Duration::from_secs(1), ..f };
         f2.stop_if_idle().await;
         assert!(!f2.is_running().await, "idle: stopped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn messaging_enabled_reads_platform_flags() {
+        let dir = std::env::temp_dir().join(format!("features-msg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("profiles/work")).unwrap();
+        assert!(!messaging_enabled(&dir));
+        std::fs::write(dir.join("config.yaml"), "platforms:\n  telegram:\n    enabled: false\n").unwrap();
+        assert!(!messaging_enabled(&dir));
+        std::fs::write(dir.join("profiles/work/config.yaml"), "platforms:\n  whatsapp:\n    enabled: true\n").unwrap();
+        assert!(messaging_enabled(&dir));
         let _ = std::fs::remove_dir_all(dir);
     }
 

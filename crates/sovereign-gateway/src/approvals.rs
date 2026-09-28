@@ -44,6 +44,8 @@ pub struct Hub {
     /// Sessions running unattended (`/api/agent/run`): every approval is
     /// denied immediately, with no desktop prompt and no grant ever applying.
     headless: Mutex<HashSet<String>>,
+    /// Bot chat key (`/api/agent/run` `session_key`) -> its engine session, so one chat is one conversation.
+    bot_sessions: Mutex<HashMap<String, String>>,
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
 }
 
@@ -67,12 +69,31 @@ impl Hub {
         self.clients.lock().await.push(client);
     }
 
+    /// Whether a desktop window has `session` open (the driver's engine link
+    /// yields to it: the window renders, observes and prompts).
+    pub async fn has_window(&self, session_id: &str) -> bool {
+        for client in self.clients.lock().await.iter() {
+            if client.sessions.lock().await.contains(session_id) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn remove(&self, id: u64) {
         self.clients.lock().await.retain(|c| c.id != id);
     }
 
     pub fn next_client_id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn bot_session(&self, key: &str) -> Option<String> {
+        self.bot_sessions.lock().await.get(key).cloned()
+    }
+
+    pub async fn set_bot_session(&self, key: &str, session_id: &str) {
+        self.bot_sessions.lock().await.insert(key.to_string(), session_id.to_string());
     }
 
     pub async fn mark_headless(&self, session_id: &str) {
@@ -330,6 +351,15 @@ mod tests {
         let id = request_id(rx2.recv().await.unwrap());
         assert!(hub.answer(&id, "deny").await);
         assert_eq!(asked.await.unwrap(), "deny");
+    }
+
+    #[tokio::test]
+    async fn bot_chat_key_maps_to_one_session() {
+        let hub = Hub::default();
+        assert_eq!(hub.bot_session("telegram:1").await, None);
+        hub.set_bot_session("telegram:1", "s1").await;
+        assert_eq!(hub.bot_session("telegram:1").await.as_deref(), Some("s1"));
+        assert_eq!(hub.bot_session("telegram:2").await, None);
     }
 
     #[tokio::test]
