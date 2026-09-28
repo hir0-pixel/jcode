@@ -168,6 +168,19 @@ fn store(home: &Path) -> Result<std::sync::Arc<sovereign_prime::entries::EntrySt
     sovereign_prime::entries::EntryStore::open_cached(home).context("opening learning store")
 }
 
+/// A learned memory's text lives once, in jcode's memory store; its harness
+/// entry only holds `reference.memory_id` (see `refine::MemorySink`). Entries
+/// without a pointer (learning off) carry their own text.
+fn memory_body(entry: &sovereign_prime::entries::HarnessEntry) -> String {
+    entry.reference["memory_id"]
+        .as_str()
+        .and_then(|id| {
+            let graph = jcode_base::memory::MemoryManager::new().load_global_graph().ok()?;
+            graph.get_memory(id).map(|m| m.content.clone())
+        })
+        .unwrap_or_else(|| entry.content.clone())
+}
+
 fn graph(home: &Path) -> Result<Value> {
     let store = store(home)?;
     graph_from_store(&store)
@@ -195,7 +208,7 @@ fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Valu
         let timestamp = entry.created_at_ms / 1000;
         if kind == "memory" {
             memory.push(json!({
-                "source": "memory", "timestamp": timestamp, "title": entry.title, "body": entry.content,
+                "source": "memory", "timestamp": timestamp, "title": entry.title, "body": memory_body(&entry),
             }));
         }
         nodes.push(json!({
@@ -251,7 +264,7 @@ fn node_from_store(
         return Ok(None);
     }
     Ok(Some(
-        json!({"ok": true, "kind": entry.kind.as_str(), "label": entry.title, "content": entry.content}),
+        json!({"ok": true, "kind": entry.kind.as_str(), "label": entry.title, "content": memory_body(&entry)}),
     ))
 }
 
@@ -274,6 +287,9 @@ fn delete_from_store(
         return Ok(None);
     }
     store.delete(id)?;
+    if let Some(memory_id) = entry.reference["memory_id"].as_str() {
+        let _ = jcode_base::memory::MemoryManager::new().forget(memory_id);
+    }
     Ok(Some(
         json!({"ok": true, "message": format!("deleted '{}'", entry.title)}),
     ))
@@ -309,13 +325,23 @@ fn edit_in_store(
             "message": format!("content exceeds {} characters", sovereign_prime::entries::MAX_CONTENT_CHARS),
         })));
     }
-    store.update(
-        id,
-        sovereign_prime::entries::EntryPatch {
-            content: Some(content.to_string()),
-            ..Default::default()
-        },
-    )?;
+    if let Some(memory_id) = entry.reference["memory_id"].as_str() {
+        let manager = jcode_base::memory::MemoryManager::new();
+        let mut graph = manager.load_global_graph()?;
+        if let Some(memory) = graph.get_memory_mut(memory_id) {
+            memory.content = content.to_string();
+            memory.updated_at = chrono::Utc::now();
+            manager.save_global_graph(&graph)?;
+        }
+    } else {
+        store.update(
+            id,
+            sovereign_prime::entries::EntryPatch {
+                content: Some(content.to_string()),
+                ..Default::default()
+            },
+        )?;
+    }
     Ok(Some(
         json!({"ok": true, "message": format!("updated '{}'", entry.title)}),
     ))

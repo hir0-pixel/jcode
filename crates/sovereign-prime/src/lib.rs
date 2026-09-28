@@ -6,10 +6,9 @@ pub mod agent_loop;
 pub mod agent_loop_host;
 mod bundled_skills;
 pub mod entries;
-pub mod harness;
 pub mod host;
-pub mod learning;
 pub mod refine;
+pub mod skill_files;
 mod worker;
 
 pub use host::{LlmQuery, ReplHost, RunOutput};

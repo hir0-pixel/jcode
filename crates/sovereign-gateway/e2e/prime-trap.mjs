@@ -124,7 +124,7 @@ async function withEngine(fn) {
   if (!proxyErr.includes('listening on')) { proxy.kill('SIGTERM'); throw new Error(`proxy did not start: ${proxyErr}`) }
 
   const token = crypto.randomBytes(24).toString('hex')
-  const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_IDLE_MS: String(IDLE_MS) }
+  const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
   delete env.SOVEREIGN_LEARNING // let the default (local-idle) switch learning on for a loopback model
   const engine = spawn(BIN, ['--provider-profile', 'bench', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
@@ -227,10 +227,11 @@ async function runRepetition(n) {
       results.a.cost = costOf(results.a, PRICE)
 
       // --- Wait for a learning pass over session A ---
-      const logFile = path.join(jcodeHome, 'harness', 'log.jsonl')
+      // Learning is Prime's checkpoint gate (SOVEREIGN_LEARN_TURN_INTERVAL=1): the
+      // engine announces a pass that changed the harness as status.update kind=learning.
       const t0 = Date.now()
-      const learnLog = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [])
-      while (!learnLog().some(e => e.op === 'learn' && e.session === a) && Date.now() - t0 < IDLE_MS + 120_000) await sleep(1000)
+      const learned = () => client.events.some(e => e.session_id === a && e.type === 'status.update' && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || ''))
+      while (!learned() && Date.now() - t0 < IDLE_MS + 120_000) await sleep(1000)
 
       // --- Session B: same instruction, brand-new chat, fresh trap repo ---
       const dirB = fs.mkdtempSync(path.join(os.tmpdir(), `prime-trap-b-${n}-`))

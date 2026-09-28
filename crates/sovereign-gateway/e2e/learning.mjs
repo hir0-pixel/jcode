@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Live check of the Prime learning loop: a chat with a learning signal gets
-// exactly one pass after it goes idle (memories and/or a rule, logged, the
-// desktop told); a chat without one costs no learning call. Needs Ollama.
+// Live check of the Prime learning loop (checkpoint gate, turn interval 1): after
+// a turn the gate is asked once; when it approves, /refine CRUD stores the lesson
+// (a memory lives once in jcode's memory store), the desktop is told, and a
+// brand-new chat applies it. Needs Ollama.
 //
 //   node crates/sovereign-gateway/e2e/learning.mjs
 import { spawn } from 'node:child_process'
@@ -12,7 +13,6 @@ import path from 'node:path'
 
 const BIN = process.env.SOVEREIGN_BIN || path.resolve('target/release/sovereign')
 const MODEL = process.env.E2E_MODEL || 'sovereign/bench-hermes-64k:latest'
-const IDLE_MS = 4000
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sovereign-learning-e2e-'))
 const jcodeHome = path.join(home, '.jcode')
 fs.mkdirSync(jcodeHome, { recursive: true })
@@ -29,7 +29,7 @@ const check = (cond, msg) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 // Default mode (local-idle) must switch learning on for a loopback model.
-const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_IDLE_MS: String(IDLE_MS) }
+const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
 delete env.SOVEREIGN_LEARNING
 const engine = spawn(BIN, ['--provider-profile', 'local', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
 let stderr = ''
@@ -71,40 +71,29 @@ const turn = async (sid, text) => {
   }
   throw new Error('turn timed out')
 }
-const logFile = path.join(jcodeHome, 'harness', 'log.jsonl')
-const learnLog = sid => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [])
-  .filter(e => e.op === 'learn' && e.session === sid)
-const watermark = sid => {
-  const f = path.join(jcodeHome, 'harness', 'learned.json')
-  return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8'))[sid] : undefined
-}
+const learnedNote = sid => events.find(e => e.type === 'status.update' && e.session_id === sid && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || ''))
+const graph = async () => (await fetch(`http://127.0.0.1:${port}/api/learning/graph`, { headers: { 'X-Hermes-Session-Token': token } })).json()
 
 try {
-  // 1. No signal: a plain question. The pass must not call the model.
+  // 1. A plain question: the gate may say no; nothing must break.
   const plain = (await rpc('session.create', { cwd: home })).result.session_id
-  await turn(plain, 'What is 2 plus 2? Reply with just the number.')
-  const t0 = Date.now()
-  while (watermark(plain) === undefined && Date.now() - t0 < IDLE_MS + 30_000) await sleep(500)
-  check(watermark(plain) > 0, `no-signal chat is examined after idle (watermark ${watermark(plain)})`)
-  check(learnLog(plain).length === 0, 'no-signal chat costs no learning call')
+  const done = await turn(plain, 'What is 2 plus 2? Reply with just the number.')
+  check(done.type === 'message.complete', 'a plain chat completes with learning on')
 
-  // 2. Signal: an explicit "from now on ... remember".
+  // 2. An explicit "from now on ... remember" is a durable preference.
   const taught = (await rpc('session.create', { cwd: home })).result.session_id
-  const from = events.length
   await turn(taught, 'From now on, whenever I ask for a quick script, write it in Nim. Please remember that.')
   const t1 = Date.now()
-  while (learnLog(taught).length === 0 && Date.now() - t1 < IDLE_MS + 300_000) await sleep(1000)
-  const entries = learnLog(taught)
-  check(entries.length === 1, `one learning pass for the signal chat (${entries.length})`)
-  const e = entries[0] || {}
-  check(e.signals?.explicit === true, 'the explicit request was the signal')
-  check((e.memories_stored || 0) + (e.rule ? 1 : 0) >= 1, `something was learned (memories ${e.memories_stored}, rule ${JSON.stringify(e.rule)})`)
-  const note = events.slice(from).find(ev => ev.type === 'status.update' && ev.session_id === taught && ev.payload?.kind === 'learning')
-  check(Boolean(note), `the desktop is told what was learned (${note?.payload?.text})`)
+  while (!learnedNote(taught) && Date.now() - t1 < 300_000) await sleep(1000)
+  const note = learnedNote(taught)
+  check(Boolean(note), `the gate approved and the desktop is told what was learned (${note?.payload?.text})`)
+  const g = await graph()
+  const mem = (g.memory || []).find(m => /nim/i.test(m.body || ''))
+  check(Boolean(mem), 'the preference is stored as one memory entry (graph memory body mentions Nim)')
 
-  // 3. No second pass without new messages.
-  await sleep(IDLE_MS + 3000)
-  check(learnLog(taught).length === 1, 'no repeat pass over already-seen messages')
+  // 3. No repeat pass without new turns beyond the interval: one note per turn at most.
+  await sleep(3000)
+  check(events.filter(e => e.session_id === taught && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || '')).length <= 1, 'no repeat pass over already-seen messages')
 
   // 4. The lesson is usable in a brand-new chat.
   const fresh = (await rpc('session.create', { cwd: home })).result.session_id

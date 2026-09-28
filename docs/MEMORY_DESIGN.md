@@ -26,12 +26,16 @@ this proposal:
   for manual `hermes curator run`). jcode's LLM memory-extraction sidecar (a model call every
   12 turns and on every disconnect), its rerank/judge path, the remote Jev relevance service
   (memory, browser handoff, voice intent) and their config keys are removed from the engine.
-- **M3 learning loop** (`sovereign-prime/src/learning.rs`, `sovereign-gateway/src/learn.rs`):
-  automatic after a chat goes idle (or after 10 unexamined turns), signal-gated with no model
-  call when there is no signal, one call per pass, evidence from user/assistant messages only,
-  at most 3 memories plus one instruction change through the `/refine` gates, a per-chat
-  watermark so nothing is examined twice. `SOVEREIGN_LEARNING=off|on|local-idle` (default:
-  learns only on a local model).
+- **M3 learning loop** (`sovereign-gateway/src/learn.rs`, `sovereign-prime/src/refine.rs`): Prime's
+  own auto-refine trigger (`reviewAutoRefine`): every `turnInterval` (25) assistant turns and after
+  a `cooldownMs` (20 min) one cheap gate call decides whether `/refine` is worth running; a "no"
+  costs only that call. No idle timer and no keyword pre-filter. A "yes" runs the one `/refine`
+  CRUD path (prompt / memory / skill / subagent entries in `EntryStore`, changeset + rollback).
+  A learned memory's text is stored once, in jcode's memory store (recalled and injected once by
+  jcode's own recall); its `EntryStore` row keeps a label and `reference.memory_id`. Skill
+  entries carry Prime's mandatory `reference{type,import,callable}` + `arguments` and are written
+  as `~/.jcode/skills/<slug>/SKILL.md`. `SOVEREIGN_LEARNING=off|on|local-idle` (default: learns
+  only on a local model); `SOVEREIGN_LEARN_TURN_INTERVAL` / `SOVEREIGN_LEARN_COOLDOWN_MS` override.
 - **No `memory_injections` table:** jcode already records each injection in the session
   (persisted) and restores the inject-once set when a session is resumed; a table would
   store the same fact twice.

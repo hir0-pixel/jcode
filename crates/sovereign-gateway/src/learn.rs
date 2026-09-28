@@ -1,47 +1,101 @@
 //! Automatic learning (the Prime loop) for chats served by this gateway.
 //!
-//! After every completed turn a timer starts. When it fires and the chat is
-//! still idle (no newer turn, nothing running), one pass looks at the messages
-//! no earlier pass has seen: with no learning signal it records the watermark
-//! and stops (no model call); with one it makes a single call, stores the
-//! evidenced memories and applies an evidenced instruction change through the
-//! Continual Harness gates. Long chats that never go idle for long get a short
-//! timer once ten turns have gone unexamined, like Hermes's review cadence.
+//! Ports Prime Agent's `reviewAutoRefine` / `_maybeAutoRefine` semantics
+//! (`refinement.ts`, `agent-session.ts`): a per-session turn counter, no
+//! idle wait. Once `turn_interval` assistant turns have passed since the
+//! last review (and a cooldown has elapsed), one lightweight model call
+//! ("the gate") decides whether anything here is worth a `/refine` pass; a
+//! "no" costs exactly that one call and resets the counter, same as a "yes".
+//! There is no free keyword pre-filter: Prime has none, so this doesn't
+//! either. A "yes" runs the existing full-CRUD `/refine` (all four entry
+//! kinds, including memory and executable skills) exactly once - the same
+//! path the interactive `/refine` command and the model-callable `refine`
+//! tool use, so there is one learning pipeline, not two.
 
 use crate::rpc::Conn;
-use serde_json::json;
-use sovereign_prime::harness::{Harness, Outcome, Turn};
-use sovereign_prime::learning::{self, Memory, SkillOutcome};
+use sovereign_prime::refine::{MemorySink, Turn, parse_json_object, transcript};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Store learned memories; `cwd` is the chat's working directory. Returns how
-/// many were new (duplicates only reinforce).
-pub type Remember = Arc<dyn Fn(Vec<Memory>, Option<String>) -> anyhow::Result<usize> + Send + Sync>;
+/// Stores a proposed memory's text in jcode's own memory store and returns
+/// its id; `cwd` is the chat's working directory. Never runs in Python.
+pub type Remember = Arc<dyn Fn(&str, &str, bool, Option<&str>) -> anyhow::Result<String> + Send + Sync>;
+/// Removes a memory stored through [`Remember`] (rollback / refine delete).
+pub type Forget = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Learning {
-    /// Idle time after a turn before a pass runs.
-    pub idle: Duration,
+    /// Assistant turns since the last auto-refine review before the gate is
+    /// asked again (Prime default: 25; `settings.autoRefine.turnInterval`).
+    pub turn_interval: usize,
+    /// Minimum time between two gate calls, regardless of turn count
+    /// (Prime default: 20 minutes; `settings.autoRefine.cooldownMs`).
+    pub cooldown: Duration,
     pub remember: Remember,
-    /// Prime's auto-refine review (`learning.review`, default off/`false`):
-    /// when on, every pass that has a learning signal (the same free gate
-    /// above) also asks the model for a full Continual Harness CRUD proposal
-    /// (`sovereign_prime::refine`) and applies it through the same
-    /// evidence-gated path `/refine` uses. Off, a pass behaves exactly as
-    /// before this existed.
-    pub review: bool,
+    pub forget: Forget,
 }
 
-/// Unexamined turns after which the short timer applies.
-pub const CADENCE_TURNS: usize = 10;
-pub const CADENCE_IDLE: Duration = Duration::from_secs(15);
+/// Runs `f` with the bridge to jcode's memory store (`None` when learning is
+/// off, in which case memory entries just carry their text).
+pub(crate) fn with_sink<R>(
+    learning: Option<&Learning>,
+    cwd: Option<String>,
+    f: impl FnOnce(Option<&MemorySink<'_>>) -> R,
+) -> R {
+    let Some(l) = learning else { return f(None) };
+    let remember = |text: &str, category: &str, user_stated: bool| {
+        (l.remember)(text, category, user_stated, cwd.as_deref())
+    };
+    let forget = |id: &str| (l.forget)(id);
+    f(Some(&MemorySink { remember: &remember, forget: &forget }))
+}
 
-/// One learning pass over `session`'s unexamined messages. Returns a short
-/// human summary when something was learned.
-pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -> anyhow::Result<Option<String>> {
+/// Prime's `AUTO_REFINE_REVIEW_SYSTEM_PROMPT` / `parseAutoRefineReview`: one
+/// cheap call that decides whether a `/refine` pass is worth its cost.
+struct GateReview {
+    should_refine: bool,
+    instructions: Option<String>,
+}
+
+fn gate_request(turns_since_last_review: usize, fresh: &[Turn]) -> (String, String) {
+    let system = "You are this agent's automatic /refine review gate. Decide whether this checkpoint should run \
+                  /refine. Auto /refine writes local Continual Harness state by default, so approve when the \
+                  trajectory contains evidence useful to this session's future turns. Reject one-off noise, \
+                  unsupported hypotheses, and transient tool output. Return JSON only: {\"shouldRefine\": true|false, \
+                  \"rationale\": <short reason>, \"instructions\": <optional concise instructions for /refine if \
+                  shouldRefine is true>}."
+        .to_string();
+    let user = format!(
+        "Trigger: turn_interval; {turns_since_last_review} assistant turns since the last auto-refine review.\n\n\
+         Conversation:\n{}",
+        transcript(fresh)
+    );
+    (system, user)
+}
+
+fn parse_gate_review(reply: &str) -> GateReview {
+    let Some(value) = parse_json_object(reply) else {
+        return GateReview { should_refine: false, instructions: None };
+    };
+    GateReview {
+        should_refine: value["shouldRefine"].as_bool().unwrap_or(false),
+        instructions: value["instructions"].as_str().map(str::to_string),
+    }
+}
+
+/// One learning checkpoint over `session`'s unexamined messages: the pending
+/// scheduled `/refine` request (if any) always runs first, then the
+/// turn-interval gate. `turns_since_review` is the caller's count of
+/// assistant turns since the last gate call (kept in `rpc.rs`, which also
+/// enforces the turn-interval and cooldown before calling `pass` at all).
+/// Returns a short human summary when something ran.
+pub(crate) async fn pass(
+    conn: &Arc<Conn>,
+    session: &str,
+    learning: &Learning,
+    gate_due: Option<usize>,
+) -> anyhow::Result<Option<String>> {
     let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
-    let harness = Harness::new(std::path::Path::new(&conn.config().home));
     let history = conn.history(session).await?;
     let turns: Vec<Turn> = history["messages"]
         .as_array()
@@ -69,8 +123,9 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
                 session, "learning", Some("Scheduled refine"), None, None, started,
                 reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
             );
+            let cwd = conn.session_cwd(session).await;
             refine_summary = match reply {
-                Ok(done) => match sovereign_prime::refine::apply(store, session, &done.text, &turns, global, "refine-tool") {
+                Ok(done) => match with_sink(Some(learning), cwd, |sink| sovereign_prime::refine::apply(store, session, &done.text, &turns, global, "refine-tool", sink)) {
                     Ok(outcome) => Some(outcome.summary),
                     Err(err) => Some(format!("no change ({err:#})")),
                 },
@@ -78,84 +133,70 @@ pub(crate) async fn pass(conn: &Arc<Conn>, session: &str, learning: &Learning) -
             };
         }
     }
+    // Not a checkpoint turn: only the scheduled request above was due.
+    let (Some(turns_since_review), Some(store)) = (gate_due, &store) else {
+        return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
+    };
     // An undo or rewind can leave fewer messages than the watermark.
-    let seen = harness.watermark(session).min(turns.len());
+    let seen = store.watermark(session).min(turns.len());
     let fresh = &turns[seen..];
     if fresh.is_empty() {
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
-    let signals = learning::signals(fresh);
-    if !signals.any() {
-        harness.set_watermark(session, turns.len())?;
+
+    // The gate: one cheap call, always asked once the turn-interval and
+    // cooldown allow it (the caller in `rpc.rs` enforces both before calling
+    // `pass` at all). No keyword pre-filter: Prime has none either.
+    let (gsystem, guser) = gate_request(turns_since_review, fresh);
+    let gate_started = crate::observability::now();
+    let greply = complete(gsystem, guser).await;
+    conn.observer.record_aux(
+        session, "learning", Some("Auto-refine gate"), None, None, gate_started,
+        greply.as_ref().ok().and_then(|d| d.usage), greply.as_ref().err().map(|e| e.to_string()).as_deref(),
+    );
+    store.set_watermark(session, turns.len())?;
+    let review = match greply {
+        Ok(done) => parse_gate_review(&done.text),
+        Err(_) => GateReview { should_refine: false, instructions: None },
+    };
+    if !review.should_refine {
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
-    let (system, user) = learning::request(&harness, fresh, signals.effort);
+
+    let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, review.instructions.as_deref(), false);
     let started = crate::observability::now();
-    let reply = complete(system, user).await;
-    conn.observer.record_aux(session, "learning", Some("Learning pass"), None, None, started, reply.as_ref().ok().and_then(|done| done.usage), reply.as_ref().err().map(|err| err.to_string()).as_deref());
-    let learned = learning::apply(&harness, &reply?.text, fresh, signals.effort).map_err(anyhow::Error::msg)?;
+    let reply = complete(system, user).await?;
+    conn.observer.record_aux(
+        session, "learning", Some("Auto-refine"), None, None, started, reply.usage, None,
+    );
     let cwd = conn.session_cwd(session).await;
-    let stored = if learned.memories.is_empty() { 0 } else { (learning.remember)(learned.memories, cwd)? };
-    harness.set_watermark(session, turns.len())?;
-    let rule = match &learned.harness {
-        Ok(Outcome::Updated { changes, .. }) => Some(changes.clone()),
-        _ => None,
-    };
-    let skill_name = match &learned.skill {
-        Ok(Some(SkillOutcome::Created { name })) => Some(format!("new skill \"{name}\"")),
-        Ok(Some(SkillOutcome::Updated { name })) => Some(format!("updated skill \"{name}\"")),
-        _ => None,
-    };
-    // Prime's auto-refine review: same signal gate, one extra model call that
-    // may propose a full Continual Harness changeset (any of the 4 entry
-    // kinds), applied through the same gate `/refine` uses.
-    let mut review_summary = None;
-    if learning.review {
-        if let Some(store) = &store {
-            let (rsystem, ruser) = sovereign_prime::refine::build_request(store, session, fresh, None, false);
-            let rstarted = crate::observability::now();
-            let rreply = complete(rsystem, ruser).await;
-            conn.observer.record_aux(
-                session, "learning", Some("Auto-refine review"), None, None, rstarted,
-                rreply.as_ref().ok().and_then(|d| d.usage), rreply.as_ref().err().map(|e| e.to_string()).as_deref(),
-            );
-            if let Ok(done) = rreply {
-                match sovereign_prime::refine::apply(&store, session, &done.text, fresh, false, "auto") {
-                    Ok(outcome) => {
-                        harness.log(json!({"op": "auto_refine", "session": session, "changeset": outcome.changeset_id, "summary": outcome.summary}))?;
-                        review_summary = Some(outcome.summary);
-                    }
-                    Err(_) => {} // no durable edit this pass; not an error worth surfacing
-                }
-            }
-        }
-    }
-    harness.log(json!({
-        "op": "learn",
-        "session": session,
-        "signals": {"correction": signals.correction, "explicit": signals.explicit, "effort": signals.effort},
-        "memories_stored": stored,
-        "rejected": learned.rejected,
-        "rule": rule,
-        "rule_rejected": learned.harness.as_ref().err(),
-        "skill": skill_name,
-        "skill_rejected": learned.skill.as_ref().err(),
-    }))?;
-    let mut parts = Vec::new();
-    if stored > 0 {
-        parts.push(format!("{stored} new memor{}", if stored == 1 { "y" } else { "ies" }));
-    }
-    if let Some(rule) = &rule {
-        parts.push(format!("instructions: {rule}"));
-    }
-    if let Some(skill) = &skill_name {
-        parts.push(skill.clone());
-    }
-    if let Some(summary) = &review_summary {
-        parts.push(format!("auto-refine: {summary}"));
-    }
+    let outcome = with_sink(Some(learning), cwd, |sink| {
+        sovereign_prime::refine::apply(store, session, &reply.text, fresh, false, "auto", sink)
+    })
+    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    let mut parts = vec![outcome.summary];
     if let Some(summary) = &refine_summary {
         parts.push(format!("refine: {summary}"));
     }
-    Ok((!parts.is_empty()).then(|| format!("Learned {}.", parts.join("; "))))
+    Ok(Some(format!("Learned {}.", parts.join("; "))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_reply_parsing_defaults_to_no() {
+        let yes = parse_gate_review("```json\n{\"shouldRefine\": true, \"instructions\": \"save the pnpm rule\"}\n```");
+        assert!(yes.should_refine && yes.instructions.as_deref() == Some("save the pnpm rule"));
+        assert!(!parse_gate_review("not json at all").should_refine);
+        assert!(!parse_gate_review("{\"shouldRefine\": false}").should_refine);
+    }
+
+    #[test]
+    fn gate_request_is_one_bounded_call_with_the_turn_count() {
+        let turns = vec![Turn { role: "user".into(), text: "hello".into() }];
+        let (_, user) = gate_request(25, &turns);
+        assert!(user.contains("25 assistant turns") && user.contains("hello"));
+    }
 }

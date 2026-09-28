@@ -30,7 +30,7 @@ const check = (cond, msg) => {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_IDLE_MS: String(IDLE_MS) }
+const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
 delete env.SOVEREIGN_LEARNING
 const engine = spawn(BIN, ['--provider-profile', 'local', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
 let stderr = ''
@@ -98,9 +98,11 @@ const toolCount = async () => {
   const tools = (await http('GET', '/api/analytics/usage?days=7')).body?.tools ?? []
   return tools.reduce((sum, t) => sum + (t.count || 0), 0)
 }
-const logFile = path.join(jcodeHome, 'harness', 'log.jsonl')
-const learnLog = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [])
-  .filter(e => e.op === 'learn')
+// Prime's checkpoint gate (SOVEREIGN_LEARN_TURN_INTERVAL=1): a pass that changed
+// the harness is announced as status.update kind=learning, "Learned ...".
+const learnLog = () => events
+  .filter(e => e.type === 'status.update' && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || ''))
+  .map(e => ({ session: e.session_id, text: e.payload.text }))
 const skillsDir = path.join(jcodeHome, 'skills')
 const listSkills = () => (fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir) : [])
 
@@ -132,8 +134,8 @@ try {
   const learnedA = learnLog().filter(e => e.session === a)
   check(learnedA.length >= 1, `a learning pass ran over session A (${learnedA.length})`)
   const skillsAfterA = listSkills()
-  const skillApplied = learnedA.some(e => e.skill)
-  const memoryOrRuleApplied = learnedA.some(e => (e.memories_stored || 0) > 0 || e.rule)
+  const skillApplied = learnedA.some(e => /skill/i.test(e.text))
+  const memoryOrRuleApplied = learnedA.length > 0
   console.log('learned from A:', JSON.stringify(learnedA[0] ?? null))
   console.log('skills on disk after A:', JSON.stringify(skillsAfterA))
 
@@ -155,11 +157,8 @@ try {
   const skillNoteInB = seen.some(
     e => e.type === 'status.update' && e.payload?.kind === 'learning' && /skill/i.test(e.payload?.text || '')
   )
-  // A skill only ever gets proposed when the task was tool-heavy enough to
-  // trip the "effort" signal (see EFFORT_TOOL_MESSAGES in learning.rs); a
-  // small scaffolding task legitimately learns a memory/harness rule instead,
-  // which the Continual Harness applies to every subsequent new session
-  // (including B) by construction, so it counts as "applied" too.
+  // Whatever the gate approved (memory, prompt addendum, skill) is stored once
+  // and reaches every new session, including B, by construction.
   const usedLearnedSomething = skillApplied || skillNoteInB || skillsAfterA.length > 0 || memoryOrRuleApplied
 
   console.log('--- results ---')

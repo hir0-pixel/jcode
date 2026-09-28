@@ -59,6 +59,7 @@ const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS harness_changesets_recent ON harness_changesets(session, created_at_ms DESC);
     CREATE TABLE IF NOT EXISTS harness_seq(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS harness_watermark(session TEXT PRIMARY KEY, seen INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS harness_pending_refine(
         session TEXT PRIMARY KEY,
         instructions TEXT,
@@ -788,6 +789,26 @@ impl EntryStore {
             "INSERT INTO harness_pending_refine(session, instructions, global, created_at_ms) VALUES (?1,?2,?3,?4) \
              ON CONFLICT(session) DO UPDATE SET instructions = ?2, global = ?3, created_at_ms = ?4",
             params![session, instructions, global as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// How many messages of `session` an auto-refine checkpoint has already
+    /// seen, so a restart never re-examines them.
+    pub fn watermark(&self, session: &str) -> usize {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row("SELECT seen FROM harness_watermark WHERE session = ?1", [session], |r| r.get::<_, i64>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0) as usize
+    }
+
+    pub fn set_watermark(&self, session: &str, seen: usize) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO harness_watermark(session, seen) VALUES (?1,?2) ON CONFLICT(session) DO UPDATE SET seen = ?2",
+            params![session, seen as i64],
         )?;
         Ok(())
     }
