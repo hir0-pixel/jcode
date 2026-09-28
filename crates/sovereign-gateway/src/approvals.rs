@@ -149,8 +149,6 @@ pub struct Hub {
     shown: Mutex<HashMap<String, (String, Value)>>,
     /// Sessions where the user chose "session" (allow for the rest of it).
     session_grants: Mutex<HashSet<String>>,
-    /// The user chose "always": allow until the engine restarts.
-    always: std::sync::atomic::AtomicBool,
     next: AtomicU64,
     /// Sessions running unattended (`/api/agent/run`) -> their surface ("cron" | "bot"). No desktop
     /// prompt ever waits on them; see [`Hub::unattended`].
@@ -331,10 +329,12 @@ impl Hub {
         if self.headless.lock().await.contains_key(session_id) {
             return self.unattended(session_id, tool, command, reason).await;
         }
-        if self.always.load(Ordering::Relaxed) {
-            let choice = "session".to_string();
-            self.audit(session_id, tool, command, &choice, "session-grant");
-            return choice;
+        // "always" is per command, as in Hermes: its permanent allowlist (or, when the config
+        // can't take the grant, a sticky in-memory one) — never a blanket allow-everything.
+        let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
+        if home.as_deref().is_some_and(|home| allowlisted(home, command)) || self.sticky_grants.lock().await.contains(command) {
+            self.audit(session_id, tool, command, "always", "allowlist");
+            return "always".into();
         }
         if self.session_grants.lock().await.contains(session_id) {
             let choice = "session".to_string();
@@ -382,7 +382,12 @@ impl Hub {
             "session" => {
                 self.session_grants.lock().await.insert(session_id.to_string());
             }
-            "always" => self.always.store(true, Ordering::Relaxed),
+            "always" => {
+                let saved = home.as_deref().is_some_and(|home| allow_permanently(home, command));
+                if !saved {
+                    self.sticky_grants.lock().await.insert(command.to_string());
+                }
+            }
             _ => {}
         }
         let timed_out = choice == "deny";
@@ -557,6 +562,19 @@ mod tests {
         assert_eq!(asked.await.unwrap(), "session");
         // Granted for the session: no second prompt.
         assert_eq!(hub.decide("s", "bash", "rm -rf dist", "r").await, "session");
+        // "always" covers that exact command in every session, never other commands.
+        let (_c3, mut rx3) = client(&hub, "u").await;
+        let h = hub.clone();
+        let asked = tokio::spawn(async move { h.decide("u", "bash", "cargo publish", "r").await });
+        let id = request_id(rx3.recv().await.unwrap());
+        assert!(hub.answer(&id, "always").await);
+        assert_eq!(asked.await.unwrap(), "always");
+        assert_eq!(hub.decide("u", "bash", "cargo publish", "r").await, "always");
+        let h = hub.clone();
+        let other = tokio::spawn(async move { h.decide("u", "bash", "git push --force", "r").await });
+        let id = request_id(rx3.recv().await.unwrap());
+        assert!(hub.answer(&id, "deny").await);
+        assert_eq!(other.await.unwrap(), "deny", "an always grant must not allow other commands");
         // Another session still asks, and a denial is final.
         let (_c2, mut rx2) = client(&hub, "t").await;
         let h = hub.clone();

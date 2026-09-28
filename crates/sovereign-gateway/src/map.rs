@@ -249,13 +249,12 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
     out
 }
 
-/// Hermes approval choice → jcode permission decision. `session` maps to a
-/// one-time allow: jcode's `allow_always` persists beyond the session, which
-/// would silently widen what the user granted.
+/// Hermes approval choice → jcode permission decision. Session and permanent
+/// grants are owned by [`crate::approvals::Hub`] (permanent ones in Hermes's
+/// `command_allowlist`), so jcode only ever gets a one-time allow.
 pub fn approval_decision(choice: &str) -> &'static str {
     match choice {
-        "once" | "session" => "allow",
-        "always" => "allow_always",
+        "once" | "session" | "always" => "allow",
         _ => "deny",
     }
 }
@@ -549,7 +548,7 @@ mod tests {
     fn approval_session_scope_never_widens() {
         assert_eq!(approval_decision("once"), "allow");
         assert_eq!(approval_decision("session"), "allow");
-        assert_eq!(approval_decision("always"), "allow_always");
+        assert_eq!(approval_decision("always"), "allow");
         assert_eq!(approval_decision("deny"), "deny");
         assert_eq!(approval_decision("anything-else"), "deny");
     }
