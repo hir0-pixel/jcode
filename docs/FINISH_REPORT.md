@@ -593,3 +593,20 @@ Prime's `steer` delivery cannot interrupt a currently running turn and is
 rejected explicitly. No claim is made that this one delivery mode is equivalent
 to Prime's. The full plain-task schema-token measurement is pending the final
 benchmark gate.
+
+### Follow-up item 5: TUI-free `sovereign` dependency trial (2026-09-28)
+
+**Blocked after compiler trial; no TUI or generic CLI files were deleted.** The
+desktop entrypoint parses only desktop serve arguments and starts the engine
+directly, but it still imports `jcode::cli::provider_init::ProviderChoice` and
+calls `jcode::cli::dispatch::run_gateway`. `cargo tree --offline -e normal -p
+jcode -i jcode-tui` proves the root `jcode` library has a normal dependency on
+`jcode-tui`, and release builds compile it. I trialed replacing the root
+`pub use jcode_tui::*` with `pub use jcode_app_core::*`, then ran
+`cargo check --offline --bin sovereign`: it failed with 49 errors because the
+generic CLI library imports `crate::tui`, `video_export`, and other modules
+only re-exported by `jcode-tui`. The trial change was reverted. A TUI-free
+binary requires first moving the gateway/provider composition root and
+separating the generic CLI into another crate; deleting the re-export or TUI
+crate now would break the workspace. The session-cache and keybind hooks are
+TUI-only, and `run_gateway` does not register them.
