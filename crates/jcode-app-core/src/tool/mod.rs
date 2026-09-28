@@ -14,10 +14,7 @@ mod edit;
 mod edit_stats;
 mod file_diff;
 pub(crate) mod file_lock;
-// The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
 mod delegate;
-#[allow(dead_code)]
-mod goal;
 pub mod inflight;
 mod invalid;
 mod ls;
