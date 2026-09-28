@@ -538,6 +538,43 @@ pub enum Urgency {
 - [ ] Pattern detection (auto-suggest promotions)
 - [ ] Urgency inference from context
 
+## Unattended approvals (cron, bots, goals with no window)
+
+Sovereign runs approval-gated commands (the `pre_tool` hook, then `approvals.rs`) and jcode permission
+requests for sessions nobody is watching: `/api/agent/run` turns (cron fires and bot chats, marked
+`surface: "cron" | "bot"`), and goal, loop and heartbeat continuations when no desktop window can answer.
+Nothing waits for a human there.
+
+**How the reference systems behave**
+
+- Prime Agent has no built-in approval model. Gates are extensions (`examples/extensions/permission-gate.ts`):
+  a pattern list (`rm -rf`, `sudo`, `chmod 777`), a UI prompt when `ctx.hasUI`, and in print/JSON mode
+  (no UI) it blocks by default. Goals and daemon workers run with the client's OS permissions; the tool
+  allowlist (`--tools`) is the only static control.
+- Hermes (`tools/approval.py`): `approvals.mode` (`manual` | `smart` | `off`), `approvals.cron_mode`,
+  `single_query_mode` and `unattended_mode` (`deny` | `approve`, default `deny`; deny blocks instantly so the
+  agent finds another way), a permanent `command_allowlist`, and a hardline blocklist that holds even under
+  `off`.
+
+**Policy implemented (`Hub::unattended`)**
+
+1. Catastrophic commands (home, root, credentials) are always blocked before any approval logic.
+2. An exact command the user approved after the fact runs (see 5).
+3. The user's Hermes config (`$HERMES_HOME/config.yaml`) decides: `approvals.mode: off` allows every
+   unattended surface; `approvals.cron_mode: approve` allows cron; `approvals.unattended_mode: approve` allows
+   bots and goals. Anything else, including a missing or unreadable config, is deny.
+4. A denial is recorded in the observability approvals table (`decision: deny`, `actor: headless-deny`;
+   policy and late approvals appear as `actor: policy` / `user-later`) and parked: the desktop receives a
+   normal `approval` prompt marked `unattended` ("Blocked while unattended (cron): ..."), and a desktop that
+   connects later is shown the open ones. Parked prompts live in memory for 24 h, at most 50.
+5. Answering that prompt records a grant for the exact command text: `once` lets the next unattended run
+   through once, `session` / `always` until the engine restarts. If the session has an active goal, loop or
+   heartbeat it is also told to carry on. A cron or bot run has already ended; its approval only lets the next
+   fire pass.
+
+Not mapped: Hermes's per-pattern `command_allowlist` keys (the engine classifies with `jcode-command-risk`, not
+Hermes's pattern table) and per-profile configs (only `$HERMES_HOME/config.yaml` is read).
+
 ---
 
 *Last updated: 2026-02-08*

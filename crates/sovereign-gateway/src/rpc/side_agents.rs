@@ -84,6 +84,7 @@ impl Conn {
                 cwd.as_deref(),
                 Some(title),
                 None,
+                RunOpts::default(),
                 RUN_TIMEOUT,
             )
             .await;

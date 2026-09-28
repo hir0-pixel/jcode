@@ -92,6 +92,25 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
     });
 }
 
+/// The user approved a command this goal session was denied while unattended: tell it so it can
+/// go on. Only sessions with an active goal, loop or heartbeat are resumed (a cron or bot run has
+/// ended; its late approval just lets the next run through).
+pub(crate) fn resume(session_id: &str, command: &str) {
+    let Some(driver) = DRIVER.get().cloned() else { return };
+    let (sid, text) = (
+        session_id.to_string(),
+        format!("The user has now approved this command: {command}\nYou may run it; carry on with the task."),
+    );
+    tokio::spawn(async move {
+        let active = ControlStore::open_cached(Path::new(&driver.conn.config.home)).and_then(|s| s.active_sessions());
+        if active.is_ok_and(|a| a.contains(&sid)) {
+            if let Err(err) = driver.conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
+                eprintln!("sovereign: resume {sid} after approval: {}", err.message);
+            }
+        }
+    });
+}
+
 fn prompt_of(continuation: Continuation) -> String {
     match continuation {
         Continuation::Goal(p) | Continuation::Autonomous(p) => p,

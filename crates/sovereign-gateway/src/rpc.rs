@@ -405,7 +405,9 @@ impl Conn {
     }
 
     /// Send a message and wait until jcode acknowledges it (or rejects it).
-    async fn submit(self: &Arc<Self>, session_id: &str, text: &str) -> Result<()> {
+    /// Send a user message. `reminder` rides the turn's uncached system-reminder slot (not the
+    /// cached static prefix, not the transcript) and lasts for this turn only.
+    async fn submit(self: &Arc<Self>, session_id: &str, text: &str, reminder: Option<&str>) -> Result<()> {
         self.ensure_attached(session_id).await?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.accept_waiters
@@ -418,7 +420,7 @@ impl Conn {
         let reply = self
             .send_on(
                 &link,
-                json!({ "req": "send_message", "session_id": session_id, "content": text }),
+                json!({ "req": "send_message", "session_id": session_id, "content": text, "system_reminder": reminder }),
             )
             .await?;
         tokio::select! {
@@ -523,12 +525,12 @@ impl Conn {
                     description,
                 } => {
                     if self.driver || self.hub.is_headless(&session_id).await {
-                        // Headless (`/api/agent/run`, or the driver with no window open): deny outright, no desktop prompt.
+                        // Unattended (`/api/agent/run`, or the driver with no window open): no prompt waits;
+                        // Hermes's approval config decides, else deny and park it for the desktop.
                         let conn = self.clone();
                         tokio::spawn(async move {
-                            let _ = conn
-                                .resolve_approval(&session_id, &request_id, "deny")
-                                .await;
+                            let choice = conn.hub.unattended(&session_id, &tool_name, &description, "").await;
+                            let _ = conn.resolve_approval(&session_id, &request_id, &choice).await;
                         });
                         continue;
                     }
@@ -1788,7 +1790,7 @@ impl Conn {
                 if let Some(original) = &self.replay_of {
                     self.observer.link_replay(&run, original);
                 }
-                if let Err(err) = self.submit(&id, &text).await {
+                if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str()).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
                 }
@@ -2425,6 +2427,42 @@ pub async fn replay_run(
     }))
 }
 
+/// What differs between headless callers of [`agent_run`].
+pub(crate) struct RunOpts<'a> {
+    /// "cron" | "bot" | "goal": which Hermes unattended-approval setting applies.
+    pub surface: &'static str,
+    /// Per-turn system context (a bot's platform, user and formatting rules), sent as the turn's
+    /// system reminder so it never enters the cached static prefix or the transcript.
+    pub instructions: Option<&'a str>,
+}
+
+impl Default for RunOpts<'_> {
+    fn default() -> Self {
+        Self { surface: "goal", instructions: None }
+    }
+}
+
+/// Bot chat key -> engine session, persisted in `sovereign.db` (`engine_settings`) so a bot
+/// conversation survives an engine restart.
+fn bot_session_setting(key: &str) -> String {
+    format!("bot_session:{key}")
+}
+
+fn load_bot_session(home: &str, key: &str) -> Option<String> {
+    sovereign_prime::entries::EntryStore::open_cached(Path::new(home)).ok()?.setting(&bot_session_setting(key))
+}
+
+fn save_bot_session(home: &str, key: &str, session_id: &str) {
+    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(home)) {
+        let _ = store.set_setting(&bot_session_setting(key), session_id);
+    }
+}
+
+/// The user approved a command an unattended run was denied: a goal session picks its work back up.
+pub(crate) fn resume_after_approval(session_id: &str, command: &str) {
+    driver::resume(session_id, command);
+}
+
 pub(crate) async fn agent_run(
     config: Arc<Config>,
     hub: Arc<Hub>,
@@ -2434,8 +2472,10 @@ pub(crate) async fn agent_run(
     cwd: Option<&str>,
     title: Option<&str>,
     session_key: Option<&str>,
+    opts: RunOpts<'_>,
     timeout: Duration,
 ) -> Result<Value> {
+    let home = config.home.clone();
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
     let client = Arc::new(Client {
         id: hub.next_client_id(),
@@ -2474,10 +2514,7 @@ pub(crate) async fn agent_run(
 
     // A `session_key` (one bot chat) resumes its engine session; otherwise (or on
     // first use) a fresh one is created and remembered under the key.
-    let resumed = match session_key {
-        Some(key) => hub.bot_session(key).await,
-        None => None,
-    };
+    let resumed = session_key.and_then(|key| load_bot_session(&home, key));
     let resumed = match resumed {
         Some(id) => conn
             .dispatch("session.activate", &json!({ "session_id": id, "omit_messages": true }))
@@ -2502,20 +2539,20 @@ pub(crate) async fn agent_run(
                 bail!("engine did not return a session id");
             }
             if let Some(key) = session_key {
-                hub.set_bot_session(key, &id).await;
+                save_bot_session(&home, key, &id);
             }
             id
         }
     };
 
-    // Every approval on this session is denied outright, before it can ever
-    // reach a desktop prompt (see the two `Out::Approval`/`decide` gates).
-    hub.mark_headless(&session_id).await;
+    // Nobody waits on an approval here: both gates (`Out::Approval`, `decide`) apply
+    // the unattended policy (Hermes config, else deny and park for the desktop).
+    hub.mark_headless(&session_id, opts.surface).await;
 
     let outcome = tokio::time::timeout(timeout, async {
         conn.dispatch(
             "prompt.submit",
-            &json!({ "session_id": session_id, "text": prompt }),
+            &json!({ "session_id": session_id, "text": prompt, "system_reminder": opts.instructions }),
         )
         .await
         .map_err(|e| anyhow!(e.message))?;
@@ -2725,4 +2762,25 @@ pub async fn run(
         task.abort();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bot_chat_keeps_its_engine_session_across_an_engine_restart() {
+        let home = std::env::temp_dir().join(format!("bot-sessions-{}", std::process::id()));
+        let home_str = home.to_string_lossy().to_string();
+        assert_eq!(load_bot_session(&home_str, "telegram:1"), None);
+        save_bot_session(&home_str, "telegram:1", "session_a");
+        save_bot_session(&home_str, "telegram:2", "session_b");
+        save_bot_session(&home_str, "telegram:1", "session_c"); // a chat re-mapped
+        // "Restart": a fresh store on the same sovereign.db, not the process-cached one.
+        let reopened = sovereign_prime::entries::EntryStore::open(&home).unwrap();
+        assert_eq!(reopened.setting(&bot_session_setting("telegram:1")).as_deref(), Some("session_c"));
+        assert_eq!(reopened.setting(&bot_session_setting("telegram:2")).as_deref(), Some("session_b"));
+        assert_eq!(load_bot_session(&home_str, "telegram:3"), None);
+        let _ = std::fs::remove_dir_all(home);
+    }
 }

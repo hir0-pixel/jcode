@@ -2,24 +2,25 @@ use std::sync::{LazyLock, RwLock};
 
 use jcode_provider_metadata::{is_safe_env_file_name, is_safe_env_key_name};
 
-/// Fallback resolvers consulted by [`load_api_key_from_env_or_config`] after the
-/// environment and config-file lookups fail. Higher-level crates register
+/// Override resolvers consulted by [`load_api_key_from_env_or_config`] BEFORE the
+/// environment and config files: a key an override owner defines always wins, and
+/// everything else here only fills the gaps it leaves. Higher-level crates register
 /// resolvers at startup so this leaf crate does not need to depend on auth.
-type ApiKeyFallbackResolver = fn(&str) -> Option<String>;
+type ApiKeyOverrideResolver = fn(&str) -> Option<String>;
 
-static API_KEY_FALLBACK_RESOLVERS: LazyLock<RwLock<Vec<ApiKeyFallbackResolver>>> =
+static API_KEY_OVERRIDE_RESOLVERS: LazyLock<RwLock<Vec<ApiKeyOverrideResolver>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 
-/// Register a fallback API-key resolver consulted when env/config lookups miss.
-pub fn register_api_key_fallback_resolver(resolver: ApiKeyFallbackResolver) {
-    API_KEY_FALLBACK_RESOLVERS
+/// Register an API-key resolver that takes precedence over env/config lookups.
+pub fn register_api_key_override_resolver(resolver: ApiKeyOverrideResolver) {
+    API_KEY_OVERRIDE_RESOLVERS
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(resolver);
 }
 
-fn resolve_api_key_fallback(env_key: &str) -> Option<String> {
-    let resolvers = API_KEY_FALLBACK_RESOLVERS
+fn resolve_api_key_override(env_key: &str) -> Option<String> {
+    let resolvers = API_KEY_OVERRIDE_RESOLVERS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for resolver in resolvers.iter() {
@@ -98,6 +99,10 @@ pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option
         return None;
     }
 
+    if let Some(key) = resolve_api_key_override(env_key) {
+        return Some(key);
+    }
+
     if let Ok(key) = std::env::var(env_key)
         && let Some(key) = clean_loaded_value(&key, env_key)
     {
@@ -132,10 +137,6 @@ pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option
                 return Some(key);
             }
         }
-    }
-
-    if let Some(key) = resolve_api_key_fallback(env_key) {
-        return Some(key);
     }
 
     None

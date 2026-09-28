@@ -10,9 +10,16 @@
 //! secret, a malformed request or a hook error all mean "deny". The secret
 //! only lets a caller *create* a prompt; answers come only from an
 //! authenticated desktop socket.
+//!
+//! Unattended runs (cron, bot turns, goals with no window) cannot wait for an
+//! answer: they follow the Hermes approval config (`approvals.mode: off`,
+//! `cron_mode` / `unattended_mode: approve`) and otherwise deny, parking the
+//! blocked command as a normal `approval` prompt on the desktop so the user can
+//! approve it later (see docs/SAFETY_SYSTEM.md).
 
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -21,6 +28,22 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// How long a prompt waits for the user. Shorter than the hook's own limit.
 pub const DECISION_TIMEOUT: Duration = Duration::from_secs(240);
+/// How long a denied unattended command stays open for a late approval.
+const PARK_TTL: Duration = Duration::from_secs(24 * 3600);
+const MAX_PARKED: usize = 50;
+
+/// Whether the user's Hermes config (`$HERMES_HOME/config.yaml`) lets an unattended `surface`
+/// ("cron", "bot", "goal") run approval-gated commands: `approvals.mode: off`, or `cron_mode`
+/// (cron) / `unattended_mode` (everything else) set to `approve`. Default and any read error: no.
+fn policy_allows(home: &Path, surface: &str) -> bool {
+    let approvals = std::fs::read_to_string(home.join("config.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .map(|cfg| cfg["approvals"].clone())
+        .unwrap_or_default();
+    let key = if surface == "cron" { "cron_mode" } else { "unattended_mode" };
+    approvals["mode"].as_str() == Some("off") || approvals[key].as_str() == Some("approve")
+}
 
 /// A desktop connection able to show prompts.
 pub struct Client {
@@ -41,11 +64,13 @@ pub struct Hub {
     /// The user chose "always": allow until the engine restarts.
     always: std::sync::atomic::AtomicBool,
     next: AtomicU64,
-    /// Sessions running unattended (`/api/agent/run`): every approval is
-    /// denied immediately, with no desktop prompt and no grant ever applying.
-    headless: Mutex<HashSet<String>>,
-    /// Bot chat key (`/api/agent/run` `session_key`) -> its engine session, so one chat is one conversation.
-    bot_sessions: Mutex<HashMap<String, String>>,
+    /// Sessions running unattended (`/api/agent/run`) -> their surface ("cron" | "bot"). No desktop
+    /// prompt ever waits on them; see [`Hub::unattended`].
+    headless: Mutex<HashMap<String, &'static str>>,
+    /// Exact commands the user approved after the fact: consumed by the next unattended run needing
+    /// it (`once`), or good until the engine restarts (`session` / `always`).
+    once_grants: Mutex<HashSet<String>>,
+    sticky_grants: Mutex<HashSet<String>>,
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
 }
 
@@ -66,6 +91,13 @@ impl Hub {
     }
 
     pub async fn add(&self, client: Arc<Client>) {
+        // A desktop that connects later still sees what unattended runs were denied meanwhile.
+        for (id, (_, params)) in self.shown.lock().await.iter() {
+            if params["unattended"] == true {
+                let frame = json!({ "jsonrpc": "2.0", "id": id, "method": "approval", "params": params });
+                let _ = client.to_ws.send(Message::Text(frame.to_string())).await;
+            }
+        }
         self.clients.lock().await.push(client);
     }
 
@@ -88,16 +120,8 @@ impl Hub {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn bot_session(&self, key: &str) -> Option<String> {
-        self.bot_sessions.lock().await.get(key).cloned()
-    }
-
-    pub async fn set_bot_session(&self, key: &str, session_id: &str) {
-        self.bot_sessions.lock().await.insert(key.to_string(), session_id.to_string());
-    }
-
-    pub async fn mark_headless(&self, session_id: &str) {
-        self.headless.lock().await.insert(session_id.to_string());
+    pub async fn mark_headless(&self, session_id: &str, surface: &'static str) {
+        self.headless.lock().await.insert(session_id.to_string(), surface);
     }
 
     pub async fn unmark_headless(&self, session_id: &str) {
@@ -105,16 +129,72 @@ impl Hub {
     }
 
     pub async fn is_headless(&self, session_id: &str) -> bool {
-        self.headless.lock().await.contains(session_id)
+        self.headless.lock().await.contains_key(session_id)
+    }
+
+    /// An approval nobody can answer now (a cron / bot turn, or a goal with no desktop): allowed by
+    /// the user's Hermes config or an earlier late approval (`once`), otherwise denied and parked as
+    /// a normal desktop `approval` prompt so the user can approve it later.
+    pub(crate) async fn unattended(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
+        let surface = self.headless.lock().await.get(session_id).copied().unwrap_or("goal");
+        let granted = self.once_grants.lock().await.remove(command) || self.sticky_grants.lock().await.contains(command);
+        let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
+        if granted || home.is_some_and(|home| policy_allows(&home, surface)) {
+            self.audit(session_id, tool, command, "once", if granted { "user-later" } else { "policy" });
+            return "once".into();
+        }
+        self.audit(session_id, tool, command, "deny", "headless-deny");
+        self.park(session_id, tool, command, reason, surface).await;
+        "deny".into()
+    }
+
+    /// Show a denied unattended command on the desktop; an approval records a late grant and, for a
+    /// goal session, resumes it.
+    async fn park(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str, surface: &str) {
+        let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        let params = json!({
+            "session_id": session_id,
+            "request_id": request_id,
+            "command": command.chars().take(4000).collect::<String>(),
+            "description": format!("Blocked while unattended ({surface}): {reason}. Approve to let it run next time."),
+            "tool_name": tool,
+            "choices": ["once", "session", "always", "deny"],
+            "allow_permanent": true,
+            "allow_session": true,
+            "unattended": true,
+        });
+        {
+            let mut shown = self.shown.lock().await;
+            let parked = shown.values().filter(|(_, p)| p["unattended"] == true);
+            if parked.clone().count() >= MAX_PARKED || parked.into_iter().any(|(sid, p)| sid == session_id && p["command"] == command) {
+                return;
+            }
+            shown.insert(request_id.clone(), (session_id.to_string(), params.clone()));
+        }
+        self.pending.lock().await.insert(request_id.clone(), (session_id.to_string(), tx));
+        let frame = json!({ "jsonrpc": "2.0", "id": request_id, "method": "approval", "params": params }).to_string();
+        self.broadcast_text(frame).await;
+        let (hub, session, tool, command) = (self.clone(), session_id.to_string(), tool.to_string(), command.to_string());
+        tokio::spawn(async move {
+            let choice = tokio::time::timeout(PARK_TTL, rx).await.ok().and_then(Result::ok).unwrap_or_default();
+            hub.pending.lock().await.remove(&request_id);
+            hub.shown.lock().await.remove(&request_id);
+            match choice.as_str() {
+                "once" => drop(hub.once_grants.lock().await.insert(command.clone())),
+                "session" | "always" => drop(hub.sticky_grants.lock().await.insert(command.clone())),
+                _ => return,
+            }
+            hub.audit(&session, &tool, &command, &choice, "user-later");
+            crate::rpc::resume_after_approval(&session, &command);
+        });
     }
 
     /// Ask the user whether `command` may run. Returns the Hermes choice
     /// (`once` / `session` / `always` / `deny`).
-    pub async fn decide(&self, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
-        if self.headless.lock().await.contains(session_id) {
-            let choice = "deny".to_string();
-            self.audit(session_id, tool, command, &choice, "headless-deny");
-            return choice;
+    pub async fn decide(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
+        if self.headless.lock().await.contains_key(session_id) {
+            return self.unattended(session_id, tool, command, reason).await;
         }
         if self.always.load(Ordering::Relaxed) {
             let choice = "session".to_string();
@@ -137,9 +217,7 @@ impl Hub {
             if showing.is_empty() { all } else { showing }
         };
         if clients.is_empty() {
-            let choice = "deny".to_string();
-            self.audit(session_id, tool, command, &choice, "headless-deny");
-            return choice;
+            return self.unattended(session_id, tool, command, reason).await;
         }
         let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
@@ -330,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_desktop_means_deny() {
-        assert_eq!(Hub::default().decide("s", "bash", "rm -rf x", "r").await, "deny");
+        assert_eq!(Arc::new(Hub::default()).decide("s", "bash", "rm -rf x", "r").await, "deny");
     }
 
     #[tokio::test]
@@ -354,23 +432,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bot_chat_key_maps_to_one_session() {
-        let hub = Hub::default();
-        assert_eq!(hub.bot_session("telegram:1").await, None);
-        hub.set_bot_session("telegram:1", "s1").await;
-        assert_eq!(hub.bot_session("telegram:1").await.as_deref(), Some("s1"));
-        assert_eq!(hub.bot_session("telegram:2").await, None);
+    async fn unattended_denial_is_parked_for_the_desktop_and_a_late_approval_lets_the_next_run_through() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "other").await;
+        hub.mark_headless("cron-run", "cron").await;
+        // Nobody waits: the run is denied at once, and the desktop gets the prompt anyway.
+        assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "deny");
+        let Message::Text(frame) = rx.recv().await.unwrap() else { panic!() };
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["params"]["unattended"], true);
+        assert_eq!(frame["params"]["command"], "rm -rf build");
+        // The same command is not parked twice; a later desktop connection is shown the open prompt.
+        assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "deny");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(hub.pending_for("cron-run").await.len(), 1);
+        let (_late, mut late_rx) = client(&hub, "x").await;
+        assert_eq!(request_id(late_rx.recv().await.unwrap()), frame["id"].as_str().unwrap());
+        // The user approves it once: the next unattended run passes, exactly once.
+        assert!(hub.answer(frame["id"].as_str().unwrap(), "once").await);
+        for _ in 0..50 {
+            if hub.once_grants.lock().await.contains("rm -rf build") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "once");
+        assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "deny");
+    }
+
+    #[test]
+    fn hermes_approval_config_decides_what_unattended_surfaces_may_run() {
+        let home = std::env::temp_dir().join(format!("approvals-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let allows = |yaml: &str, surface: &str| {
+            std::fs::write(home.join("config.yaml"), yaml).unwrap();
+            policy_allows(&home, surface)
+        };
+        assert!(!policy_allows(&home, "cron"), "no config: deny");
+        assert!(!allows("approvals:\n  mode: smart\n  cron_mode: deny\n", "cron"));
+        assert!(allows("approvals:\n  cron_mode: approve\n", "cron"));
+        assert!(!allows("approvals:\n  cron_mode: approve\n", "bot"), "cron_mode is for cron only");
+        assert!(allows("approvals:\n  unattended_mode: approve\n", "bot"));
+        assert!(allows("approvals:\n  unattended_mode: approve\n", "goal"));
+        assert!(allows("approvals:\n  mode: \"off\"\n", "cron"));
+        assert!(!allows(": not yaml [", "cron"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
-    async fn headless_denies_without_prompting_the_desktop() {
+    async fn headless_sessions_never_wait_on_a_prompt_and_ordinary_sessions_still_ask_afterwards() {
         let hub = Arc::new(Hub::default());
         let (_c, mut rx) = client(&hub, "s").await;
-        hub.mark_headless("s").await;
+        hub.mark_headless("s", "bot").await;
         assert_eq!(hub.decide("s", "bash", "rm -rf x", "r").await, "deny");
-        assert!(rx.try_recv().is_err(), "no approval frame should reach the desktop client");
         hub.unmark_headless("s").await;
-        // Ordinary sessions still prompt afterwards.
+        while rx.try_recv().is_ok() {}
         let h = hub.clone();
         let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf x", "r").await });
         let id = request_id(rx.recv().await.unwrap());

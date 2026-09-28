@@ -9,11 +9,11 @@
 
 use anyhow::{Context, Result, bail};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Hermes can take a while on a cold start (it measured ~1.6 s warm here).
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -33,6 +33,16 @@ struct Running {
     port: u16,
 }
 
+/// Drop guard from [`Features::lease`].
+pub struct Lease(std::sync::Arc<Features>);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.leases.fetch_sub(1, Ordering::Relaxed);
+        self.0.touch("lease-released", "lease");
+    }
+}
+
 pub struct Features {
     /// Program + leading args (e.g. `["/…/hermes"]`); `serve …` is appended.
     command: Vec<String>,
@@ -41,8 +51,10 @@ pub struct Features {
     /// Milliseconds since `epoch` of the last forwarded call.
     last_used_ms: AtomicU64,
     epoch: Instant,
-    /// Unix millis: do not idle-stop while `now < cron_hold_until_ms` (cron wake hold).
-    cron_hold_until_ms: AtomicU64,
+    /// Work in flight that must not be idle-stopped (a cron tick running jobs); see [`Lease`].
+    leases: AtomicUsize,
+    /// Rung when a forwarded call touched the cron API, so the cron timer re-reads `jobs.json`.
+    pub cron_changed: Notify,
     /// This gateway's own REST base URL and auth token, so cron (`run_job`)
     /// can call `/api/agent/run` instead of its own `AIAgent`. `None` until
     /// `set_engine_env` runs, right after the gateway binds its port.
@@ -57,7 +69,8 @@ impl Features {
             running: Mutex::new(None),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
-            cron_hold_until_ms: AtomicU64::new(0),
+            leases: AtomicUsize::new(0),
+            cron_changed: Notify::new(),
             engine_env: std::sync::Mutex::new(None),
         }
     }
@@ -70,27 +83,18 @@ impl Features {
 
     pub fn touch(&self, route: &str, source: &str) {
         self.last_used_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if route.starts_with("/api/cron") || route.starts_with("cron.") {
+            self.cron_changed.notify_one();
+        }
         if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() {
             eprintln!("feature_activity at={:?} route={} source={}", SystemTime::now(), route, source);
         }
     }
 
-    pub fn set_cron_hold_until(&self, until: SystemTime) {
-        let ms = until.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        self.cron_hold_until_ms.fetch_max(ms, Ordering::Relaxed);
-    }
-
-    pub fn clear_cron_hold(&self) {
-        self.cron_hold_until_ms.store(0, Ordering::Relaxed);
-    }
-
-    pub fn cron_held(&self) -> bool {
-        let until = self.cron_hold_until_ms.load(Ordering::Relaxed);
-        if until == 0 {
-            return false;
-        }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-        now < until
+    /// Keep the backend alive until the returned guard drops.
+    pub fn lease(self: &std::sync::Arc<Self>) -> Lease {
+        self.leases.fetch_add(1, Ordering::Relaxed);
+        Lease(self.clone())
     }
 
     fn idle_for(&self) -> Duration {
@@ -126,9 +130,8 @@ impl Features {
         let mut child = command.args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
             .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
-            // Desktop-owned serve runs the in-process cron ticker (stock Hermes
-            // desktop does the same). Without this, waking Python for a due job
-            // would serve Cron HTTP but never fire schedules.
+            // Desktop-owned backend. With SOVEREIGN_ENGINE_URL set (below) it runs no cron
+            // ticker: the engine's timer fires `POST /api/cron/tick` at the due time.
             .env("HERMES_DESKTOP", "1")
             // Hermes's parent-death watchdog: exit within ~2 s if the engine
             // dies, even by SIGKILL (kill_on_drop only covers clean exits).
@@ -171,15 +174,8 @@ impl Features {
 
     /// Stop the backend if it has been idle for `IDLE_STOP_AFTER`.
     pub async fn stop_if_idle(&self) {
-        if self.cron_held() {
-            if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=hold reason=cron-lease"); }
+        if self.leases.load(Ordering::Relaxed) > 0 {
             return;
-        }
-        if let Ok(home) = std::env::var("HERMES_HOME") {
-            if crate::cron_wake::due_within_wake_lead(std::path::Path::new(&home)) {
-                if std::env::var_os("SOVEREIGN_TRACE_FEATURE_ACTIVITY").is_some() { eprintln!("feature_idle decision=hold reason=due-within-wake-lead"); }
-                return;
-            }
         }
         if let Ok(home) = std::env::var("HERMES_HOME") {
             if messaging_enabled(std::path::Path::new(&home)) {

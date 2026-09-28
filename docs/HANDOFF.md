@@ -16,11 +16,11 @@ Left unstaged (user theme/marketplace work): do **not** commit `vscode-marketpla
 
 ### sovereign-engine `feature/sovereign-observability`
 
-- Bundled Python env + idle stop, cron wake-before-due, Ollama alias warm (`num_ctx` pin, `keep_alive -1` / unload `0`), gateway startup stubs so Python is not woken by boot probes.
+- Bundled Python env + idle stop, engine-owned cron timer, Ollama alias warm (`num_ctx` pin, `keep_alive -1` / unload `0`), gateway startup stubs so Python is not woken by boot probes.
 
 ## Cron scheduler (verified)
 
-Desktop cron ticks inside `hermes serve` when `HERMES_DESKTOP=1`. Idle-stop killed that process; `cron_wake.rs` starts Python `SOVEREIGN_CRON_WAKE_LEAD_MS` before `next_run_at`, holds until the job advances, then idle-stop reclaims it. Packaged proof: `apps/desktop/release/sovereign-cron-due/`.
+The engine owns cron timing (`crates/sovereign-gateway/src/cron_tick.rs`): it reads `next_run_at` from Hermes's `jobs.json`, sleeps until the earliest one (no polling; re-read on any cron API call, at most every 10 min), then starts Python for one `POST /api/cron/tick` (Hermes's own `cron.scheduler.tick`, which runs the model turn through `/api/agent/run`, records the run and delivers). The backend runs no cron ticker of its own when `SOVEREIGN_ENGINE_URL` is set and idle-stop reclaims it afterwards. The packaged cron-due proof (`apps/desktop/release/sovereign-cron-due/`) predates this change and has not been re-run.
 
 ## Step 1 — macOS arm64 (verified)
 

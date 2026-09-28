@@ -9,7 +9,7 @@
 
 pub mod approvals;
 pub mod auth;
-pub mod cron_wake;
+pub mod cron_tick;
 pub mod features;
 pub mod learn;
 mod hermes_env;
@@ -199,7 +199,7 @@ impl Gateway {
                     idle.stop_if_idle().await;
                 }
             });
-            tokio::spawn(cron_wake::run(features));
+            tokio::spawn(cron_tick::run(features));
         }
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
@@ -671,6 +671,10 @@ async fn handle(
                 body["cwd"].as_str(),
                 body["title"].as_str(),
                 body["session_key"].as_str().filter(|k| !k.is_empty()),
+                rpc::RunOpts {
+                    surface: if body["surface"] == "bot" { "bot" } else { "cron" },
+                    instructions: body["instructions"].as_str().filter(|i| !i.trim().is_empty()),
+                },
                 Duration::from_secs(timeout_s),
             )
             .await;
