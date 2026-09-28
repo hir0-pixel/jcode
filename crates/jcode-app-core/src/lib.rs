@@ -32,7 +32,6 @@ pub mod build;
 pub mod channel;
 pub use jcode_base::external_auth;
 pub mod notifications;
-pub mod overnight;
 pub mod server;
 pub mod session_effort;
 pub mod session_launch;

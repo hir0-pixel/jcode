@@ -32,7 +32,6 @@ members = [
     "crates/sovereign-prime",
     "crates/jcode-memory-types",
     "crates/jcode-message-types",
-    "crates/jcode-overnight-core",
     "crates/jcode-plan",
     "crates/jcode-swarm-core",
     "crates/jcode-protocol",
