@@ -163,11 +163,11 @@ impl Agent {
     /// *static* (cached) part so provider prompt caching still applies: a
     /// running session's cache stays valid because this only changes when a
     /// brand-new session builds its first prompt, matching M9's "applied to
-    /// new sessions" contract for `/refine`. Sovereign engine only (gated on
-    /// the same env var as the REPL and `refine` tool), and best-effort: any
-    /// storage error here must never break prompt building.
+    /// new sessions" contract for `/refine`. Sovereign engine only (the same
+    /// engine gate as the `refine` tool; no Python needed), and best-effort:
+    /// any storage error here must never break prompt building.
     fn append_continual_harness_addenda(&self, split: &mut crate::prompt::SplitSystemPrompt) {
-        if std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_none() {
+        if std::env::var_os("SOVEREIGN_REPL_WORKER").is_none() {
             return;
         }
         let Ok(home) = jcode_base::storage::jcode_dir() else {
@@ -191,7 +191,7 @@ impl Agent {
     }
 
     fn append_repl_guidance(&self, split: &mut crate::prompt::SplitSystemPrompt) {
-        if std::env::var_os("SOVEREIGN_HERMES_PYTHON").is_none() {
+        if !crate::tool::repl_available() {
             return;
         }
         if !split.static_part.is_empty() {

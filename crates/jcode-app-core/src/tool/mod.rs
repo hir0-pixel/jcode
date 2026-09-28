@@ -28,6 +28,11 @@ mod repl;
 mod session_goal;
 mod session_heartbeat;
 pub(crate) use repl::take_pending_compaction;
+
+/// Whether the REPL tool can run here (Hermes's interpreter is present).
+pub(crate) fn repl_available() -> bool {
+    repl::ReplTool::from_env().is_some()
+}
 mod replace;
 pub(crate) mod sdk;
 pub(crate) mod serde_coerce;

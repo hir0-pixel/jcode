@@ -2293,3 +2293,29 @@ fn system_prompt_override_restores_and_does_not_leak_across_sessions() {
         assert_eq!(attached.build_system_prompt_split(None).static_part, prompt);
     }
 }
+
+#[test]
+fn learned_prompt_addenda_reach_the_prompt_without_python() {
+    use sovereign_prime::entries::{EntryKind, EntryStore, NewEntry, Scope};
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let saved: Vec<_> = ["JCODE_HOME", "SOVEREIGN_REPL_WORKER", "SOVEREIGN_HERMES_PYTHON"]
+        .map(|key| (key, std::env::var_os(key))).into();
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::env::set_var("SOVEREIGN_REPL_WORKER", "/bin/sovereign");
+    crate::env::remove_var("SOVEREIGN_HERMES_PYTHON");
+    EntryStore::open_cached(home.path())
+        .unwrap()
+        .create(NewEntry::new(EntryKind::Prompt, Scope::Global, "t", "Always run the linter first."))
+        .unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let agent = Agent::new(provider, Registry::empty());
+    let prompt = agent.build_system_prompt_split(None).static_part;
+    for (key, value) in saved {
+        match value {
+            Some(value) => crate::env::set_var(key, value),
+            None => crate::env::remove_var(key),
+        }
+    }
+    assert!(prompt.contains("# Continual Harness") && prompt.contains("Always run the linter first."), "{prompt}");
+}
