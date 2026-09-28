@@ -188,7 +188,7 @@ impl Observer {
             .unwrap_or(false);
         refresh_children(&mut db, home, capture_content)?;
         db.execute(
-            "UPDATE obs_runs SET status='interrupted',ended_at_ms=?1,outcome='wedged' WHERE status='spawned'",
+            "UPDATE fact_turn SET status='interrupted',ended_at_ms=?1,outcome='wedged' WHERE status='spawned'",
             [now()],
         )?;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
@@ -643,7 +643,7 @@ impl Observer {
 
     pub fn metered_usage(&self) -> rusqlite::Result<(f64, u64)> {
         let db = self.read_db.lock().unwrap();
-        db.query_row("SELECT COALESCE(SUM(cost_usd), 0), COUNT(cost_usd) FROM obs_runs", [], |row| {
+        db.query_row("SELECT COALESCE(SUM(cost_usd), 0), COUNT(cost_usd) FROM fact_turn", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
     }
@@ -880,8 +880,8 @@ impl Observer {
             "SELECT date(r.started_at_ms/1000,'unixepoch','localtime') AS day, COUNT(DISTINCT r.session_id),
                     SUM(r.input_tokens), SUM(r.output_tokens), SUM(r.cache_read_tokens),
                     CASE WHEN SUM(r.unpriced_calls)>0 THEN NULL ELSE SUM(r.cost_usd) END,
-                    SUM((SELECT COUNT(*) FROM obs_spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)), SUM(r.unpriced_calls)
-             FROM obs_runs r WHERE r.started_at_ms>=?1 GROUP BY day ORDER BY day",
+                    SUM((SELECT COUNT(*) FROM spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)), SUM(r.unpriced_calls)
+             FROM fact_turn r WHERE r.started_at_ms>=?1 GROUP BY day ORDER BY day",
         )?;
         let daily = daily
             .query_map([since], |r| {
@@ -894,8 +894,8 @@ impl Observer {
         let mut by_model = db.prepare(
             "SELECT r.model, COUNT(DISTINCT r.session_id), SUM(r.input_tokens), SUM(r.output_tokens),
                     CASE WHEN SUM(r.unpriced_calls)>0 THEN NULL ELSE SUM(r.cost_usd) END,
-                    SUM((SELECT COUNT(*) FROM obs_spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)), SUM(r.unpriced_calls)
-             FROM obs_runs r WHERE r.started_at_ms>=?1 GROUP BY r.model ORDER BY SUM(r.input_tokens) DESC",
+                    SUM((SELECT COUNT(*) FROM spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)), SUM(r.unpriced_calls)
+             FROM fact_turn r WHERE r.started_at_ms>=?1 GROUP BY r.model ORDER BY SUM(r.input_tokens) DESC",
         )?;
         let by_model = by_model
             .query_map([since], |r| {
@@ -904,7 +904,7 @@ impl Observer {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut tools = db.prepare(
-            "SELECT s.name, COUNT(*) FROM obs_runs r JOIN obs_spans s ON s.run_id=r.id
+            "SELECT s.name, COUNT(*) FROM fact_turn r JOIN spans s ON s.run_id=r.id
              WHERE r.started_at_ms>=?1 AND s.kind='execute_tool' GROUP BY s.name ORDER BY COUNT(*) DESC",
         )?;
         let tools: Vec<(String, i64)> = tools.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -916,7 +916,7 @@ impl Observer {
         let sum = |key: &str| daily.iter().map(|d| d[key].as_i64().unwrap_or(0)).sum::<i64>();
         let unpriced = sum("unpriced_calls");
         let cost: Option<f64> = (unpriced == 0).then(|| daily.iter().map(|d| d["estimated_cost"].as_f64().unwrap_or(0.0)).sum());
-        let sessions: i64 = db.query_row("SELECT COUNT(DISTINCT session_id) FROM obs_runs WHERE started_at_ms>=?1", [since], |r| r.get(0))?;
+        let sessions: i64 = db.query_row("SELECT COUNT(DISTINCT session_id) FROM fact_turn WHERE started_at_ms>=?1", [since], |r| r.get(0))?;
         Ok(json!({
             "period_days": days,
             "daily": daily,
@@ -935,7 +935,7 @@ impl Observer {
         let db = self.read_db.lock().unwrap();
         let since = now() - days as i64 * 86_400_000;
         let (sessions, turns): (i64, i64) = db.query_row(
-            "SELECT COUNT(DISTINCT session_id), COUNT(*) FROM obs_runs WHERE parent_id IS NULL AND started_at_ms>=?1",
+            "SELECT COUNT(DISTINCT session_id), COUNT(*) FROM fact_turn WHERE parent_id IS NULL AND started_at_ms>=?1",
             [since],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -949,12 +949,12 @@ impl Observer {
 }
 
 pub(crate) fn detail_from_db(db: &Connection, id: &str) -> rusqlite::Result<Value> {
-        let mut stmt = db.prepare(&format!("SELECT {} FROM obs_runs WHERE id=?1", operations::RUN_COLS))?;
+        let mut stmt = db.prepare(&format!("SELECT {} FROM fact_turn WHERE id=?1", operations::RUN_COLS))?;
         let run = operations::overlay_wedged(stmt.query_row([id], operations::run_row)?, now());
-        let mut spans = db.prepare("SELECT s.id,s.run_id,s.parent_id,s.root_id,s.kind,s.name,s.status,s.started_at_ms,s.ended_at_ms,s.input_tokens,s.output_tokens,s.cache_read_tokens,s.cache_write_tokens,s.cost_usd,s.error,c.input,c.output,s.model,s.provider,s.attributes FROM obs_spans s LEFT JOIN obs_content c ON c.id=s.id WHERE s.run_id=?1 ORDER BY s.started_at_ms")?;
+        let mut spans = db.prepare("SELECT s.id,s.run_id,s.parent_id,s.root_id,s.kind,s.name,s.status,s.started_at_ms,s.ended_at_ms,s.input_tokens,s.output_tokens,s.cache_read_tokens,s.cache_write_tokens,s.cost_usd,s.error,c.input,c.output,s.model,s.provider,s.attributes FROM spans s LEFT JOIN span_content c ON c.id=s.id WHERE s.run_id=?1 ORDER BY s.started_at_ms")?;
         let spans = spans.query_map([id], |r| Ok(json!({"id":r.get::<_,String>(0)?,"run_id":r.get::<_,String>(1)?,"parent_id":r.get::<_,String>(2)?,"root_id":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"name":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"started_at_ms":r.get::<_,i64>(7)?,"ended_at_ms":r.get::<_,Option<i64>>(8)?,"input_tokens":r.get::<_,i64>(9)?,"output_tokens":r.get::<_,i64>(10)?,"cache_read_tokens":r.get::<_,i64>(11)?,"cache_write_tokens":r.get::<_,i64>(12)?,"cost_usd":r.get::<_,Option<f64>>(13)?,"error":r.get::<_,Option<String>>(14)?,"input":r.get::<_,Option<String>>(15)?,"output":r.get::<_,Option<String>>(16)?,"model":r.get::<_,Option<String>>(17)?,"provider":r.get::<_,Option<String>>(18)?,"attributes":serde_json::from_str::<Value>(&r.get::<_,String>(19)?).unwrap_or_else(|_| json!({}))})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let content: Option<(Option<String>, Option<String>)> = db
-            .query_row("SELECT input,output FROM obs_content WHERE id=?1", [id], |r| {
+            .query_row("SELECT input,output FROM span_content WHERE id=?1", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .ok();
@@ -967,11 +967,11 @@ fn setup(db: &mut Connection) -> rusqlite::Result<()> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
     db.execute(
         // Work the process died in the middle of: evestack's `wedged`.
-        "UPDATE obs_runs SET status='interrupted',ended_at_ms=?1,outcome='wedged' WHERE status IN ('running','queued')",
+        "UPDATE fact_turn SET status='interrupted',ended_at_ms=?1,outcome='wedged' WHERE status IN ('running','queued')",
         [now()],
     )?;
     db.execute(
-        "UPDATE obs_spans SET status='interrupted',ended_at_ms=?1 WHERE status='running'",
+        "UPDATE spans SET status='interrupted',ended_at_ms=?1 WHERE status='running'",
         [now()],
     )?;
     Ok(())
@@ -979,12 +979,12 @@ fn setup(db: &mut Connection) -> rusqlite::Result<()> {
 
 fn prune(db: &Connection, at: i64, retention_days: i64) -> rusqlite::Result<()> {
     let day = 86_400_000_i64;
-    db.execute("DELETE FROM obs_content WHERE id IN (SELECT id FROM obs_runs WHERE started_at_ms<?1 UNION SELECT id FROM obs_spans WHERE started_at_ms<?1)", [at - retention_days * day])?;
+    db.execute("DELETE FROM span_content WHERE id IN (SELECT id FROM fact_turn WHERE started_at_ms<?1 UNION SELECT id FROM spans WHERE started_at_ms<?1)", [at - retention_days * day])?;
     db.execute(
-        "DELETE FROM obs_spans WHERE ended_at_ms IS NOT NULL AND ended_at_ms<?1",
+        "DELETE FROM spans WHERE ended_at_ms IS NOT NULL AND ended_at_ms<?1",
         [at - retention_days * day],
     )?;
-    db.execute("DELETE FROM obs_runs WHERE ended_at_ms IS NOT NULL AND ended_at_ms<?1", [at - retention_days * day])?;
+    db.execute("DELETE FROM fact_turn WHERE ended_at_ms IS NOT NULL AND ended_at_ms<?1", [at - retention_days * day])?;
     Ok(())
 }
 
@@ -1004,10 +1004,10 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 status,
                 at,
             } => {
-                tx.execute("INSERT OR IGNORE INTO obs_runs(id,session_id,parent_id,root_id,kind,title,model,provider,status,started_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![id,session,parent,root,kind,title,model,provider,status,at])?;
+                tx.execute("INSERT OR IGNORE INTO fact_turn(id,session_id,parent_id,root_id,kind,title,model,provider,status,started_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![id,session,parent,root,kind,title,model,provider,status,at])?;
             }
             Op::RunActivate { id } => {
-                tx.execute("UPDATE obs_runs SET status='running' WHERE id=?1", [id])?;
+                tx.execute("UPDATE fact_turn SET status='running' WHERE id=?1", [id])?;
             }
             Op::RunEnd {
                 id,
@@ -1017,16 +1017,16 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 model_calls,
             } => {
                 tx.execute(
-                    "UPDATE obs_runs SET status=?2,error=?3,ended_at_ms=?4 WHERE id=?1",
+                    "UPDATE fact_turn SET status=?2,error=?3,ended_at_ms=?4 WHERE id=?1",
                     params![id, status, error, at],
                 )?;
                 apply_run_end_flags(&tx, &id, &status, &error, model_calls)?;
             }
             Op::RunTtft { id, at } => {
-                tx.execute("UPDATE obs_runs SET ttft_ms=?2-started_at_ms WHERE id=?1 AND ttft_ms IS NULL", params![id, at])?;
+                tx.execute("UPDATE fact_turn SET ttft_ms=?2-started_at_ms WHERE id=?1 AND ttft_ms IS NULL", params![id, at])?;
             }
             Op::RunReplayOf { id, replay_of } => {
-                tx.execute("UPDATE obs_runs SET replay_of=?2 WHERE id=?1", params![id, replay_of])?;
+                tx.execute("UPDATE fact_turn SET replay_of=?2 WHERE id=?1", params![id, replay_of])?;
             }
             Op::Approval {
                 run_id,
@@ -1045,12 +1045,12 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 name,
                 at,
             } => {
-                tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms) VALUES(?1,?2,?2,?3,?4,?5,'running',?6)", params![id,run,root,kind,name,at])?;
+                tx.execute("INSERT OR IGNORE INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms) VALUES(?1,?2,?2,?3,?4,?5,'running',?6)", params![id,run,root,kind,name,at])?;
                 if kind == "execute_tool" {
                     // evestack's span_coverage: at least something landed for
                     // this run, but not yet a model call — see the 'full'
                     // upgrade in the Usage arm below.
-                    tx.execute("UPDATE obs_runs SET span_coverage='partial' WHERE id=?1 AND span_coverage='none'", [run])?;
+                    tx.execute("UPDATE fact_turn SET span_coverage='partial' WHERE id=?1 AND span_coverage='none'", [run])?;
                 }
             }
             Op::SpanEnd {
@@ -1060,7 +1060,7 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                 at,
             } => {
                 tx.execute(
-                    "UPDATE obs_spans SET status=?2,error=?3,ended_at_ms=?4 WHERE id=?1",
+                    "UPDATE spans SET status=?2,error=?3,ended_at_ms=?4 WHERE id=?1",
                     params![id, status, error, at],
                 )?;
             }
@@ -1096,13 +1096,13 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                     attributes["gen_ai.usage.cache_creation.input_tokens"] = json!(cache_write);
                 }
                 let status = if error.is_some() { "error" } else { "complete" };
-                let inserted = tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![span,run,root,kind,status,started,ended,input,output,cache_read,cache_write,cost,error,model,provider,attributes.to_string()])?;
+                let inserted = tx.execute("INSERT OR IGNORE INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![span,run,root,kind,status,started,ended,input,output,cache_read,cache_write,cost,error,model,provider,attributes.to_string()])?;
                 if inserted != 0 {
-                    tx.execute("UPDATE obs_runs SET input_tokens=input_tokens+?2,output_tokens=output_tokens+?3,cache_read_tokens=cache_read_tokens+?4,cache_write_tokens=cache_write_tokens+?5,unpriced_calls=unpriced_calls+CASE WHEN ?6 IS NULL THEN 1 ELSE 0 END,cost_usd=CASE WHEN ?6 IS NULL OR unpriced_calls>0 THEN NULL ELSE COALESCE(cost_usd,0)+?6 END,span_coverage='full' WHERE id=?1", params![run,input,output,cache_read,cache_write,cost])?;
+                    tx.execute("UPDATE fact_turn SET input_tokens=input_tokens+?2,output_tokens=output_tokens+?3,cache_read_tokens=cache_read_tokens+?4,cache_write_tokens=cache_write_tokens+?5,unpriced_calls=unpriced_calls+CASE WHEN ?6 IS NULL THEN 1 ELSE 0 END,cost_usd=CASE WHEN ?6 IS NULL OR unpriced_calls>0 THEN NULL ELSE COALESCE(cost_usd,0)+?6 END,span_coverage='full' WHERE id=?1", params![run,input,output,cache_read,cache_write,cost])?;
                 }
             }
             Op::Content { id, input, output } => {
-                tx.execute("INSERT INTO obs_content(id,input,output) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET input=COALESCE(excluded.input,input),output=COALESCE(excluded.output,output)", params![id,input,output])?;
+                tx.execute("INSERT INTO span_content(id,input,output) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET input=COALESCE(excluded.input,input),output=COALESCE(excluded.output,output)", params![id,input,output])?;
             }
         }
     }
@@ -1124,7 +1124,7 @@ fn refresh_children(
     home: &Path,
     capture_content: bool,
 ) -> rusqlite::Result<()> {
-    let mut stmt = db.prepare("SELECT c.id,c.session_id,c.root_id,p.session_id FROM obs_runs c JOIN obs_runs p ON p.id=c.parent_id WHERE c.status='spawned'")?;
+    let mut stmt = db.prepare("SELECT c.id,c.session_id,c.root_id,p.session_id FROM fact_turn c JOIN fact_turn p ON p.id=c.parent_id WHERE c.status='spawned'")?;
     let children = stmt
         .query_map([], |row| {
             Ok((
@@ -1227,27 +1227,27 @@ fn refresh_children(
         let ended = message_time(last);
         // Same outcome/coverage vocabulary as apply_run_end_flags / the
         // execute_tool and Usage arms above — this reconciliation path writes
-        // obs_runs directly rather than through Op::RunEnd, so it computes
+        // fact_turn directly rather than through Op::RunEnd, so it computes
         // both here instead of falling through to run_outcome.
         let outcome = if calls.is_empty() { "no_model_call" } else { "ok" };
         let span_coverage = if !calls.is_empty() { "full" } else if !tools.is_empty() || !results.is_empty() { "partial" } else { "none" };
         let tx = db.transaction()?;
-        tx.execute("UPDATE obs_runs SET status='complete',ended_at_ms=?2,provider=?3,model=?4,input_tokens=?5,output_tokens=?6,cache_read_tokens=?7,cache_write_tokens=?8,cost_usd=?9,unpriced_calls=?10,outcome=?11,span_coverage=?12 WHERE id=?1", params![run,ended,provider,model,input,output,read,write,total_cost,unpriced_calls,outcome,span_coverage])?;
+        tx.execute("UPDATE fact_turn SET status='complete',ended_at_ms=?2,provider=?3,model=?4,input_tokens=?5,output_tokens=?6,cache_read_tokens=?7,cache_write_tokens=?8,cost_usd=?9,unpriced_calls=?10,outcome=?11,span_coverage=?12 WHERE id=?1", params![run,ended,provider,model,input,output,read,write,total_cost,unpriced_calls,outcome,span_coverage])?;
         for (n, (at, i, o, r, w, cost)) in calls.into_iter().enumerate() {
             let kind = if n == 0 { "chat" } else { "tool_followup" };
             let attributes = json!({"gen_ai.operation.name":"chat","gen_ai.provider.name":provider,"gen_ai.request.model":model,
                 "gen_ai.response.model":model,"gen_ai.usage.input_tokens":i,"gen_ai.usage.output_tokens":o,
                 "gen_ai.usage.cache_read.input_tokens":r,"gen_ai.usage.cache_creation.input_tokens":w,
                 "gen_ai.conversation.id":session}).to_string();
-            tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call','complete',?5,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![format!("{run}:chat:{n}"),run,root,kind,at,i,o,r,w,cost,model,provider,attributes])?;
+            tx.execute("INSERT OR IGNORE INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,model,provider,attributes) VALUES(?1,?2,?2,?3,?4,'Model call','complete',?5,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![format!("{run}:chat:{n}"),run,root,kind,at,i,o,r,w,cost,model,provider,attributes])?;
         }
         for (id, at, result) in results {
             if let Some((name, started, args)) = tools.remove(&id) {
                 let span = format!("{run}:tool:{id}");
-                tx.execute("INSERT OR IGNORE INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms) VALUES(?1,?2,?2,?3,'execute_tool',?4,'complete',?5,?6)", params![span,run,root,name,started,at])?;
+                tx.execute("INSERT OR IGNORE INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms) VALUES(?1,?2,?2,?3,'execute_tool',?4,'complete',?5,?6)", params![span,run,root,name,started,at])?;
                 if capture_content {
                     tx.execute(
-                        "INSERT OR IGNORE INTO obs_content(id,input,output) VALUES(?1,?2,?3)",
+                        "INSERT OR IGNORE INTO span_content(id,input,output) VALUES(?1,?2,?3)",
                         params![span, capped(&args), capped(&result)],
                     )?;
                 }
@@ -1267,7 +1267,7 @@ fn refresh_children(
                 .as_array()
                 .and_then(|parts| parts.iter().find_map(|part| part["text"].as_str()));
             tx.execute(
-                "INSERT OR IGNORE INTO obs_content(id,input,output) VALUES(?1,?2,?3)",
+                "INSERT OR IGNORE INTO span_content(id,input,output) VALUES(?1,?2,?3)",
                 params![run, prompt.map(capped), reply.map(capped)],
             )?;
         }
@@ -1459,7 +1459,7 @@ mod tests {
             usage_known: true, error: None,
             started: now(), ended: now(),
         }]).unwrap();
-        assert_eq!(db.query_row("SELECT input_tokens FROM obs_runs WHERE id='r'", [], |r| r.get::<_, i64>(0)).unwrap(), 100);
+        assert_eq!(db.query_row("SELECT input_tokens FROM fact_turn WHERE id='r'", [], |r| r.get::<_, i64>(0)).unwrap(), 100);
         write_batch(&mut db, vec![Op::Usage {
             run: "r".into(), span: "canceled".into(), root: "r".into(), kind: "other",
             model: "gpt-5.4".into(), provider: "openai".into(), session: "s".into(),
@@ -1467,11 +1467,11 @@ mod tests {
             usage_known: false, error: Some("interrupted".into()), started: now(), ended: now(),
         }]).unwrap();
         let (cost, unpriced): (Option<f64>, i64) = db.query_row(
-            "SELECT cost_usd,unpriced_calls FROM obs_runs WHERE id='r'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT cost_usd,unpriced_calls FROM fact_turn WHERE id='r'", [], |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
         assert_eq!((cost, unpriced), (None, 1));
         let (status, attributes): (String, String) = db.query_row(
-            "SELECT status,attributes FROM obs_spans WHERE id='canceled'", [], |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT status,attributes FROM spans WHERE id='canceled'", [], |r| Ok((r.get(0)?, r.get(1)?)),
         ).unwrap();
         assert_eq!(status, "error");
         assert!(serde_json::from_str::<Value>(&attributes).unwrap().get("gen_ai.usage.input_tokens").is_none());
@@ -1479,22 +1479,22 @@ mod tests {
         assert_eq!(cost_usd("unknown", "x", 100, 50, 0, 0), None);
         setup(&mut db).unwrap();
         let status: String = db
-            .query_row("SELECT status FROM obs_runs WHERE id='r'", [], |r| r.get(0))
+            .query_row("SELECT status FROM fact_turn WHERE id='r'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "interrupted");
         db.execute(
-            "UPDATE obs_spans SET ended_at_ms=?1",
+            "UPDATE spans SET ended_at_ms=?1",
             [now() - 31 * 86_400_000_i64],
         )
         .unwrap();
         prune(&db, now(), 30).unwrap();
         assert_eq!(
-            db.query_row("SELECT count(*) FROM obs_spans", [], |r| r.get::<_, i64>(0))
+            db.query_row("SELECT count(*) FROM spans", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
         );
         assert_eq!(
-            db.query_row("SELECT count(*) FROM obs_runs", [], |r| r.get::<_, i64>(0))
+            db.query_row("SELECT count(*) FROM fact_turn", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             1
         );
@@ -1613,7 +1613,7 @@ mod tests {
         assert_eq!(ops.iter().filter(|op| matches!(op, Op::Usage { run, usage_known: false, kind: "cron", model, provider, session, cost: None, error: Some(_), .. } if run == &interrupted && model == "gpt-5.4" && provider == "openai" && session == "s")).count(), 1);
         write_batch(&mut db, ops).unwrap();
         let (calls, unpriced, cost): (i64, i64, Option<f64>) = db.query_row(
-            "SELECT COUNT(*), MAX(r.unpriced_calls), MAX(r.cost_usd) FROM obs_runs r JOIN obs_spans s ON s.run_id=r.id WHERE r.id=?1 AND s.model IS NOT NULL",
+            "SELECT COUNT(*), MAX(r.unpriced_calls), MAX(r.cost_usd) FROM fact_turn r JOIN spans s ON s.run_id=r.id WHERE r.id=?1 AND s.model IS NOT NULL",
             [&interrupted], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!((calls, unpriced, cost), (1, 1, None));
@@ -1656,7 +1656,7 @@ mod tests {
         for _ in 0..100 {
             let db = Connection::open(dir.join("sovereign.db")).unwrap();
             let count: i64 = db
-                .query_row("SELECT count(*) FROM obs_runs", [], |row| row.get(0))
+                .query_row("SELECT count(*) FROM fact_turn", [], |row| row.get(0))
                 .unwrap();
             if count == 1000 {
                 break;
@@ -1664,13 +1664,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let mut db = Connection::open(dir.join("sovereign.db")).unwrap();
-        let runs: Vec<String> = db.prepare("SELECT id FROM obs_runs ORDER BY id").unwrap()
+        let runs: Vec<String> = db.prepare("SELECT id FROM fact_turn ORDER BY id").unwrap()
             .query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(runs.len(), 1000);
         let started = Instant::now();
         let tx = db.transaction().unwrap();
         {
-            let mut insert = tx.prepare("INSERT INTO obs_spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,model,provider) VALUES(?1,?2,?2,?2,'tool_followup','Model call','complete',?3,?3,100,20,'local','ollama')").unwrap();
+            let mut insert = tx.prepare("INSERT INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,model,provider) VALUES(?1,?2,?2,?2,'tool_followup','Model call','complete',?3,?3,100,20,'local','ollama')").unwrap();
             for (i, run) in runs.iter().enumerate() {
                 for n in 0..49 {
                     insert.execute(params![format!("{run}:extra:{n}"), run, now() + i as i64]).unwrap();
@@ -1679,14 +1679,14 @@ mod tests {
         }
         tx.commit().unwrap();
         let write_us = started.elapsed().as_secs_f64() * 1e6 / 49_000.0;
-        assert_eq!(db.query_row("SELECT COUNT(*) FROM obs_spans", [], |r| r.get::<_,i64>(0)).unwrap(), 50_000);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM spans", [], |r| r.get::<_,i64>(0)).unwrap(), 50_000);
         let plan = |sql: &str| -> String {
             db.prepare(sql).unwrap().query_map([], |r| r.get::<_,String>(3)).unwrap()
                 .map(Result::unwrap).collect::<Vec<_>>().join("; ")
         };
-        println!("list plan: {}", plan("EXPLAIN QUERY PLAN SELECT id FROM obs_runs ORDER BY started_at_ms DESC LIMIT 200"));
-        println!("analytics plan: {}", plan("EXPLAIN QUERY PLAN SELECT SUM((SELECT COUNT(*) FROM obs_spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)) FROM obs_runs r WHERE r.started_at_ms>=0"));
-        println!("detail plan: {}", plan("EXPLAIN QUERY PLAN SELECT id FROM obs_spans WHERE run_id='bench' ORDER BY started_at_ms"));
+        println!("list plan: {}", plan("EXPLAIN QUERY PLAN SELECT id FROM fact_turn ORDER BY started_at_ms DESC LIMIT 200"));
+        println!("analytics plan: {}", plan("EXPLAIN QUERY PLAN SELECT SUM((SELECT COUNT(*) FROM spans s WHERE s.run_id=r.id AND s.model IS NOT NULL)) FROM fact_turn r WHERE r.started_at_ms>=0"));
+        println!("detail plan: {}", plan("EXPLAIN QUERY PLAN SELECT id FROM spans WHERE run_id='bench' ORDER BY started_at_ms"));
         fn measure(mut f: impl FnMut()) -> (f64, f64) {
             let mut samples = Vec::with_capacity(100);
             for _ in 0..100 {

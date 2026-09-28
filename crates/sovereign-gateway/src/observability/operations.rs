@@ -71,7 +71,7 @@ pub fn budget_status(db: &Connection, home: &Path, at: i64) -> rusqlite::Result<
     let cfg = ObsConfig::load(home);
     let day_start = at - (at % 86_400_000);
     let spend: f64 = db.query_row(
-        "SELECT COALESCE(SUM(cost_usd),0) FROM obs_runs WHERE started_at_ms>=?1 AND cost_usd IS NOT NULL",
+        "SELECT COALESCE(SUM(cost_usd),0) FROM fact_turn WHERE started_at_ms>=?1 AND cost_usd IS NOT NULL",
         [day_start],
         |r| r.get(0),
     )?;
@@ -88,7 +88,7 @@ pub fn budget_status(db: &Connection, home: &Path, at: i64) -> rusqlite::Result<
 
 fn kind_spend(db: &Connection, since: i64) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare(
-        "SELECT kind, COALESCE(SUM(cost_usd),0) FROM obs_runs WHERE started_at_ms>=?1 AND cost_usd IS NOT NULL GROUP BY kind",
+        "SELECT kind, COALESCE(SUM(cost_usd),0) FROM fact_turn WHERE started_at_ms>=?1 AND cost_usd IS NOT NULL GROUP BY kind",
     )?;
     let rows = stmt
         .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?
@@ -98,11 +98,11 @@ fn kind_spend(db: &Connection, since: i64) -> rusqlite::Result<Value> {
 
 /// The `run_row` projection. `step_count` (model calls) and `tools_called`
 /// are evestack's fact_turn columns of the same name, counted from spans
-/// through `obs_spans_run` rather than stored twice.
+/// through `spans_run` rather than stored twice.
 pub const RUN_COLS: &str = "id,session_id,parent_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,\
     input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,error,title,unpriced_calls,flags,replay_of,outcome,span_coverage,ttft_ms,\
-    (SELECT COUNT(*) FROM obs_spans s WHERE s.run_id=obs_runs.id AND s.model IS NOT NULL),\
-    (SELECT COUNT(*) FROM obs_spans s WHERE s.run_id=obs_runs.id AND s.kind='execute_tool')";
+    (SELECT COUNT(*) FROM spans s WHERE s.run_id=fact_turn.id AND s.model IS NOT NULL),\
+    (SELECT COUNT(*) FROM spans s WHERE s.run_id=fact_turn.id AND s.kind='execute_tool')";
 
 pub fn list_filtered(
     db: &Connection,
@@ -114,7 +114,7 @@ pub fn list_filtered(
     session: Option<&str>,
     at: i64,
 ) -> rusqlite::Result<Vec<Value>> {
-    let mut sql = format!("SELECT {RUN_COLS} FROM obs_runs WHERE 1=1");
+    let mut sql = format!("SELECT {RUN_COLS} FROM fact_turn WHERE 1=1");
     let mut binds: Vec<String> = Vec::new();
     if let Some(s) = session.filter(|s| !s.is_empty()) {
         sql.push_str(" AND session_id=?");
@@ -160,7 +160,7 @@ pub fn list_filtered(
     Ok(rows?.into_iter().map(|row| overlay_wedged(row, at)).collect())
 }
 
-/// `obs_runs.outcome` never stores `wedged` (see `run_outcome`'s doc comment):
+/// `fact_turn.outcome` never stores `wedged` (see `run_outcome`'s doc comment):
 /// it only applies to a run still `status='running'`, which changes without a
 /// RunEnd write to react to. Overlaying it at read time is evestack's
 /// periodically-`refresh_facts()`-ed `fact_turn.outcome` made exact instead of
@@ -219,9 +219,9 @@ pub fn run_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 }
 
 pub fn monitors(db: &Connection, since: i64, dropped: u64) -> rusqlite::Result<Value> {
-    // EXPLAIN QUERY PLAN (tests): obs_runs_recent index on started_at_ms for window filter.
+    // EXPLAIN QUERY PLAN (tests): fact_turn_recent index on started_at_ms for window filter.
     let mut run_lat = db.prepare(
-        "SELECT kind, (ended_at_ms-started_at_ms) FROM obs_runs WHERE started_at_ms>=?1 AND ended_at_ms IS NOT NULL",
+        "SELECT kind, (ended_at_ms-started_at_ms) FROM fact_turn WHERE started_at_ms>=?1 AND ended_at_ms IS NOT NULL",
     )?;
     let mut by_kind: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
     for row in run_lat.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
@@ -243,8 +243,8 @@ pub fn monitors(db: &Connection, since: i64, dropped: u64) -> rusqlite::Result<V
         .collect();
 
     let mut model_lat = db.prepare(
-        "SELECT s.kind, (s.ended_at_ms-s.started_at_ms), s.output_tokens FROM obs_spans s
-         JOIN obs_runs r ON r.id=s.run_id WHERE r.started_at_ms>=?1 AND s.model IS NOT NULL AND s.ended_at_ms IS NOT NULL",
+        "SELECT s.kind, (s.ended_at_ms-s.started_at_ms), s.output_tokens FROM spans s
+         JOIN fact_turn r ON r.id=s.run_id WHERE r.started_at_ms>=?1 AND s.model IS NOT NULL AND s.ended_at_ms IS NOT NULL",
     )?;
     let mut model_by_kind: std::collections::HashMap<String, (Vec<i64>, Vec<f64>)> = std::collections::HashMap::new();
     for row in model_lat.query_map([since], |r| {
@@ -286,7 +286,7 @@ pub fn monitors(db: &Connection, since: i64, dropped: u64) -> rusqlite::Result<V
                 COALESCE(SUM(CASE WHEN status IN ('error','failed') THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN (flags & ?2) != 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN unpriced_calls>0 THEN 1 ELSE 0 END), 0)
-         FROM obs_runs WHERE started_at_ms>=?1",
+         FROM fact_turn WHERE started_at_ms>=?1",
         params![since, FLAG_NO_MODEL_CALL],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
@@ -322,7 +322,7 @@ fn percentile_f(sorted: &[f64], p: f64) -> Option<f64> {
 /// `turn_id` the run id, `option_id` the decision, `approver` the actor.
 pub fn list_approvals(db: &Connection, limit: u64) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare(
-        "SELECT id,at_ms,session_id,run_id,request_kind,tool,decision,actor,approver_via,command_preview FROM obs_approvals ORDER BY at_ms DESC LIMIT ?1",
+        "SELECT id,at_ms,session_id,run_id,request_kind,tool,decision,actor,approver_via,command_preview FROM approvals ORDER BY at_ms DESC LIMIT ?1",
     )?;
     let rows = stmt
         .query_map([limit.min(500)], |r| {
@@ -346,7 +346,7 @@ pub fn list_approvals(db: &Connection, limit: u64) -> rusqlite::Result<Value> {
 /// evestack.memory_deletions, newest first.
 pub fn list_memory_deletions(db: &Connection, limit: u64) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare(
-        "SELECT id,deleted_at_ms,memory_id,scope,content,tags,actor,actor_via FROM obs_memory_deletions ORDER BY deleted_at_ms DESC, id DESC LIMIT ?1",
+        "SELECT id,deleted_at_ms,memory_id,scope,content,tags,actor,actor_via FROM memory_deletions ORDER BY deleted_at_ms DESC, id DESC LIMIT ?1",
     )?;
     let rows = stmt
         .query_map([limit.min(500)], |r| {
@@ -367,10 +367,10 @@ pub fn list_memory_deletions(db: &Connection, limit: u64) -> rusqlite::Result<Va
 
 /// evestack's sessions list: one row per session (its top-level turns), with
 /// the rollup evestack's listSessions computes. The LIMIT applies to the
-/// session ids first, using `obs_runs_session`, before any per-session work.
+/// session ids first, using `fact_turn_session`, before any per-session work.
 pub fn list_sessions(db: &Connection, limit: u64, at: i64) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare(
-        "WITH recent AS (SELECT session_id, MAX(started_at_ms) AS last_ms FROM obs_runs
+        "WITH recent AS (SELECT session_id, MAX(started_at_ms) AS last_ms FROM fact_turn
                          WHERE parent_id IS NULL GROUP BY session_id ORDER BY last_ms DESC LIMIT ?1)
          SELECT r.session_id, recent.last_ms, COUNT(*), MIN(r.started_at_ms),
                 SUM(r.outcome='failed'), SUM(r.outcome='cancelled'), SUM(r.outcome='no_model_call'),
@@ -378,13 +378,13 @@ pub fn list_sessions(db: &Connection, limit: u64, at: i64) -> rusqlite::Result<V
                 SUM(r.status IN ('running','queued')),
                 SUM(r.input_tokens), SUM(r.output_tokens),
                 SUM(r.unpriced_calls), SUM(r.cost_usd),
-                (SELECT COUNT(*) FROM obs_runs c WHERE c.parent_id IS NOT NULL AND c.root_id IN
-                    (SELECT id FROM obs_runs t WHERE t.session_id=r.session_id AND t.parent_id IS NULL)),
-                (SELECT model FROM obs_runs l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
-                (SELECT provider FROM obs_runs l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
-                (SELECT kind FROM obs_runs l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
-                (SELECT outcome FROM obs_runs l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1)
-         FROM recent JOIN obs_runs r ON r.session_id=recent.session_id AND r.parent_id IS NULL
+                (SELECT COUNT(*) FROM fact_turn c WHERE c.parent_id IS NOT NULL AND c.root_id IN
+                    (SELECT id FROM fact_turn t WHERE t.session_id=r.session_id AND t.parent_id IS NULL)),
+                (SELECT model FROM fact_turn l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
+                (SELECT provider FROM fact_turn l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
+                (SELECT kind FROM fact_turn l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1),
+                (SELECT outcome FROM fact_turn l WHERE l.session_id=r.session_id AND l.parent_id IS NULL ORDER BY l.started_at_ms DESC LIMIT 1)
+         FROM recent JOIN fact_turn r ON r.session_id=recent.session_id AND r.parent_id IS NULL
          GROUP BY r.session_id ORDER BY recent.last_ms DESC",
     )?;
     let rows = stmt
@@ -416,19 +416,20 @@ pub fn list_sessions(db: &Connection, limit: u64, at: i64) -> rusqlite::Result<V
     Ok(json!({ "sessions": rows }))
 }
 
-/// evestack's facts views over `obs_fact_turn` / `obs_fact_tool_call`: turn
+/// evestack's facts over `fact_turn` / `fact_tool_call`: turn
 /// outcomes per model and per-tool call counts, failure rate and latency.
 /// Failure rate divides by judged calls only (`ok IS NOT NULL`), like
 /// lib/metrics.ts: an unjudged call is neither a win nor a loss.
 pub fn facts(db: &Connection, since: i64) -> rusqlite::Result<Value> {
     let mut outcomes = db.prepare(
-        "SELECT model, outcome, COUNT(*) FROM obs_fact_turn WHERE started_at_ms>=?1 AND run_type='turn' GROUP BY model, outcome ORDER BY model",
+        "SELECT model, CASE WHEN outcome='running' AND status='running' AND started_at_ms < CAST(strftime('%s','now') AS INTEGER)*1000 - 3600000
+                THEN 'wedged' ELSE outcome END AS o, COUNT(*) FROM fact_turn WHERE started_at_ms>=?1 AND parent_id IS NULL GROUP BY model, o ORDER BY model",
     )?;
     let outcomes = outcomes
         .query_map([since], |r| Ok(json!({"model": r.get::<_, String>(0)?, "outcome": r.get::<_, String>(1)?, "turns": r.get::<_, i64>(2)?})))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut calls = db.prepare(
-        "SELECT tool_name, ok, duration_ms FROM obs_fact_tool_call WHERE started_at_ms>=?1 ORDER BY tool_name",
+        "SELECT tool_name, ok, duration_ms FROM fact_tool_call WHERE started_at_ms>=?1 ORDER BY tool_name",
     )?;
     let mut by_tool: std::collections::BTreeMap<String, (i64, i64, i64, Vec<i64>)> = Default::default();
     for row in calls.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?)))? {
@@ -500,7 +501,7 @@ pub fn promote_run(db: &Connection, home: &Path, run_id: &str, at: i64) -> rusql
 
 pub fn turn_index(db: &Connection, session: &str, started_at_ms: i64) -> rusqlite::Result<i64> {
     db.query_row(
-        "SELECT COUNT(*) FROM obs_runs WHERE session_id=?1 AND parent_id IS NULL AND started_at_ms<?2",
+        "SELECT COUNT(*) FROM fact_turn WHERE session_id=?1 AND parent_id IS NULL AND started_at_ms<?2",
         params![session, started_at_ms],
         |r| r.get(0),
     )
@@ -536,12 +537,12 @@ pub fn apply_run_end_flags(
 ) -> rusqlite::Result<()> {
     if status == "complete" && error.is_none() && model_calls == 0 {
         tx.execute(
-            "UPDATE obs_runs SET flags = flags | ?2 WHERE id=?1",
+            "UPDATE fact_turn SET flags = flags | ?2 WHERE id=?1",
             params![id, FLAG_NO_MODEL_CALL],
         )?;
     }
     tx.execute(
-        "UPDATE obs_runs SET outcome=?2 WHERE id=?1",
+        "UPDATE fact_turn SET outcome=?2 WHERE id=?1",
         params![id, run_outcome(status, error, model_calls)],
     )?;
     Ok(())
@@ -553,7 +554,7 @@ pub fn apply_run_end_flags(
 /// `status='running'` plus age is definitive rather than a liveness guess.
 pub fn wedged_count(db: &Connection, at: i64) -> rusqlite::Result<i64> {
     db.query_row(
-        "SELECT COUNT(*) FROM obs_runs WHERE status='running' AND started_at_ms<?1",
+        "SELECT COUNT(*) FROM fact_turn WHERE status='running' AND started_at_ms<?1",
         [at - STUCK_TURN_MS],
         |r| r.get(0),
     )
@@ -571,7 +572,7 @@ pub fn write_approval(
 ) -> rusqlite::Result<()> {
     let preview: String = command.chars().take(500).collect();
     tx.execute(
-        "INSERT INTO obs_approvals(run_id,session_id,tool,command_preview,decision,actor,at_ms,request_kind,approver_via) VALUES(?1,?2,?3,?4,?5,?6,?7,'tool-approval','session')",
+        "INSERT INTO approvals(run_id,session_id,tool,command_preview,decision,actor,at_ms,request_kind,approver_via) VALUES(?1,?2,?3,?4,?5,?6,?7,'tool-approval','session')",
         params![run_id, session, tool, preview, decision, actor, at],
     )?;
     Ok(())
@@ -728,7 +729,7 @@ pub fn evaluate_alerts(
     for (key, severity, state, message) in checks {
         let prev: Option<String> = db
             .query_row(
-                "SELECT state FROM obs_alerts WHERE monitor_key=?1",
+                "SELECT state FROM alert_state WHERE monitor_key=?1",
                 [key],
                 |r| r.get(0),
             )
@@ -740,10 +741,10 @@ pub fn evaluate_alerts(
         }
         let should_notify = transition_notify(prev_state, new_state);
         db.execute(
-            "INSERT INTO obs_alerts(monitor_key,state,severity,message,updated_at_ms,last_notified_ms)
+            "INSERT INTO alert_state(monitor_key,state,severity,message,updated_at_ms,last_notified_ms)
              VALUES(?1,?2,?3,?4,?5,?6)
              ON CONFLICT(monitor_key) DO UPDATE SET state=excluded.state, message=excluded.message,
-             updated_at_ms=excluded.updated_at_ms, last_notified_ms=COALESCE(excluded.last_notified_ms, obs_alerts.last_notified_ms)",
+             updated_at_ms=excluded.updated_at_ms, last_notified_ms=COALESCE(excluded.last_notified_ms, alert_state.last_notified_ms)",
             params![
                 key,
                 new_state.as_str(),
@@ -807,7 +808,7 @@ fn fire_webhook(url: &str, payload: &Value) {
 
 /// evestack.alert_state.
 pub fn list_alerts(db: &Connection) -> rusqlite::Result<Value> {
-    let mut stmt = db.prepare("SELECT id,state,severity,title,detail,since_ms,notified_at_ms FROM obs_alert_state ORDER BY id")?;
+    let mut stmt = db.prepare("SELECT monitor_key,state,severity,monitor_key,message,updated_at_ms,last_notified_ms FROM alert_state ORDER BY monitor_key")?;
     let rows = stmt
         .query_map([], |r| {
             Ok(json!({
@@ -839,20 +840,20 @@ mod tests {
     fn list_filtered_uses_started_at_index() {
         let db = mem_db();
         db.execute(
-            "INSERT INTO obs_runs(id,session_id,root_id,kind,model,provider,status,started_at_ms,title)
+            "INSERT INTO fact_turn(id,session_id,root_id,kind,model,provider,status,started_at_ms,title)
              VALUES('a','s','a','invoke_agent','m','p','complete',1,'hello')",
             [],
         )
         .unwrap();
         let plan: String = db
-            .prepare("EXPLAIN QUERY PLAN SELECT id FROM obs_runs WHERE status='complete' ORDER BY started_at_ms DESC LIMIT 10")
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM fact_turn WHERE status='complete' ORDER BY started_at_ms DESC LIMIT 10")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
             .unwrap()
             .map(Result::unwrap)
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(plan.contains("obs_runs") || plan.contains("INDEX"), "{plan}");
+        assert!(plan.contains("fact_turn") || plan.contains("INDEX"), "{plan}");
         let rows = list_filtered(&db, 10, Some("complete"), None, Some("hel"), None, None, 0).unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -871,7 +872,7 @@ mod tests {
         let at = 86_400_000_i64 * 10;
         let day_start = at - (at % 86_400_000);
         db.execute(
-            "INSERT INTO obs_runs(id,session_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,cost_usd,flags)
+            "INSERT INTO fact_turn(id,session_id,root_id,kind,model,provider,status,started_at_ms,ended_at_ms,cost_usd,flags)
              VALUES('r','s','r','invoke_agent','m','p','complete',?1,?2,0.5,0)",
             params![day_start + 1000, day_start + 2000],
         )
@@ -891,13 +892,13 @@ mod tests {
         let mut db = mem_db();
         let tx = db.transaction().unwrap();
         tx.execute(
-            "INSERT INTO obs_runs(id,session_id,root_id,kind,model,provider,status,started_at_ms) VALUES('x','s','x','invoke_agent','m','p','running',1)",
+            "INSERT INTO fact_turn(id,session_id,root_id,kind,model,provider,status,started_at_ms) VALUES('x','s','x','invoke_agent','m','p','running',1)",
             [],
         )
         .unwrap();
         apply_run_end_flags(&tx, "x", "complete", &None, 0).unwrap();
         tx.commit().unwrap();
-        let flags: i64 = db.query_row("SELECT flags FROM obs_runs WHERE id='x'", [], |r| r.get(0)).unwrap();
+        let flags: i64 = db.query_row("SELECT flags FROM fact_turn WHERE id='x'", [], |r| r.get(0)).unwrap();
         assert_eq!(flags & FLAG_NO_MODEL_CALL, FLAG_NO_MODEL_CALL);
     }
 
@@ -916,25 +917,25 @@ mod tests {
                 .join(" | ")
         };
         for (sql, index) in [
-            ("SELECT id FROM obs_runs ORDER BY started_at_ms DESC LIMIT 50", "obs_runs_recent"),
-            ("SELECT id FROM obs_runs WHERE session_id='s' ORDER BY started_at_ms DESC LIMIT 50", "obs_runs_session"),
-            ("SELECT id FROM obs_runs WHERE kind='cron' ORDER BY started_at_ms DESC LIMIT 50", "obs_runs_kind_recent"),
-            ("SELECT id FROM obs_runs WHERE outcome='failed' ORDER BY started_at_ms DESC LIMIT 50", "obs_runs_outcome_recent"),
-            ("SELECT COUNT(*) FROM obs_runs WHERE status='running' AND started_at_ms<5", "obs_runs_status_started"),
-            ("SELECT id FROM obs_runs WHERE root_id='r' AND parent_id IS NOT NULL", "obs_runs_root"),
-            ("SELECT id FROM obs_runs WHERE parent_id='r'", "obs_runs_parent"),
-            ("SELECT id FROM obs_spans WHERE run_id='r' ORDER BY started_at_ms", "obs_spans_run"),
-            ("SELECT id FROM obs_spans WHERE name='bash' ORDER BY started_at_ms DESC LIMIT 20", "obs_spans_name"),
-            ("SELECT id FROM obs_approvals WHERE session_id='s' ORDER BY at_ms DESC", "obs_approvals_session"),
-            ("SELECT id FROM obs_approvals ORDER BY at_ms DESC LIMIT 20", "obs_approvals_recent"),
-            ("SELECT id FROM obs_memory_deletions ORDER BY deleted_at_ms DESC LIMIT 20", "obs_memory_deletions_recent"),
+            ("SELECT id FROM fact_turn ORDER BY started_at_ms DESC LIMIT 50", "fact_turn_recent"),
+            ("SELECT id FROM fact_turn WHERE session_id='s' ORDER BY started_at_ms DESC LIMIT 50", "fact_turn_session"),
+            ("SELECT id FROM fact_turn WHERE kind='cron' ORDER BY started_at_ms DESC LIMIT 50", "fact_turn_kind_recent"),
+            ("SELECT id FROM fact_turn WHERE outcome='failed' ORDER BY started_at_ms DESC LIMIT 50", "fact_turn_outcome_recent"),
+            ("SELECT COUNT(*) FROM fact_turn WHERE status='running' AND started_at_ms<5", "fact_turn_status_started"),
+            ("SELECT id FROM fact_turn WHERE root_id='r' AND parent_id IS NOT NULL", "fact_turn_root"),
+            ("SELECT id FROM fact_turn WHERE parent_id='r'", "fact_turn_parent"),
+            ("SELECT id FROM spans WHERE run_id='r' ORDER BY started_at_ms", "spans_run"),
+            ("SELECT id FROM spans WHERE name='bash' ORDER BY started_at_ms DESC LIMIT 20", "spans_name"),
+            ("SELECT id FROM approvals WHERE session_id='s' ORDER BY at_ms DESC", "approvals_session"),
+            ("SELECT id FROM approvals ORDER BY at_ms DESC LIMIT 20", "approvals_recent"),
+            ("SELECT id FROM memory_deletions ORDER BY deleted_at_ms DESC LIMIT 20", "memory_deletions_recent"),
             // The sessions list picks its LIMIT session ids from the covering
             // session index before joining anything.
-            ("SELECT session_id, MAX(started_at_ms) FROM obs_runs WHERE parent_id IS NULL GROUP BY session_id", "obs_runs_session"),
+            ("SELECT session_id, MAX(started_at_ms) FROM fact_turn WHERE parent_id IS NULL GROUP BY session_id", "fact_turn_session"),
         ] {
             let p = plan(sql);
             assert!(p.contains(index), "{sql}\n  plans as: {p}");
-            assert!(!p.contains("SCAN obs_runs |") && !p.ends_with("SCAN obs_runs"), "{sql}\n  scans the table: {p}");
+            assert!(!p.contains("SCAN fact_turn |") && !p.ends_with("SCAN fact_turn"), "{sql}\n  scans the table: {p}");
         }
     }
 }

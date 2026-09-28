@@ -401,7 +401,7 @@ python3 scripts/bench/abeval.py report
 Measures per task/rep: success, model calls, prompt/cached/completion tokens,
 dummy cost (`scripts/lib/bench-prices.mjs`'s table), wall time, tool calls and
 tool errors (Hermes from its NeMo Relay ATOF trace; Sovereign from
-`JCODE_HOME/sovereign.db`'s `obs_runs`/`obs_spans`). Expected runtime: ~10-30
+`JCODE_HOME/sovereign.db`'s `fact_turn`/`spans`). Expected runtime: ~10-30
 min for 9 tasks x 3 reps x 1 arm on a fast local model; scales with model
 latency, not with this harness.
 

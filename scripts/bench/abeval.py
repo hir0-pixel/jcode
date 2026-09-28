@@ -24,7 +24,7 @@ Fairness rules:
   - Tool-call / tool-error counts come from each product's OWN trace, because
     that is the only thing the proxy cannot see: Hermes from its NeMo Relay
     ATOF file (via hermes ab_eval.score_run), Sovereign from
-    JCODE_HOME/sovereign.db (obs_runs/obs_spans, kind='execute_tool').
+    JCODE_HOME/sovereign.db (fact_turn/spans, kind='execute_tool').
   - Every run gets a throwaway HOME/HERMES_HOME/JCODE_HOME; the user's real
     ~/.hermes and ~/.jcode are never touched. hermes-agent itself is read-only
     (imported, never modified).
@@ -457,13 +457,13 @@ def sovereign_tool_metrics(jcode_home, session_id):
         return {"tool_calls": None, "tool_errors": None}
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        run_ids = [r[0] for r in con.execute("SELECT id FROM obs_runs WHERE session_id=?", (session_id,))]
+        run_ids = [r[0] for r in con.execute("SELECT id FROM fact_turn WHERE session_id=?", (session_id,))]
         if not run_ids:
             return {"tool_calls": 0, "tool_errors": 0}
         qmarks = ",".join("?" * len(run_ids))
         total = con.execute(
             f"SELECT COUNT(*), SUM(CASE WHEN status='error' OR error IS NOT NULL THEN 1 ELSE 0 END) "
-            f"FROM obs_spans WHERE root_id IN ({qmarks}) AND kind='execute_tool'",
+            f"FROM spans WHERE root_id IN ({qmarks}) AND kind='execute_tool'",
             run_ids,
         ).fetchone()
         return {"tool_calls": total[0] or 0, "tool_errors": total[1] or 0}

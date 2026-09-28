@@ -65,7 +65,6 @@ async fn http_post(port: u16, path: &str, body: &str, token: Option<&str>) -> (u
 }
 
 #[tokio::test]
-#[ignore = "manual: run with release engine; lib tests cover SQL; live.mjs covers 401"]
 async fn observability_routes_require_token() {
     let home = std::env::temp_dir().join(format!("sovereign-obs-route-test-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();

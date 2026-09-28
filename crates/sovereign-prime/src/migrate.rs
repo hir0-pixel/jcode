@@ -21,6 +21,52 @@ const MIGRATIONS: &[&str] = &[
         params TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL
     );",
+    // 3: observability tables take EveStack's names. A file that never had the old tables gets them
+    // as empty shells first so the renames always apply; the observability baseline
+    // (`gateway/observability/schema.rs`) adds the newer columns and recreates views, indexes and the
+    // memory-deletion trigger. Must run before that baseline creates the new names.
+    "DROP VIEW IF EXISTS obs_fact_turn; DROP VIEW IF EXISTS obs_fact_tool_call; DROP VIEW IF EXISTS obs_alert_state;
+    DROP TRIGGER IF EXISTS obs_memory_audit;
+    DROP INDEX IF EXISTS obs_runs_recent; DROP INDEX IF EXISTS obs_runs_session; DROP INDEX IF EXISTS obs_runs_kind_recent;
+    DROP INDEX IF EXISTS obs_runs_outcome_recent; DROP INDEX IF EXISTS obs_runs_status_started; DROP INDEX IF EXISTS obs_runs_root;
+    DROP INDEX IF EXISTS obs_runs_parent; DROP INDEX IF EXISTS obs_spans_run; DROP INDEX IF EXISTS obs_spans_name;
+    DROP INDEX IF EXISTS obs_approvals_recent; DROP INDEX IF EXISTS obs_approvals_session; DROP INDEX IF EXISTS obs_memory_deletions_recent;
+    CREATE TABLE IF NOT EXISTS obs_runs(
+        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_id TEXT, root_id TEXT NOT NULL,
+        kind TEXT NOT NULL, title TEXT, model TEXT NOT NULL, provider TEXT NOT NULL,
+        status TEXT NOT NULL, started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL, error TEXT, unpriced_calls INTEGER NOT NULL DEFAULT 0,
+        flags INTEGER NOT NULL DEFAULT 0, replay_of TEXT
+    );
+    CREATE TABLE IF NOT EXISTS obs_spans(
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_id TEXT NOT NULL, root_id TEXT NOT NULL,
+        kind TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL,
+        started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER,
+        input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL, error TEXT, model TEXT, provider TEXT,
+        attributes TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS obs_content(id TEXT PRIMARY KEY, input TEXT, output TEXT);
+    CREATE TABLE IF NOT EXISTS obs_approvals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, session_id TEXT NOT NULL,
+        tool TEXT NOT NULL, command_preview TEXT NOT NULL, decision TEXT NOT NULL,
+        actor TEXT NOT NULL, at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS obs_alerts(
+        monitor_key TEXT PRIMARY KEY, state TEXT NOT NULL, severity TEXT NOT NULL,
+        message TEXT, updated_at_ms INTEGER NOT NULL, last_notified_ms INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS obs_memory_deletions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, deleted_at_ms INTEGER NOT NULL,
+        memory_id TEXT NOT NULL, scope TEXT, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '',
+        actor TEXT, actor_via TEXT NOT NULL DEFAULT 'unidentified'
+    );
+    ALTER TABLE obs_runs RENAME TO fact_turn; ALTER TABLE obs_spans RENAME TO spans;
+    ALTER TABLE obs_content RENAME TO span_content; ALTER TABLE obs_approvals RENAME TO approvals;
+    ALTER TABLE obs_alerts RENAME TO alert_state; ALTER TABLE obs_memory_deletions RENAME TO memory_deletions;",
 ];
 
 /// The schema version this engine writes.
@@ -90,7 +136,7 @@ mod tests {
         // A pre-versioning file (user_version 0) with user data.
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("PRAGMA user_version = 0; DROP TABLE parked_approvals; INSERT INTO engine_settings VALUES('k','v');").unwrap();
+            conn.execute_batch("PRAGMA user_version = 0; DROP TABLE parked_approvals; DROP TABLE fact_turn; DROP TABLE spans; DROP TABLE span_content; DROP TABLE approvals; DROP TABLE alert_state; DROP TABLE memory_deletions; INSERT INTO engine_settings VALUES('k','v');").unwrap();
         }
         let conn = open(&path, schema).unwrap();
         assert_eq!(version(&conn).unwrap(), CURRENT);

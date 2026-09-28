@@ -298,8 +298,8 @@ function sovereignToolMetrics(jcodeHome, sessionId) {
   if (!fs.existsSync(dbPath)) return { tool_calls: null, tool_errors: null }
   try {
     const sql =
-      `SELECT COUNT(*), SUM(CASE WHEN s.status='error' OR s.error IS NOT NULL THEN 1 ELSE 0 END) FROM obs_spans s ` +
-      `JOIN obs_runs r ON r.id = s.root_id WHERE r.session_id='${sessionId.replace(/'/g, "''")}' AND s.kind='execute_tool';`
+      `SELECT COUNT(*), SUM(CASE WHEN s.status='error' OR s.error IS NOT NULL THEN 1 ELSE 0 END) FROM spans s ` +
+      `JOIN fact_turn r ON r.id = s.root_id WHERE r.session_id='${sessionId.replace(/'/g, "''")}' AND s.kind='execute_tool';`
     const out = execFileSync('sqlite3', ['-readonly', dbPath, sql], { encoding: 'utf8' }).trim()
     const [calls, errs] = out.split('|')
     return { tool_calls: Number(calls || 0), tool_errors: Number(errs || 0) }

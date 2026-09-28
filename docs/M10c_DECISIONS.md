@@ -6,14 +6,14 @@ Local EveStack-style **monitors, budgets, alerts, approvals audit, promote/repla
 
 ## Storage (schema v4)
 
-- `obs_runs.flags` bit `1` = `no_model_call` (complete, no error, zero model spans).
-- `obs_runs.replay_of` links a replay run to its source.
-- `obs_approvals` append-only audit (command preview capped at 500 chars).
-- `obs_alerts` holds last monitor state for transition dedup.
+- `fact_turn.flags` bit `1` = `no_model_call` (complete, no error, zero model spans).
+- `fact_turn.replay_of` links a replay run to its source.
+- `approvals` append-only audit (command preview capped at 500 chars).
+- `alert_state` holds last monitor state for transition dedup.
 
 ## Queries
 
-- List filters use `obs_runs_recent` / `obs_runs_kind_recent` with `ORDER BY started_at_ms DESC LIMIT` (see unit test `EXPLAIN QUERY PLAN` on filtered list).
+- List filters use `fact_turn_recent` / `fact_turn_kind_recent` with `ORDER BY started_at_ms DESC LIMIT` (see unit test `EXPLAIN QUERY PLAN` on filtered list).
 - Monitors aggregate in SQL then compute p50/p95/p99 in Rust over bounded window rows (1h / 24h / 7d).
 
 ## Budgets
