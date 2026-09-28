@@ -1,0 +1,217 @@
+//! The one engine-level owner of goal / autonomous / heartbeat continuations.
+//!
+//! It is not a desktop window: a single task started with the gateway holds
+//! its own engine link (`Conn { driver: true }`), so goals keep going with no
+//! window attached, resume after an engine restart, and heartbeats fire from a
+//! timer. The link watches only sessions that have an active goal, loop or
+//! heartbeat, and yields (renders and observes nothing) for any session a
+//! window has open, since that window's own connection does all of it.
+//! Continuations are sent through the normal `prompt.submit` path, so tracing
+//! and learning see them like any other turn.
+//!
+//! No idle cost: with no active goal, loop or heartbeat the task just waits
+//! for a poke (a finished turn, `/goal`, `/heartbeat`, `session.control`).
+
+use super::*;
+use sovereign_prime::agent_loop::{Continuation, ControlStore, after_turn, due_heartbeat};
+use std::sync::OnceLock;
+use tokio::sync::Notify;
+
+/// Heartbeat resolution while something is active (heartbeats are >= 60 s).
+const TICK: Duration = Duration::from_secs(15);
+
+struct Driver {
+    conn: Arc<Conn>,
+    wake: Notify,
+}
+
+static DRIVER: OnceLock<Arc<Driver>> = OnceLock::new();
+
+/// Something may have become active: re-scan now.
+pub(crate) fn poke() {
+    if let Some(driver) = DRIVER.get() {
+        driver.wake.notify_one();
+    }
+}
+
+/// Start the driver task (once, with the gateway).
+pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>) {
+    tokio::spawn(async move {
+        let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
+        tokio::spawn(async move { while ws_out.recv().await.is_some() {} });
+        let client = Arc::new(Client {
+            id: hub.next_client_id(),
+            to_ws: to_ws.clone(),
+            sessions: Mutex::new(Default::default()),
+        });
+        let conn = Arc::new(Conn {
+            config,
+            to_ws,
+            control: Mutex::new(None),
+            links: Mutex::new(HashMap::new()),
+            link_tasks: Mutex::new(Vec::new()),
+            known: Mutex::new(HashMap::new()),
+            fresh: Mutex::new(std::collections::HashSet::new()),
+            learning_now: Mutex::new(std::collections::HashSet::new()),
+            driver: true,
+            next_id: AtomicU64::new(1),
+            next_server_request: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+            accept_waiters: Mutex::new(HashMap::new()),
+            upstream: Mutex::new(None),
+            next_forward: AtomicU64::new(1),
+            hub,
+            client,
+            observer,
+            run_kind: "invoke_agent",
+            run_title: None,
+            replay_of: None,
+        });
+        match conn.open_link().await {
+            Ok(link) => *conn.control.lock().await = Some(link),
+            Err(err) => return eprintln!("sovereign: goal driver could not reach the engine: {err:#}"),
+        }
+        let driver = Arc::new(Driver { conn, wake: Notify::new() });
+        let _ = DRIVER.set(driver.clone());
+        let mut first = true;
+        loop {
+            let active = driver.tick(first).await;
+            first = false;
+            if active {
+                tokio::select! {
+                    _ = tokio::time::sleep(TICK) => {}
+                    _ = driver.wake.notified() => {}
+                }
+            } else {
+                driver.wake.notified().await;
+            }
+        }
+    });
+}
+
+fn prompt_of(continuation: Continuation) -> String {
+    match continuation {
+        Continuation::Goal(p) | Continuation::Autonomous(p) => p,
+        Continuation::Heartbeat { prompt, .. } => prompt,
+    }
+}
+
+/// Prompts to send now: for each idle active session a due heartbeat, and on
+/// the first pass (after an engine restart nothing is running) the goal or
+/// loop continuation, so work resumes where it stopped.
+fn due_work(store: &ControlStore, active: &[String], first: bool, busy: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    active
+        .iter()
+        .filter(|sid| !busy(sid))
+        .filter_map(|sid| {
+            let resumed = if first { after_turn(store, sid, 0, false, false).ok().flatten() } else { None };
+            let cont = resumed.or_else(|| due_heartbeat(store, sid).ok().flatten())?;
+            Some((sid.clone(), prompt_of(cont)))
+        })
+        .collect()
+}
+
+impl Driver {
+    /// One scan: watch the active sessions, send due work. `false` when
+    /// nothing is active (the task then sleeps until poked).
+    async fn tick(&self, first: bool) -> bool {
+        let conn = &self.conn;
+        let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
+            return false;
+        };
+        let active = store.active_sessions().unwrap_or_default();
+        for sid in &active {
+            if let Err(err) = conn.ensure_attached(sid).await {
+                if first {
+                    eprintln!("sovereign: goal driver cannot attach {sid}: {err:#}");
+                }
+            }
+        }
+        let stale: Vec<String> = conn.links.lock().await.keys().filter(|k| !active.contains(k)).cloned().collect();
+        for sid in stale {
+            conn.links.lock().await.remove(&sid);
+            conn.sessions.lock().await.remove(&sid);
+            conn.known.lock().await.remove(&sid);
+        }
+        conn.link_tasks.lock().await.retain(|task| !task.is_finished());
+        let busy: std::collections::HashSet<String> = {
+            let sessions = conn.sessions.lock().await;
+            active
+                .iter()
+                .filter(|sid| sessions.get(*sid).is_some_and(SessionState::turn_active) || conn.observer.has_active_run(sid))
+                .cloned()
+                .collect()
+        };
+        for (sid, text) in due_work(&store, &active, first, |sid| busy.contains(sid)) {
+            if let Err(err) = conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
+                eprintln!("sovereign: goal driver submit for {sid}: {}", err.message);
+            }
+        }
+        !active.is_empty()
+    }
+}
+
+/// After a completed turn on `conn`: maybe inject the goal / loop / heartbeat
+/// continuation through that connection, then poke the driver so it watches
+/// (or stops watching) the session.
+pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
+    tokio::spawn(async move {
+        let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
+            return;
+        };
+        let usage = &payload["usage"];
+        let tokens = usage["total"]
+            .as_u64()
+            .unwrap_or_else(|| usage["input"].as_u64().unwrap_or(0) + usage["output"].as_u64().unwrap_or(0)) as i64;
+        let interrupted = payload["status"].as_str() == Some("interrupted");
+        let busy = || async { conn.sessions.lock().await.get(&session_id).is_some_and(SessionState::turn_active) };
+        let subagents_running = conn.child_sessions_running(&session_id).await;
+        let continuation = match after_turn(&store, &session_id, tokens, subagents_running, interrupted) {
+            Ok(None) if !interrupted && !busy().await => due_heartbeat(&store, &session_id).ok().flatten(),
+            Ok(next) => next,
+            Err(err) => return eprintln!("sovereign: after_turn for {session_id}: {err:#}"),
+        };
+        if let Some(cont) = continuation {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if !busy().await {
+                let text = prompt_of(cont);
+                if let Err(err) = conn.dispatch("prompt.submit", &json!({ "session_id": session_id, "text": text })).await {
+                    eprintln!("sovereign: agent loop submit for {session_id}: {}", err.message);
+                }
+            }
+        }
+        poke();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sovereign_prime::agent_loop::{Heartbeat, SessionGoal};
+
+    #[test]
+    fn driver_resumes_goals_once_and_fires_due_heartbeats_only_when_idle() {
+        let home = std::env::temp_dir().join(format!("driver-{}", std::process::id()));
+        let store = ControlStore::open(&home).unwrap();
+        store.set_goal("goal", Some(&SessionGoal::new("ship the parser"))).unwrap();
+        let mut beat = Heartbeat::new("beat", "check the build", 60);
+        beat.last_fired_at_ms = 0;
+        store.upsert_heartbeat(&beat).unwrap();
+        let active = store.active_sessions().unwrap();
+        assert_eq!(active, ["beat", "goal"]);
+
+        // A busy session is left alone (and its heartbeat stays due).
+        assert!(due_work(&store, &active, false, |sid| sid == "beat").is_empty());
+        // After a restart: the goal resumes and the due heartbeat fires.
+        let work = due_work(&store, &active, true, |_| false);
+        assert_eq!(work.len(), 2);
+        assert!(work.iter().any(|(sid, p)| sid == "goal" && p.contains("ship the parser")));
+        assert!(work.iter().any(|(sid, p)| sid == "beat" && p.contains("check the build")));
+        // The heartbeat fired once; goals are not re-sent by later ticks.
+        assert!(due_work(&store, &active, false, |_| false).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+}
