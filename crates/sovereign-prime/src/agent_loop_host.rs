@@ -3,6 +3,14 @@
 use crate::agent_loop::{
     ControlStore, GoalStatus, Heartbeat, HeartbeatStatus, SessionGoal, handle_heartbeat_command,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -10,16 +18,39 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
     let op: Value = serde_json::from_str(op_json).context("goal() expects JSON")?;
     match op["op"].as_str().unwrap_or("get") {
         "get" => Ok(goal_result(store.get_goal(session_id)?).to_string()),
+        "progress" => {
+            let mut goal = store
+                .get_goal(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("No active goal to record progress on."))?;
+            let note = op["note"].as_str().unwrap_or("").trim();
+            if note.is_empty() {
+                anyhow::bail!("goal progress requires a note describing what was tried");
+            }
+            let verification = op["verification"].as_str().unwrap_or("none").trim();
+            let error = op["error"].as_str().unwrap_or("").trim();
+            let mut line = format!("{verification}: {note}");
+            if !error.is_empty() {
+                line.push_str(&format!(" ({error})"));
+            }
+            goal.record_attempt(line);
+            goal.updated_at_ms = now_ms();
+            store.set_goal(session_id, Some(&goal))?;
+            Ok(goal_result(Some(goal)).to_string())
+        }
         "complete" => {
             let mut goal = store
                 .get_goal(session_id)?
                 .ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
+            let verification = op["verification"].as_str().unwrap_or("").trim();
+            if verification.is_empty() {
+                anyhow::bail!(
+                    "goal complete requires verification: describe the test/build/command you ran and its result"
+                );
+            }
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
-            goal.updated_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(goal.updated_at_ms);
+            goal.completion_verification = Some(verification.to_string());
+            goal.updated_at_ms = now_ms();
             store.set_goal(session_id, Some(&goal))?;
             Ok(goal_result(Some(goal)).to_string())
         }
@@ -67,6 +98,10 @@ fn goal_result(goal: Option<SessionGoal>) -> Value {
             "remaining_tokens": remaining_tokens,
             "turns_used": goal.turns_used,
             "max_turns": goal.max_turns,
+            // Budget exhaustion never discards progress: the attempt log
+            // rides along in the report so a paused/expired goal still
+            // shows what was tried and verified so far.
+            "attempt_log": goal.attempt_log,
         })
     });
     let goal = goal.map(|goal| {
@@ -81,6 +116,9 @@ fn goal_result(goal: Option<SessionGoal>) -> Value {
             "started_at_ms": goal.started_at_ms,
             "created_at_ms": goal.created_at_ms,
             "updated_at_ms": goal.updated_at_ms,
+            "attempt_log": goal.attempt_log,
+            "plateaued": goal.plateaued(),
+            "completion_verification": goal.completion_verification,
         })
     });
     json!({
@@ -124,10 +162,8 @@ pub fn heartbeat_host(store: &ControlStore, session_id: &str, op_json: &str) -> 
             heartbeat.label = op["label"].as_str().map(str::to_owned);
             match op["delivery_mode"].as_str() {
                 None | Some("follow_up") => {}
-                Some("steer") => anyhow::bail!(
-                    "RLM heartbeats run when the session is idle; steer delivery is unsupported"
-                ),
-                Some(_) => anyhow::bail!("RLM heartbeat delivery_mode must be follow_up"),
+                Some("steer") => heartbeat.delivery_mode = "steer".into(),
+                Some(_) => anyhow::bail!("RLM heartbeat delivery_mode must be follow_up or steer"),
             }
             store.upsert_heartbeat(&heartbeat)?;
             Ok(
@@ -152,11 +188,10 @@ pub fn heartbeat_host(store: &ControlStore, session_id: &str, op_json: &str) -> 
                     heartbeat.label = op["label"].as_str().map(str::to_owned);
                 }
                 match op["delivery_mode"].as_str() {
-                    None | Some("follow_up") => {}
-                    Some("steer") => anyhow::bail!(
-                        "RLM heartbeats run when the session is idle; steer delivery is unsupported"
-                    ),
-                    Some(_) => anyhow::bail!("RLM heartbeat delivery_mode must be follow_up"),
+                    None => {}
+                    Some("follow_up") => heartbeat.delivery_mode = "follow_up".into(),
+                    Some("steer") => heartbeat.delivery_mode = "steer".into(),
+                    Some(_) => anyhow::bail!("RLM heartbeat delivery_mode must be follow_up or steer"),
                 }
                 if let Some(interval) = op["interval"].as_str() {
                     heartbeat.interval_seconds = parse_interval(interval)?;
@@ -232,10 +267,27 @@ mod tests {
         assert_eq!(create["remaining_tokens"], 9000);
         assert!(goal_host(&store, "s", r#"{"op":"create","text":"replace"}"#).is_err());
 
-        let complete: Value =
-            serde_json::from_str(&goal_host(&store, "s", r#"{"op":"complete"}"#).unwrap()).unwrap();
+        // Completion without a cited verification is rejected.
+        assert!(goal_host(&store, "s", r#"{"op":"complete"}"#).is_err());
+        assert!(
+            goal_host(&store, "s", r#"{"op":"complete","verification":"   "}"#).is_err()
+        );
+
+        let complete: Value = serde_json::from_str(
+            &goal_host(
+                &store,
+                "s",
+                r#"{"op":"complete","verification":"ran `cargo test -p sovereign-prime`, 12 passed"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(complete["goal"]["status"], "done");
         assert_eq!(complete["completion_budget_report"]["token_budget"], 9000);
+        assert_eq!(
+            complete["goal"]["completion_verification"],
+            "ran `cargo test -p sovereign-prime`, 12 passed"
+        );
     }
 
     #[test]
@@ -287,11 +339,22 @@ mod tests {
         .unwrap();
         assert_eq!(all["heartbeats"][0]["status"], "paused");
         assert_eq!(all["heartbeats"][0]["label"], "tests");
+        // "steer" is accepted for RLM heartbeats: it is stored, not rejected;
+        // busy-turn delivery is handled by `due_steer_heartbeat` (see
+        // agent_loop.rs), not by refusing creation.
         assert!(
             heartbeat_host(
                 &store,
                 "s",
                 r#"{"op":"rlm_create","instruction":"interrupt","delivery_mode":"steer"}"#,
+            )
+            .is_ok()
+        );
+        assert!(
+            heartbeat_host(
+                &store,
+                "s",
+                r#"{"op":"rlm_create","instruction":"bogus","delivery_mode":"nonsense"}"#,
             )
             .is_err()
         );
@@ -335,5 +398,78 @@ mod tests {
         assert!(parse_interval("0m").is_err());
         assert!(parse_interval("999999999999999999999h").is_err());
         assert!(parse_interval("💥").is_err());
+    }
+
+    #[test]
+    fn goal_progress_op_records_capped_attempt_log_and_never_fails_on_bad_verification() {
+        let store = ControlStore::memory().unwrap();
+        goal_host(&store, "s", r#"{"op":"create","text":"ship it"}"#).unwrap();
+        assert!(goal_host(&store, "s", r#"{"op":"progress"}"#).is_err(), "note is required");
+
+        let result: Value = serde_json::from_str(
+            &goal_host(
+                &store,
+                "s",
+                r#"{"op":"progress","note":"ran the build","verification":"fail","error":"linker error"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let log = result["goal"]["attempt_log"].as_array().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], "fail: ran the build (linker error)");
+
+        // A failed verification never fails the op or ends the goal.
+        assert_eq!(result["goal"]["status"], "active");
+    }
+
+    #[test]
+    fn budget_exhaustion_report_carries_the_attempt_log() {
+        let store = ControlStore::memory().unwrap();
+        goal_host(
+            &store,
+            "s",
+            r#"{"op":"create","text":"ship it","token_budget":10}"#,
+        )
+        .unwrap();
+        goal_host(
+            &store,
+            "s",
+            r#"{"op":"progress","note":"tried approach A","verification":"fail"}"#,
+        )
+        .unwrap();
+        // Exhaust the token budget via a normal turn.
+        crate::agent_loop::after_turn(&store, "s", 10, false, false).unwrap();
+        let paused: Value = serde_json::from_str(&goal_host(&store, "s", r#"{"op":"get"}"#).unwrap())
+            .unwrap();
+        assert_eq!(paused["goal"]["status"], "paused");
+        let report_log = paused["completion_budget_report"]["attempt_log"]
+            .as_array()
+            .unwrap();
+        assert_eq!(report_log[0], "fail: tried approach A");
+    }
+
+    #[test]
+    fn goal_complete_requires_verification_and_stores_it() {
+        let store = ControlStore::memory().unwrap();
+        goal_host(&store, "s", r#"{"op":"create","text":"ship it"}"#).unwrap();
+        assert!(
+            goal_host(&store, "s", r#"{"op":"complete"}"#).is_err(),
+            "completion without a cited verification must be rejected"
+        );
+        let done: Value = serde_json::from_str(
+            &goal_host(
+                &store,
+                "s",
+                r#"{"op":"complete","verification":"ran `cargo test`, all green"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(done["goal"]["status"], "done");
+        assert_eq!(
+            done["goal"]["completion_verification"],
+            "ran `cargo test`, all green"
+        );
     }
 }

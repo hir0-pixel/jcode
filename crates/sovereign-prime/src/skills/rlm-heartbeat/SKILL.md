@@ -27,19 +27,22 @@ await rlm_heartbeat.delete("job-id")
 - `await rlm_heartbeat.create(instruction, interval=None, label=None,
   delivery_mode=None)` — create a recurring heartbeat for this session. The
   default interval is every 5 minutes. Multiple RLM heartbeats may run at once;
-  use labels to distinguish them. Heartbeats run when the session is idle.
-  `delivery_mode="follow_up"` is accepted to make that behavior explicit;
-  `"steer"` is rejected because the engine does not interrupt busy turns.
+  use labels to distinguish them. `delivery_mode="follow_up"` (the default)
+  only delivers once the session goes idle; `delivery_mode="steer"` delivers
+  at the next turn boundary even while the session is busy, via a soft
+  interrupt (it does not abort an in-flight model call).
 - `await rlm_heartbeat.update(id, instruction=None, interval=None, label=None,
   status=None, delivery_mode=None)` — update one RLM heartbeat by id. `status`
-  may be `"pause"` or `"resume"`; only `delivery_mode="follow_up"` is
-  supported.
+  may be `"pause"` or `"resume"`; `delivery_mode` may be `"follow_up"` or
+  `"steer"`.
 - `await rlm_heartbeat.delete(id)` — cancel one RLM heartbeat by id.
 
 ## Delivery
 
-The engine polls heartbeats when a session is idle. Busy-turn steering is not
-available through this skill.
+`follow_up` heartbeats are only delivered once the session is fully idle
+(no pending goal/autonomous continuation, no running subagents). `steer`
+heartbeats are delivered as soon as they are due, at the session's next turn
+boundary, even mid-task — like a soft interrupt, not a hard cancel.
 
 ## Rules
 

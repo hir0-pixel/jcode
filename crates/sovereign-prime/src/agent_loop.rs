@@ -227,7 +227,23 @@ pub struct SessionGoal {
     pub contract: Value,
     /// Pause continuations while waiting on subagents.
     pub waiting_on_subagents: bool,
+    /// Capped, one-line-per-turn attempt log: what was tried, whether
+    /// verification passed, and the key error if it failed. Only ever
+    /// injected into the per-turn continuation prompt (never the cached
+    /// static prefix), and capped at `MAX_ATTEMPT_LOG` entries of at most
+    /// `MAX_ATTEMPT_LEN` chars each so it stays a small, bounded addition.
+    pub attempt_log: Vec<String>,
+    /// The verification the model cited when it called `complete` (what it
+    /// ran and the result). Required for completion; also surfaced in the
+    /// budget-exhaustion report so a paused/expired goal still shows what
+    /// was verified so far.
+    pub completion_verification: Option<String>,
 }
+
+/// Attempt-log bounds (NVIDIA AVO long-horizon harness: a small, bounded
+/// per-turn note, not unbounded history).
+pub const MAX_ATTEMPT_LOG: usize = 8;
+pub const MAX_ATTEMPT_LEN: usize = 80;
 
 impl SessionGoal {
     pub fn new(title: impl Into<String>) -> Self {
@@ -250,7 +266,42 @@ impl SessionGoal {
             gates: Vec::new(),
             contract: empty_contract(),
             waiting_on_subagents: false,
+            attempt_log: Vec::new(),
+            completion_verification: None,
         }
+    }
+
+    /// Record one capped, one-line attempt-log entry for this turn. Never
+    /// ends the goal on a failed tool call or failed verification — only
+    /// completion, budget exhaustion, or a user cancel do that.
+    pub fn record_attempt(&mut self, line: impl Into<String>) {
+        let mut line = line.into();
+        if line.chars().count() > MAX_ATTEMPT_LEN {
+            line = line
+                .chars()
+                .take(MAX_ATTEMPT_LEN.saturating_sub(1))
+                .collect::<String>();
+            line.push('…');
+        }
+        self.attempt_log.push(line);
+        if self.attempt_log.len() > MAX_ATTEMPT_LOG {
+            let excess = self.attempt_log.len() - MAX_ATTEMPT_LOG;
+            self.attempt_log.drain(0..excess);
+        }
+    }
+
+    /// Cheap, no-model-call plateau heuristic: the last 3 attempt-log
+    /// entries are identical, meaning several consecutive continuation
+    /// turns produced no new passing verification, the same repeated tool
+    /// error, or no file changes (the caller is expected to phrase attempt
+    /// notes so that "no progress" collapses to the same string).
+    pub fn plateaued(&self) -> bool {
+        let n = self.attempt_log.len();
+        if n < 3 {
+            return false;
+        }
+        let last = &self.attempt_log[n - 3..];
+        last.iter().all(|line| line == &last[0])
     }
 
     pub fn out_of_budget(&self) -> Option<&'static str> {
@@ -291,6 +342,12 @@ impl SessionGoal {
         if let Some(reason) = &self.last_reason {
             v["last_reason"] = json!(reason);
         }
+        if !self.attempt_log.is_empty() {
+            v["attempt_log"] = json!(self.attempt_log);
+        }
+        if let Some(verification) = &self.completion_verification {
+            v["completion_verification"] = json!(verification);
+        }
         v
     }
 
@@ -313,6 +370,8 @@ impl SessionGoal {
             "gates": self.gates.iter().map(QualityGate::to_json).collect::<Vec<_>>(),
             "contract": self.contract,
             "waiting_on_subagents": self.waiting_on_subagents,
+            "attempt_log": self.attempt_log,
+            "completion_verification": self.completion_verification,
         })
     }
 
@@ -349,6 +408,17 @@ impl SessionGoal {
                 empty_contract()
             },
             waiting_on_subagents: v["waiting_on_subagents"].as_bool().unwrap_or(false),
+            attempt_log: v["attempt_log"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            completion_verification: v["completion_verification"]
+                .as_str()
+                .map(str::to_string),
         })
     }
 
@@ -382,9 +452,29 @@ impl SessionGoal {
     }
 
     pub fn continuation_prompt(&self) -> String {
+        let mut log_block = String::new();
+        if !self.attempt_log.is_empty() {
+            log_block.push_str("\n\nRecent attempts (most recent last):\n");
+            for line in &self.attempt_log {
+                log_block.push_str("- ");
+                log_block.push_str(line);
+                log_block.push('\n');
+            }
+        }
+        let steer = if self.plateaued() {
+            "\n[Plateau detected] The last few turns made no new verified progress \
+             (same result repeated). Abandon the current approach and try a genuinely \
+             different strategy instead of repeating what already failed above."
+        } else {
+            ""
+        };
         format!(
-            "[Continuing toward your standing goal]\nGoal: {}\n\nContinue working toward this goal. Take the next concrete step. \
-             If you believe the goal is complete, call the goal tool with op=complete. \
+            "[Continuing toward your standing goal]\nGoal: {}{log_block}{steer}\n\n\
+             Continue working toward this goal. Take the next concrete step, then record it with \
+             session_goal op=progress (note, verification, error). Verify by execution (run the \
+             relevant tests/build/command) before claiming success. \
+             Only call session_goal op=complete once you have actually run that verification, and \
+             cite what you ran and its result. \
              If you are blocked and need input from the user, say so clearly and stop.",
             self.title
         )
@@ -650,6 +740,10 @@ pub struct Heartbeat {
     pub created_at_ms: i64,
     pub last_fired_at_ms: i64,
     pub fire_count: i64,
+    /// "follow_up" (default; deliver only once the session is idle) or
+    /// "steer" (RLM heartbeats only; deliver at the next turn boundary even
+    /// while the session is busy, via a soft interrupt).
+    pub delivery_mode: String,
 }
 
 impl Heartbeat {
@@ -682,6 +776,7 @@ impl Heartbeat {
                 now
             },
             fire_count: 0,
+            delivery_mode: "follow_up".to_string(),
         }
     }
 
@@ -715,6 +810,7 @@ impl Heartbeat {
             "created_at_ms": self.created_at_ms,
             "last_fired_at_ms": self.last_fired_at_ms,
             "fire_count": self.fire_count,
+            "delivery_mode": self.delivery_mode,
         })
     }
 
@@ -730,6 +826,10 @@ impl Heartbeat {
             created_at_ms: v["created_at_ms"].as_i64().unwrap_or(0),
             last_fired_at_ms: v["last_fired_at_ms"].as_i64().unwrap_or(0),
             fire_count: v["fire_count"].as_i64().unwrap_or(0),
+            delivery_mode: v["delivery_mode"]
+                .as_str()
+                .unwrap_or("follow_up")
+                .to_string(),
         })
     }
 
@@ -1126,6 +1226,29 @@ pub fn due_heartbeat(store: &ControlStore, session_id: &str) -> Result<Option<Co
     let now = now_ms();
     for mut hb in store.list_heartbeats(session_id)? {
         if hb.is_due(now) {
+            hb.fire_count += 1;
+            hb.last_fired_at_ms = now;
+            store.upsert_heartbeat(&hb)?;
+            return Ok(Some(Continuation::Heartbeat {
+                id: hb.id.clone(),
+                prompt: hb.fire_prompt(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Poll due RLM "steer" heartbeats for a session. Unlike `due_heartbeat`, the
+/// caller does NOT need to gate on idle: steer-mode RLM heartbeats are meant
+/// to reach a busy session at its next turn boundary via a soft interrupt,
+/// not wait for the whole session to go idle. Only `source == "rlm"` and
+/// `delivery_mode == "steer"` heartbeats are considered here; plain
+/// `follow_up` heartbeats (including the user's own) stay on the
+/// idle-only `due_heartbeat` path.
+pub fn due_steer_heartbeat(store: &ControlStore, session_id: &str) -> Result<Option<Continuation>> {
+    let now = now_ms();
+    for mut hb in store.list_heartbeats(session_id)? {
+        if hb.source == "rlm" && hb.delivery_mode == "steer" && hb.is_due(now) {
             hb.fire_count += 1;
             hb.last_fired_at_ms = now;
             store.upsert_heartbeat(&hb)?;
@@ -1688,5 +1811,110 @@ mod tests {
             store.get_goal("s1").unwrap().unwrap().status,
             GoalStatus::Paused
         );
+    }
+
+    #[test]
+    fn attempt_log_is_capped_and_truncated() {
+        let mut goal = SessionGoal::new("x");
+        for i in 0..12 {
+            goal.record_attempt(format!("attempt number {i}"));
+        }
+        assert_eq!(goal.attempt_log.len(), MAX_ATTEMPT_LOG);
+        // Oldest entries are dropped, newest kept.
+        assert_eq!(goal.attempt_log.first().unwrap(), "attempt number 4");
+        assert_eq!(goal.attempt_log.last().unwrap(), "attempt number 11");
+
+        let long = "x".repeat(200);
+        goal.record_attempt(long);
+        let last = goal.attempt_log.last().unwrap();
+        assert!(last.chars().count() <= MAX_ATTEMPT_LEN);
+        assert!(last.ends_with('…'));
+    }
+
+    #[test]
+    fn plateau_detection_needs_no_model_call() {
+        let mut goal = SessionGoal::new("x");
+        assert!(!goal.plateaued(), "empty log is never a plateau");
+        goal.record_attempt("fail: same build error");
+        goal.record_attempt("pass: different step");
+        assert!(!goal.plateaued(), "two distinct entries is not a plateau");
+        goal.record_attempt("fail: same build error");
+        goal.record_attempt("fail: same build error");
+        goal.record_attempt("fail: same build error");
+        assert!(
+            goal.plateaued(),
+            "3 identical consecutive attempts is a plateau"
+        );
+    }
+
+    #[test]
+    fn continuation_prompt_injects_attempt_log_and_steer_on_plateau() {
+        let mut goal = SessionGoal::new("ship it");
+        let prompt = goal.continuation_prompt();
+        assert!(!prompt.contains("Recent attempts"));
+        assert!(!prompt.contains("Plateau detected"));
+
+        goal.record_attempt("fail: lint error");
+        let prompt = goal.continuation_prompt();
+        assert!(prompt.contains("Recent attempts"));
+        assert!(prompt.contains("fail: lint error"));
+        assert!(!prompt.contains("Plateau detected"));
+
+        goal.record_attempt("fail: lint error");
+        goal.record_attempt("fail: lint error");
+        let prompt = goal.continuation_prompt();
+        assert!(prompt.contains("Plateau detected"));
+        assert!(prompt.contains("different strategy"));
+    }
+
+    #[test]
+    fn failed_verification_never_ends_the_goal_only_budget_does() {
+        let store = ControlStore::memory().unwrap();
+        let mut goal = SessionGoal::new("x");
+        goal.max_turns = 2;
+        goal.record_attempt("fail: verification failed");
+        store.set_goal("s1", Some(&goal)).unwrap();
+        // A failed verification is just an attempt-log entry; the goal keeps
+        // going until budget exhaustion, completion, or a user cancel.
+        let c1 = after_turn(&store, "s1", 0, false, false).unwrap();
+        assert!(matches!(c1, Some(Continuation::Goal(_))));
+        assert_eq!(
+            store.get_goal("s1").unwrap().unwrap().status,
+            GoalStatus::Active
+        );
+        // Budget exhaustion is the actual stop condition, and it keeps the
+        // attempt log rather than discarding it.
+        let c2 = after_turn(&store, "s1", 0, false, false).unwrap();
+        assert!(c2.is_none());
+        let paused = store.get_goal("s1").unwrap().unwrap();
+        assert_eq!(paused.status, GoalStatus::Paused);
+        assert_eq!(paused.attempt_log, vec!["fail: verification failed"]);
+    }
+
+    #[test]
+    fn due_steer_heartbeat_ignores_follow_up_and_fires_rlm_steer() {
+        let store = ControlStore::memory().unwrap();
+        let mut follow_up = Heartbeat::new("s1", "watch build", 60);
+        follow_up.source = "rlm".into();
+        follow_up.last_fired_at_ms = now_ms() - 61_000;
+        store.upsert_heartbeat(&follow_up).unwrap();
+        assert!(due_steer_heartbeat(&store, "s1").unwrap().is_none());
+
+        let mut steer = Heartbeat::new("s1", "check progress", 60);
+        steer.source = "rlm".into();
+        steer.delivery_mode = "steer".into();
+        steer.last_fired_at_ms = now_ms() - 61_000;
+        store.upsert_heartbeat(&steer).unwrap();
+        let due = due_steer_heartbeat(&store, "s1").unwrap();
+        assert!(matches!(due, Some(Continuation::Heartbeat { .. })));
+        // Follow-up heartbeat on the same session is untouched.
+        assert!(store.user_heartbeat("s1").unwrap().is_none());
+        let stored_follow_up = store
+            .list_heartbeats("s1")
+            .unwrap()
+            .into_iter()
+            .find(|h| h.id == follow_up.id)
+            .unwrap();
+        assert_eq!(stored_follow_up.fire_count, 0);
     }
 }

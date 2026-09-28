@@ -14,7 +14,7 @@ impl Tool for SessionGoalTool {
     }
 
     fn description(&self) -> &str {
-        "Get, set, or complete the unattended session goal (persists across turns; the gateway continues the session until done or budget hit)."
+        "Get, set, log progress on, or complete the unattended session goal (persists across turns; the gateway continues the session until done or budget hit). Record each continuation's outcome with op=progress; op=complete requires citing a verification you actually ran."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -22,8 +22,11 @@ impl Tool for SessionGoalTool {
             "type": "object",
             "properties": {
                 "intent": super::intent_schema_property(),
-                "op": { "type": "string", "enum": ["get", "create", "complete"], "description": "get status, create/replace goal text, or mark complete" },
-                "text": { "type": "string", "description": "Goal text when op=create" }
+                "op": { "type": "string", "enum": ["get", "create", "progress", "complete"], "description": "get status, create/replace goal text, log a one-line progress note, or mark complete" },
+                "text": { "type": "string", "description": "Goal text when op=create" },
+                "note": { "type": "string", "description": "op=progress: one short line — what you tried this turn" },
+                "verification": { "type": "string", "description": "op=progress: pass/fail/none result of what you ran; op=complete: what you ran and its result (required)" },
+                "error": { "type": "string", "description": "op=progress: the key error, if any" }
             },
             "required": ["op"]
         })
@@ -37,7 +40,18 @@ impl Tool for SessionGoalTool {
                 json!({ "op": "create", "text": input["text"].as_str().unwrap_or_default() })
                     .to_string()
             }
-            "complete" => json!({ "op": "complete" }).to_string(),
+            "progress" => json!({
+                "op": "progress",
+                "note": input["note"].as_str().unwrap_or_default(),
+                "verification": input["verification"].as_str().unwrap_or_default(),
+                "error": input["error"].as_str().unwrap_or_default(),
+            })
+            .to_string(),
+            "complete" => json!({
+                "op": "complete",
+                "verification": input["verification"].as_str().unwrap_or_default(),
+            })
+            .to_string(),
             _ => json!({ "op": "get" }).to_string(),
         };
         let text = sovereign_prime::agent_loop_host::goal_host(&store, &ctx.session_id, &op_json)?;

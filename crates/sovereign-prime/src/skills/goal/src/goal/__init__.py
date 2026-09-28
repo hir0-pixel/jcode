@@ -41,12 +41,39 @@ async def create(objective: str, token_budget: int | None = None) -> dict[str, A
     return await host_request("goal.create", payload)
 
 
-async def complete() -> dict[str, Any]:
+async def progress(note: str, verification: str = "none", error: str = "") -> dict[str, Any]:
+    """Record one short attempt-log line for the current continuation turn.
+
+    `note` is what you tried this turn. `verification` should say what you ran
+    and whether it passed ("pass: cargo test -p foo" / "fail: build error").
+    `error` is the key error, if any. Kept short and capped by the host (last
+    8 entries, ~80 chars each) and only ever shown in the next continuation
+    prompt, never resent in full history. A failed tool call or failed
+    verification does not end the goal — only `complete()`, budget
+    exhaustion, or a user cancel do.
+    """
+    if not isinstance(note, str) or not note.strip():
+        raise ValueError("note must be a non-empty str")
+    if not isinstance(verification, str):
+        raise TypeError(f"verification must be str, got {type(verification).__name__}")
+    if not isinstance(error, str):
+        raise TypeError(f"error must be str, got {type(error).__name__}")
+    payload: dict[str, Any] = {"note": note, "verification": verification}
+    if error:
+        payload["error"] = error
+    return await host_request("goal.progress", payload)
+
+
+async def complete(verification: str) -> dict[str, Any]:
     """Mark the existing thread goal achieved.
 
     Use only when the objective has actually been achieved and no required
     work remains — not because the budget is nearly exhausted or because you
-    are stopping work. Pause, resume, and budget-limit transitions are
-    controlled by the user and the host.
+    are stopping work. `verification` is required: describe the test, build,
+    or command you actually ran and its result (e.g. "ran `pytest`, 42
+    passed"). Pause, resume, and budget-limit transitions are controlled by
+    the user and the host.
     """
-    return await host_request("goal.complete")
+    if not isinstance(verification, str) or not verification.strip():
+        raise ValueError("verification must be a non-empty str describing what you ran and its result")
+    return await host_request("goal.complete", {"verification": verification})
