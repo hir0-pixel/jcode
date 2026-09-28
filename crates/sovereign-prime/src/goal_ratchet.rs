@@ -126,6 +126,11 @@ pub fn snapshot(cwd: &Path, session: &str, n: u32) -> Option<String> {
     git(cwd, &[], &["rev-parse", "--is-inside-work-tree"])?;
     let idx = std::env::temp_dir().join(format!("akira-idx-{}-{n}-{}", std::process::id(), session.len()));
     let _ = std::fs::remove_file(&idx);
+    // Seed from a copy of the real index so `add -A` reuses its stat cache and
+    // only re-hashes changed files (the real index itself is never written).
+    if let Some(real) = git(cwd, &[], &["rev-parse", "--git-path", "index"]) {
+        let _ = std::fs::copy(cwd.join(real), &idx);
+    }
     let e = [("GIT_INDEX_FILE", idx.as_path())];
     let sha = (|| {
         git(cwd, &e, &["add", "-A"])?;
