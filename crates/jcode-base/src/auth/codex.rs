@@ -529,10 +529,7 @@ fn account_from_credentials(
 }
 
 fn load_env_api_key() -> Option<String> {
-    std::env::var("OPENAI_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    jcode_provider_env::env_secret("OPENAI_API_KEY")
         .or_else(|| {
             crate::provider_catalog::load_api_key_from_env_or_config("OPENAI_API_KEY", "openai.env")
         })

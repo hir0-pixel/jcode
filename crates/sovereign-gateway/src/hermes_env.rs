@@ -25,6 +25,10 @@ fn resolve(key: &str) -> Option<String> {
     resolve_in(Path::new(&std::env::var_os("HERMES_HOME")?), key)
 }
 
+/// Tests that set `HERMES_HOME` hold this so they do not race each other.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn register() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| jcode_base::provider_catalog::register_api_key_override_resolver(resolve));
@@ -53,8 +57,7 @@ mod tests {
     #[test]
     fn a_rotated_hermes_key_beats_stale_jcode_and_env_keys_which_only_fill_gaps() {
         use jcode_base::provider_catalog::load_api_key_from_env_or_config as load;
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("hermes-env-order-{}", std::process::id()));
         let (jcode, hermes) = (dir.join("jcode"), dir.join("hermes"));
         std::fs::create_dir_all(&hermes).unwrap();
@@ -71,9 +74,16 @@ mod tests {
         register();
         assert_eq!(load("FAKE_ROTATED_API_KEY", "fake.env").as_deref(), Some("rotated-hermes-key"));
         assert_eq!(load("FAKE_GAP_API_KEY", "fake.env").as_deref(), Some("jcode-gap-key"));
+        // Direct reads and auth probes (`env_secret`) see the same rotated key, and a key only Hermes has.
+        use jcode_base::provider_catalog::env_secret;
+        assert_eq!(env_secret("FAKE_ROTATED_API_KEY").as_deref(), Some("rotated-hermes-key"));
+        std::fs::write(hermes.join(".env"), "FAKE_ROTATED_API_KEY=rotated-hermes-key\nFAKE_ONLY_API_KEY=hermes-only\n").unwrap();
+        assert_eq!(env_secret("FAKE_ONLY_API_KEY").as_deref(), Some("hermes-only"));
+        std::fs::write(hermes.join(".env"), "FAKE_ROTATED_API_KEY=rotated-hermes-key\n").unwrap();
         // Removed from Hermes: the jcode/env keys are the fallback again.
         std::fs::write(hermes.join(".env"), "").unwrap();
         assert_eq!(load("FAKE_ROTATED_API_KEY", "fake.env").as_deref(), Some("stale-env-key"));
+        assert_eq!(env_secret("FAKE_ROTATED_API_KEY").as_deref(), Some("stale-env-key"));
         unsafe {
             std::env::remove_var("FAKE_ROTATED_API_KEY");
             std::env::remove_var("HERMES_HOME");

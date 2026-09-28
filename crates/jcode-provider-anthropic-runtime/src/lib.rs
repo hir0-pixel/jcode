@@ -100,10 +100,7 @@ fn direct_auth_mode() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
-            if std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
+            if jcode_base::provider_catalog::env_secret("ANTHROPIC_AUTH_TOKEN").is_some() {
                 "bearer".to_string()
             } else {
                 "header".to_string()

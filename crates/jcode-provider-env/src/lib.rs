@@ -83,6 +83,17 @@ fn clean_loaded_value(raw: &str, env_key: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
+/// A credential variable as the engine sees it: the override owner's value (Hermes `.env`), else the
+/// process environment. For direct reads and auth-status probes that have no env file of their own;
+/// everything else goes through [`load_api_key_from_env_or_config`].
+pub fn env_secret(env_key: &str) -> Option<String> {
+    if !is_safe_env_key_name(env_key) {
+        return None;
+    }
+    resolve_api_key_override(env_key)
+        .or_else(|| std::env::var(env_key).ok().and_then(|value| clean_loaded_value(&value, env_key)))
+}
+
 pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option<String> {
     if !is_safe_env_key_name(env_key) {
         jcode_logging::warn(&format!(

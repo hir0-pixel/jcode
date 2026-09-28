@@ -1023,9 +1023,7 @@ pub struct ControlStore {
 impl ControlStore {
     pub fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home).ok();
-        let conn = Connection::open(home.join("sovereign.db")).context("opening sovereign.db")?;
-        conn.execute_batch(SCHEMA)
-            .context("migrating session control tables")?;
+        let conn = crate::migrate::open(&home.join("sovereign.db"), SCHEMA).context("opening sovereign.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1049,6 +1047,7 @@ impl ControlStore {
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        crate::migrate::run(&conn, None)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

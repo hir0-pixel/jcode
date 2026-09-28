@@ -5750,6 +5750,7 @@ dependencies = [
  "httparse",
  "jcode-app-core",
  "jcode-base",
+ "jcode-build-meta",
  "jcode-command-risk",
  "jcode-harness-api-server",
  "jcode-provider-core",

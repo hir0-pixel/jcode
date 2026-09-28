@@ -559,21 +559,33 @@ Nothing waits for a human there.
 **Policy implemented (`Hub::unattended`)**
 
 1. Catastrophic commands (home, root, credentials) are always blocked before any approval logic.
-2. An exact command the user approved after the fact runs (see 5).
+2. An exact command the user approved after the fact runs (see 5), and so does a command Hermes's permanent
+   `command_allowlist` (in `config.yaml`) already holds: the exact command text or a `*` / `?` glob, never a
+   compound command (any shell metacharacter disqualifies, stricter than Hermes). Hermes also stores
+   dangerous-pattern keys ("recursive delete") in that list; they are not command text and never match here.
 3. The user's Hermes config (`$HERMES_HOME/config.yaml`) decides: `approvals.mode: off` allows every
    unattended surface; `approvals.cron_mode: approve` allows cron; `approvals.unattended_mode: approve` allows
    bots and goals. Anything else, including a missing or unreadable config, is deny.
 4. A denial is recorded in the observability approvals table (`decision: deny`, `actor: headless-deny`;
-   policy and late approvals appear as `actor: policy` / `user-later`) and parked: the desktop receives a
-   normal `approval` prompt marked `unattended` ("Blocked while unattended (cron): ..."), and a desktop that
-   connects later is shown the open ones. Parked prompts live in memory for 24 h, at most 50.
+   policy, allowlist and late approvals appear as `actor: policy` / `allowlist` / `user-later`) and parked: the
+   desktop receives a normal `approval` prompt marked `unattended` ("Blocked while unattended (cron): ..."), and
+   a desktop that connects later is shown the open ones. Parked prompts live 24 h, at most 50, and are persisted
+   in `sovereign.db` (`parked_approvals`), so an engine restart keeps them.
 5. Answering that prompt records a grant for the exact command text: `once` lets the next unattended run
-   through once, `session` / `always` until the engine restarts. If the session has an active goal, loop or
-   heartbeat it is also told to carry on. A cron or bot run has already ended; its approval only lets the next
-   fire pass.
+   through once, `session` until the engine restarts. `always` is written to Hermes's `command_allowlist` in
+   `config.yaml` (the same block-list format Hermes writes; the single owner of permanent approvals) and only
+   falls back to an in-memory grant when the file is unwritable or shaped in a way the engine won't rewrite
+   (an inline `[a, b]` list). If the session has an active goal, loop or heartbeat it is also told to carry on.
+   A cron or bot run has already ended; its approval only lets the next fire pass.
 
-Not mapped: Hermes's per-pattern `command_allowlist` keys (the engine classifies with `jcode-command-risk`, not
-Hermes's pattern table) and per-profile configs (only `$HERMES_HOME/config.yaml` is read).
+Profiles: the engine is one process per Hermes profile. `--profile P` (or, with no flag, Hermes's sticky
+`active_profile` file, unless `HERMES_HOME` already points into `profiles/`) sets `HERMES_HOME` for the whole
+process, so the approval config, the allowlist, the `.env` key override and the cron stores all follow it.
+Switching profile restarts the engine.
+
+Not mapped: Hermes's dangerous-pattern keys in `command_allowlist` (the engine classifies with
+`jcode-command-risk`, not Hermes's pattern table). An attended `always` answer still means "allow everything
+until the engine restarts" (a blanket flag), unlike the late unattended `always`.
 
 ---
 

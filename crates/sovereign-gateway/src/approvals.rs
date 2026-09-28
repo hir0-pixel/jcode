@@ -45,6 +45,94 @@ fn policy_allows(home: &Path, surface: &str) -> bool {
     approvals["mode"].as_str() == Some("off") || approvals[key].as_str() == Some("approve")
 }
 
+/// Hermes's `command_allowlist` matching (`approval_floors._command_matches_permanent_allowlist`):
+/// the exact command text, or a `*` / `?` glob, never for a compound command. Stricter than Hermes
+/// where it is cheaper to be: any shell metacharacter disqualifies, and `[...]` classes only match
+/// literally. Hermes also keeps dangerous-pattern keys ("recursive delete") in this list; they are
+/// not command text, so they never match here.
+fn has_shell_operator(command: &str) -> bool {
+    command.chars().any(|c| matches!(c, ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}' | '\\' | '\n' | '\r'))
+}
+
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((b'*', rest)) => (0..=text.len()).any(|i| glob_match(rest, &text[i..])),
+        Some((b'?', rest)) => !text.is_empty() && glob_match(rest, &text[1..]),
+        Some((c, rest)) => text.first() == Some(c) && glob_match(rest, &text[1..]),
+    }
+}
+
+fn config_allowlist(home: &Path) -> Vec<String> {
+    let cfg = std::fs::read_to_string(home.join("config.yaml")).ok().and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok());
+    cfg.and_then(|c| c["command_allowlist"].as_sequence().cloned())
+        .map(|list| list.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).collect())
+        .unwrap_or_default()
+}
+
+fn allowlisted(home: &Path, command: &str) -> bool {
+    let command = command.trim();
+    !command.is_empty()
+        && !has_shell_operator(command)
+        && config_allowlist(home).iter().any(|p| {
+            !p.is_empty() && (p == command || (!p.contains('[') && p.contains(['*', '?']) && glob_match(p.as_bytes(), command.as_bytes())))
+        })
+}
+
+/// Add `command` to Hermes's `command_allowlist` in `$home/config.yaml`, the format Hermes itself
+/// writes for an `always` answer (a block list of command text). A plain text edit so the rest of
+/// the file is untouched; a shape it does not recognise is left alone (false: grant stays in memory).
+fn allow_permanently(home: &Path, command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command.contains('\n') || has_shell_operator(command) {
+        return false;
+    }
+    let path = home.join("config.yaml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let valid = |t: &str| serde_yaml::from_str::<serde_yaml::Value>(t).ok().filter(|v| v.is_mapping() || v.is_null());
+    let Some(cfg) = valid(&text) else { return false };
+    if config_allowlist(home).iter().any(|p| p == command) {
+        return true;
+    }
+    if !cfg["command_allowlist"].is_null() && !cfg["command_allowlist"].is_sequence() {
+        return false;
+    }
+    let item = |indent: &str| format!("{indent}- {}", serde_json::to_string(command).unwrap_or_default());
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    match lines.iter().position(|l| l.starts_with("command_allowlist:")) {
+        None => {
+            lines.push("command_allowlist:".into());
+            lines.push(item(""));
+        }
+        Some(at) => {
+            let rest = lines[at]["command_allowlist:".len()..].split('#').next().unwrap_or("").trim().to_string();
+            if rest == "[]" {
+                lines[at] = "command_allowlist:".into();
+                lines.insert(at + 1, item(""));
+            } else if rest.is_empty() {
+                let is_item = |l: &String| l.trim_start().starts_with("- ") || l.trim() == "-";
+                let last = (at + 1..lines.len()).take_while(|&i| is_item(&lines[i])).last().unwrap_or(at);
+                let indent: String = lines.get(at + 1).filter(|l| is_item(l)).map(|l| l.chars().take_while(|c| *c == ' ').collect()).unwrap_or_default();
+                lines.insert(last + 1, item(&indent));
+            } else {
+                return false;
+            }
+        }
+    }
+    let edited = lines.join("\n") + "\n";
+    if !valid(&edited).is_some_and(|v| v["command_allowlist"].as_sequence().is_some_and(|l| l.iter().any(|x| x.as_str() == Some(command)))) {
+        return false;
+    }
+    let tmp = path.with_extension("yaml.tmp");
+    let done = std::fs::write(&tmp, edited).is_ok()
+        && std::fs::metadata(&path).map_or(true, |m| std::fs::set_permissions(&tmp, m.permissions()).is_ok())
+        && std::fs::rename(&tmp, &path).is_ok();
+    if !done {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
 /// A desktop connection able to show prompts.
 pub struct Client {
     pub id: u64,
@@ -68,15 +156,43 @@ pub struct Hub {
     /// prompt ever waits on them; see [`Hub::unattended`].
     headless: Mutex<HashMap<String, &'static str>>,
     /// Exact commands the user approved after the fact: consumed by the next unattended run needing
-    /// it (`once`), or good until the engine restarts (`session` / `always`).
+    /// it (`once`), or good until the engine restarts (`session`; `always` only when Hermes's config
+    /// can't take it, see [`allow_permanently`]).
     once_grants: Mutex<HashSet<String>>,
     sticky_grants: Mutex<HashSet<String>>,
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
+    /// Where parked unattended prompts persist (sovereign.db), so a restart keeps them.
+    store: std::sync::Mutex<Option<Arc<sovereign_prime::entries::EntryStore>>>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 impl Hub {
     pub fn set_observer(&self, observer: std::sync::Arc<crate::observability::Observer>) {
         *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    fn store(&self) -> Option<Arc<sovereign_prime::entries::EntryStore>> {
+        self.store.lock().unwrap().clone()
+    }
+
+    /// Persist parked prompts in `store` and re-arm the ones still inside their 24 h window.
+    pub async fn set_store(self: &Arc<Self>, store: Arc<sovereign_prime::entries::EntryStore>) {
+        *self.store.lock().unwrap() = Some(store.clone());
+        let ttl_ms = PARK_TTL.as_millis() as i64;
+        for (request_id, session, params, created) in store.park_load(now_ms() - ttl_ms) {
+            let Ok(params) = serde_json::from_str::<Value>(&params) else { continue };
+            // Ids restart at 0 with the process: keep new ones clear of the restored ones.
+            if let Some(n) = request_id.strip_prefix("approval-").and_then(|n| n.parse::<u64>().ok()) {
+                self.next.fetch_max(n + 1, Ordering::Relaxed);
+            }
+            let left = Duration::from_millis((created + ttl_ms - now_ms()).max(0) as u64);
+            let (tool, command) = (params["tool_name"].as_str().unwrap_or("bash").to_string(), params["command"].as_str().unwrap_or_default().to_string());
+            self.shown.lock().await.insert(request_id.clone(), (session.clone(), params));
+            self.arm(request_id, session, tool, command, left).await;
+        }
     }
 
     fn audit(&self, session_id: &str, tool: &str, command: &str, decision: &str, actor: &str) {
@@ -139,8 +255,9 @@ impl Hub {
         let surface = self.headless.lock().await.get(session_id).copied().unwrap_or("goal");
         let granted = self.once_grants.lock().await.remove(command) || self.sticky_grants.lock().await.contains(command);
         let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
-        if granted || home.is_some_and(|home| policy_allows(&home, surface)) {
-            self.audit(session_id, tool, command, "once", if granted { "user-later" } else { "policy" });
+        let allowlisted = home.as_deref().is_some_and(|home| allowlisted(home, command));
+        if granted || allowlisted || home.is_some_and(|home| policy_allows(&home, surface)) {
+            self.audit(session_id, tool, command, "once", if granted { "user-later" } else if allowlisted { "allowlist" } else { "policy" });
             return "once".into();
         }
         self.audit(session_id, tool, command, "deny", "headless-deny");
@@ -152,7 +269,6 @@ impl Hub {
     /// goal session, resumes it.
     async fn park(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str, surface: &str) {
         let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
-        let (tx, rx) = oneshot::channel();
         let params = json!({
             "session_id": session_id,
             "request_id": request_id,
@@ -172,17 +288,36 @@ impl Hub {
             }
             shown.insert(request_id.clone(), (session_id.to_string(), params.clone()));
         }
-        self.pending.lock().await.insert(request_id.clone(), (session_id.to_string(), tx));
+        if let Some(store) = self.store() {
+            let _ = store.park_save(&request_id, session_id, &params.to_string(), now_ms());
+        }
         let frame = json!({ "jsonrpc": "2.0", "id": request_id, "method": "approval", "params": params }).to_string();
+        self.arm(request_id, session_id.to_string(), tool.to_string(), command.to_string(), PARK_TTL).await;
         self.broadcast_text(frame).await;
-        let (hub, session, tool, command) = (self.clone(), session_id.to_string(), tool.to_string(), command.to_string());
+    }
+
+    /// Wait up to `ttl` for the user's answer to a parked prompt, then record the grant.
+    async fn arm(self: &Arc<Self>, request_id: String, session: String, tool: String, command: String, ttl: Duration) {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(request_id.clone(), (session.clone(), tx));
+        let hub = self.clone();
         tokio::spawn(async move {
-            let choice = tokio::time::timeout(PARK_TTL, rx).await.ok().and_then(Result::ok).unwrap_or_default();
+            let choice = tokio::time::timeout(ttl, rx).await.ok().and_then(Result::ok).unwrap_or_default();
             hub.pending.lock().await.remove(&request_id);
             hub.shown.lock().await.remove(&request_id);
+            if let Some(store) = hub.store() {
+                store.park_delete(&request_id);
+            }
             match choice.as_str() {
                 "once" => drop(hub.once_grants.lock().await.insert(command.clone())),
-                "session" | "always" => drop(hub.sticky_grants.lock().await.insert(command.clone())),
+                "session" => drop(hub.sticky_grants.lock().await.insert(command.clone())),
+                // Permanent grants belong to Hermes's config; in memory only if it can't take them.
+                "always" => {
+                    let saved = std::env::var_os("HERMES_HOME").is_some_and(|home| allow_permanently(Path::new(&home), &command));
+                    if !saved {
+                        hub.sticky_grants.lock().await.insert(command.clone());
+                    }
+                }
                 _ => return,
             }
             hub.audit(&session, &tool, &command, &choice, "user-later");
@@ -458,6 +593,80 @@ mod tests {
         }
         assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "once");
         assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "deny");
+    }
+
+    #[test]
+    fn hermes_command_allowlist_is_read_and_an_always_grant_is_written_in_its_format() {
+        let home = std::env::temp_dir().join(format!("approvals-allowlist-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let cfg = home.join("config.yaml");
+        assert!(!allowlisted(&home, "make clean"), "no config: not allowed");
+        std::fs::write(&cfg, "# mine\napprovals:\n  mode: manual\ncommand_allowlist:\n- recursive delete\n- podman *\n").unwrap();
+        assert!(allowlisted(&home, "podman ps -a"));
+        assert!(!allowlisted(&home, "podman ps; rm -rf x"), "compound commands never match");
+        assert!(!allowlisted(&home, "rm -rf build"), "a pattern key is not command text");
+        // An always grant lands in the same list, the rest of the file untouched.
+        assert!(allow_permanently(&home, "rm -rf build"));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.starts_with("# mine\napprovals:") && text.contains("- podman *\n- \"rm -rf build\"\n"), "{text}");
+        assert!(allowlisted(&home, "rm -rf build") && !allowlisted(&home, "rm -rf dist"));
+        assert!(allow_permanently(&home, "rm -rf build"), "already there");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+        // Other shapes: absent key, empty list, refused commands.
+        std::fs::write(&cfg, "model: x\ncommand_allowlist: []\n").unwrap();
+        assert!(allow_permanently(&home, "make clean") && allowlisted(&home, "make clean"));
+        std::fs::write(&cfg, "model: x").unwrap();
+        assert!(allow_permanently(&home, "make clean") && allowlisted(&home, "make clean"));
+        assert!(!allow_permanently(&home, "make a && make b") && !allow_permanently(&home, "a\nb"));
+        std::fs::write(&cfg, "command_allowlist: [a, b]\n").unwrap();
+        assert!(!allow_permanently(&home, "make clean"), "inline lists are left alone");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn late_always_lands_in_hermes_config_and_parked_prompts_survive_a_restart() {
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("approvals-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: env is only touched under ENV_LOCK.
+        unsafe { std::env::set_var("HERMES_HOME", &home) };
+        let hub = Arc::new(Hub::default());
+        hub.set_store(sovereign_prime::entries::EntryStore::open(&home).unwrap().into()).await;
+        assert_eq!(hub.decide("s1", "bash", "rm -rf a", "r").await, "deny");
+        assert_eq!(hub.decide("s2", "bash", "rm -rf b", "r").await, "deny");
+        // Engine restart: a new hub on the same sovereign.db still holds both prompts.
+        let hub = Arc::new(Hub::default());
+        hub.set_store(sovereign_prime::entries::EntryStore::open(&home).unwrap().into()).await;
+        assert_eq!(hub.pending_for("s1").await.len(), 1);
+        let (_c, mut rx) = client(&hub, "x").await;
+        let mut ids = vec![request_id(rx.recv().await.unwrap()), request_id(rx.recv().await.unwrap())];
+        ids.sort();
+        assert_eq!(ids, ["approval-0", "approval-1"]);
+        // New prompts do not reuse a restored id.
+        for session in ["s1", "s3"] {
+            hub.mark_headless(session, "cron").await;
+        }
+        assert_eq!(hub.decide("s3", "bash", "rm -rf c", "r").await, "deny");
+        assert!(hub.pending_for("s3").await.iter().all(|p| p["request_id"] != "approval-0" && p["request_id"] != "approval-1"));
+        // "Always" answered after the restart is written to Hermes's config, not kept in memory.
+        let a = ids.iter().find(|id| hub.shown.try_lock().unwrap()[id.as_str()].1["command"] == "rm -rf a").unwrap().clone();
+        assert!(hub.answer(&a, "always").await);
+        for _ in 0..100 {
+            if allowlisted(&home, "rm -rf a") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(allowlisted(&home, "rm -rf a"));
+        assert!(hub.sticky_grants.lock().await.is_empty());
+        assert_eq!(hub.decide("s1", "bash", "rm -rf a", "r").await, "once", "allowlisted now, in every later engine too");
+        // The answered prompt is gone from the store; the other survives another restart.
+        let hub = Arc::new(Hub::default());
+        hub.set_store(sovereign_prime::entries::EntryStore::open(&home).unwrap().into()).await;
+        assert_eq!(hub.pending_for("s1").await.len(), 0);
+        assert_eq!(hub.pending_for("s2").await.len(), 1);
+        unsafe { std::env::remove_var("HERMES_HOME") };
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

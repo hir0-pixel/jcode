@@ -86,11 +86,7 @@ pub(crate) fn openai_effective_auth_mode() -> &'static str {
         Ok(creds) if !creds.refresh_token.is_empty() || creds.id_token.is_some() => "oauth",
         Ok(_) => "api-key",
         Err(_) => {
-            if std::env::var("OPENAI_API_KEY")
-                .ok()
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false)
-            {
+            if jcode_provider_env::env_secret("OPENAI_API_KEY").is_some() {
                 "api-key"
             } else {
                 "oauth"

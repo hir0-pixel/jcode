@@ -139,9 +139,10 @@ mod tests {
 
     #[test]
     fn engine_memory_is_the_single_store_behind_the_screen() {
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("memory-rest-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        // SAFETY: the only test in this crate touching JCODE_HOME.
+        // SAFETY: JCODE_HOME is only touched under ENV_LOCK.
         unsafe { std::env::set_var("JCODE_HOME", &home) };
         assert_eq!(status().unwrap()["builtin_files"], json!({"memory": 0, "user": 0}));
         let note = add("repo uses cargo", "fact", "test").unwrap();

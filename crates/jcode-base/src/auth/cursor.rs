@@ -265,11 +265,8 @@ fn read_vscdb_key(db_path: &PathBuf, key: &str) -> Result<String> {
 /// 1. `CURSOR_API_KEY` env var
 /// 2. Saved key in `~/.config/jcode/cursor.env`
 pub fn load_api_key() -> Result<String> {
-    if let Ok(key) = std::env::var("CURSOR_API_KEY") {
-        let trimmed = jcode_provider_env::sanitize_secret_value(&key);
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
+    if let Some(key) = jcode_provider_env::env_secret("CURSOR_API_KEY") {
+        return Ok(key);
     }
 
     let file_path = config_file_path()?;

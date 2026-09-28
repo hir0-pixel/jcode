@@ -11,6 +11,7 @@ futures-util = "0.3"
 httparse = "1"
 libc = "0.2"
 jcode-base = { path = "../jcode-base" }
+jcode-build-meta = { path = "../jcode-build-meta" }
 jcode-app-core = { path = "../jcode-app-core" }
 jcode-command-risk = { path = "../jcode-command-risk" }
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }

@@ -122,6 +122,11 @@ impl Drop for AlertLoop {
     }
 }
 
+/// The git commit this engine was built from (`/api/status` `sha`, `sovereign __version`).
+pub fn build_sha() -> &'static str {
+    jcode_build_meta::git_hash()
+}
+
 pub struct Gateway {
     listener: TcpListener,
     local: SocketAddr,
@@ -144,6 +149,9 @@ impl Gateway {
             .await
             .context("binding gateway")?;
         let local = listener.local_addr()?;
+        // First opener of sovereign.db: applies (and backs up before) any schema migration.
+        let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&config.home))
+            .context("opening sovereign.db")?;
         let (alert_tx, alert_rx) = std::sync::mpsc::sync_channel::<Value>(64);
         let observer = observability::Observer::open(
             std::path::Path::new(&config.home),
@@ -153,6 +161,7 @@ impl Gateway {
         )?;
         let hub = Arc::new(approvals::Hub::default());
         hub.set_observer(observer.clone());
+        hub.set_store(store).await;
         let alert_hub = hub.clone();
         let alert_loop = AlertLoop(tokio::spawn(async move {
             loop {
@@ -635,6 +644,8 @@ async fn handle(
         ("GET", "/api/status") => {
             let body = json!({
                 "version": config.version,
+                // The build this engine was compiled from; the desktop checks it against its bundle manifest.
+                "sha": build_sha(),
                 "engine": "sovereign",
                 "gateway_running": true,
                 "gateway_state": "running",

@@ -2,6 +2,7 @@
 //!
 //!   sovereign [--profile P] serve --host H --port N
 //!   sovereign __pre-tool
+//!   sovereign __version      (JSON {version, sha}; read by the desktop packager)
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,37 @@ fn profile_home(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     })
 }
 
+fn hermes_root() -> Option<PathBuf> {
+    std::env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes")))
+}
+
+/// Hermes's rule with no `--profile` flag (`_apply_profile_override`): the sticky `active_profile`
+/// file of the Hermes root names the profile, unless `HERMES_HOME` already points into `profiles/`.
+/// A name that is not a profile directory here is ignored rather than failing the engine.
+fn sticky_profile(root: &Path) -> Option<String> {
+    if root.parent().and_then(Path::file_name).is_some_and(|p| p == "profiles") {
+        return None;
+    }
+    let name = std::fs::read_to_string(root.join("active_profile")).ok()?.trim().to_string();
+    (name != "default" && profile_home(root, &name).is_ok_and(|home| home.is_dir())).then_some(name)
+}
+
+/// Scope this process to a Hermes profile: `HERMES_HOME` is the one place approvals, `.env`, cron
+/// and defaults are read from.
+fn activate_profile(root: &Path, name: &str) -> anyhow::Result<()> {
+    let selected = profile_home(root, name)?;
+    if !selected.is_dir() {
+        anyhow::bail!("Hermes profile does not exist: {}", selected.display());
+    }
+    // SAFETY: called before the Tokio runtime or any child processes start.
+    unsafe { std::env::set_var("HERMES_HOME", selected) };
+    // SAFETY: still before runtime startup and child process creation.
+    unsafe { std::env::set_var("SOVEREIGN_PROFILE", name) };
+    Ok(())
+}
+
 fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
     let mut i = 0;
     while i < args.len() {
@@ -53,23 +85,17 @@ fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
             arg => arg.strip_prefix("--profile=").map(str::to_owned),
         };
         if let Some(name) = name {
-            let root = std::env::var_os("HERMES_HOME")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes"))
-                })
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve Hermes home for --profile"))?;
-            let selected = profile_home(&root, &name)?;
-            if !selected.is_dir() {
-                anyhow::bail!("Hermes profile does not exist: {}", selected.display());
-            }
-            // SAFETY: called before the Tokio runtime or any child processes start.
-            unsafe { std::env::set_var("HERMES_HOME", selected) };
-            // SAFETY: still before runtime startup and child process creation.
-            unsafe { std::env::set_var("SOVEREIGN_PROFILE", &name) };
+            let root = hermes_root().ok_or_else(|| anyhow::anyhow!("cannot resolve Hermes home for --profile"))?;
+            activate_profile(&root, &name)?;
             return Ok(Some(name));
         }
         i += 1;
+    }
+    if let Some(root) = hermes_root()
+        && let Some(name) = sticky_profile(&root)
+    {
+        activate_profile(&root, &name)?;
+        return Ok(Some(name));
     }
     Ok(None)
 }
@@ -121,6 +147,10 @@ fn parse_gateway_args(args: &[String]) -> anyhow::Result<GatewayArgs> {
 fn main() -> Result<()> {
     // pre_tool gate (spawned by jcode before each tool call): ask a human
     // before risky shell commands. Exit 0 allows, 2 blocks.
+    if std::env::args().nth(1).as_deref() == Some("__version") {
+        println!("{}", serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "sha": sovereign_gateway::build_sha() }));
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("__pre-tool") {
         let file = jcode::storage::jcode_dir()
             .map(|d| d.join("sovereign-approval.json"))
@@ -262,7 +292,7 @@ fn install_ollama_signal_unload() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_gateway_args, profile_home};
+    use super::{parse_gateway_args, profile_home, sticky_profile};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -298,5 +328,20 @@ mod tests {
             PathBuf::from("/tmp/hermes")
         );
         assert!(profile_home(Path::new("/tmp/hermes"), "../escape").is_err());
+    }
+
+    #[test]
+    fn without_a_profile_flag_the_sticky_active_profile_applies_like_in_hermes() {
+        let root = std::env::temp_dir().join(format!("sticky-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("profiles/work")).unwrap();
+        assert_eq!(sticky_profile(&root), None, "no active_profile file");
+        std::fs::write(root.join("active_profile"), "work\n").unwrap();
+        assert_eq!(sticky_profile(&root).as_deref(), Some("work"));
+        assert_eq!(sticky_profile(&root.join("profiles/work")), None, "HERMES_HOME already names a profile");
+        std::fs::write(root.join("active_profile"), "default").unwrap();
+        assert_eq!(sticky_profile(&root), None);
+        std::fs::write(root.join("active_profile"), "gone").unwrap();
+        assert_eq!(sticky_profile(&root), None, "not a profile directory: ignored");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

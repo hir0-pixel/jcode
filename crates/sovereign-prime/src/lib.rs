@@ -8,6 +8,7 @@ mod bundled_skills;
 pub mod goal_ratchet;
 pub mod entries;
 pub mod host;
+pub mod migrate;
 pub mod refine;
 pub mod skill_files;
 mod worker;

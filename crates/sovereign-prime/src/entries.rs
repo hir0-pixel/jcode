@@ -317,9 +317,7 @@ fn applied_edit_from_json(v: &Value) -> Option<AppliedEdit> {
 impl EntryStore {
     pub fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home).ok();
-        let conn = Connection::open(home.join("sovereign.db")).context("opening sovereign.db")?;
-        conn.execute_batch(SCHEMA)
-            .context("migrating harness entry tables")?;
+        let conn = crate::migrate::open(&home.join("sovereign.db"), SCHEMA).context("opening sovereign.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -347,6 +345,7 @@ impl EntryStore {
     pub fn memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        crate::migrate::run(&conn, None)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -843,6 +842,33 @@ impl EntryStore {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// Unattended approvals parked for a late answer, so a restart keeps them.
+    pub fn park_save(&self, request_id: &str, session_id: &str, params: &str, created_at_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT OR REPLACE INTO parked_approvals(request_id, session_id, params, created_at_ms) VALUES (?1,?2,?3,?4)",
+            params![request_id, session_id, params, created_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn park_delete(&self, request_id: &str) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = conn.execute("DELETE FROM parked_approvals WHERE request_id = ?1", [request_id]);
+    }
+
+    /// Rows newer than `min_created_ms` as `(request_id, session_id, params, created_at_ms)`; older ones are dropped.
+    pub fn park_load(&self, min_created_ms: i64) -> Vec<(String, String, String, i64)> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = conn.execute("DELETE FROM parked_approvals WHERE created_at_ms < ?1", [min_created_ms]);
+        let Ok(mut stmt) = conn.prepare("SELECT request_id, session_id, params, created_at_ms FROM parked_approvals ORDER BY created_at_ms") else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
     }
 
     /// Whether Prime's auto-refine runs: on unless the user turned it off.

@@ -92,7 +92,7 @@ pub fn resolve_dual_credential_auth(
             // auth probe, but re-check defensively so an env-only key set after the
             // cached snapshot still reports honestly.
             let has_api_key =
-                auth.anthropic.has_api_key || std::env::var("ANTHROPIC_API_KEY").is_ok();
+                auth.anthropic.has_api_key || jcode_provider_env::env_secret("ANTHROPIC_API_KEY").is_some();
             (has_oauth, has_api_key)
         }
         jcode_provider_core::DualAuthProvider::OpenAI => {

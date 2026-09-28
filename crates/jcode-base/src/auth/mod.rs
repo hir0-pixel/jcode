@@ -1639,10 +1639,7 @@ fn copilot_source() -> Option<(AuthCredentialSource, String)> {
 }
 
 fn env_var_nonempty(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
+    jcode_provider_env::env_secret(key).is_some()
 }
 
 fn config_file_has_key(file_name: &str, env_key: &str) -> bool {

@@ -192,10 +192,7 @@ fn load_named_profile_api_key(
         return load_api_key_from_env_or_config(env_key, env_file);
     }
 
-    std::env::var(env_key)
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
+    jcode_base::provider_catalog::env_secret(env_key)
 }
 
 fn parse_env_bool(value: &str) -> Option<bool> {
