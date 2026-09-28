@@ -10,8 +10,6 @@ pub use browser::set_bridge as set_browser_bridge;
 mod communicate;
 mod config_edit_notice;
 mod conversation_search;
-mod debug_socket;
-mod desktop_selfdev;
 mod edit;
 mod edit_stats;
 mod file_diff;
@@ -35,7 +33,6 @@ mod session_heartbeat;
 pub(crate) use repl::take_pending_compaction;
 mod replace;
 pub(crate) mod sdk;
-pub mod selfdev;
 pub(crate) mod serde_coerce;
 mod session_search;
 pub(crate) mod session_search_index;
@@ -481,13 +478,6 @@ impl Registry {
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "selfdev", selfdev::SelfDevTool::new);
-            Self::insert_tool_timed(
-                &mut m,
-                &mut timings,
-                "desktop_selfdev",
-                desktop_selfdev::DesktopSelfDevTool::new,
-            );
             let nonzero: Vec<String> = timings
                 .iter()
                 .filter(|(_, ms)| *ms > 0)
@@ -889,29 +879,6 @@ impl Registry {
                 "Tool '{}' is disabled",
                 resolved_name
             );
-        }
-        // Enforce product separation here too: batch/subcalls dispatch through
-        // the registry without going through Agent::validate_tool_allowed.
-        if !is_custom
-            && matches!(
-                resolved_name,
-                "selfdev" | "debug_socket" | "desktop_selfdev"
-            )
-        {
-            let desktop = ctx
-                .working_dir
-                .as_deref()
-                .and_then(jcode_selfdev_types::desktop_repo_root)
-                .is_some();
-            if desktop && matches!(resolved_name, "selfdev" | "debug_socket") {
-                anyhow::bail!(
-                    "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev'.",
-                    resolved_name
-                );
-            }
-            if !desktop && resolved_name == "desktop_selfdev" {
-                anyhow::bail!("Tool 'desktop_selfdev' requires a Jcode Desktop source checkout.");
-            }
         }
         if !is_custom && let Some(policy) = session_tool_policy(&ctx.session_id) {
             if let Some(allowed) = policy.allowed_tools.as_ref()
@@ -1577,25 +1544,6 @@ impl Registry {
                 }
             });
         }
-    }
-
-    /// Register self-dev tools (only for canary/self-dev sessions)
-    pub async fn register_selfdev_tools(&self) {
-        // Self-dev management tool
-        let selfdev_tool = selfdev::SelfDevTool::new();
-        self.register(
-            "selfdev".to_string(),
-            Arc::new(selfdev_tool) as Arc<dyn Tool>,
-        )
-        .await;
-
-        // Debug socket tool for direct debug socket access
-        let debug_socket_tool = debug_socket::DebugSocketTool::new();
-        self.register(
-            "debug_socket".to_string(),
-            Arc::new(debug_socket_tool) as Arc<dyn Tool>,
-        )
-        .await;
     }
 
     /// Register ambient-mode tools (only for ambient sessions)

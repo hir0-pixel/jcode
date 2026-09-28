@@ -83,7 +83,6 @@ pub fn start_overnight_run(options: OvernightStartOptions) -> Result<OvernightLa
     child.model = Some(options.provider.model());
     let coordinator_session_id = child.id.clone();
     let coordinator_session_name = child.display_name().to_string();
-    let child_is_canary = child.is_canary;
     if !options.use_current_session {
         child.status = SessionStatus::Closed;
     }
@@ -156,7 +155,6 @@ pub fn start_overnight_run(options: OvernightStartOptions) -> Result<OvernightLa
             child,
             options.provider,
             options.registry,
-            child_is_canary,
         );
         None
     };
@@ -194,11 +192,10 @@ fn spawn_supervisor(
     child: Session,
     provider: Arc<dyn Provider>,
     registry: Registry,
-    child_is_canary: bool,
 ) {
     let fut = async move {
         if let Err(err) =
-            run_supervisor(manifest.clone(), child, provider, registry, child_is_canary).await
+            run_supervisor(manifest.clone(), child, provider, registry).await
         {
             let mut updated = load_manifest(&manifest.run_id).unwrap_or(manifest.clone());
             updated.status = OvernightRunStatus::Failed;
@@ -233,7 +230,6 @@ async fn run_supervisor(
     child: Session,
     provider: Arc<dyn Provider>,
     registry: Registry,
-    child_is_canary: bool,
 ) -> Result<()> {
     record_event(
         &manifest,
@@ -252,10 +248,6 @@ async fn run_supervisor(
         true,
     )?;
     render_review_html(&manifest)?;
-
-    if child_is_canary {
-        registry.register_selfdev_tools().await;
-    }
 
     let mut agent = Agent::new_with_session(provider, registry, child, None);
     let mut next_prompt = build_coordinator_prompt(&manifest, &preflight);

@@ -67,14 +67,12 @@ jcode-schema-dialect = { path = "../jcode-schema-dialect" }
 # NOTE: jcode-app-core does NOT depend on any jcode-tui-* crate. They were
 # unused dead dependency edges here (the TUI declares them itself). Removing
 # them stops a jcode-tui-* edit from cascading a recompile through app-core.
-jcode-update-core = { path = "../jcode-update-core" }
 jcode-terminal-image = { path = "../jcode-terminal-image" }
 
 # Streaming
 tokio-stream = "0.1"
 
 # TUI
-ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 
 # Markdown & syntax highlighting
@@ -97,7 +95,6 @@ jcode-plan = { path = "../jcode-plan" }
 jcode-swarm-core = { path = "../jcode-swarm-core" }
 jcode-selfdev-types = { path = "../jcode-selfdev-types" }
 jcode-session-types = { path = "../jcode-session-types" }
-jcode-setup-hints = { path = "../jcode-setup-hints" }
 jcode-task-types = { path = "../jcode-task-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }
 sovereign-prime = { path = "../sovereign-prime" }

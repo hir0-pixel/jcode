@@ -43,10 +43,6 @@ fn find_wrap_marker_incremental(accumulated: &str, appended_len: usize) -> Optio
 }
 
 fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, bool) {
-    if tc.name == "selfdev" {
-        return ("Reload initiated. Process restarting...".to_string(), false);
-    }
-
     let action = tc
         .input
         .get("action")
@@ -1610,9 +1606,8 @@ impl Agent {
                     ));
                     tool_handle.abort();
 
-                    // For selfdev reload and wait-like tools, the interruption is expected:
-                    // selfdev initiated the restart, while wait-like tools should be resumed
-                    // after reload rather than treated as failed work.
+                    // Wait-like tools should be resumed after reload rather than
+                    // treated as failed work.
                     let (interrupted_msg, is_error) =
                         reload_interrupted_tool_result(tc, tool_elapsed.as_secs_f64());
 

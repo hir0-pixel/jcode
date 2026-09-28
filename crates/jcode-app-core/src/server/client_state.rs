@@ -440,12 +440,12 @@ fn history_reload_recovery_snapshot(
         )),
     }
 
-    let reload_ctx = crate::tool::selfdev::ReloadContext::peek_for_session(session_id)
+    let reload_ctx = super::reload_context::ReloadContext::peek_for_session(session_id)
         .ok()
         .flatten();
     let inferred_interrupted = was_interrupted
         .unwrap_or_else(|| infer_persisted_session_interrupted_by_reload(session_id));
-    let directive = crate::tool::selfdev::ReloadContext::recovery_directive_for_session(
+    let directive = super::reload_context::ReloadContext::recovery_directive_for_session(
         session_id,
         reload_ctx.as_ref(),
         inferred_interrupted,

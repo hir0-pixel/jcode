@@ -407,9 +407,6 @@ impl Agent {
     /// `tool_definitions`, this does not pin the tool snapshot or consume the
     /// one-shot late-MCP-discovery check before the first real turn.
     pub(crate) async fn prewarm_provider(&self) {
-        if self.session.is_canary {
-            self.registry.register_selfdev_tools().await;
-        }
         let tools = match &self.locked_tools {
             Some(tools) => tools.clone(),
             None => self.build_filtered_tool_definitions().await,
@@ -419,10 +416,6 @@ impl Agent {
     }
 
     pub(super) async fn tool_definitions(&mut self) -> Vec<ToolDefinition> {
-        if self.session.is_canary {
-            self.registry.register_selfdev_tools().await;
-        }
-
         // Return locked tools if available (prevents cache invalidation from
         // tools arriving asynchronously after the first API request).
         //
@@ -512,11 +505,6 @@ impl Agent {
                     .tool_is_disabled(&self.disabled_tools, &tool.name)
             });
         }
-        Self::apply_selfdev_tool_surface(
-            &mut tools,
-            self.session.is_canary,
-            self.is_desktop_selfdev(),
-        );
         self.apply_mcp_tool_exposure(&mut tools);
         let mut tools = crate::tool::sdk::apply_definitions(&self.session.id, tools);
         if let Some(config) = sdk.as_ref() {
@@ -546,32 +534,6 @@ impl Agent {
             tools.retain(|tool| !tool.name.starts_with("mcp__"));
         } else {
             tools.retain(|tool| !matches!(tool.name.as_str(), "mcp_search" | "mcp_call"));
-        }
-    }
-
-    /// Expose the `selfdev` tool only while running in self-development mode.
-    fn apply_selfdev_tool_surface(
-        tools: &mut Vec<ToolDefinition>,
-        is_canary: bool,
-        is_desktop: bool,
-    ) {
-        // Desktop development is a separate product mode, not a CLI canary.
-        // Never advertise CLI build/reload or TUI debug sockets in that mode.
-        if is_desktop {
-            tools.retain(|tool| !matches!(tool.name.as_str(), "selfdev" | "debug_socket"));
-            return;
-        }
-        tools.retain(|tool| tool.name != "desktop_selfdev");
-        if !is_canary {
-            tools.retain(|tool| tool.name != "selfdev");
-            return;
-        }
-        for tool in tools.iter_mut() {
-            if tool.name == "selfdev" {
-                tool.description =
-                    crate::tool::selfdev::SelfDevTool::description_for(true).to_string();
-                tool.input_schema = crate::tool::selfdev::SelfDevTool::schema_for(true);
-            }
         }
     }
 
@@ -607,9 +569,6 @@ impl Agent {
 
     /// Get full tool definitions for debug introspection (bypasses lock)
     pub async fn tool_definitions_for_debug(&self) -> Vec<crate::message::ToolDefinition> {
-        if self.session.is_canary {
-            self.registry.register_selfdev_tools().await;
-        }
         self.build_filtered_tool_definitions().await
     }
 
@@ -713,18 +672,6 @@ impl Agent {
                 );
                 sdk_enabled = true;
             }
-        }
-        let is_desktop = self.is_desktop_selfdev();
-        if is_desktop && matches!(name, "selfdev" | "debug_socket") {
-            return Err(anyhow::anyhow!(
-                "Tool '{}' targets Jcode CLI, not Desktop. Use 'desktop_selfdev' in Desktop self-development mode.",
-                name
-            ));
-        }
-        if !is_desktop && name == "desktop_selfdev" {
-            return Err(anyhow::anyhow!(
-                "Tool 'desktop_selfdev' is only available in a Jcode Desktop source checkout."
-            ));
         }
         if sdk_enabled {
             return Ok(());

@@ -74,9 +74,6 @@ pub(super) async fn create_headless_session(
         registry.enable_memory_test_mode().await;
     }
 
-    if selfdev_requested {
-        registry.register_selfdev_tools().await;
-    }
 
     registry
         .register_mcp_tools_for_dir(

@@ -11,8 +11,6 @@ use tokio_stream::wrappers::ReceiverStream;
 #[path = "agent_tests/tool_streaming.rs"]
 mod tool_streaming;
 
-#[path = "agent_tests/desktop_selfdev.rs"]
-mod desktop_selfdev;
 
 
 struct DelayedProvider {

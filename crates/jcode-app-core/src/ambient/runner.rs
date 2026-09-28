@@ -393,9 +393,6 @@ impl AmbientRunnerHandle {
         let session = Session::load(session_id)?;
         let cycle_provider = provider.fork();
         let registry = tool::Registry::new(cycle_provider.clone()).await;
-        if session.is_canary {
-            registry.register_selfdev_tools().await;
-        }
 
         let mut agent = Agent::new(cycle_provider, registry);
         agent.set_debug(session.is_debug);
@@ -466,13 +463,9 @@ impl AmbientRunnerHandle {
         child.save()?;
 
         let child_session_id = child.id.clone();
-        let child_is_canary = child.is_canary;
         let child_is_debug = child.is_debug;
         let cycle_provider = provider.fork();
         let registry = tool::Registry::new(cycle_provider.clone()).await;
-        if child_is_canary {
-            registry.register_selfdev_tools().await;
-        }
 
         let mut agent = Agent::new_with_session(cycle_provider, registry, child, None);
         agent.set_debug(child_is_debug);

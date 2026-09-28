@@ -1,15 +1,13 @@
-//! `sovereign`: the engine binary with the Hermes backend command line, so the
-//! Hermes desktop can launch it exactly as it launches `hermes serve`:
+//! `sovereign`: the headless engine binary launched by the Hermes desktop:
 //!
-//!   sovereign [--profile P] serve --host H --port N   →  jcode gateway --host H --port N
-//!
-//! Anything else passes through unchanged, so `sovereign login` etc. still work.
+//!   sovereign [--profile P] serve --host H --port N
+//!   sovereign __pre-tool
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 struct GatewayArgs {
-    provider: jcode::cli::provider_init::ProviderChoice,
+    provider: jcode::sovereign_runtime::ProviderChoice,
     model: Option<String>,
     host: String,
     port: u16,
@@ -78,7 +76,7 @@ fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
 
 fn parse_gateway_args(args: &[String]) -> anyhow::Result<GatewayArgs> {
     use clap::ValueEnum;
-    let mut provider = jcode::cli::provider_init::ProviderChoice::YoloAuto;
+    let mut provider = jcode::sovereign_runtime::ProviderChoice::YoloAuto;
     let mut model = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000;
@@ -193,7 +191,7 @@ fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(jcode::cli::dispatch::run_gateway(
+        .block_on(jcode::sovereign_runtime::run_gateway(
             &args.provider,
             args.model.as_deref(),
             &args.host,
