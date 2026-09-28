@@ -26,9 +26,27 @@ fs.writeFileSync(path.join(hermesHome, 'mcp-tokens/settings-oauth.json'), JSON.s
   expires_at: Date.now() / 1000 + 3600,
 }), { mode: 0o600 })
 const token = crypto.randomBytes(24).toString('hex')
+const memorySecret = `private-${crypto.randomBytes(12).toString('hex')}`
+const memoryDir = path.join(jcodeHome, 'memory')
+fs.mkdirSync(memoryDir, { recursive: true })
+const memoryTimestamp = new Date().toISOString()
+fs.writeFileSync(path.join(memoryDir, 'global.json'), JSON.stringify({
+  graph_version: 2,
+  memories: {
+    'settings-memory-fixture': {
+      id: 'settings-memory-fixture', category: 'fact',
+      content: `My private recall token is ${memorySecret}.`,
+      tags: ['private', 'recall', 'token'],
+      search_text: `private recall token ${memorySecret}`,
+      created_at: memoryTimestamp, updated_at: memoryTimestamp,
+      access_count: 0, trust: 'high', strength: 1, active: true, confidence: 1,
+    },
+  },
+  tags: {}, clusters: {}, edges: {}, reverse_edges: {}, metadata: {},
+}))
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`,
+  `[provider]\ndefault_provider = "openai-compatible"\n`,
 )
 const env = {
   ...process.env,
@@ -44,6 +62,43 @@ delete env.SOVEREIGN_PROVIDER
 delete env.SOVEREIGN_MODEL
 const children = []
 const oauthCalls = []
+const ollamaRequests = []
+const ollamaProxyPaths = []
+const ollamaProxyOutcomes = []
+const activeChatRequests = new Set()
+const ollamaRequestUpstreams = new WeakMap()
+const ollamaProxy = http.createServer(async (request, response) => {
+  ollamaProxyPaths.push(`${request.method} ${request.url}`)
+  const chunks = []
+  for await (const chunk of request) chunks.push(chunk)
+  const body = Buffer.concat(chunks)
+  let capturedRequest
+  try {
+    const parsed = JSON.parse(body.toString('utf8'))
+    if (Array.isArray(parsed.messages)) {
+      capturedRequest = parsed
+      ollamaRequests.push(parsed)
+    }
+  } catch {}
+  const upstream = http.request({
+    hostname: '127.0.0.1', port: 11434, path: request.url, method: request.method,
+    headers: { ...request.headers, host: '127.0.0.1:11434', connection: 'close' }, agent: false,
+  }, upstreamResponse => {
+    upstreamResponse.once('end', () => ollamaProxyOutcomes.push(`${request.method} ${request.url} -> ${upstreamResponse.statusCode} ended`))
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers)
+    upstreamResponse.pipe(response)
+  })
+  if (request.method === 'POST' && request.url?.includes('/chat/completions') && capturedRequest) {
+    ollamaRequestUpstreams.set(capturedRequest, upstream)
+    activeChatRequests.add(upstream)
+    upstream.once('close', () => activeChatRequests.delete(upstream))
+  }
+  response.on('close', () => {
+    if (!response.writableEnded) upstream.destroy()
+  })
+  upstream.on('error', error => response.destroy(error))
+  upstream.end(body)
+})
 const oauthMcp = http.createServer(async (request, response) => {
   const chunks = []
   for await (const chunk of request) chunks.push(chunk)
@@ -105,6 +160,18 @@ const waitPort = async (proc, marker) => {
 
 let ws
 try {
+  await new Promise((resolve, reject) => {
+    ollamaProxy.once('error', reject)
+    ollamaProxy.listen(0, '127.0.0.1', resolve)
+  })
+  const ollamaProxyUrl = `http://127.0.0.1:${ollamaProxy.address().port}/v1`
+// The engine's generic provider remains pointed directly at Ollama. Only
+// Hermes's selected named profile uses the capture proxy, so the live request
+// assertion proves provider selection changes the route.
+env.JCODE_OPENAI_COMPAT_API_BASE = 'http://127.0.0.1:11434/v1'
+  env.OPENAI_COMPAT_API_KEY = 'ollama'
+  fs.writeFileSync(path.join(jcodeHome, 'config.toml'),
+    `[provider]\ndefault_provider = "openai-compatible"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "${ollamaProxyUrl}"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\nsupports_reasoning_effort = true\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
   await new Promise((resolve, reject) => {
     oauthMcp.once('error', reject)
     oauthMcp.listen(0, '127.0.0.1', resolve)
@@ -187,8 +254,8 @@ try {
     body: JSON.stringify({ config: {
       memory: { memory_enabled: false },
       agent: { reasoning_effort: 'low' },
-      providers: { 'openai-compatible': {
-        base_url: 'http://127.0.0.1:11434/v1', api_key: 'ollama', model,
+      providers: { local: {
+        base_url: ollamaProxyUrl, api_key: 'ollama', model,
         context_length: 65536, models: [{ id: model, context_length: 65536 }],
       } },
     } }),
@@ -203,13 +270,13 @@ try {
   const modelSetting = await fetch(`${base}/api/model/set`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
-    body: JSON.stringify({ scope: 'main', provider: 'openai-compatible', model, confirm_expensive_model: true }),
+    body: JSON.stringify({ scope: 'main', provider: 'local', model, base_url: ollamaProxyUrl, api_key: 'ollama', confirm_expensive_model: true }),
   })
   if (!modelSetting.ok) throw new Error(`Hermes model setting returned ${modelSetting.status}: ${await modelSetting.text()}`)
   const soulSetting = await fetch(`${base}/api/profiles/default/soul`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
-    body: JSON.stringify({ content: 'When a user asks for the settings marker, include SYSTEM_PROMPT_APPLIED in your response.' }),
+    body: JSON.stringify({ content: 'When a user asks for the settings marker, include SYSTEM_PROMPT_APPLIED in your response. If asked for the private recall token and it is not visible in the current conversation, respond with MEMORY_RECALL_DISABLED and do not guess or use tools.' }),
   })
   if (!soulSetting.ok) throw new Error(`Hermes profile prompt setting returned ${soulSetting.status}: ${await soulSetting.text()}`)
 
@@ -247,23 +314,9 @@ try {
   const created = await rpc('session.create', { cwd: home })
   const sid = created.result?.session_id
   if (!sid) throw new Error(`session.create failed: ${JSON.stringify(created)}`)
-  if (created.result.info?.model !== model || created.result.info?.provider !== 'openai-compatible' ||
+  if (created.result.info?.model !== model || created.result.info?.provider !== 'local' ||
     created.result.info?.reasoning_effort !== 'low' || created.result.info?.memory_enabled !== false) {
     throw new Error(`Hermes model/provider/reasoning/memory settings did not reach the engine session: ${JSON.stringify(created.result.info)}`)
-  }
-  const changedModel = await rpc('config.set', { session_id: sid, key: 'model', value: `${model} --provider local` })
-  if (changedModel.error || changedModel.result?.value !== `${model} --provider local`) {
-    throw new Error(`model/provider setting failed: ${JSON.stringify(changedModel)}`)
-  }
-  const changedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'high' })
-  if (changedEffort.error || changedEffort.result?.value !== 'high') {
-    throw new Error(`reasoning setting failed: ${JSON.stringify(changedEffort)}`)
-  }
-  // Verify the chosen setting reaches the engine, then disable reasoning for
-  // the live tool-use turns so this test stays bounded on the local model.
-  const boundedEffort = await rpc('config.set', { session_id: sid, key: 'reasoning', value: 'none' })
-  if (boundedEffort.error || boundedEffort.result?.value !== 'none') {
-    throw new Error(`reasoning effort could not be reset for bounded e2e turns: ${JSON.stringify(boundedEffort)}`)
   }
   const sendTurn = async (text, targetSid = sid, timeoutMs = 180_000) => {
     const from = events.length
@@ -277,6 +330,100 @@ try {
       throw new Error(`chat did not complete: ${JSON.stringify(events.slice(from))}\n${engine.output()}`)
     }
   }
+  const setMemoryEnabled = async enabled => {
+    const response = await fetch(`${base}/api/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+      body: JSON.stringify({ config: { memory: { memory_enabled: enabled } } }),
+    })
+    if (!response.ok) throw new Error(`Hermes memory setting ${enabled} returned ${response.status}: ${await response.text()}`)
+  }
+  const waitModelRequest = async marker => {
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const matching = ollamaRequests.find(request => JSON.stringify(request.messages).includes(marker))
+      if (matching) return matching
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    return undefined
+  }
+  const chatDiagnostics = async sessionId => {
+    const [active, history] = await Promise.all([
+      rpc('session.active_list', { current_session_id: sessionId }),
+      rpc('session.history', { session_id: sessionId }),
+    ])
+    const logDirectory = path.join(jcodeHome, 'logs')
+    const logFiles = fs.existsSync(logDirectory)
+      ? fs.readdirSync(logDirectory).filter(name => name.endsWith('.log')).sort()
+      : []
+    const logTail = logFiles.length
+      ? fs.readFileSync(path.join(logDirectory, logFiles.at(-1)), 'utf8').split('\n')
+          .filter(line => /API call starting|provider|model|turn|error/i.test(line)).slice(-30)
+      : []
+    const messages = history.result?.messages || []
+    return JSON.stringify({
+      active: active.result,
+      history: messages.slice(-3).map(message => ({ role: message.role, name: message.name, type: message.type })),
+      ollamaProxyPaths, ollamaProxyOutcomes, logTail,
+    })
+  }
+  const interruptCapturedTurn = async (sessionId, marker) => {
+    const captured = ollamaRequests.find(request => JSON.stringify(request.messages).includes(marker))
+    const upstream = captured && ollamaRequestUpstreams.get(captured)
+    if (!upstream) throw new Error(`no upstream Ollama request was captured for ${marker}`)
+    const interrupted = await rpc('session.interrupt', { session_id: sessionId })
+    if (interrupted.error) throw new Error(`could not stop captured settings turn: ${JSON.stringify(interrupted)}`)
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const active = await rpc('session.active_list', { current_session_id: sessionId })
+      if (active.error) throw new Error(`could not check captured settings turn state: ${JSON.stringify(active)}`)
+      if (!active.result?.sessions?.some(session => session.id === sessionId && session.current)) {
+        if (activeChatRequests.has(upstream)) {
+          const closed = new Promise(resolve => upstream.once('close', resolve))
+          upstream.destroy()
+          await Promise.race([closed, new Promise(resolve => setTimeout(resolve, 1000))])
+        }
+        activeChatRequests.delete(upstream)
+        return
+      }
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    throw new Error(`captured settings turn remained active after interrupt: ${engine.output()}`)
+  }
+  const disabledMemory = (await rpc('session.create', { cwd: home })).result
+  if (disabledMemory?.info?.memory_enabled !== false) {
+    throw new Error(`Hermes memory disable setting did not reach its isolated engine session: ${JSON.stringify(disabledMemory?.info)}`)
+  }
+  const disabledMemorySid = disabledMemory.session_id
+  const disabledReasoning = await rpc('config.set', { session_id: disabledMemorySid, key: 'reasoning', value: 'none' })
+  if (disabledReasoning.error) throw new Error(`memory behavior check could not bound reasoning effort: ${JSON.stringify(disabledReasoning)}`)
+  const disabledMarker = `memory-off-${crypto.randomBytes(8).toString('hex')}`
+  const disabledPrompt = `For check ${disabledMarker}, what is my private recall token?`
+  const disabledSubmit = await rpc('prompt.submit', { session_id: disabledMemorySid, text: disabledPrompt })
+  if (disabledSubmit.error) throw new Error(`disabled-memory chat was rejected: ${JSON.stringify(disabledSubmit)}`)
+  const disabledRequest = await waitModelRequest(disabledMarker)
+  if (!disabledRequest) throw new Error(`disabled-memory chat never reached the model capture proxy (events=${JSON.stringify(events.slice(-10))}, diagnostics=${await chatDiagnostics(disabledMemorySid)}): ${engine.output()}`)
+  if (JSON.stringify(disabledRequest.messages).includes(memorySecret)) {
+    throw new Error('disabled Hermes memory leaked the seeded recall fact into the model request')
+  }
+  await interruptCapturedTurn(disabledMemorySid, disabledMarker)
+  await setMemoryEnabled(true)
+  const memoryEnabled = (await rpc('session.create', { cwd: home })).result
+  if (memoryEnabled?.info?.memory_enabled !== true) {
+    throw new Error(`Hermes memory enable setting did not reach the engine: ${JSON.stringify(memoryEnabled?.info)}`)
+  }
+  const memoryEffort = await rpc('config.set', { session_id: memoryEnabled.session_id, key: 'reasoning', value: 'none' })
+  if (memoryEffort.error) throw new Error(`memory behavior check could not set reasoning to none: ${JSON.stringify(memoryEffort)}`)
+  const enabledMarker = `memory-on-${crypto.randomBytes(8).toString('hex')}`
+  const enabledPrompt = `For check ${enabledMarker}, what is my private recall token?`
+  const enabledSubmit = await rpc('prompt.submit', { session_id: memoryEnabled.session_id, text: enabledPrompt })
+  if (enabledSubmit.error) throw new Error(`enabled-memory prompt was rejected: ${JSON.stringify(enabledSubmit)}`)
+  const enabledRequest = await waitModelRequest(enabledMarker)
+  if (!enabledRequest) throw new Error(`enabled-memory chat never reached the model capture proxy (paths=${JSON.stringify(ollamaProxyPaths)}, events=${JSON.stringify(events.slice(-10))}): ${engine.output()}`)
+  if (!JSON.stringify(enabledRequest.messages).includes(memorySecret)) {
+    throw new Error(`enabled Hermes memory did not reach the local Ollama request: ${JSON.stringify(enabledRequest.messages)}`)
+  }
+  await interruptCapturedTurn(memoryEnabled.session_id, enabledMarker)
   // Agent/MCP startup is lazy. Reload through the engine's management tool
   // before the second turn so its model-facing registry contains the server tool.
   await sendTurn('Use the mcp management tool with action reload to connect the configured MCP server. Then reply with exactly READY.')
@@ -305,10 +452,35 @@ try {
   if (!/(unavailable|not available|disabled|cannot|can't|no bash|no terminal)/.test(assistantText)) {
     throw new Error(`chat did not reflect the disabled terminal tool: ${JSON.stringify(messages)}`)
   }
+  const highReasoningUpdate = await fetch(`${base}/api/config`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Token': token },
+    body: JSON.stringify({ config: { agent: { reasoning_effort: 'high' } } }),
+  })
+  if (!highReasoningUpdate.ok) throw new Error(`Hermes reasoning setting returned ${highReasoningUpdate.status}: ${await highReasoningUpdate.text()}`)
+  const highReasoningSession = (await rpc('session.create', { cwd: home })).result
+  if (highReasoningSession?.info?.reasoning_effort !== 'high') {
+    throw new Error(`Hermes high reasoning setting did not reach the engine session: ${JSON.stringify(highReasoningSession?.info)}`)
+  }
+  const reasoningMarker = `reasoning-high-${crypto.randomBytes(8).toString('hex')}`
+  const reasoningSubmit = await rpc('prompt.submit', {
+    session_id: highReasoningSession.session_id, text: `Reply READY for ${reasoningMarker}`,
+  })
+  if (reasoningSubmit.error) throw new Error(`high reasoning chat was rejected: ${JSON.stringify(reasoningSubmit)}`)
+  const reasoningRequest = await waitModelRequest(reasoningMarker)
+  if (!reasoningRequest) throw new Error(`high reasoning chat never reached local Ollama: ${engine.output()}`)
+  if (reasoningRequest.model !== model || reasoningRequest.reasoning_effort !== 'high') {
+    throw new Error(`Hermes-selected model/provider/reasoning did not reach the model request: ${JSON.stringify({
+      model: reasoningRequest.model, reasoning_effort: reasoningRequest.reasoning_effort,
+    })}`)
+  }
+  await interruptCapturedTurn(highReasoningSession.session_id, reasoningMarker)
   console.log('PASS Hermes API added MCP server; Rust engine chat called it and received its result')
   console.log('PASS Hermes API added OAuth MCP server; Rust engine chat used the cached OAuth bearer token')
   console.log('PASS Hermes skills hub installed into JCODE_HOME/skills and the Rust engine lists it')
   console.log('PASS Hermes terminal toolset toggle is persisted by Python and enforced by Rust chat')
+  console.log('PASS Hermes memory toggle excludes/includes the seeded memory context in Rust chat requests')
+  console.log('PASS Hermes model/provider and reasoning settings reach the local model request')
 } finally {
   if (ws && ws.readyState < WebSocket.CLOSING) ws.close()
   for (const child of [...children].reverse()) stop(child)
@@ -318,5 +490,6 @@ try {
     setTimeout(() => { stop(child); resolve() }, 5000)
   })))
   fs.rmSync(root, { recursive: true, force: true })
+  ollamaProxy.close()
   oauthMcp.close()
 }

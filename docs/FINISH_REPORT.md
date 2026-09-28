@@ -486,3 +486,77 @@ the session RPCs, engine settings, and the final no-chat-RPC-forwarding check.
 GPT-6 Sol reviewed the diff and advised it was minimal and correct; its only
 caveat was that a host-inherited `JCODE_NAMED_PROVIDER_PROFILE` could override
 the test config, which did not occur in the verified run.
+
+### Item B continuation: live memory, browser, voice output, and wake diagnostics (2026-09-28)
+
+GPT-6 Sol advised running an isolated live `wake.status` and `wake.start` with
+lazy installs explicitly disabled; mocked `wake.feed` or UI store tests would
+not prove real microphone capture. The settings e2e now seeds a random private
+memory fact in the temporary JCODE_HOME, captures the outbound local Ollama
+request, and proves that the secret is absent with memory off and present after
+the Hermes setting enables memory for a new engine session. The live run passed
+with stdio MCP, OAuth MCP, skill hub, terminal tool toggle, model/provider,
+reasoning, system prompt, and memory checks.
+
+The browser-controller e2e now uses cached Playwright Chromium, connects through
+the authenticated engine `browser.manage` route via local CDP, reads status,
+and disconnects. It passed. The local voice e2e uses macOS `say` plus
+`afconvert` to synthesize a real WAV, then checks the Hermes TTS lease
+acquire/release. The same isolated Hermes backend run sets
+`HERMES_DISABLE_LAZY_INSTALLS=1`, confirms live `wake.status` reports
+unavailable, confirms `wake.start` refuses with `reason=unavailable`, and
+verifies the refusal does not persist `wake_word.enabled=true`. These checks
+passed; no dependency install was attempted.
+
+Actual wake activation remains open for owner permission and hardware: the
+host reports no input devices (`system_profiler SPAudioDataType` lists none;
+AVFoundation lists none), and Hermes's `.venv` has no `openwakeword`. To attempt
+the real detector e2e, the owner must authorize this exact venv-only install
+and provide an audio input device:
+
+```sh
+../hermes-agent/.venv/bin/python -m pip install openwakeword==0.6.0 onnxruntime==1.27.0 sounddevice==0.5.5 numpy==2.4.3 ai-edge-litert==2.1.6
+```
+
+Wake activation is not marked pass. Advisor review also caught that the browser
+check proves only CDP connect/status/disconnect, not a page navigation and
+content read through the browser tool or packaged desktop; that walkthrough
+row remains open. The memory-settings e2e now correlates each captured Ollama
+request to a unique prompt marker so a late request from the disabled-memory
+turn cannot satisfy the enabled-memory assertion. The browser and audio e2e
+files plus the extended memory-settings e2e remain uncommitted pending a final
+focused rerun and item-B commit.
+
+### Item B continuation: live settings and local feature reruns (2026-09-28)
+
+Fixed the settings test's cancellation race by tracking only the marked
+`/v1/chat/completions` request and closing that upstream after the disposable
+session becomes inactive. Full generation is unnecessary for verifying the
+captured memory and reasoning payloads; MCP behavior checks still wait for full
+chat turns. The live `hermes-mcp-settings.mjs` e2e passed against the existing
+local Ollama model, including actual stdio and OAuth MCP calls, skills hub
+install, tool toggle, profile prompt, model/provider selection, reasoning
+effort, and memory enabled/disabled prompt contents. Advisor review caught that
+the earlier fixture pointed both provider choices at one proxy, which did not
+prove routing; the final passing rerun leaves the generic provider pointed at
+Ollama directly and sends only the Hermes-selected named profile through the
+capture proxy. The memory assertion is described as context injection, not a
+completed recall answer.
+
+The browser lifecycle e2e and local audio e2e both passed again. I attempted
+browser content coverage through the actual forwarded `/api/browser/act` route
+with `feature=1`, a localhost page fixture, and a disposable Hermes
+configuration. The route correctly rejected the first request without
+`feature=1`; after adding it and allowing private URLs only in the throwaway
+home, the browser tool timed out after 120 seconds. Inspection confirms
+`browser_tool.py` invokes the `agent-browser` CLI, which is absent from PATH,
+the Hermes repo, desktop node_modules, and npm cache. Cached Playwright would
+test a substitute driver, so no such workaround is claimed. Browser navigation
+remains open pending owner approval for `npm install --prefix
+/tmp/akira-agent-browser agent-browser@^0.26.0`, followed by rerunning the same
+e2e with that prefix's `node_modules/.bin` on PATH. The passing cached-Chromium
+`browser.manage` connect/status/disconnect check is recorded separately.
+
+Wake activation remains open pending the venv-only detector dependency install
+listed above and an available microphone/input device. The focused local TTS
+and unavailable-wake e2e passed again without installing anything.
