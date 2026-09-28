@@ -244,6 +244,66 @@ pub struct SessionGoal {
 /// per-turn note, not unbounded history).
 pub const MAX_ATTEMPT_LOG: usize = 8;
 pub const MAX_ATTEMPT_LEN: usize = 80;
+/// Consecutive auto-recorded turns examined for plateau detection.
+pub const PLATEAU_TURNS: usize = 3;
+
+/// What the engine observed in one turn, accumulated from `tool.complete`
+/// events (no model call, no prompt tokens).
+#[derive(Default)]
+struct TurnObs {
+    tools: u32,
+    failed: u32,
+    files_changed: bool,
+    verified: bool,
+    first_err: Option<String>,
+}
+
+fn turn_obs() -> &'static Mutex<HashMap<String, TurnObs>> {
+    static OBS: OnceLock<Mutex<HashMap<String, TurnObs>>> = OnceLock::new();
+    OBS.get_or_init(Default::default)
+}
+
+/// Strip paths and digits so identical failures compare equal.
+fn normalize_error(err: &str) -> String {
+    let first = err.trim().trim_start_matches("Error:").trim().lines().next().unwrap_or("");
+    let words: Vec<String> = first
+        .split_whitespace()
+        .map(|w| {
+            if w.contains('/') || w.contains('\\') {
+                "<p>".to_string()
+            } else {
+                w.chars().filter(|c| !c.is_ascii_digit()).collect()
+            }
+        })
+        .collect();
+    words.join(" ").to_lowercase().chars().take(30).collect()
+}
+
+/// Record one completed tool call for `session_id`'s current turn. Called by
+/// the gateway at `tool.complete`; drained by `after_turn`.
+pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
+    let failed = result.starts_with("Error:");
+    let mut map = turn_obs().lock().unwrap();
+    let obs = map.entry(session_id.to_string()).or_default();
+    obs.tools += 1;
+    if failed {
+        obs.failed += 1;
+        obs.first_err.get_or_insert_with(|| normalize_error(result));
+        return;
+    }
+    if matches!(name, "edit" | "write" | "patch" | "apply_patch" | "multiedit") {
+        obs.files_changed = true;
+    }
+    if name == "bash" {
+        let cmd = args["command"].as_str().unwrap_or("").to_lowercase();
+        if ["test", "build", "check", "lint", "clippy", "pytest", "tsc"]
+            .iter()
+            .any(|k| cmd.contains(k))
+        {
+            obs.verified = true;
+        }
+    }
+}
 
 impl SessionGoal {
     pub fn new(title: impl Into<String>) -> Self {
@@ -290,18 +350,42 @@ impl SessionGoal {
         }
     }
 
-    /// Cheap, no-model-call plateau heuristic: the last 3 attempt-log
-    /// entries are identical, meaning several consecutive continuation
-    /// turns produced no new passing verification, the same repeated tool
-    /// error, or no file changes (the caller is expected to phrase attempt
-    /// notes so that "no progress" collapses to the same string).
+    /// Cheap, no-model-call plateau heuristic. Over the last
+    /// `PLATEAU_TURNS` engine-recorded `auto` lines: no successful
+    /// verification AND (same normalized error signature OR no file
+    /// changes). Also trips when the last 3 entries of any kind are
+    /// identical (model-supplied notes that repeat).
     pub fn plateaued(&self) -> bool {
         let n = self.attempt_log.len();
-        if n < 3 {
+        if n >= PLATEAU_TURNS {
+            let last = &self.attempt_log[n - PLATEAU_TURNS..];
+            if last.iter().all(|line| line == &last[0] && !line.starts_with("auto ")) {
+                return true;
+            }
+        }
+        let auto: Vec<&str> = self
+            .attempt_log
+            .iter()
+            .filter(|l| l.starts_with("auto "))
+            .map(String::as_str)
+            .collect();
+        if auto.len() < PLATEAU_TURNS {
             return false;
         }
-        let last = &self.attempt_log[n - 3..];
-        last.iter().all(|line| line == &last[0])
+        let last = &auto[auto.len() - PLATEAU_TURNS..];
+        let field = |l: &str, key: &str| -> String {
+            l.split(" | ")
+                .find_map(|p| p.strip_prefix(key))
+                .unwrap_or("")
+                .to_string()
+        };
+        if last.iter().any(|l| field(l, "ver=") == "pass") {
+            return false;
+        }
+        let err0 = field(last[0], "err=");
+        let same_err = !err0.is_empty() && last.iter().all(|l| field(l, "err=") == err0);
+        let no_files = last.iter().all(|l| field(l, "files=") == "no");
+        same_err || no_files
     }
 
     pub fn out_of_budget(&self) -> Option<&'static str> {
@@ -1105,6 +1189,7 @@ pub fn after_turn(
     subagents_running: bool,
     user_interrupted: bool,
 ) -> Result<Option<Continuation>> {
+    let obs = turn_obs().lock().unwrap().remove(session_id);
     if user_interrupted {
         if let Some(mut goal) = store.get_goal(session_id)? {
             if goal.status == GoalStatus::Active {
@@ -1130,6 +1215,15 @@ pub fn after_turn(
         if goal.status == GoalStatus::Active {
             goal.turns_used += 1;
             goal.tokens_used += tokens_this_turn;
+            let o = obs.unwrap_or_default();
+            goal.record_attempt(format!(
+                "auto t{} f{} | files={} | ver={} | err={}",
+                o.tools,
+                o.failed,
+                if o.files_changed { "yes" } else { "no" },
+                if o.verified { "pass" } else { "none" },
+                o.first_err.unwrap_or_default()
+            ));
             goal.updated_at_ms = now_ms();
             if subagents_running {
                 goal.waiting_on_subagents = true;
@@ -1888,7 +1982,56 @@ mod tests {
         assert!(c2.is_none());
         let paused = store.get_goal("s1").unwrap().unwrap();
         assert_eq!(paused.status, GoalStatus::Paused);
-        assert_eq!(paused.attempt_log, vec!["fail: verification failed"]);
+        assert_eq!(paused.attempt_log[0], "fail: verification failed");
+    }
+
+    fn run_auto_turn(store: &ControlStore, sid: &str, calls: &[(&str, Value, &str)]) {
+        for (name, args, result) in calls {
+            observe_tool(sid, name, args, result);
+        }
+        after_turn(store, sid, 0, false, false).unwrap();
+    }
+
+    #[test]
+    fn auto_attempt_line_recorded_without_op_progress() {
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("auto1", Some(&SessionGoal::new("x"))).unwrap();
+        run_auto_turn(
+            &store,
+            "auto1",
+            &[("edit", json!({}), "ok"), ("bash", json!({"command":"cargo test"}), "ok")],
+        );
+        let g = store.get_goal("auto1").unwrap().unwrap();
+        assert_eq!(g.attempt_log.len(), 1);
+        assert_eq!(g.attempt_log[0], "auto t2 f0 | files=yes | ver=pass | err=");
+        assert!(g.attempt_log[0].len() <= MAX_ATTEMPT_LEN);
+    }
+
+    #[test]
+    fn repeated_normalized_error_is_a_plateau() {
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("auto2", Some(&SessionGoal::new("x"))).unwrap();
+        for i in 0..PLATEAU_TURNS {
+            let err = format!("Error: cannot find /tmp/run{i}/a.rs line {i}");
+            run_auto_turn(&store, "auto2", &[("edit", json!({}), "ok"), ("bash", json!({}), &err)]);
+        }
+        let g = store.get_goal("auto2").unwrap().unwrap();
+        assert!(g.plateaued(), "{:?}", g.attempt_log);
+        assert!(g.continuation_prompt().contains("Plateau detected"));
+    }
+
+    #[test]
+    fn file_change_plus_passing_test_is_not_a_plateau() {
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("auto3", Some(&SessionGoal::new("x"))).unwrap();
+        for _ in 0..PLATEAU_TURNS {
+            run_auto_turn(
+                &store,
+                "auto3",
+                &[("edit", json!({}), "ok"), ("bash", json!({"command":"cargo test"}), "ok")],
+            );
+        }
+        assert!(!store.get_goal("auto3").unwrap().unwrap().plateaued());
     }
 
     #[test]
