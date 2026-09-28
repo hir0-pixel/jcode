@@ -610,3 +610,9 @@ binary requires first moving the gateway/provider composition root and
 separating the generic CLI into another crate; deleting the re-export or TUI
 crate now would break the workspace. The session-cache and keybind hooks are
 TUI-only, and `run_gateway` does not register them.
+
+### Follow-up item 6: full-workspace test failure fix
+
+Skipped per instruction: the most recent full-workspace run passed 8,071 tests
+with 0 failures (59 ignored, 1,254 filtered across 212 suites). Part C also
+passes 39 Prime unit and 13 real-worker integration tests.
