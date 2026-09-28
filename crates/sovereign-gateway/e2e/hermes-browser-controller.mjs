@@ -26,6 +26,7 @@ const hermesRoot = process.env.HERMES_REPO || path.resolve('../hermes-agent')
 let engine
 let browser
 let ws
+let fixtureServer
 
 const port = async () => {
   const server = http.createServer()
@@ -33,6 +34,18 @@ const port = async () => {
   const value = server.address().port
   await new Promise(resolve => server.close(resolve))
   return value
+}
+const startFixture = async () => {
+  const marker = `browser-route-proof-${crypto.randomBytes(8).toString('hex')}`
+  fixtureServer = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end(`<main><h1>Hermes local browser fixture</h1><p>${marker}</p></main>`)
+  })
+  await new Promise((resolve, reject) => {
+    fixtureServer.once('error', reject)
+    fixtureServer.listen(0, '127.0.0.1', resolve)
+  })
+  return { marker, url: `http://127.0.0.1:${fixtureServer.address().port}/` }
 }
 const waitPort = async (proc, marker) => {
   const until = Date.now() + 60_000
@@ -46,6 +59,9 @@ const waitPort = async (proc, marker) => {
 }
 try {
   if (!fs.existsSync(chromium)) throw new Error(`cached Chromium is absent: ${chromium}`)
+  const fixture = await startFixture()
+  fs.writeFileSync(path.join(hermesHome, 'config.yaml'), 'security:\n  allow_private_urls: true\n')
+  env.AGENT_BROWSER_EXECUTABLE_PATH = chromium
   const browserPort = await port()
   const browserUrl = `http://127.0.0.1:${browserPort}`
   browser = spawn(chromium, [
@@ -103,9 +119,28 @@ try {
   if (disconnected.error || disconnected.result?.connected !== false) {
     throw new Error(`Hermes browser controller did not release CDP: ${JSON.stringify(disconnected)}`)
   }
-  console.log('PASS browser controller connected, returned CDP status, and disconnected a real local Chromium instance')
+  const engineBase = `http://127.0.0.1:${enginePort}`
+  const browserAction = async (action, params) => {
+    const response = await fetch(`${engineBase}/api/browser/act?feature=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hermes-session-token': token },
+      body: JSON.stringify({ action, task_id: 'browser-route-e2e', params }),
+    })
+    return { status: response.status, body: await response.json() }
+  }
+  const navigation = await browserAction('navigate', { url: fixture.url })
+  const snapshot = await browserAction('snapshot', { full: true })
+  if (navigation.status !== 200 || !navigation.body.success || navigation.body.url !== fixture.url ||
+      !JSON.stringify(navigation.body).includes('Hermes local browser fixture')) {
+    throw new Error(`Hermes browser route did not navigate to the local fixture: ${JSON.stringify(navigation)}`)
+  }
+  if (snapshot.status !== 200 || !snapshot.body.success || !JSON.stringify(snapshot.body).includes(fixture.marker)) {
+    throw new Error(`Hermes browser route snapshot did not contain the local fixture marker: ${JSON.stringify(snapshot)}`)
+  }
+  console.log('PASS browser controller connected, returned CDP status, disconnected, and navigated/read a local page through /api/browser/act')
 } finally {
   ws?.close()
+  if (fixtureServer) await new Promise(resolve => fixtureServer.close(resolve))
   for (const child of [engine?.child, browser]) {
     if (child && child.exitCode === null) {
       try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGTERM') } catch {}

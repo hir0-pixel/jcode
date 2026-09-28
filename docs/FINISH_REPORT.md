@@ -641,3 +641,31 @@ was built from the shallow clone under `/tmp/prime-agent` using its workspace
 build after dependencies were installed there with lifecycle scripts disabled.
 No Prime installer or global install was run. The clone is removed after this
 benchmark; this is a smoke check, not the full benchmark suite.
+
+### Item B closure: browser route and real wake detection (2026-09-28)
+
+The owner approved installing `agent-browser@^0.26.0` only in
+`/tmp/akira-agent-browser`; its lifecycle script was inspected and run there to
+prepare the CLI. `hermes-browser-controller.mjs` now drives the actual forwarded
+`/api/browser/act` route against a local HTTP fixture and cached local Chromium.
+It asserts the exact navigation URL, page heading, and a random marker in the
+full browser snapshot. The e2e passed; no external site is contacted.
+
+The owner also approved the pinned wake dependencies in the existing Hermes
+`.venv` and first-use model downloads. The packages were installed through that
+uv-managed venv (the venv has no pip), without changing tracked Hermes files.
+`hermes-wake-activation.mjs` synthesizes “Hey Hermes” locally with macOS `say`,
+converts it to 16 kHz mono PCM, starts Hermes with an isolated temporary home,
+feeds the audio to the real openWakeWord/TFLite detector, and verifies the
+`wake.detected` event is delivered to the same authenticated WebSocket owner.
+It then stops the detector. The real detector test passed with lazy installs
+disabled. The shared wake model assets reside inside the approved Hermes `.venv`;
+the test's configuration, runtime state, and generated audio use temporary
+homes. This uses client-capture, so it does not claim physical microphone
+coverage (the host has no available input device).
+
+GPT-6 Sol's B review requested exact route-level browser navigation/content
+assertions and verification of the owner-scoped wake event; both are present.
+The revised browser and wake feature rows now pass in
+`docs/HERMES_FEATURE_CHECK.md`. These changes are recorded by the focused
+Item-B commit referenced from that table.
