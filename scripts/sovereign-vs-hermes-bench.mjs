@@ -288,6 +288,9 @@ async function startBackend(product, home, token) {
         'requires_api_key = false',
         `default_model = "${MODEL}"`,
         '',
+        '[provider]',
+        'default_provider = "bench"',
+        '',
         '[[providers.bench.models]]',
         `id = "${MODEL}"`,
         `context_window = ${NUM_CTX}`,
@@ -299,7 +302,7 @@ async function startBackend(product, home, token) {
     // cost figures consistent with the benchmark's dummy-cost math.
     Object.assign(env, { JCODE_HOME: jcodeHome, SOVEREIGN_PRICE_TABLE: process.env.SOVEREIGN_PRICE_TABLE || path.join(__dirname, 'sovereign-prices.json') })
     cmd = SOVEREIGN_BIN
-    args = ['--provider-profile', 'bench', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0']
+    args = ['--provider', 'openai-compatible', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0']
   }
   const child = spawn(cmd, args, { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
   const errLog = fs.createWriteStream(path.join(outDir, `${product}-${path.basename(home)}.stderr.log`))
@@ -307,6 +310,7 @@ async function startBackend(product, home, token) {
   const port = await new Promise((resolve, reject) => {
     let buf = ''
     const timer = setTimeout(() => reject(new Error(`${product}: no READY line in 180s`)), 180_000)
+    child.once('error', error => { clearTimeout(timer); reject(error) })
     child.stdout.on('data', d => {
       buf += d
       const m = buf.match(/HERMES_BACKEND_READY port=(\d+)/)

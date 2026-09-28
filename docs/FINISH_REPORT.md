@@ -616,3 +616,28 @@ TUI-only, and `run_gateway` does not register them.
 Skipped per instruction: the most recent full-workspace run passed 8,071 tests
 with 0 failures (59 ignored, 1,254 filtered across 212 suites). Part C also
 passes 39 Prime unit and 13 real-worker integration tests.
+
+### Follow-up item 7: three-arm benchmark and schema measurement (2026-09-28)
+
+The MJS plain-task smoke initially used the removed `--provider-profile` flag
+and failed to start Sovereign. The disposable JCode config now selects the
+`bench` named provider and the runner uses supported `--provider
+openai-compatible` arguments. A one-run `plain` task then passed both turns
+with the local Ollama model. It measured 7,762 tool-schema tokens per call,
+18 above the 7,744 baseline and 282 below the 8,044 maximum. Raw result:
+`docs/benchmark-runs/2026-09-28T07-45-02/`.
+
+The first launch also exposed an unhandled child-process spawn error when a
+configured Hermes executable is missing; the runner now catches that error so
+the arm can be reported without crashing the benchmark process. The earlier
+temporary Hermes path typo was corrected by setting `HERMES_BIN` explicitly.
+
+The required 1-task/1-repetition comparison passed for all three arms on
+`err_case_search`, with the same local model, local counting proxy, and
+600-second task limit. Hermes passed with 2 model calls, 2 tool calls, and
+214.3 seconds; Sovereign passed with 7 model calls, 8 tool calls, and 147.0
+seconds; Prime passed with 4 model calls, 3 tool calls, and 82.7 seconds. Prime
+was built from the shallow clone under `/tmp/prime-agent` using its workspace
+build after dependencies were installed there with lifecycle scripts disabled.
+No Prime installer or global install was run. The clone is removed after this
+benchmark; this is a smoke check, not the full benchmark suite.

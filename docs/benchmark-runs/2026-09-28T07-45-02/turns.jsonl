@@ -1,0 +1,2 @@
+{"label":"sovereign|plain|run1","product":"sovereign","task":"plain","run":1,"session":1,"turn":1,"ok":true,"ms":69516,"reply":"The capital of Australia is Canberra.","error":null}
+{"label":"sovereign|plain|run1","product":"sovereign","task":"plain","run":1,"session":1,"turn":2,"ok":true,"ms":3066,"reply":"Canberra has roughly 480,000 residents.","error":null}

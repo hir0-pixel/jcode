@@ -1,0 +1,21 @@
+{
+  "started_at": "2026-09-28T07:45:16.013Z",
+  "upstream": "http://127.0.0.1:11434",
+  "listen": "127.0.0.1:18080",
+  "requests": 2,
+  "chat_completions": 2,
+  "api_chat": 0,
+  "api_generate": 0,
+  "other": 0,
+  "prompt_tokens": 17929,
+  "cached_tokens": 8944,
+  "completion_tokens": 67,
+  "eval_count": 0,
+  "prompt_eval_count": 0,
+  "bytes_in": 66421,
+  "bytes_out": 15118,
+  "paths": {
+    "/v1/chat/completions": 2
+  },
+  "updated_at": "2026-09-28T07:46:52.706Z"
+}

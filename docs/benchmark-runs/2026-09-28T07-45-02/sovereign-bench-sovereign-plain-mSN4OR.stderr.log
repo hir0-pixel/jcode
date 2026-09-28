@@ -1,0 +1,5 @@
+Using bench via OpenAI-compatible API as the initial provider
+Using model: sovereign/bench-hermes-64k:latest
+sovereign: learning on (local model: true)
+harness API bridge: list_sessions ids=1.5ms metadata=2.0ms total=2.1ms count=1
+harness API bridge: list_sessions ids=1.7ms metadata=2.9ms total=3.0ms count=1

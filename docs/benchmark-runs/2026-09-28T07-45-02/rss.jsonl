@@ -1,0 +1,3 @@
+{"label":"sovereign|plain|run1","phase":"idle-before-chat","backend_kb":32096,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":23309536}
+{"label":"sovereign|plain|run1","phase":"idle-after-session-1","backend_kb":40896,"backend_procs":["sovereign"],"python_kb":0,"ollama_kb":24267072}
+{"label":"sovereign|plain|run1","phase":"peak","backend_kb":43312,"ollama_kb":24267072,"python_kb":0}
