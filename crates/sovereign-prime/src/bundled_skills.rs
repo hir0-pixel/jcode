@@ -67,6 +67,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("skills/skill-creator/SKILL.md"),
     ),
     (
+        "prime-skill-creator/src/skill_creator/__init__.py",
+        include_str!("skills/skill-creator/src/skill_creator/__init__.py"),
+    ),
+    (
         "prime-skill-creator/references/python-skills.md",
         include_str!("skills/skill-creator/references/python-skills.md"),
     ),

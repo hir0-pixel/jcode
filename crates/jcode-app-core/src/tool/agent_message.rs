@@ -65,9 +65,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn messaging_schema_stays_under_two_hundred_tokens() {
+    fn messaging_schema_stays_under_two_hundred_estimated_tokens() {
         let schema = AgentMessageTool::new().parameters_schema().to_string();
-        assert!(schema.len() / 4 < 200, "schema too large: {schema}");
+        let estimated_tokens = schema.len().div_ceil(4);
+        assert!(
+            estimated_tokens < 200,
+            "{estimated_tokens} estimated tokens: {schema}"
+        );
     }
 
     #[test]

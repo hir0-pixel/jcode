@@ -105,6 +105,9 @@ async fn tool_dispatch_overhead_p95_under_one_millisecond() {
     registry
         .register("dispatch_bench".into(), Arc::new(DispatchBenchTool))
         .await;
+    // A regular tool turn with the optional REPL host present must not spawn
+    // Python or pay its cold-start cost unless the REPL tool is called.
+    let unused_repl = sovereign_prime::ReplHost::new(std::path::PathBuf::from("not-started"));
     let dir = tempfile::tempdir().unwrap();
     let mut samples = Vec::with_capacity(120);
     for i in 0..120 {
@@ -123,6 +126,7 @@ async fn tool_dispatch_overhead_p95_under_one_millisecond() {
             .await
             .unwrap();
         assert_eq!(output.output, i.to_string());
+        assert_eq!(unused_repl.live_workers().await, 0);
         samples.push(start.elapsed());
     }
     samples.sort_unstable();

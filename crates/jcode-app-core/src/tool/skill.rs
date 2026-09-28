@@ -124,26 +124,8 @@ impl Tool for SkillTool {
 
 impl SkillTool {
     async fn create_skill(&self, params: SkillInput) -> Result<ToolOutput> {
-        let name = params
-            .name
-            .ok_or_else(|| anyhow::anyhow!("'name' is required for create action"))?;
-        let description = params
-            .description
-            .ok_or_else(|| anyhow::anyhow!("'description' is required for create action"))?;
-        let instructions = params
-            .instructions
-            .ok_or_else(|| anyhow::anyhow!("'instructions' is required for create action"))?;
-        let root = jcode_base::storage::jcode_dir()?.join("skills");
-        let path = create_skill_files(
-            &root,
-            &name,
-            &description,
-            &instructions,
-            params.package_name.as_deref(),
-            params.package_code.as_deref(),
-        )?;
-        let mut registry = self.registry.write().await;
-        registry.reload_global()?;
+        let name = params.name.clone().unwrap_or_else(|| "skill".to_string());
+        let path = create_skill_with_registry(&self.registry, params).await?;
         Ok(
             ToolOutput::new(format!("Created skill '{}' at {}", name, path.display()))
                 .with_title(format!("Skills: Created {name}")),
@@ -402,6 +384,37 @@ fn append_endorsed_skills(output: &mut String, installed: &std::collections::Has
     output.push_str(
         "NVIDIA CUDA-X skills come from the official catalog at https://github.com/NVIDIA/skills.\n",
     );
+}
+
+pub(crate) async fn create_skill_for_repl(input: Value) -> Result<std::path::PathBuf> {
+    let params: SkillInput = serde_json::from_value(input)?;
+    create_skill_with_registry(&SkillRegistry::shared_registry(), params).await
+}
+
+async fn create_skill_with_registry(
+    registry: &Arc<RwLock<SkillRegistry>>,
+    params: SkillInput,
+) -> Result<std::path::PathBuf> {
+    let name = params
+        .name
+        .ok_or_else(|| anyhow::anyhow!("'name' is required for create action"))?;
+    let description = params
+        .description
+        .ok_or_else(|| anyhow::anyhow!("'description' is required for create action"))?;
+    let instructions = params
+        .instructions
+        .ok_or_else(|| anyhow::anyhow!("'instructions' is required for create action"))?;
+    let root = jcode_base::storage::jcode_dir()?.join("skills");
+    let path = create_skill_files(
+        &root,
+        &name,
+        &description,
+        &instructions,
+        params.package_name.as_deref(),
+        params.package_code.as_deref(),
+    )?;
+    registry.write().await.reload_global()?;
+    Ok(path)
 }
 
 fn create_skill_files(

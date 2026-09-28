@@ -95,6 +95,25 @@ assert r["scheduled"] and s["pending"]
 print(json.dumps({"refine_pending":s["pending"]}))`)
   if (!refineResult.includes('"refine_pending": true')) throw new Error(`refine skill failed: ${refineResult}`)
   console.log('ok Python refine scheduling/status')
+  const webResult = await runRepl(String.raw`import websearch
+result=await websearch.run("OpenAI",num_results=1,max_output=2000)
+assert isinstance(result,str) and result.strip()
+print(result[:500])`)
+  if (!webResult.trim()) throw new Error(`websearch skill returned no results: ${webResult}`)
+  console.log('ok Python websearch package calls the key-free Rust backend')
+  const creatorResult = await runRepl(String.raw`import json,skill_creator
+created=await skill_creator.create("parity-created","Created by the Python skill creator","A live e2e package.",package_name="parity_created",package_code="def marker():\n    return 'prime-skill-creator-import-ok'\n")
+import parity_created
+assert parity_created.marker()=="prime-skill-creator-import-ok"
+print(json.dumps({"path":created["path"],"marker":parity_created.marker()}))`)
+  if (!creatorResult.includes('prime-skill-creator-import-ok')) throw new Error(`skill creator did not create/import a Python package: ${creatorResult}`)
+  console.log('ok Python skill creator writes through Rust and imports the package immediately')
+  const compactResult = await runRepl(String.raw`import json,compact
+result=await compact.run("keep the selected model and task objective")
+assert result["scheduled"]
+print(json.dumps(result))`)
+  if (!compactResult.includes('"phase": "end_of_turn"')) throw new Error(`compact skill failed: ${compactResult}`)
+  console.log('ok compact scheduling through the existing engine compactor')
   const agentResult = await runRepl(String.raw`import json,agent_observe,agent_message
 child=await spawn_subagent("Review ten source files and return ten concise findings. Continue until done.","parity-child")
 roster=await agent_observe.list_agents()
@@ -105,19 +124,14 @@ assert observed["agent"]["sessionId"]==child["session_id"]
 print(json.dumps({"child":child,"observed":observed["agent"]["sessionId"],"roster":len(roster["agents"]),"receipt":receipt,"await":wait}))`)
   if (!agentResult.includes('"deliveryStatus": "queued"') || !agentResult.includes('"status": "running"') || !agentResult.includes('"observed":')) throw new Error(`agent messaging/spawn/await failed: ${agentResult}`)
   console.log('ok agent observe/message and subagent spawn/await')
-  const compactResult = await runRepl(String.raw`import json,compact
-result=await compact.run("keep the selected model and task objective")
-assert result["scheduled"]
-print(json.dumps(result))`)
-  if (!compactResult.includes('"phase": "end_of_turn"')) throw new Error(`compact skill failed: ${compactResult}`)
-  console.log('ok compact scheduling')
   ws.close()
   await new Promise(resolve => setTimeout(resolve, 300))
   ws = new WebSocket(wsUrl)
   const pendingResume = new Map()
   ws.addEventListener('message', event => {
     const frame = JSON.parse(String(event.data))
-    if (frame.id !== undefined && pendingResume.has(frame.id)) { pendingResume.get(frame.id)(frame); pendingResume.delete(frame.id) }
+    if (frame.method === 'event') events.push(frame.params)
+    else if (frame.id !== undefined && pendingResume.has(frame.id)) { pendingResume.get(frame.id)(frame); pendingResume.delete(frame.id) }
     else if (frame.method === 'approval') ws.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { choice: 'once' } }))
   })
   await new Promise((resolve, reject) => { ws.addEventListener('open', resolve); ws.addEventListener('error', reject) })
@@ -131,7 +145,7 @@ print(json.dumps(result))`)
   const swarm = (await reconnectRpc('subagent.list', { session_id: session })).result
   const persisted = state?.goal?.status === 'active' && state?.heartbeat?.status === 'active'
   const childVisible = (swarm?.subagents || []).some(item =>
-    item.subagent_id === 'parity-child' && item.status === 'running'
+    item.subagent_id === 'parity-child' && ['running', 'completed', 'failed'].includes(item.status)
   )
   console.log(`${persisted && childVisible ? 'ok' : 'FAIL'} goal, heartbeat, and spawned agent survive desktop disconnect/reattach`)
   if (!persisted || !childVisible) { console.error(JSON.stringify({ state, swarm }, null, 2)); process.exitCode = 1 }

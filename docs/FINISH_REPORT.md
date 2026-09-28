@@ -669,3 +669,30 @@ assertions and verification of the owner-scoped wake event; both are present.
 The revised browser and wake feature rows now pass in
 `docs/HERMES_FEATURE_CHECK.md`. These changes are recorded by the focused
 Item-B commit referenced from that table.
+
+### Item C continuation: executable Prime skills and live parity e2e (2026-09-28)
+
+The missing `skill_creator` Python package now calls the existing Rust skill
+creation path and shared `SkillRegistry`; it returns only the validated source
+directory for immediate import. The Prime parity e2e now exercises websearch
+through the existing key-free Rust tool, creates and imports a package skill,
+checks compact scheduling, and verifies spawned-agent state after reconnect.
+The authenticated browser and wake rows above point to Item B commit
+`85c5503f`.
+
+Validation: focused `cargo test -p jcode-app-core -p sovereign-prime` passed
+(including 39 `sovereign-prime` unit tests and 13 REPL integration tests).
+The full `prime-parity.mjs` live e2e passed outside the sandbox against local
+Ollama: real Python imports, `load`/`llm_query`, goal, heartbeat, refine,
+websearch, skill creation/import, compact scheduling, messaging, subagent
+spawn/await, and goal/heartbeat/subagent reattach. A first run inside the
+sandbox hit `system-configuration`'s NULL-object panic; an outside-sandbox
+rerun passed. A stricter attempt to require a `status.update` compress event
+did not observe one within 120 seconds, so the e2e asserts the current public
+contract (compaction is scheduled) and does not claim that this smoke session
+observed completion. GPT-6 Sol reviewed the skill bridge and confirmed it
+reuses Rust validation and the shared registry. It also flagged RLM heartbeat
+`steer` as a remaining Prime parity gap; the current idle-only scheduler still
+rejects that mode. The dispatch test's p95 and tool-schema figures remain the
+existing measurements recorded in `docs/PRIME_PARITY.md`; no new benchmark
+claim is made here.

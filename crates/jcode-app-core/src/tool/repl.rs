@@ -347,6 +347,14 @@ impl Tool for ReplTool {
                     })
                 })
             },
+            skill: Arc::new(move |input| {
+                Box::pin(async move {
+                    let input: Value = serde_json::from_str(&input)?;
+                    let path = super::skill::create_skill_for_repl(input).await?;
+                    let src = path.join("src");
+                    Ok(json!({ "path": path, "src": src }).to_string())
+                })
+            }),
             ..sovereign_prime::host::ExtraHostFns::default()
         };
         #[cfg(target_os = "macos")]
