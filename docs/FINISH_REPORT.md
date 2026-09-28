@@ -696,3 +696,104 @@ reuses Rust validation and the shared registry. It also flagged RLM heartbeat
 rejects that mode. The dispatch test's p95 and tool-schema figures remain the
 existing measurements recorded in `docs/PRIME_PARITY.md`; no new benchmark
 claim is made here.
+
+### Item D closure: jcode terminal UI, generic CLI and dead-code removal (2026-09-29)
+
+**Status: complete.** Reviewed the uncommitted diff that removed jcode's
+terminal UI, generic CLI, installer, self-update, self-dev and pairing code,
+fixed what it left broken, swept for additional dead code the removal exposed,
+and committed the result.
+
+Correctness review of the new `sovereign` entrypoint (`src/bin/sovereign.rs` +
+`src/sovereign_runtime.rs`, 885 lines, previously untracked) against
+`hermes-agent/apps/desktop` and `crates/sovereign-gateway`: `serve`/`gateway`,
+`__pre-tool`, and the Hermes Python feature worker are all fully wired,
+consuming every `SOVEREIGN_HERMES_*` env var the desktop sets and printing the
+exact `HERMES_BACKEND_READY` line the desktop waits on. No missing subcommand,
+no silently-ignored flag, no dropped env var.
+
+Fixed one real compile break: `crates/jcode-app-core/src/server/reload_context.rs`
+(the extracted `ReloadContext`) was missing the `save()` method its own tests
+called; added it (writes JSON to the per-session path via
+`crate::storage::write_json`). Cleaned two dangling empty
+`if session.is_canary { }` blocks left in `crates/jcode-app-core/src/ambient/runner.rs`
+after `register_selfdev_tools()` calls were deleted.
+
+Dead-code sweep, each candidate verified by dependency-graph/grep evidence
+before deletion (never by assumption), `cargo check --workspace --all-targets --offline`
+re-verified clean after every batch:
+- Crates deleted (zero path-dependency references anywhere in the workspace,
+  confirmed by scripting every `Cargo.toml`): `jcode-setup-hints`,
+  `jcode-update-core` (the old self-update mechanism), `jcode-fuzzy`,
+  `jcode-productivity-core`, `jcode-sdk` (a 7,108-line unused harness-API
+  client SDK).
+- `jcode-app-core` modules deleted, each confirmed to have zero external
+  callers and, via the diff itself, to have had all of their real callers
+  living exclusively in the now-fully-deleted `crates/jcode-tui/*`: `update.rs`,
+  `update_rate_limit.rs`, `session_rebuild.rs`, `restart_snapshot.rs`,
+  `ssh_remote.rs`, `startup_profile.rs`, `setup_hints.rs`, `catchup.rs`,
+  `mission.rs`, `network_retry.rs`, `perf.rs`, `server_spawn.rs`, and
+  `replay.rs`/`replay/tests.rs` (a TUI screen-recording/demo-capture module).
+  Deleting `replay.rs` also let the `ratatui` dependency (and its `fontdb`/
+  `rustybuzz`/`unicode-truncate` build-profile overrides) drop out of the
+  `sovereign` binary's build graph entirely.
+- A real, currently-reachable correctness bug found in a file the diff never
+  touched: `crates/jcode-base/src/prompt.rs` still injected
+  `DESKTOP_SELFDEV_MODE_PROMPT` into the live, cached system prompt whenever
+  `is_desktop_working_dir()` matched, explicitly instructing the model to use
+  the `desktop_selfdev` tool — which this same removal deleted. The detector
+  itself (`jcode_selfdev_types::desktop_repo_root`) also matched an obsolete
+  `jcode-desktop`/`crates/jcode-desktop-ui` repo layout, not the current Hermes
+  `apps/desktop`. Removed both dead prompt-injection branches (desktop and
+  CLI/TUI) and their now-orphaned helpers (`SelfDevProductContext`,
+  `build_selfdev_prompt_*`, the three `.txt` prompt assets), plus the
+  downstream-orphaned `jcode_selfdev_types::desktop` module and its now-unused
+  `toml`/`tempfile` deps. Updated `prompt_tests.rs` accordingly.
+- Dead test/benchmark files exercising already-deleted CLI/TUI features
+  (none referenced from CI or active docs): 6 Python CLI-feature test scripts
+  (`test_auth_import_cli.py`, `test_login_qr_cli.py`, `test_native_ssh_*.py`
+  x3, `test_selfdev_reload.py`), 2 TUI e2e scripts (`expand_badge_headed_wtype.py`,
+  `expand_badge_headless.py`), and 11 TUI animation/idle-render benchmark
+  scripts (`bench_selfdev_build.sh`, `bench_selfdev_checkpoints.sh`,
+  `check_donut_animates_live.py`, `count_idle_draws.py`,
+  `diagnose_idle_render_cost.py`, `dump_fresh_spawn_screen.py`,
+  `measure_key_echo.py`, `profile_idle_donut.py`, `test_desktop_selfdev.py`,
+  `verify_donut_still_animates.py`, `which_overlay_blocks_donut.py`).
+- `cargo tree -e normal --offline -i jcode-tui` finds no such package in the
+  graph at all.
+
+Suspected-but-not-deleted feature (listed per instructions rather than
+removed): `jcode-overnight-core` / `crates/jcode-app-core/src/overnight.rs`
+(the `/overnight` long-running-session supervisor). It has zero callers
+anywhere — no command dispatcher, no `sovereign-gateway` route, and no hit in
+`hermes-agent/apps/desktop` source outside a built i18n bundle and a packaged
+doc copy. It is a substantial, plausibly-intentional standing feature rather
+than obvious cruft, so it was left in place pending an owner decision instead
+of being deleted.
+
+Validation: `cargo check --workspace --all-targets --offline` is clean (only
+pre-existing, legitimate dead-code warnings on fields unrelated to this work).
+A full serial `cargo test --workspace --offline -j2 --no-fail-fast -- --test-threads=1`
+run: **4,424 passed, 13 failed** (all 13 in `sovereign-prime --test repl`,
+which panics with `staged Hermes CPython: NotPresent` — every one of those
+tests calls `std::env::var("SOVEREIGN_HERMES_PYTHON").expect(...)` and that
+file has zero changes in this diff; no staged Python interpreter exists in
+this environment, and installing/staging one is out of this item's scope). An
+earlier fail-fast pass also surfaced a single `jcode-base::hooks` test failure
+that did not reproduce on rerun in isolation or on the final full run — a
+pre-existing, unrelated test-isolation flake (shared process state between two
+tests), not a regression from this work.
+
+`cargo build --release --offline --bin sovereign` passed. Release binary:
+`target/release/sovereign`, **68.6 MB**.
+
+Commits (both `git -c user.name=rameelmalik`, working tree left clean):
+- `31a410c49` "Remove jcode terminal UI, generic CLI and dead crates" — the
+  sovereign entrypoint, the `reload_context.save()` fix, the `ambient/runner.rs`
+  cleanup, the full jcode-tui/CLI/installer/self-dev/provider-doctor removal,
+  the 5 fully-orphaned crate deletions and their `Cargo.toml`/workspace-member/
+  profile-override cleanup, and the dead test/benchmark script deletions
+  (596 files changed).
+- `2a6e32481` "Remove dead self-dev prompt injection" — the `prompt.rs`/
+  `prompt_tests.rs` fix and the resulting `jcode-selfdev-types` cleanup
+  (8 files changed).
