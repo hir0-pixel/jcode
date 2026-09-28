@@ -5,11 +5,11 @@ description: Read-only roster and observation of an agent's parent, siblings, an
 
 # Agent Observe
 
-Observe the current agent's nuclear family through the local daemon: parent,
-siblings, direct children, and self. `list_agents` is the one family roster and
-covers every member `agent_message.send` can reach. `get_agent` and
-`recent_messages` hydrate an inactive child before reading it. They cannot read
-a root sibling that has no live session in this worker.
+Observe the current session's visible family roster through the local daemon:
+parent, siblings, direct children, and self when those members are returned by
+the swarm. The roster is constrained to the family used by `agent_message.send`.
+`get_agent` and `recent_messages` query the selected session through the engine;
+they can fail when that session's context is unavailable.
 This skill is read-only: it can list family sessions, inspect one session, and fetch
 bounded recent message previews. It cannot prompt, steer, clear, kill, rename, or
 otherwise mutate another session.
@@ -17,31 +17,22 @@ otherwise mutate another session.
 Call directly from the kernel:
 
 ```python
-children = await rlm.list_subagents()
-child = next((item for item in children if item.active_session_id), None)
+agents = await agent_observe.list_agents()
+child = next((item for item in agents["agents"] if item["relationship"] == "child"), None)
 if child is not None:
-    worker = await agent_observe.get_agent(child.session_name)
-    recent = await agent_observe.recent_messages(child.session_name, limit=6)
-    # Deletion is a parent-owned RLM operation, not an observe mutation:
-    await rlm.delete_subagent(child)
+    worker = await agent_observe.get_agent(child["sessionId"])
+    recent = await agent_observe.recent_messages(child["sessionId"], limit=6)
 ```
 
 ## API
 
-- `await agent_observe.list_agents()` returns `current` and `agents`, the full
-  nuclear family: parent, siblings, and direct children, active or not. Each
-  agent carries `sessionId`, optional `sessionName`, `relationship`
-  (`parent`/`sibling`/`child`), `status` (`running`/`idle`/`inactive`), the live
-  `activity` of a resident session, `isSessionActive`, and the counts and
-  message previews known for it: `latestMessage` for a live session,
-  `firstMessage` for an inactive child. A member with no live session has
-  no `activeSessionId` and no live detail; address it with `agent_message.send`
-  using its `relationship` plus its `sessionName`, or its `sessionId` when the
-  member has no name. For direct children,
-  `await rlm.list_subagents()` also exposes parent-owned lifecycle handles.
-- `await agent_observe.get_agent(target)` returns `agent`, where `agent`
-  contains one live agent summary. `target` is resolved like other live-session
-  selectors: active id, session id/name, or unambiguous suffix.
+- `await agent_observe.list_agents()` returns `current` and `agents`. Each
+  summary can include `sessionId`, `sessionName`, `activeSessionId`,
+  `relationship`, `status`, `activity`, `isSessionActive`, `taskLabel`,
+  `detail`, and `latestMessage` (the stored completion report).
+- `await agent_observe.get_agent(target)` returns one family member summary.
+  `target` may be its session id, session name, task label, or unambiguous id
+  suffix.
 - `await agent_observe.recent_messages(target, limit=8, max_chars=800)`
   returns up to `limit` recent bounded message previews for the target session.
   `limit` must be 1-50, and `max_chars` must be 80-2000.

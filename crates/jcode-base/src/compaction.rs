@@ -996,6 +996,7 @@ impl CompactionManager {
                 messages_to_summarize,
                 existing_summary,
                 pending_model_calls,
+                None,
             )
             .await;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -1169,6 +1170,16 @@ impl CompactionManager {
         all_messages: &[Message],
         provider: Arc<dyn Provider>,
     ) -> Result<(), String> {
+        self.force_compact_with_instructions(all_messages, provider, None)
+    }
+
+    /// Force compaction with optional user focus instructions.
+    pub fn force_compact_with_instructions(
+        &mut self,
+        all_messages: &[Message],
+        provider: Arc<dyn Provider>,
+        instructions: Option<String>,
+    ) -> Result<(), String> {
         if self.pending_task.is_some() {
             return Err("Compaction already in progress".to_string());
         }
@@ -1216,6 +1227,7 @@ impl CompactionManager {
                 messages_to_summarize,
                 existing_summary,
                 pending_model_calls,
+                instructions,
             )
             .await;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -1807,6 +1819,7 @@ async fn generate_compaction_artifact(
     messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
     pending_model_calls: PendingModelCalls,
+    instructions: Option<String>,
 ) -> GeneratedCompaction {
     let start = Instant::now();
     let mut model_calls = Vec::new();
@@ -1847,66 +1860,73 @@ async fn generate_compaction_artifact(
             native_started_ms,
         )
     });
-    match provider
-        .native_compact(
-            &messages,
-            existing_summary
-                .as_ref()
-                .map(|summary| summary.text.as_str()),
-            existing_summary
-                .as_ref()
-                .and_then(|summary| summary.openai_encrypted_content.as_deref()),
-        )
-        .await
-    {
-        Ok(native) => {
-            if let Some(index) = native_call_index {
-                finish_model_call(&pending_model_calls, index, native.usage, None);
+    if instructions.is_none() {
+        match provider
+            .native_compact(
+                &messages,
+                existing_summary
+                    .as_ref()
+                    .map(|summary| summary.text.as_str()),
+                existing_summary
+                    .as_ref()
+                    .and_then(|summary| summary.openai_encrypted_content.as_deref()),
+            )
+            .await
+        {
+            Ok(native) => {
+                if let Some(index) = native_call_index {
+                    finish_model_call(&pending_model_calls, index, native.usage, None);
+                }
+                model_calls.push(CompactionModelCall {
+                    provider: native_provider,
+                    model: native_model,
+                    started_ms: native_started_ms,
+                    usage: native.usage,
+                    error: None,
+                });
+                if let Some(encrypted_content) = native.openai_encrypted_content.as_ref()
+                    && !openai_encrypted_content_is_sendable(encrypted_content)
+                {
+                    crate::logging::warn(&format!(
+                        "[compaction] OpenAI native compaction returned oversized encrypted_content ({} chars); falling back to text summary",
+                        encrypted_content.len(),
+                    ));
+                } else {
+                    return GeneratedCompaction {
+                        result: Ok(CompactionResult {
+                            summary_text: native.summary_text.unwrap_or_default(),
+                            openai_encrypted_content: native.openai_encrypted_content,
+                            covers_up_to_turn: messages.len(),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            summarized_messages: messages.len(),
+                        }),
+                        model_calls,
+                    };
+                }
             }
-            model_calls.push(CompactionModelCall {
-                provider: native_provider,
-                model: native_model,
-                started_ms: native_started_ms,
-                usage: native.usage,
-                error: None,
-            });
-            if let Some(encrypted_content) = native.openai_encrypted_content.as_ref()
-                && !openai_encrypted_content_is_sendable(encrypted_content)
-            {
-                crate::logging::warn(&format!(
-                    "[compaction] OpenAI native compaction returned oversized encrypted_content ({} chars); falling back to text summary",
-                    encrypted_content.len(),
-                ));
-            } else {
-                return GeneratedCompaction {
-                    result: Ok(CompactionResult {
-                        summary_text: native.summary_text.unwrap_or_default(),
-                        openai_encrypted_content: native.openai_encrypted_content,
-                        covers_up_to_turn: messages.len(),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        summarized_messages: messages.len(),
-                    }),
-                    model_calls,
-                };
+            Err(error) if trace_native_error => {
+                if let Some(index) = native_call_index {
+                    finish_model_call(&pending_model_calls, index, None, Some(error.to_string()));
+                }
+                model_calls.push(CompactionModelCall {
+                    provider: native_provider,
+                    model: native_model,
+                    started_ms: native_started_ms,
+                    usage: None,
+                    error: Some(error.to_string()),
+                });
             }
+            Err(_) => {}
         }
-        Err(error) if trace_native_error => {
-            if let Some(index) = native_call_index {
-                finish_model_call(&pending_model_calls, index, None, Some(error.to_string()));
-            }
-            model_calls.push(CompactionModelCall {
-                provider: native_provider,
-                model: native_model,
-                started_ms: native_started_ms,
-                usage: None,
-                error: Some(error.to_string()),
-            });
-        }
-        Err(_) => {}
     }
 
     let max_prompt_chars = provider.context_window().saturating_sub(4000) * CHARS_PER_TOKEN;
-    let prompt = build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    let mut prompt =
+        build_compaction_prompt(&messages, existing_summary.as_ref(), max_prompt_chars);
+    if let Some(instructions) = instructions {
+        prompt.push_str("\n\nAdditional user focus for this summary:\n");
+        prompt.push_str(&instructions);
+    }
 
     // Generate summary using simple completion
     let started_ms = SystemTime::now()
@@ -2008,6 +2028,7 @@ pub async fn build_transfer_compaction_state_with_model_calls(
         messages.clone(),
         existing_summary,
         Arc::new(Mutex::new(Vec::new())),
+        None,
     )
     .await;
     for call in generated.model_calls {

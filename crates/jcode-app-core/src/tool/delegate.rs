@@ -1,7 +1,7 @@
 //! Compact subagent delegation (spawn / message / list / stop / status) via swarm internals.
 
-use super::{Tool, ToolContext, ToolOutput};
 use super::communicate::CommunicateTool;
+use super::{Tool, ToolContext, ToolOutput};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -12,7 +12,9 @@ pub struct DelegateTool {
 
 impl DelegateTool {
     pub fn new() -> Self {
-        Self { inner: CommunicateTool::new() }
+        Self {
+            inner: CommunicateTool::new(),
+        }
     }
 }
 
@@ -62,17 +64,24 @@ impl Tool for DelegateTool {
                     let home = jcode_base::storage::jcode_dir()?;
                     let store = sovereign_prime::entries::EntryStore::open_cached(&home)?;
                     if let Some(spec) = store.resolve_subagent_spec(&ctx.session_id, name)? {
-                        prompt = format!("{}\n\n{}", spec.content.trim(), rest[name.len()..].trim());
+                        prompt =
+                            format!("{}\n\n{}", spec.content.trim(), rest[name.len()..].trim());
                     }
                 }
             }
-            if mapped.get("label").and_then(Value::as_str).is_none_or(str::is_empty) {
+            if mapped
+                .get("label")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
                 mapped["label"] = json!("delegate");
             }
             mapped["prompt"] = json!(prompt);
         }
         if action == "message" {
-            let target = input["target_session"].as_str().or(input["to_session"].as_str());
+            let target = input["target_session"]
+                .as_str()
+                .or(input["to_session"].as_str());
             if let Some(t) = target {
                 mapped["to_session"] = json!(t);
             }

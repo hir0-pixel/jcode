@@ -1,6 +1,6 @@
 """Read-only Prime Agent session observation skill.
 
-All session lookup and data access live in the TypeScript daemon. These
+All session lookup and data access live in the Rust host. These
 functions only call the host bridge exposed inside the Prime Agent Python
 kernel.
 """
@@ -13,7 +13,7 @@ from rlm import host_request
 
 
 async def list_agents() -> dict[str, Any]:
-    """List the full nuclear family: parent, siblings, children, active or not."""
+    """List the current session and family members visible in the swarm roster."""
     return await host_request("agent_observe.list")
 
 

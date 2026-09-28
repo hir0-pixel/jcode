@@ -1,5 +1,5 @@
-mod agentgrep;
 mod agent_message;
+mod agentgrep;
 pub mod ambient;
 mod apply_patch;
 mod bash;
@@ -17,6 +17,7 @@ mod edit_stats;
 mod file_diff;
 pub(crate) mod file_lock;
 // The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
+mod delegate;
 #[allow(dead_code)]
 mod goal;
 pub mod inflight;
@@ -28,10 +29,10 @@ mod open;
 mod patch;
 mod read;
 mod refine;
+mod repl;
 mod session_goal;
 mod session_heartbeat;
-mod delegate;
-mod repl;
+pub(crate) use repl::take_pending_compaction;
 mod replace;
 pub(crate) mod sdk;
 pub mod selfdev;
@@ -553,8 +554,16 @@ impl Registry {
         // same gate as the REPL (both are sovereign-prime features).
         if is_sovereign_engine {
             Self::insert_tool(&mut tools_map, "refine", refine::RefineTool);
-            Self::insert_tool(&mut tools_map, "session_goal", session_goal::SessionGoalTool);
-            Self::insert_tool(&mut tools_map, "heartbeat", session_heartbeat::SessionHeartbeatTool);
+            Self::insert_tool(
+                &mut tools_map,
+                "session_goal",
+                session_goal::SessionGoalTool,
+            );
+            Self::insert_tool(
+                &mut tools_map,
+                "heartbeat",
+                session_heartbeat::SessionHeartbeatTool,
+            );
             Self::insert_tool(&mut tools_map, "delegate", delegate::DelegateTool::new());
             Self::insert_tool(
                 &mut tools_map,

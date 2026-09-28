@@ -560,3 +560,36 @@ e2e with that prefix's `node_modules/.bin` on PATH. The passing cached-Chromium
 Wake activation remains open pending the venv-only detector dependency install
 listed above and an available microphone/input device. The focused local TTS
 and unavailable-wake e2e passed again without installing anything.
+
+### Follow-up item 4: Prime skill and REPL completion (2026-09-28)
+
+Added executable Python-package contracts for Prime's goal, refine, RLM
+heartbeat, messaging, observation, compaction, websearch, and skill-creator
+workflows. These wrappers call the existing Rust engine and swarm features;
+they do not introduce a second agent loop. Goal callbacks now return structured
+state and completion budgets, reject replacement of an active goal, and reject
+explicit malformed/non-positive token budgets. RLM heartbeat records retain
+labels in the shared store, can list inactive records, and keep user heartbeats
+separate. The existing idle-only scheduler explicitly rejects `steer` delivery.
+`skill_manage create` accepts a confined optional Python package, installed
+skills are imported directly by the persistent worker, and compaction queues
+run at the end of the current turn. The cached static prompt now includes
+Prime's prompt-as-data and programmatic `llm_query` guidance.
+
+The new `crates/sovereign-gateway/e2e/prime-parity.mjs` passed with the local
+Ollama model and Hermes venv CPython. It exercises stdlib and package imports,
+`load()` plus `llm_query()`, goal budget/create/complete, RLM heartbeat,
+refine, agent observe/message, subagent spawn/await, compact scheduling, and
+disconnect/reconnect with the active goal, heartbeat, and child visible. The
+Rust `sovereign-prime` suite passed 39 unit plus 13 worker integration tests.
+The REPL test measured cold start at 79.1 ms, warm p50 at 75.5 µs and p95 at
+340.5 µs. Tool-dispatch p50 was 78.0 µs and p95 was 88.8 µs. The compact
+agent-message schema passed its under-200 estimated-token check. Full-workspace
+`cargo fmt --check` still reports pre-existing formatting differences outside
+this item; changed Prime host code was formatted and `git diff --check` passes.
+
+Known compatibility limit: the existing heartbeat scheduler is idle-only, so
+Prime's `steer` delivery cannot interrupt a currently running turn and is
+rejected explicitly. No claim is made that this one delivery mode is equivalent
+to Prime's. The full plain-task schema-token measurement is pending the final
+benchmark gate.

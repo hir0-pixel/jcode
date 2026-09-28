@@ -1,6 +1,6 @@
 """Prime Agent RLM heartbeat skill: internal recurring session checks.
 
-All heartbeat state lives in the TypeScript host; these functions are thin
+All heartbeat state lives in the Rust host; these functions are thin
 typed wrappers over the generic host bridge (`rlm.host_request`). They only
 work inside the Prime Agent Python kernel.
 """
@@ -12,7 +12,7 @@ from typing import Any, Literal
 from rlm import host_request
 
 StatusUpdate = Literal["pause", "resume"]
-DeliveryMode = Literal["steer", "follow_up"]
+DeliveryMode = Literal["follow_up"]
 
 
 def _normalize_delivery_mode(delivery_mode: DeliveryMode | None) -> str | None:
@@ -20,8 +20,8 @@ def _normalize_delivery_mode(delivery_mode: DeliveryMode | None) -> str | None:
         return None
     if not isinstance(delivery_mode, str):
         raise TypeError(f"delivery_mode must be str or None, got {type(delivery_mode).__name__}")
-    if delivery_mode not in {"steer", "follow_up"}:
-        raise ValueError('delivery_mode must be "steer", "follow_up", or None')
+    if delivery_mode != "follow_up":
+        raise ValueError('delivery_mode must be "follow_up"; RLM heartbeats run when the session is idle')
     return delivery_mode
 
 
@@ -40,9 +40,8 @@ async def create(
 ) -> dict[str, Any]:
     """Create an internal recurring heartbeat for the current agent session.
 
-    delivery_mode controls how the scheduled prompt is delivered when the
-    session is busy: "steer" (default) interrupts the current turn, "follow_up"
-    waits for it to finish.
+    Heartbeats run when the session is idle. ``follow_up`` makes that delivery
+    behavior explicit; busy-turn steering is not supported.
     """
     if not isinstance(instruction, str):
         raise TypeError(f"instruction must be str, got {type(instruction).__name__}")

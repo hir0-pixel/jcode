@@ -66,12 +66,21 @@ impl MockServer {
             let _ = stream.write_all(out.as_bytes()).await;
             let _ = stream.shutdown().await;
         });
-        Self { base_url, captured, task }
+        Self {
+            base_url,
+            captured,
+            task,
+        }
     }
 
     fn take_request(self) -> (String, Value) {
         self.task.abort();
-        let captured = self.captured.lock().unwrap().take().expect("no request captured");
+        let captured = self
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
         let body: Value = serde_json::from_slice(&captured.body).unwrap_or(Value::Null);
         (captured.head, body)
     }
@@ -118,8 +127,13 @@ fn schema_definition_stays_under_the_token_budget() {
 
 #[tokio::test]
 async fn execute_forwards_action_and_params_with_the_session_token() {
-    let server = MockServer::start("200 OK", r#"{"success": true, "url": "https://example.com"}"#).await;
-    let tool = BrowserTool::with_endpoint(format!("{}/api/browser/act", server.base_url), "tok-abc");
+    let server = MockServer::start(
+        "200 OK",
+        r#"{"success": true, "url": "https://example.com"}"#,
+    )
+    .await;
+    let tool =
+        BrowserTool::with_endpoint(format!("{}/api/browser/act", server.base_url), "tok-abc");
 
     let out = tool
         .execute(
@@ -128,7 +142,10 @@ async fn execute_forwards_action_and_params_with_the_session_token() {
         )
         .await
         .unwrap();
-    assert_eq!(out.output, r#"{"success": true, "url": "https://example.com"}"#);
+    assert_eq!(
+        out.output,
+        r#"{"success": true, "url": "https://example.com"}"#
+    );
 
     let (head, body) = server.take_request();
     assert!(head.starts_with("POST /api/browser/act"), "{head}");
@@ -169,7 +186,10 @@ async fn unknown_action_never_reaches_the_network() {
 async fn missing_bridge_is_a_clean_error_not_a_panic() {
     let tool = BrowserTool::new();
     let err = tool
-        .execute(json!({"action": "navigate", "url": "https://example.com"}), ctx())
+        .execute(
+            json!({"action": "navigate", "url": "https://example.com"}),
+            ctx(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not configured"), "{err}");

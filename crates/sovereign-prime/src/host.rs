@@ -41,6 +41,7 @@ pub struct ExtraHostFns {
     pub spawn_subagent: HostFn,
     pub agent_message: HostFn,
     pub websearch: HostFn,
+    pub compact: HostFn,
 }
 
 impl Default for ExtraHostFns {
@@ -57,6 +58,7 @@ impl Default for ExtraHostFns {
             spawn_subagent: unavailable("spawn_subagent"),
             agent_message: unavailable("agent_message"),
             websearch: unavailable("websearch"),
+            compact: unavailable("compact"),
         }
     }
 }
@@ -518,6 +520,7 @@ async fn drive(
                         (extra.agent_message)(truncate(arg, MAX_QUERY_CHARS)).await
                     }
                     Some("websearch") => (extra.websearch)(truncate(arg, MAX_QUERY_CHARS)).await,
+                    Some("compact") => (extra.compact)(truncate(arg, MAX_QUERY_CHARS)).await,
                     _ => Err(anyhow!("unknown host function")),
                 };
                 let reply = match reply {

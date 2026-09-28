@@ -58,7 +58,14 @@ async def heartbeat(op="list", **options):
 
 
 async def spawn_subagent(prompt, name="worker"):
-    return await host_call("spawn_subagent", json.dumps({"prompt": prompt, "label": name}))
+    return json.loads(await host_call("spawn_subagent", json.dumps({"prompt": prompt, "label": name})))
+
+
+async def await_subagent(session_id, timeout=20):
+    """Wait up to timeout seconds for a child and return its completion report."""
+    return json.loads(await host_call("spawn_subagent", json.dumps({
+        "action": "await", "target": session_id, "timeout": timeout,
+    })))
 
 
 async def agent_message(action, message=None, target=None):
@@ -69,24 +76,13 @@ async def host_request(name, payload=None):
     """Prime skill bridge for host operations already implemented by Rust."""
     payload = payload or {}
     if name.startswith("agent_message."):
-        if name != "agent_message.send":
+        if name not in {"agent_message.send"}:
             raise ValueError(f"unsupported Prime host request: {name}")
-        role = payload.get("receiver_role")
-        if role != "child":
-            raise ValueError("Akira direct messages currently target a child session")
-        result = await host_call("agent_message", json.dumps({
-            "action": "send", "message": payload.get("message"),
-            "target": payload.get("receiver_name"),
-        }))
-        return {"text": result}
-    if name == "agent_observe.list":
-        result = await host_call("agent_message", json.dumps({"action": "list"}))
-        return {"text": result}
-    if name in {"agent_observe.get", "agent_observe.recent"}:
-        result = await host_call("agent_message", json.dumps({
-            "action": "read", "target": payload.get("target"),
-        }))
-        return {"text": result}
+        return json.loads(await host_call("agent_message", json.dumps({"host_request": name, "payload": payload})))
+    if name.startswith("agent_observe."):
+        if name not in {"agent_observe.list", "agent_observe.get", "agent_observe.recent"}:
+            raise ValueError(f"unsupported Prime host request: {name}")
+        return json.loads(await host_call("agent_message", json.dumps({"host_request": name, "payload": payload})))
     if name.startswith("rlm_heartbeat."):
         op = name.removeprefix("rlm_heartbeat.")
         if op not in {"list", "create", "update", "delete"}:
@@ -94,7 +90,10 @@ async def host_request(name, payload=None):
         request = {"op": "rlm_" + op, **payload}
         return json.loads(await host_call("heartbeat", json.dumps(request)))
     if name.startswith("compact."):
-        raise ValueError("REPL compaction is unavailable; use the chat /compact command")
+        op = name.removeprefix("compact.")
+        if op not in {"status", "run"}:
+            raise ValueError(f"unsupported Prime host request: {name}")
+        return json.loads(await host_call("compact", json.dumps({"op": op, **payload})))
     if name.startswith("goal."):
         op = name.removeprefix("goal.")
         if op not in {"get", "create", "complete"}:
@@ -102,6 +101,8 @@ async def host_request(name, payload=None):
         request = {"op": op}
         if op == "create":
             request["text"] = payload.get("objective", payload.get("text"))
+            if "token_budget" in payload:
+                request["token_budget"] = payload["token_budget"]
         return json.loads(await host_call("goal", json.dumps(request)))
     if name.startswith("refine."):
         op = name.removeprefix("refine.")
@@ -125,6 +126,7 @@ namespace.update({
     "goal": goal,
     "heartbeat": heartbeat,
     "spawn_subagent": spawn_subagent,
+    "await_subagent": await_subagent,
     "agent_message": agent_message,
 })
 write_frame({"op": "ready", "pid": os.getpid()})

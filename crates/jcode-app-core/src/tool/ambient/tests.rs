@@ -116,7 +116,6 @@ fn test_ambient_inputs_accept_string_numbers_and_bools() {
     }))
     .expect("request_permission must accept string wait flag (#106)");
     assert!(perm.wait);
-
 }
 
 #[test]
@@ -279,4 +278,3 @@ async fn test_request_permission_rejects_non_ambient_session() {
             .contains("request_permission is only available to ambient sessions")
     );
 }
-

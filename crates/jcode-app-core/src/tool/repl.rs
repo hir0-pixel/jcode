@@ -11,14 +11,44 @@ use async_trait::async_trait;
 #[cfg(not(target_os = "macos"))]
 use jcode_tool_core::{StdinInputRequest, ToolExecutionMode};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_os = "macos"))]
 use tokio::time::{Duration, timeout};
 
 const MAX_OUTPUT_CHARS: usize = 8_000;
 const SUBQUERY_SYSTEM: &str = "You are a focused sub-agent. Answer the request using only the text it contains. Be concise and exact.";
+static PENDING_COMPACTION: OnceLock<StdMutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+pub(crate) fn take_pending_compaction(session_id: &str) -> Option<Option<String>> {
+    PENDING_COMPACTION
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session_id)
+}
+
+fn queue_compaction(session_id: &str, instructions: Option<String>) -> bool {
+    let mut pending = PENDING_COMPACTION
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if pending.contains_key(session_id) {
+        return false;
+    }
+    pending.insert(session_id.to_owned(), instructions);
+    true
+}
+
+fn compaction_pending(session_id: &str) -> bool {
+    PENDING_COMPACTION
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(session_id)
+}
 
 #[cfg(not(target_os = "macos"))]
 async fn approve_cell(ctx: &ToolContext, code: &str) -> Result<bool> {
@@ -47,6 +77,26 @@ async fn approve_cell(ctx: &ToolContext, code: &str) -> Result<bool> {
 
 pub struct ReplTool {
     host: Arc<sovereign_prime::ReplHost>,
+}
+
+#[cfg(test)]
+mod compaction_request_tests {
+    use super::{compaction_pending, queue_compaction, take_pending_compaction};
+
+    #[test]
+    fn compact_intent_is_session_scoped_and_consumed_once() {
+        let session = format!("compact-test-{}", std::process::id());
+        assert!(!compaction_pending(&session));
+        assert!(queue_compaction(&session, Some("keep decisions".into())));
+        assert!(!queue_compaction(&session, None));
+        assert!(compaction_pending(&session));
+        assert_eq!(
+            take_pending_compaction(&session),
+            Some(Some("keep decisions".into()))
+        );
+        assert!(!compaction_pending(&session));
+        assert_eq!(take_pending_compaction(&session), None);
+    }
 }
 
 static HOST: OnceLock<Option<Arc<sovereign_prime::ReplHost>>> = OnceLock::new();
@@ -189,13 +239,32 @@ impl Tool for ReplTool {
                         let op: Value = serde_json::from_str(&op_json).unwrap_or_default();
                         let prompt = op["prompt"].as_str().unwrap_or_default();
                         let label = op["label"].as_str().unwrap_or("worker");
+                        if op["action"].as_str() == Some("await") {
+                            let target = op["target"].as_str().unwrap_or_default();
+                            let timeout = op["timeout"].as_u64().unwrap_or(20);
+                            let result = super::communicate::prime_await_subagent(
+                                &context.session_id,
+                                target,
+                                timeout,
+                            )
+                            .await?;
+                            return Ok(result.to_string());
+                        }
                         let output = super::delegate::DelegateTool::new()
                             .execute(
                                 json!({"action":"spawn","prompt":prompt,"label":label}),
                                 context,
                             )
                             .await?;
-                        Ok(output.output)
+                        let session_id = output
+                            .output
+                            .split_once("Spawned new agent:")
+                            .map(|(_, id)| id.trim())
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("delegate did not return a spawned session id")
+                            })?;
+                        Ok(json!({ "session_id": session_id, "status": "spawned" }).to_string())
                     })
                 })
             },
@@ -205,6 +274,15 @@ impl Tool for ReplTool {
                     let context = context.clone();
                     Box::pin(async move {
                         let op: Value = serde_json::from_str(&op_json).unwrap_or_default();
+                        if let Some(operation) = op["host_request"].as_str() {
+                            let result = super::communicate::prime_agent_host_request(
+                                &context.session_id,
+                                operation,
+                                &op["payload"],
+                            )
+                            .await?;
+                            return Ok(result.to_string());
+                        }
                         let action = op["action"].as_str().unwrap_or("list");
                         let mut request = json!({"action":action});
                         match action {
@@ -244,6 +322,28 @@ impl Tool for ReplTool {
                             )
                             .await?;
                         Ok(output.output)
+                    })
+                })
+            },
+            compact: {
+                let session_id = ctx.session_id.clone();
+                Arc::new(move |op_json| {
+                    let session_id = session_id.clone();
+                    Box::pin(async move {
+                        let op: serde_json::Value = serde_json::from_str(&op_json)?;
+                        match op["op"].as_str().unwrap_or_default() {
+                            "status" => {
+                                Ok(json!({ "scheduled": compaction_pending(&session_id) })
+                                    .to_string())
+                            }
+                            "run" => {
+                                let instructions = op["instructions"].as_str().map(str::to_owned);
+                                let scheduled = queue_compaction(&session_id, instructions);
+                                Ok(json!({ "scheduled": scheduled, "phase": "end_of_turn" })
+                                    .to_string())
+                            }
+                            other => anyhow::bail!("unsupported compact operation: {other}"),
+                        }
                     })
                 })
             },

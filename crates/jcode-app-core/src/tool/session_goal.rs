@@ -33,7 +33,10 @@ impl Tool for SessionGoalTool {
         let home = jcode_base::storage::jcode_dir()?;
         let store = sovereign_prime::agent_loop::ControlStore::open_cached(&home)?;
         let op_json = match input["op"].as_str().unwrap_or("get") {
-            "create" => json!({ "op": "create", "text": input["text"].as_str().unwrap_or_default() }).to_string(),
+            "create" => {
+                json!({ "op": "create", "text": input["text"].as_str().unwrap_or_default() })
+                    .to_string()
+            }
             "complete" => json!({ "op": "complete" }).to_string(),
             _ => json!({ "op": "get" }).to_string(),
         };

@@ -1,6 +1,6 @@
 """Prime Agent session-to-session messaging skill.
 
-All routing and sender identity live in the TypeScript daemon. These functions
+All routing and sender identity live in the Rust host. These functions
 only call the host bridge exposed inside the Prime Agent kernel.
 """
 

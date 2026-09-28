@@ -1,6 +1,6 @@
 """Prime Agent goal skill: manage the persistent thread goal from the kernel.
 
-All goal state lives in the TypeScript host; these functions are thin typed
+All goal state lives in the Rust host; these functions are thin typed
 wrappers over the generic host bridge (`rlm.host_request`). They only work
 inside the Prime Agent Python kernel.
 """
@@ -16,8 +16,8 @@ async def get() -> dict[str, Any]:
     """Read the current thread goal.
 
     Returns a dict with `goal` (None when no goal is set), `remaining_tokens`,
-    and `completion_budget_report`. The `goal` dict carries the objective,
-    status, token budget, and token/elapsed-time usage.
+    and `completion_budget_report`. The `goal` dict carries objective, status,
+    token and turn budgets/usage, and timestamps.
     """
     return await host_request("goal.get")
 

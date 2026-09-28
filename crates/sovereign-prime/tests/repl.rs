@@ -84,6 +84,65 @@ async fn variables_persist_between_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn repl_cold_and_warm_latency_budgets_hold() {
+    let h = host();
+    assert_eq!(
+        h.live_workers().await,
+        0,
+        "constructing the REPL host must not start Python on turns that skip the tool"
+    );
+    let started = std::time::Instant::now();
+    let cold = h
+        .run(
+            "latency-budget",
+            "1 + 1",
+            None,
+            upper(),
+            no_refine(),
+            sovereign_prime::host::ExtraHostFns::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let cold_time = started.elapsed();
+    assert!(cold.error.is_none());
+    assert_eq!(h.live_workers().await, 1, "the first REPL call starts one worker");
+    assert!(
+        cold_time < std::time::Duration::from_millis(500),
+        "REPL cold start was {cold_time:?}"
+    );
+
+    let mut samples = Vec::with_capacity(120);
+    for _ in 0..120 {
+        let started = std::time::Instant::now();
+        let warm = h
+            .run(
+                "latency-budget",
+                "1 + 1",
+                None,
+                upper(),
+                no_refine(),
+                sovereign_prime::host::ExtraHostFns::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(warm.error.is_none());
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95 / 100) - 1];
+    println!(
+        "REPL latency: cold={cold_time:?} warm p50={:?} p95={p95:?}",
+        samples[samples.len() / 2]
+    );
+    assert!(
+        p95 < std::time::Duration::from_millis(5),
+        "warm REPL p95 was {p95:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stdlib_imports_and_python_package_skills_work() {
     let skills = PathBuf::from(std::env::var("JCODE_HOME").unwrap()).join("skills");
     let package = skills.join("parity_probe/src/parity_probe");
@@ -107,12 +166,16 @@ async fn stdlib_imports_and_python_package_skills_work() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
     let skills = PathBuf::from(std::env::var("JCODE_HOME").unwrap()).join("skills");
+    let home = std::env::temp_dir().join(format!("prime-goal-skill-{}", rand_suffix()));
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Arc::new(sovereign_prime::agent_loop::ControlStore::open(&home).unwrap());
+    let store_for_host = store.clone();
     let h = host();
     let extra = sovereign_prime::host::ExtraHostFns {
-        goal: Arc::new(|op| {
+        goal: Arc::new(move |op| {
+            let store = store_for_host.clone();
             Box::pin(async move {
-                let op: serde_json::Value = serde_json::from_str(&op)?;
-                Ok(serde_json::json!({"created": op["text"]}).to_string())
+                sovereign_prime::agent_loop_host::goal_host(&store, "goal-test", &op)
             })
         }),
         ..sovereign_prime::host::ExtraHostFns::default()
@@ -120,7 +183,7 @@ async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
     let out = h
         .run(
             "bundled-prime-skills",
-            "import goal\nresult = await goal.create('prove package bridge')\nresult['created']",
+            "import goal\ncreated = await goal.create('prove package bridge', token_budget=42)\ncurrent = await goal.get()\ncompleted = await goal.complete()\n(created['goal']['token_budget'], current['remaining_tokens'], completed['goal']['status'], completed['completion_budget_report']['token_budget'])",
             None,
             upper(),
             no_refine(),
@@ -129,8 +192,15 @@ async fn bundled_prime_skill_package_imports_and_calls_rust_host() {
         )
         .await
         .unwrap();
-    assert_eq!(out.value.as_deref(), Some("'prove package bridge'"));
+    assert_eq!(
+        out.value.as_deref(),
+        Some("(42, 42, 'done', 42)"),
+        "{:?}",
+        out.error
+    );
     assert!(skills.join("prime-goal/SKILL.md").is_file());
+    drop(store);
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,7 +223,7 @@ async fn bundled_rlm_heartbeat_skill_uses_separate_persisted_records() {
     let out = host()
         .run(
             "rlm-heartbeat-skill",
-            "import rlm_heartbeat\ncreated = await rlm_heartbeat.create('check queue', interval='5m')\nawait rlm_heartbeat.update(created['id'], status='pause')\nitems = await rlm_heartbeat.list(include_inactive=True)\nitems['heartbeats'][0]['status']",
+            "import rlm_heartbeat\ncreated = await rlm_heartbeat.create('check queue', interval='5m', label='queue', delivery_mode='follow_up')\nawait rlm_heartbeat.update(created['id'], status='pause')\nactive = await rlm_heartbeat.list()\nitems = await rlm_heartbeat.list(include_inactive=True)\nawait rlm_heartbeat.update(created['id'], status='resume')\n(items['heartbeats'][0]['status'], items['heartbeats'][0]['label'], len(active['heartbeats']))",
             None,
             upper(),
             no_refine(),
@@ -162,7 +232,12 @@ async fn bundled_rlm_heartbeat_skill_uses_separate_persisted_records() {
         )
         .await
         .unwrap();
-    assert_eq!(out.value.as_deref(), Some("'paused'"), "{:?}", out.error);
+    assert_eq!(
+        out.value.as_deref(),
+        Some("('paused', 'queue', 0)"),
+        "{:?}",
+        out.error
+    );
     assert_eq!(
         store.user_heartbeat("rlm-skills").unwrap().unwrap().id,
         user.id
@@ -203,11 +278,63 @@ async fn prime_skill_host_request_bridges_goal_and_refine() {
                 Ok("safe local results".to_string())
             })
         }),
+        agent_message: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op)?;
+                let request = op["host_request"].as_str().unwrap();
+                let payload = &op["payload"];
+                match request {
+                    "agent_observe.list" => Ok(
+                        r#"{"agents":[{"session_id":"child","relationship":"child"}]}"#.to_string(),
+                    ),
+                    "agent_observe.get" => Ok(r#"{"agent":{"session_id":"child"}}"#.to_string()),
+                    "agent_observe.recent" => {
+                        Ok(r#"{"messages":[{"role":"assistant","content":"pong"}]}"#.to_string())
+                    }
+                    "agent_message.send" => {
+                        anyhow::ensure!(payload["receiver_role"] == "child", "role not forwarded");
+                        anyhow::ensure!(payload["receiver_name"] == "worker", "name not forwarded");
+                        Ok(r#"{"receipts":[{"deliveryStatus":"sent"}]}"#.to_string())
+                    }
+                    other => anyhow::bail!("unexpected Prime operation: {other}"),
+                }
+            })
+        }),
+        spawn_subagent: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op)?;
+                if op["action"] == "await" {
+                    Ok(
+                        r#"{"session_id":"child-id","status":"completed","result":"pong"}"#
+                            .to_string(),
+                    )
+                } else {
+                    anyhow::ensure!(op["label"] == "worker", "subagent label not forwarded");
+                    Ok(r#"{"session_id":"child-id","status":"spawned"}"#.to_string())
+                }
+            })
+        }),
+        compact: Arc::new(|op| {
+            Box::pin(async move {
+                let op: serde_json::Value = serde_json::from_str(&op)?;
+                match op["op"].as_str().unwrap() {
+                    "status" => Ok(r#"{"scheduled":true}"#.to_string()),
+                    "run" => {
+                        anyhow::ensure!(
+                            op["instructions"] == "retain the decision",
+                            "focus not bridged"
+                        );
+                        Ok(r#"{"scheduled":true,"phase":"end_of_turn"}"#.to_string())
+                    }
+                    other => anyhow::bail!("unexpected compact operation: {other}"),
+                }
+            })
+        }),
         ..sovereign_prime::host::ExtraHostFns::default()
     };
     let out = h.run(
         "prime-api",
-        "import rlm\ngoal = await rlm.host_request('goal.get')\ncreated = await rlm.host_request('goal.create', {'objective': 'ship parity'})\nrefine = await rlm.host_request('refine.status')\nsearch = await rlm.host_request('websearch.run', {'query': 'local', 'num_results': 2})\n(goal['goal'], created['created'], refine['scheduled'], search['results'])",
+        "import rlm, agent_observe, agent_message, compact\ngoal = await rlm.host_request('goal.get')\ncreated = await rlm.host_request('goal.create', {'objective': 'ship parity'})\nrefine = await rlm.host_request('refine.status')\nsearch = await rlm.host_request('websearch.run', {'query': 'local', 'num_results': 2})\nroster = await agent_observe.list_agents()\nagent = await agent_observe.get_agent('child')\nrecent = await agent_observe.recent_messages('child', limit=1, max_chars=100)\nreceipt = await agent_message.send('hi', receiver_role='child', receiver_name='worker')\nchild = await spawn_subagent('reply pong', name='worker')\nfinished = await await_subagent(child['session_id'])\ncs = await compact.status()\ncr = await compact.run('retain the decision')\n(goal['goal'], created['created'], refine['scheduled'], search['results'], roster['agents'][0]['relationship'], agent['agent']['session_id'], recent['messages'][0]['content'], receipt['receipts'][0]['deliveryStatus'], finished['result'], cs['scheduled'], cr['phase'])",
         None,
         upper(),
         no_refine(),
@@ -216,9 +343,11 @@ async fn prime_skill_host_request_bridges_goal_and_refine() {
     ).await.unwrap();
     assert_eq!(
         out.value.as_deref(),
-        Some("('ship parity', 'ship parity', False, 'safe local results')")
+        Some(
+            "('ship parity', 'ship parity', False, 'safe local results', 'child', 'child', 'pong', 'sent', 'pong', True, 'end_of_turn')"
+        )
     );
-    assert_eq!(out.host_calls, 4);
+    assert_eq!(out.host_calls, 12);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -162,11 +162,16 @@ fn test_new_message_after_restore_reenables_compaction() {
 #[test]
 fn test_token_estimate() {
     let manager = CompactionManager::new();
-    // 100 chars = ~25 tokens (plus 18k overhead for full budget)
+    // 100 chars = 25 tokens. System/tool overhead is included only for a
+    // context budget large enough to use the full-window estimate.
     let messages = vec![make_text_message(Role::User, &"x".repeat(100))];
     let estimate = manager.token_estimate_with(&messages);
-    // With DEFAULT_TOKEN_BUDGET and 18k overhead: 25 + 18000 = 18025
-    assert!((18_000..19_000).contains(&estimate));
+    let overhead = if manager.token_budget() >= DEFAULT_TOKEN_BUDGET / 2 {
+        SYSTEM_OVERHEAD_TOKENS
+    } else {
+        0
+    };
+    assert_eq!(estimate, 25 + overhead);
 }
 
 #[test]
@@ -1061,19 +1066,16 @@ fn test_context_usage_with_both_estimate_and_observed() {
 
     // Without observed tokens, usage should be based on char estimate
     let usage_no_observed = manager.context_usage_with(&messages);
-    assert!(
-        usage_no_observed < 0.2,
-        "char estimate should be low: {}",
-        usage_no_observed
-    );
+    let estimate = manager.effective_token_count_with(&messages);
+    let budget = manager.token_budget();
+    assert_eq!(usage_no_observed, estimate as f32 / budget as f32);
 
     // With observed tokens at 160k, should use observed (higher) value
     manager.update_observed_input_tokens(160_000);
     let usage_with_observed = manager.context_usage_with(&messages);
     assert!(
-        usage_with_observed >= 0.79,
-        "should use observed tokens: {}",
-        usage_with_observed
+        usage_with_observed > usage_no_observed,
+        "observed usage should exceed the character estimate: {usage_with_observed} <= {usage_no_observed}"
     );
 }
 

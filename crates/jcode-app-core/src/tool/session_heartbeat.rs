@@ -39,7 +39,8 @@ impl Tool for SessionHeartbeatTool {
             "prompt": input["prompt"].as_str(),
         })
         .to_string();
-        let text = sovereign_prime::agent_loop_host::heartbeat_host(&store, &ctx.session_id, &op_json)?;
+        let text =
+            sovereign_prime::agent_loop_host::heartbeat_host(&store, &ctx.session_id, &op_json)?;
         Ok(ToolOutput::new(text))
     }
 }

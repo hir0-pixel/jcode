@@ -101,6 +101,12 @@ impl Agent {
         let start_message_index = self.message_count();
         self.fire_turn_start_hook("chat");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
+        if let Some(instructions) = crate::tool::take_pending_compaction(&self.session.id) {
+            let (status, started) = self.request_manual_compaction_with_instructions(instructions);
+            crate::logging::info(&format!(
+                "[prime-compact] scheduled end-of-turn request: started={started}; {status}"
+            ));
+        }
         self.current_turn_system_reminder = None;
         self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
@@ -552,12 +558,7 @@ impl Agent {
         // Desktop development is a separate product mode, not a CLI canary.
         // Never advertise CLI build/reload or TUI debug sockets in that mode.
         if is_desktop {
-            tools.retain(|tool| {
-                !matches!(
-                    tool.name.as_str(),
-                    "selfdev" | "debug_socket"
-                )
-            });
+            tools.retain(|tool| !matches!(tool.name.as_str(), "selfdev" | "debug_socket"));
             return;
         }
         tools.retain(|tool| tool.name != "desktop_selfdev");
@@ -1015,5 +1016,4 @@ impl Agent {
 
         Ok(())
     }
-
 }

@@ -44,6 +44,13 @@ impl Agent {
     }
 
     pub fn request_manual_compaction(&mut self) -> (String, bool) {
+        self.request_manual_compaction_with_instructions(None)
+    }
+
+    pub fn request_manual_compaction_with_instructions(
+        &mut self,
+        instructions: Option<String>,
+    ) -> (String, bool) {
         if !self.provider.supports_compaction() {
             return (
                 "Manual compaction is not available for this provider.".to_string(),
@@ -78,7 +85,7 @@ impl Agent {
                     }
                 );
 
-                match manager.force_compact_with(&messages, provider) {
+                match manager.force_compact_with_instructions(&messages, provider, instructions) {
                     Ok(()) => (
                         format!(
                             "{}\n\n📦 **Compacting context** (manual) — summarizing older messages in the background to stay within the context window.\n\

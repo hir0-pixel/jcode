@@ -199,7 +199,7 @@ impl Agent {
             split.static_part.push_str("\n\n");
         }
         split.static_part.push_str(
-            "# Recursive REPL\nKeep large context in persistent variables: `text = await load(path)`, inspect it with Python, then `await llm_query(focused_chunk)`. Use `await refine('run', instructions)` / `await refine('status')`; `await goal(op, objective)`, `await heartbeat(op, ...)`, `await spawn_subagent(prompt, name)`, and `await agent_message(action, message, target)` call engine-owned features. Save handles and query results for later turns.\n",
+            "# Recursive REPL\nTreat prompts as data: keep them in variables, slice large inputs programmatically, and use `await llm_query(focused_chunk)` only on relevant parts. Python variables persist between calls. Use `await load(path)` for files; `await refine('run', instructions)` / `await refine('status')`, `await goal(op, objective)`, `await heartbeat(op, ...)`, `await spawn_subagent(prompt, name)`, and `await agent_message(action, message, target)` call engine-owned features. Save handles and query results for later turns.\n",
         );
     }
 

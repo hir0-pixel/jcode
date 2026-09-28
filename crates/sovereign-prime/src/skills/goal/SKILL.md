@@ -22,8 +22,7 @@ await goal.complete()
 
 - `await goal.get()` — current goal as a dict: `goal` (or `None` when no goal
   is set), `remaining_tokens`, and `completion_budget_report`. The `goal` dict
-  carries `objective`, `status`, `token_budget`, `tokens_used`,
-  `time_used_seconds`, and timestamps.
+  carries `objective`, `status`, token and turn budgets/usage, and timestamps.
 - `await goal.create(objective, token_budget=None)` — start a new active goal.
   Fails while a goal is still pending (active, paused, or budget-limited); a
   completed or errored goal is replaced by the new one. Only create a goal when
@@ -33,8 +32,7 @@ await goal.complete()
 - `await goal.complete()` — mark the existing goal achieved. Use only when the
   objective has actually been achieved and no required work remains; do not
   call it merely because the budget is nearly exhausted or because you are
-  stopping work. When the result includes a `completion_budget_report`, report
-  that final usage to the user.
+  stopping work. The result includes its final token and turn budget report.
 
 ## Rules
 

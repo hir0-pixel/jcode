@@ -13,27 +13,26 @@ to include a `from` field.
 Call directly from the kernel:
 
 ```python
-children = await rlm.list_subagents()
-child = next((item for item in children if item.active_session_id), None)
+import agent_observe, agent_message
+roster = await agent_observe.list_agents()
+child = next((item for item in roster["agents"] if item["relationship"] == "child"), None)
 if child is not None:
     receipt = await agent_message.send(
         "Please inspect the latest result.",
         receiver_role="child",
-        receiver_name=child.session_name,
+        receiver_name=child["sessionName"],
     )
     # Keep the child until this follow-up finishes so its result remains observable.
 ```
 
 ## API
 
-- `await agent_observe.list_agents()` (agent-observe skill) is the roster: it
-  lists the parent, siblings, and children this skill can reach, active or not,
-  with the `relationship` and `sessionName` that `send` takes as
-  `receiver_role` and `receiver_name`.
+- `await agent_observe.list_agents()` (agent-observe skill) is the visible
+  family roster. Use its `relationship` and `sessionName` fields to select a
+  recipient.
 - `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None)` — sends one direct
-  text message to one family member. Sending to an inactive or idle completed
-  subagent wakes it and starts an ordinary follow-up turn in that same session
-  and context.
+  text message to one family member. A queued message uses the existing swarm
+  delivery path.
   The child remains available only until its parent session closes. The daemon
   resolves `receiver_role` within the current agent family; `receiver_name` is
   required for siblings and children and omitted for the unique parent.
@@ -49,10 +48,8 @@ if child is not None:
 
 ## Safety
 
-- Do not delete a child immediately after `send`: delivered follow-ups may still
-  be running and queued receipts have not run yet. Wait until observation shows
-  the child is idle and its context is no longer needed before calling
-  `await rlm.delete_subagent(child)`.
+- Observe child state before sending follow-up work; queued delivery does not
+  mean the child has completed it.
 - Reach is limited to parent, siblings, and direct children; relay through an
   intermediate child instead of messaging grandchildren or cousins directly.
 - Sender identity is daemon-derived and cannot be spoofed from Python.

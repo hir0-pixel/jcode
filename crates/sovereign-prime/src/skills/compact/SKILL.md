@@ -1,6 +1,6 @@
 ---
 name: prime-compact
-description: Check context usage and compact the conversation from the Python REPL. Use when context is filling up and substantial work remains, so the session is summarized and you keep working instead of stopping early.
+description: Check queued compaction and schedule a conversation summary from the Python REPL.
 ---
 
 # Compact
@@ -18,24 +18,21 @@ await compact.run("keep the failing test names and the migration checklist")
 
 ## API
 
-- `await compact.status()` — current context usage as a dict: `tokens`,
-  `context_window`, and `percent` (`None` right after a compaction until the
-  next model response), plus `scheduled` (whether a requested compaction is
-  already pending).
-- `await compact.run(instructions=None)` — schedule compaction. Returns
-  `{"scheduled": True}`, or `{"scheduled": False, "reason": ...}` when there
-  is nothing to compact yet. Optional `instructions` focus the summary on
-  what matters for the remaining work.
+- `await compact.status()` — returns `scheduled`, indicating whether a request
+  is waiting for the current turn to end.
+- `await compact.run(instructions=None)` — queue one compaction attempt for
+  turn end and optionally focus the summary. The existing Rust compactor may
+  reject the attempt if context is short or below its usage threshold.
 
 ## Rules
 
-- Compaction never runs mid-cell. A scheduled compaction runs when the
-  current turn ends; the harness then resumes you automatically with the
-  summary plus recent messages, and you continue the task.
+- Compaction never runs mid-cell. The engine starts its existing background
+  compactor when the current turn ends; it applies the summary through its
+  normal completion poll. This does not create another model turn.
 - The Python kernel persists through compaction — variables, imports, and
   helpers you defined all remain available.
 - Compact at a natural boundary when context usage is high and substantial
   work remains, instead of becoming terse or returning to the user early.
   Check `await compact.status()` when unsure.
-- One request per turn is enough; calling `run` again before the turn ends
-  only updates the instructions.
+- One request per turn is enough. A repeated request before turn end is
+  ignored and the first instructions are retained.

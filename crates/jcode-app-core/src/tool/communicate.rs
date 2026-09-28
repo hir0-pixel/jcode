@@ -211,6 +211,341 @@ async fn fetch_swarm_members(session_id: &str) -> Result<Vec<AgentInfo>> {
     }
 }
 
+fn prime_family_role<'a>(
+    member: &'a AgentInfo,
+    session_id: &str,
+    parent: Option<&str>,
+) -> Option<&'static str> {
+    if member.session_id == session_id {
+        Some("current")
+    } else if parent == Some(member.session_id.as_str()) {
+        Some("parent")
+    } else if member.report_back_to_session_id.as_deref() == Some(session_id) {
+        Some("child")
+    } else if parent.is_some() && member.report_back_to_session_id.as_deref() == parent {
+        Some("sibling")
+    } else {
+        None
+    }
+}
+
+fn prime_agent_summary(member: &AgentInfo, session_id: &str, parent: Option<&str>) -> Value {
+    let status = match member.status.as_deref() {
+        Some("running" | "running_stale" | "queued") => "running",
+        Some("ready" | "idle") => "idle",
+        _ => "inactive",
+    };
+    let active = member.live_attachments.unwrap_or(0) > 0
+        || member
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.is_processing);
+    json!({
+        "sessionId": member.session_id,
+        "sessionName": member.friendly_name,
+        "activeSessionId": active.then_some(&member.session_id),
+        "relationship": prime_family_role(member, session_id, parent).unwrap_or("inactive"),
+        "status": status,
+        "activity": member.activity.as_ref().map(|activity| json!({
+            "isProcessing": activity.is_processing,
+            "currentToolName": activity.current_tool_name,
+        })),
+        "isSessionActive": active,
+        "taskLabel": member.task_label,
+        "detail": member.detail,
+        "latestMessage": member.latest_completion_report,
+    })
+}
+
+fn prime_resolve_agent<'a>(
+    members: &'a [AgentInfo],
+    session_id: &str,
+    parent: Option<&str>,
+    target: &str,
+) -> Result<&'a AgentInfo> {
+    let matches = members
+        .iter()
+        .filter(|member| {
+            prime_family_role(member, session_id, parent).is_some()
+                && (member.session_id == target
+                    || member.friendly_name.as_deref() == Some(target)
+                    || member.task_label.as_deref() == Some(target)
+                    || member.session_id.ends_with(target))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [member] => Ok(*member),
+        [] => anyhow::bail!("agent target is outside the current family or not found"),
+        _ => anyhow::bail!("agent target is ambiguous; use its full session id"),
+    }
+}
+
+#[cfg(test)]
+mod prime_family_bridge_tests {
+    use super::{prime_family_role, prime_resolve_agent};
+    use crate::protocol::AgentInfo;
+
+    fn member(id: &str, name: &str, parent: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            session_id: id.into(),
+            friendly_name: Some(name.into()),
+            report_back_to_session_id: parent.map(str::to_owned),
+            ..AgentInfo::default()
+        }
+    }
+
+    #[test]
+    fn family_roster_resolves_roles_and_rejects_foreign_sessions() {
+        let members = vec![
+            member("parent-1", "parent", None),
+            member("self-1", "current", Some("parent-1")),
+            member("sibling-1", "sibling", Some("parent-1")),
+            member("child-1", "child", Some("self-1")),
+            member("foreign-1", "foreign", Some("other-parent")),
+        ];
+        let parent = Some("parent-1");
+        assert_eq!(
+            prime_family_role(&members[0], "self-1", parent),
+            Some("parent")
+        );
+        assert_eq!(
+            prime_family_role(&members[1], "self-1", parent),
+            Some("current")
+        );
+        assert_eq!(
+            prime_family_role(&members[2], "self-1", parent),
+            Some("sibling")
+        );
+        assert_eq!(
+            prime_family_role(&members[3], "self-1", parent),
+            Some("child")
+        );
+        assert_eq!(prime_family_role(&members[4], "self-1", parent), None);
+        assert_eq!(
+            prime_resolve_agent(&members, "self-1", parent, "child")
+                .unwrap()
+                .session_id,
+            "child-1"
+        );
+        assert!(prime_resolve_agent(&members, "self-1", parent, "foreign").is_err());
+    }
+
+    #[test]
+    fn family_target_suffix_must_be_unambiguous() {
+        let members = vec![
+            member("agent-ab", "one", Some("self")),
+            member("other-ab", "two", Some("self")),
+        ];
+        assert!(prime_resolve_agent(&members, "self", None, "ab").is_err());
+        assert_eq!(
+            prime_resolve_agent(&members, "self", None, "agent-ab")
+                .unwrap()
+                .session_id,
+            "agent-ab"
+        );
+    }
+}
+
+/// Prime's Python skills use this narrow adapter for role-addressed family
+/// messaging and observation. Resolution stays in Rust and is limited to the
+/// existing swarm roster; Python never chooses an arbitrary session id.
+pub(crate) async fn prime_agent_host_request(
+    session_id: &str,
+    operation: &str,
+    payload: &Value,
+) -> Result<Value> {
+    let members = fetch_swarm_members(session_id).await?;
+    let current = members
+        .iter()
+        .find(|member| member.session_id == session_id);
+    let parent = current.and_then(|member| member.report_back_to_session_id.as_deref());
+    let visible = members
+        .iter()
+        .filter(|member| prime_family_role(member, session_id, parent).is_some())
+        .map(|member| prime_agent_summary(member, session_id, parent))
+        .collect::<Vec<_>>();
+    match operation {
+        "agent_observe.list" => Ok(json!({
+            "current": current.map(|member| prime_agent_summary(member, session_id, parent))
+                .unwrap_or_else(|| json!({ "sessionId": session_id, "relationship": "current" })),
+            "agents": visible,
+        })),
+        "agent_observe.get" | "agent_observe.recent" => {
+            let target = payload["target"].as_str().unwrap_or_default();
+            let member = prime_resolve_agent(&members, session_id, parent, target)?;
+            if operation == "agent_observe.get" {
+                return Ok(json!({ "agent": prime_agent_summary(member, session_id, parent) }));
+            }
+            let request = Request::CommReadContext {
+                id: REQUEST_ID,
+                session_id: session_id.to_owned(),
+                target_session: member.session_id.clone(),
+            };
+            let messages = match send_request(request).await? {
+                ServerEvent::CommContextHistory { messages, .. } => messages,
+                response => {
+                    ensure_success(&response)?;
+                    Vec::new()
+                }
+            };
+            let limit = payload["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
+            let max_chars = payload["max_chars"].as_u64().unwrap_or(800).clamp(80, 2000) as usize;
+            let recent = messages
+                .iter()
+                .rev()
+                .take(limit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|message| {
+                    json!({
+                        "role": message.role,
+                        "content": message.content.chars().take(max_chars).collect::<String>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "target": member.session_id, "messages": recent }))
+        }
+        "agent_message.send" => {
+            let message = payload["message"].as_str().unwrap_or_default();
+            anyhow::ensure!(!message.trim().is_empty(), "message is required");
+            let role = payload["receiver_role"].as_str().unwrap_or_default();
+            let name = payload["receiver_name"].as_str();
+            if payload["target"].as_str() == Some("all") {
+                let mut receipts = Vec::new();
+                for recipient in members.iter().filter(|member| {
+                    member.session_id != session_id
+                        && prime_family_role(member, session_id, parent).is_some()
+                }) {
+                    let request = Request::CommMessage {
+                        id: REQUEST_ID,
+                        from_session: session_id.to_owned(),
+                        message: message.to_owned(),
+                        to_session: Some(recipient.session_id.clone()),
+                        channel: None,
+                        delivery: Some(CommDeliveryMode::Interrupt),
+                        wake: None,
+                        tldr: None,
+                    };
+                    let receipt = match send_request(request).await {
+                        Ok(response) => match ensure_success(&response) {
+                            Ok(()) => json!({
+                                "targetSession": recipient.session_id,
+                                "deliveryStatus": "queued",
+                            }),
+                            Err(error) => json!({
+                                "targetSession": recipient.session_id,
+                                "error": error.to_string(),
+                            }),
+                        },
+                        Err(error) => json!({
+                            "targetSession": recipient.session_id,
+                            "error": error.to_string(),
+                        }),
+                    };
+                    receipts.push(receipt);
+                }
+                return Ok(json!({ "receipts": receipts }));
+            }
+            let recipients = match role {
+                "parent" => parent
+                    .map(|id| {
+                        members
+                            .iter()
+                            .filter(|m| m.session_id == id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "child" => members
+                    .iter()
+                    .filter(|m| m.report_back_to_session_id.as_deref() == Some(session_id))
+                    .collect(),
+                "sibling" => members
+                    .iter()
+                    .filter(|m| {
+                        m.session_id != session_id
+                            && parent.is_some()
+                            && m.report_back_to_session_id.as_deref() == parent
+                    })
+                    .collect(),
+                _ => anyhow::bail!("receiver_role must be parent, sibling, or child"),
+            };
+            let recipients = if let Some(name) = name {
+                recipients
+                    .into_iter()
+                    .filter(|m| {
+                        m.session_id == name
+                            || m.friendly_name.as_deref() == Some(name)
+                            || m.task_label.as_deref() == Some(name)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                recipients
+            };
+            anyhow::ensure!(
+                !recipients.is_empty(),
+                "no matching agent in the requested family role"
+            );
+            anyhow::ensure!(
+                role == "parent" || name.is_some(),
+                "receiver_name is required for sibling and child messages"
+            );
+            anyhow::ensure!(
+                recipients.len() == 1,
+                "agent target is ambiguous; provide receiver_name"
+            );
+            let target = &recipients[0].session_id;
+            let request = Request::CommMessage {
+                id: REQUEST_ID,
+                from_session: session_id.to_owned(),
+                message: message.to_owned(),
+                to_session: Some(target.clone()),
+                channel: None,
+                wake: None,
+                delivery: Some(CommDeliveryMode::Interrupt),
+                tldr: None,
+            };
+            ensure_success(&send_request(request).await?)?;
+            Ok(json!({ "receipts": [{ "targetSession": target, "deliveryStatus": "queued" }] }))
+        }
+        _ => anyhow::bail!("unsupported Prime agent operation: {operation}"),
+    }
+}
+
+pub(crate) async fn prime_await_subagent(
+    session_id: &str,
+    target: &str,
+    timeout_secs: u64,
+) -> Result<Value> {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.clamp(1, 20));
+    loop {
+        let members = fetch_swarm_members(session_id).await?;
+        let member = members
+            .iter()
+            .find(|member| {
+                member.session_id == target
+                    && member.report_back_to_session_id.as_deref() == Some(session_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("subagent is not a child of this session"))?;
+        let status = member.status.as_deref().unwrap_or("unknown");
+        if matches!(status, "completed" | "failed" | "stopped" | "cancelled") {
+            return Ok(json!({
+                "session_id": member.session_id,
+                "status": status,
+                "result": member.latest_completion_report,
+                "detail": member.detail,
+            }));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(
+                json!({ "session_id": member.session_id, "status": status, "complete": false }),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 fn swarm_member_is_in_flight(member: &AgentInfo) -> bool {
     matches!(
         member.status.as_deref(),

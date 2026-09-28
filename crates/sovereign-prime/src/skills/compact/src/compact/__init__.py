@@ -13,23 +13,18 @@ from rlm import host_request
 
 
 async def status() -> dict[str, Any]:
-    """Read current context usage.
-
-    Returns a dict with `tokens`, `context_window`, `percent` (None right
-    after a compaction until the next model response), and `scheduled`
-    (whether a requested compaction is already pending for this turn).
+    """Read whether compaction is pending for this session.
     """
     return await host_request("compact.status")
 
 
 async def run(instructions: str | None = None) -> dict[str, Any]:
-    """Schedule context compaction.
+    """Schedule compaction after the current turn ends.
 
-    Compaction never runs mid-cell: it runs when the current turn ends and
-    the harness resumes you automatically afterwards. Returns
-    `{"scheduled": True}`, or `{"scheduled": False, "reason": ...}` when
-    there is nothing to compact. Optional `instructions` focus the summary on
-    what matters for the remaining work.
+    The engine starts its existing background compactor at turn end and
+    applies the summary when its normal poll runs. This does not start a new
+    model turn. The turn-end attempt can still reject short or low-usage
+    context. Optional `instructions` focus the resulting summary.
     """
     if instructions is not None and not isinstance(instructions, str):
         raise TypeError(f"instructions must be str or None, got {type(instructions).__name__}")

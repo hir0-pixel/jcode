@@ -81,6 +81,62 @@ async fn register_empty_mcp_tools(registry: &Registry, working_dir: &std::path::
         .await;
 }
 
+struct DispatchBenchTool;
+
+#[async_trait]
+impl Tool for DispatchBenchTool {
+    fn name(&self) -> &str {
+        "dispatch_bench"
+    }
+    fn description(&self) -> &str {
+        "No-op dispatch benchmark."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({"type":"object", "properties":{"value":{"type":"integer"}}})
+    }
+    async fn execute(&self, input: Value, _ctx: ToolContext) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::new(input["value"].to_string()))
+    }
+}
+
+#[tokio::test]
+async fn tool_dispatch_overhead_p95_under_one_millisecond() {
+    let registry = Registry::empty();
+    registry
+        .register("dispatch_bench".into(), Arc::new(DispatchBenchTool))
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut samples = Vec::with_capacity(120);
+    for i in 0..120 {
+        let ctx = ToolContext {
+            session_id: "dispatch-bench".into(),
+            message_id: "m".into(),
+            tool_call_id: format!("c{i}"),
+            working_dir: Some(dir.path().to_path_buf()),
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: ToolExecutionMode::Direct,
+        };
+        let start = std::time::Instant::now();
+        let output = registry
+            .execute("dispatch_bench", serde_json::json!({"value": i}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(output.output, i.to_string());
+        samples.push(start.elapsed());
+    }
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95 / 100) - 1];
+    println!(
+        "tool dispatch latency: p50={:?} p95={p95:?}",
+        samples[samples.len() / 2]
+    );
+    assert!(
+        p95 < std::time::Duration::from_millis(1),
+        "dispatch p95 was {p95:?}"
+    );
+}
+
 #[tokio::test]
 async fn real_mcp_registration_does_not_retain_registry_tool_map() {
     let _env_lock = crate::storage::lock_test_env();
@@ -569,8 +625,7 @@ async fn test_definitions_keep_batch_schema_generic() {
 }
 
 #[test]
-fn resolve_tool_name_maps_communicate_to_swarm() {
-}
+fn resolve_tool_name_maps_communicate_to_swarm() {}
 
 #[tokio::test]
 #[ignore]

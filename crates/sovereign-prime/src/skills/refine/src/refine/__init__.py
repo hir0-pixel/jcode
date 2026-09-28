@@ -15,9 +15,8 @@ from rlm import host_request
 async def status() -> dict[str, Any]:
     """Read current refine state.
 
-    Returns a dict with `pending` (whether a requested refine is already
-    queued for this turn) and `in_flight` (whether a refine is currently
-    planning or applying).
+    Returns a dict with `pending` (whether a requested refine is queued for
+    the end-of-turn learning pass).
     """
     return await host_request("refine.status")
 
@@ -28,10 +27,9 @@ async def run(
 ) -> dict[str, Any]:
     """Schedule continual harness refinement.
 
-    Refinement never runs mid-cell: it runs when the current turn ends and
-    the harness applies changes and rebuilds the system prompt, then resumes
-    you automatically. Returns `{"scheduled": True}`, or
-    `{"scheduled": False, "reason": ...}` when refinement cannot start.
+    Refinement never runs mid-cell: it runs in the end-of-turn learning pass,
+    and updated harness entries are used on later turns. Returns
+    `{"scheduled": True}` when the request is queued.
     Optional `instructions` focus the refinement on a specific observation.
     Set `global_=True` to target the global (cross-session) harness store;
     omit for local (session-scoped) refinement.

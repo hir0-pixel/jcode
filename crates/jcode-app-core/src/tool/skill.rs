@@ -30,7 +30,7 @@ impl SkillTool {
 
 #[derive(Deserialize)]
 struct SkillInput {
-    /// Action to perform: load (default), list, reload, reload_all, read.
+    /// Action to perform: load (default), list, reload, reload_all, read, create.
     /// `list` shows both loaded skills and the jcode-endorsed catalog.
     #[serde(default = "default_action")]
     action: String,
@@ -42,6 +42,14 @@ struct SkillInput {
     /// needs to load the prompt, so args are currently accepted and ignored.
     #[serde(default)]
     args: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    package_name: Option<String>,
+    #[serde(default)]
+    package_code: Option<String>,
 }
 
 fn default_action() -> String {
@@ -65,13 +73,17 @@ impl Tool for SkillTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["load", "list", "reload", "reload_all", "read"],
+                    "enum": ["load", "list", "reload", "reload_all", "read", "create"],
                     "description": "Action."
                 },
                 "name": {
                     "type": "string",
                     "description": "Skill name."
-                }
+                },
+                "description": {"type":"string", "description":"Short skill summary for create."},
+                "instructions": {"type":"string", "description":"SKILL.md body for create."},
+                "package_name": {"type":"string", "description":"Optional Python module name for create."},
+                "package_code": {"type":"string", "description":"Optional Python package __init__.py for create."}
             }
         })
     }
@@ -94,8 +106,9 @@ impl Tool for SkillTool {
                 self.read_skill(params.name, ctx.working_dir.as_deref())
                     .await
             }
+            "create" => self.create_skill(params).await,
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', or 'read'.",
+                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', or 'create'.",
                 params.action
             ))),
         }
@@ -110,6 +123,33 @@ impl Tool for SkillTool {
 }
 
 impl SkillTool {
+    async fn create_skill(&self, params: SkillInput) -> Result<ToolOutput> {
+        let name = params
+            .name
+            .ok_or_else(|| anyhow::anyhow!("'name' is required for create action"))?;
+        let description = params
+            .description
+            .ok_or_else(|| anyhow::anyhow!("'description' is required for create action"))?;
+        let instructions = params
+            .instructions
+            .ok_or_else(|| anyhow::anyhow!("'instructions' is required for create action"))?;
+        let root = jcode_base::storage::jcode_dir()?.join("skills");
+        let path = create_skill_files(
+            &root,
+            &name,
+            &description,
+            &instructions,
+            params.package_name.as_deref(),
+            params.package_code.as_deref(),
+        )?;
+        let mut registry = self.registry.write().await;
+        registry.reload_global()?;
+        Ok(
+            ToolOutput::new(format!("Created skill '{}' at {}", name, path.display()))
+                .with_title(format!("Skills: Created {name}")),
+        )
+    }
+
     async fn load_skill(
         &self,
         name: Option<String>,
@@ -364,6 +404,81 @@ fn append_endorsed_skills(output: &mut String, installed: &std::collections::Has
     );
 }
 
+fn create_skill_files(
+    skills_root: &std::path::Path,
+    name: &str,
+    description: &str,
+    instructions: &str,
+    package_name: Option<&str>,
+    package_code: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let valid_slug = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && value.as_bytes()[0].is_ascii_lowercase()
+    };
+    anyhow::ensure!(
+        valid_slug(name),
+        "skill name must be a lowercase slug of at most 64 characters"
+    );
+    anyhow::ensure!(
+        !description.trim().is_empty()
+            && description.len() <= 500
+            && !description.contains('\n')
+            && !description.contains('\r'),
+        "description must be a single line of at most 500 bytes"
+    );
+    anyhow::ensure!(
+        !instructions.trim().is_empty() && instructions.len() <= 20_000,
+        "instructions must contain 1-20000 bytes"
+    );
+    anyhow::ensure!(
+        package_name.is_some() == package_code.is_some(),
+        "package_name and package_code must be provided together"
+    );
+    if let (Some(module), Some(code)) = (package_name, package_code) {
+        anyhow::ensure!(
+            !module.is_empty()
+                && module.len() <= 64
+                && module.as_bytes()[0].is_ascii_alphabetic()
+                && module
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "package_name must be a Python identifier"
+        );
+        anyhow::ensure!(code.len() <= 65_536, "package_code exceeds 64 KiB");
+    }
+
+    std::fs::create_dir_all(skills_root)?;
+    let skill_dir = skills_root.join(name);
+    std::fs::create_dir(&skill_dir)
+        .map_err(|error| anyhow::anyhow!("cannot create skill '{}': {error}", name))?;
+    let result = (|| -> Result<()> {
+        let quoted_name = serde_json::to_string(name)?;
+        let quoted_description = serde_json::to_string(description)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {quoted_name}\ndescription: {quoted_description}\n---\n\n{instructions}\n"
+            ),
+        )?;
+        if let (Some(module), Some(code)) = (package_name, package_code) {
+            let package_dir = skill_dir.join("src").join(module);
+            std::fs::create_dir_all(&package_dir)?;
+            std::fs::write(package_dir.join("__init__.py"), code)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&skill_dir);
+        return Err(error);
+    }
+    Ok(skill_dir)
+}
+
 fn normalize_skill_name(name: Option<String>, action: &str) -> Result<String> {
     let name = name.ok_or_else(|| anyhow::anyhow!("'name' is required for {} action", action))?;
     let trimmed = name.trim().trim_start_matches('/').to_string();
@@ -380,6 +495,47 @@ mod tests {
     fn create_test_tool() -> SkillTool {
         let registry = Arc::new(RwLock::new(SkillRegistry::default()));
         SkillTool::new(registry)
+    }
+
+    #[test]
+    fn creates_python_package_skill_with_confined_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create_skill_files(
+            &dir.path().join("skills"),
+            "demo-skill",
+            "A test skill",
+            "Use the demo package.",
+            Some("demo_skill"),
+            Some("def value():\n    return 42\n"),
+        )
+        .unwrap();
+        assert!(created.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(created.join("src/demo_skill/__init__.py")).unwrap(),
+            "def value():\n    return 42\n"
+        );
+        assert!(
+            create_skill_files(
+                &dir.path().join("skills"),
+                "../escape",
+                "bad",
+                "bad",
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            create_skill_files(
+                &dir.path().join("skills"),
+                "demo-skill",
+                "overwrite",
+                "overwrite",
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     fn create_test_tool_with_skill(name: &str) -> (SkillTool, tempfile::TempDir) {
