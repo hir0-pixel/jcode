@@ -30,6 +30,34 @@ pub(super) async fn route(
                 }
             }
         }
+        ("GET", ["harness"]) => {
+            let home = config.home.clone();
+            match blocking(move || harness(&*store(Path::new(&home))?)).await {
+                Ok(body) => respond(stream, "200 OK", &body).await,
+                Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+            }
+        }
+        ("POST", ["harness", "rollback"]) => {
+            let body: Value = match read_body(stream, req).await {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                Err(err) => return Some(Err(err)),
+            };
+            let Some(id) = body["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string) else {
+                return Some(respond(stream, "400 Bad Request", &json!({"detail": "id is required"})).await);
+            };
+            let (home, learning) = (config.home.clone(), config.learning.clone());
+            match blocking(move || {
+                let store = store(Path::new(&home))?;
+                crate::learn::with_sink(learning.as_ref(), None, |sink| {
+                    sovereign_prime::refine::rollback(&store, "", Some(&id), sink)
+                })
+            })
+            .await
+            {
+                Ok(message) => respond(stream, "200 OK", &json!({"ok": true, "message": message})).await,
+                Err(err) => respond(stream, "409 Conflict", &json!({"ok": false, "message": err.to_string()})).await,
+            }
+        }
         ("GET", ["node"]) => {
             let Some(id) = super::auth::query_param(req.query.as_deref().unwrap_or_default(), "id")
             else {
@@ -181,9 +209,56 @@ fn memory_body(entry: &sovereign_prime::entries::HarnessEntry) -> String {
         .unwrap_or_else(|| entry.content.clone())
 }
 
-fn graph(home: &Path) -> Result<Value> {
+pub(crate) fn graph(home: &Path) -> Result<Value> {
     let store = store(home)?;
-    graph_from_store(&store)
+    let mut body = graph_from_store(&store)?;
+    // Memories the model wrote itself (memory tool) have no harness entry; show them too.
+    let referenced = store
+        .list_all(None, None)?
+        .iter()
+        .filter_map(|e| e.reference["memory_id"].as_str().map(str::to_string))
+        .collect();
+    for m in super::memory_rest::unreferenced(&referenced)? {
+        let title: String = m.content.chars().take(60).collect();
+        body["memory"].as_array_mut().unwrap().push(json!({
+            "source": "memory", "timestamp": m.created_at.timestamp(), "title": title, "body": m.content,
+        }));
+        body["nodes"].as_array_mut().unwrap().push(json!({
+            "id": format!("{MEM_PREFIX}{}", m.id), "label": title, "kind": "memory",
+            "timestamp": m.created_at.timestamp(), "category": m.category.to_string(),
+            "useCount": m.access_count, "state": "active",
+            "createdBy": m.source.unwrap_or_else(|| "model".into()), "pinned": false,
+        }));
+        body["stats"]["nodes"] = json!(body["stats"]["nodes"].as_u64().unwrap_or(0) + 1);
+        body["stats"]["memory_nodes"] = json!(body["stats"]["memory_nodes"].as_u64().unwrap_or(0) + 1);
+    }
+    Ok(body)
+}
+
+/// Node id prefix for a jcode memory that no harness entry references.
+const MEM_PREFIX: &str = "mem:";
+
+/// What Prime has taught the agent: the prompt entries injected into new
+/// sessions and the recent changesets (each one undoable).
+fn harness(store: &sovereign_prime::entries::EntryStore) -> Result<Value> {
+    let entries: Vec<Value> = store
+        .list_all(None, None)?
+        .into_iter()
+        .filter(|e| e.kind == sovereign_prime::entries::EntryKind::Prompt)
+        .map(|e| json!({
+            "id": e.id, "title": e.title, "content": e.content, "scope": e.scope.as_str(),
+            "path": e.path, "source": e.source, "timestamp": e.updated_at_ms / 1000,
+        }))
+        .collect();
+    let changesets: Vec<Value> = store
+        .recent_changesets(None, 30)?
+        .into_iter()
+        .map(|c| json!({
+            "id": c.id, "summary": c.summary, "rationale": c.rationale, "edits": c.edits.len(),
+            "rolledBack": c.rolled_back, "isRollback": c.rollback_of.is_some(), "timestamp": c.created_at_ms / 1000,
+        }))
+        .collect();
+    Ok(json!({ "entries": entries, "changesets": changesets }))
 }
 
 fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Value> {
@@ -245,7 +320,13 @@ fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Valu
     }))
 }
 
-fn node(home: &Path, id: &str) -> Result<Option<Value>> {
+pub(crate) fn node(home: &Path, id: &str) -> Result<Option<Value>> {
+    if let Some(mid) = id.strip_prefix(MEM_PREFIX) {
+        return Ok(jcode_base::memory::MemoryManager::new()
+            .load_global_graph()?
+            .get_memory(mid)
+            .map(|m| json!({"ok": true, "kind": "memory", "label": m.content.chars().take(60).collect::<String>(), "content": m.content})));
+    }
     let store = store(home)?;
     node_from_store(&store, id)
 }
@@ -268,7 +349,12 @@ fn node_from_store(
     ))
 }
 
-fn delete(home: &Path, id: &str) -> Result<Option<Value>> {
+pub(crate) fn delete(home: &Path, id: &str) -> Result<Option<Value>> {
+    if let Some(mid) = id.strip_prefix(MEM_PREFIX) {
+        return Ok(jcode_base::memory::MemoryManager::new()
+            .forget(mid)?
+            .then(|| json!({"ok": true, "message": "deleted memory"})));
+    }
     let store = store(home)?;
     delete_from_store(&store, id)
 }
@@ -296,6 +382,13 @@ fn delete_from_store(
 }
 
 fn edit(home: &Path, id: &str, content: &str) -> Result<Option<Value>> {
+    if let Some(mid) = id.strip_prefix(MEM_PREFIX) {
+        if content.trim().is_empty() {
+            return Ok(Some(json!({"ok": false, "message": "content cannot be empty"})));
+        }
+        return Ok(super::memory_rest::edit(mid, content)?
+            .then(|| json!({"ok": true, "message": "updated memory"})));
+    }
     let store = store(home)?;
     edit_in_store(&store, id, content)
 }
@@ -326,13 +419,7 @@ fn edit_in_store(
         })));
     }
     if let Some(memory_id) = entry.reference["memory_id"].as_str() {
-        let manager = jcode_base::memory::MemoryManager::new();
-        let mut graph = manager.load_global_graph()?;
-        if let Some(memory) = graph.get_memory_mut(memory_id) {
-            memory.content = content.to_string();
-            memory.updated_at = chrono::Utc::now();
-            manager.save_global_graph(&graph)?;
-        }
+        super::memory_rest::edit(memory_id, content)?;
     } else {
         store.update(
             id,
@@ -413,6 +500,29 @@ mod tests {
         assert_eq!(body["nodes"][1]["kind"], "skill");
         assert_eq!(body["nodes"][1]["id"], skill.id);
         assert_eq!(body["memory"][0]["body"], "Use Rust");
+    }
+
+    #[test]
+    fn harness_lists_prompt_entries_and_rollbackable_changesets() {
+        let home = TempHome::new();
+        let store = test_store(&home);
+        let entry = store.create(NewEntry::new(EntryKind::Prompt, Scope::Global, "Scaffold", "Cargo first")).unwrap();
+        store.create(NewEntry::new(EntryKind::Skill, Scope::Global, "Not a prompt", "x")).unwrap();
+        let cs = store
+            .record_changeset(None, Scope::Global, "learned scaffold", "why", "how",
+                &[sovereign_prime::entries::AppliedEdit { action: sovereign_prime::entries::Action::Create, id: entry.id.clone(), before: None, after: Some(entry.clone()) }],
+                None, "refine")
+            .unwrap();
+        let body = harness(&store).unwrap();
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["title"], "Scaffold");
+        assert_eq!(body["changesets"][0]["id"], cs);
+        assert_eq!(body["changesets"][0]["rolledBack"], false);
+        sovereign_prime::refine::rollback(&store, "", Some(&cs), None).unwrap();
+        let after = harness(&store).unwrap();
+        assert!(after["entries"].as_array().unwrap().is_empty());
+        assert_eq!(after["changesets"].as_array().unwrap().len(), 2);
+        assert!(after["changesets"].as_array().unwrap().iter().any(|c| c["id"] == cs && c["rolledBack"] == true));
     }
 
     #[test]

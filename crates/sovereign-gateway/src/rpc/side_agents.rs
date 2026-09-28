@@ -66,6 +66,7 @@ impl Conn {
     fn spawn_side_run(
         self: &Arc<Self>,
         parent: String,
+        kind: &'static str,
         event: &'static str,
         task_id: String,
         prompt: String,
@@ -78,9 +79,11 @@ impl Conn {
                 conn.config.clone(),
                 conn.hub.clone(),
                 conn.observer.clone(),
+                kind,
                 &prompt,
                 cwd.as_deref(),
                 Some(title),
+                None,
                 RUN_TIMEOUT,
             )
             .await;
@@ -97,7 +100,7 @@ impl Conn {
         let (parent, text) = side_args(p)?;
         let task_id = task_id("bg");
         let cwd = self.session_cwd(&parent).await;
-        self.spawn_side_run(parent, "background.complete", task_id.clone(), text, cwd, "Background task");
+        self.spawn_side_run(parent, "background", "background.complete", task_id.clone(), text, cwd, "Background task");
         Ok(json!({ "task_id": task_id }))
     }
 
@@ -190,6 +193,7 @@ impl Conn {
         .await;
         self.spawn_side_run(
             parent,
+            "preview",
             "preview.restart.complete",
             task_id.clone(),
             lines.join("\n"),

@@ -22,7 +22,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
+mod driver;
+pub(crate) use driver::start as start_driver;
 mod side_agents;
+mod spawn_tree;
 
 const HARNESS_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `prompt.submit` waits for jcode to acknowledge the message. The
@@ -246,13 +249,9 @@ pub(crate) struct Conn {
     /// Sessions created here that have not had a turn yet, so jcode has not
     /// persisted them; only these are merged into `session.list` from `known`.
     fresh: Mutex<std::collections::HashSet<String>>,
-    /// Per chat: assistant turns since the last auto-refine gate call
-    /// (Prime's `_assistantTurnsSinceAutoRefine`; no idle wait).
-    learn_state: Mutex<HashMap<String, usize>>,
-    /// Per chat: when the gate was last asked (ms), for the cooldown
-    /// (Prime's `_lastAutoRefineReviewAt` / `settings.autoRefine.cooldownMs`).
-    learn_last_review: Mutex<HashMap<String, i64>>,
     learning_now: Mutex<std::collections::HashSet<String>>,
+    /// The engine-level driver's link (see `driver.rs`), not a desktop window.
+    driver: bool,
     next_id: AtomicU64,
     next_server_request: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
@@ -472,8 +471,20 @@ impl Conn {
                 return;
             }
         }
-        self.observer.harness_event(&frame);
+        // The driver only keeps its session state while a window has the
+        // session open: the window observes, renders and prompts for it.
+        let yields = self.driver
+            && match frame["session_id"].as_str() {
+                Some(sid) => self.hub.has_window(sid).await,
+                None => false,
+            };
+        if !yields {
+            self.observer.harness_event(&frame);
+        }
         let outs = map::map_event(&frame, &mut *self.sessions.lock().await);
+        if yields {
+            return;
+        }
         for out in outs {
             match out {
                 Out::Event {
@@ -502,7 +513,7 @@ impl Conn {
                     self.emit(ty, Some(&session_id), payload).await;
                     if let Some(loop_payload) = payload_for_loop {
                         self.schedule_learning(session_id.clone());
-                        self.schedule_agent_loop(session_id, loop_payload);
+                        driver::turn_done(self.clone(), session_id, loop_payload);
                     }
                 }
                 Out::Approval {
@@ -511,8 +522,8 @@ impl Conn {
                     tool_name,
                     description,
                 } => {
-                    if self.hub.is_headless(&session_id).await {
-                        // Headless (`/api/agent/run`): deny outright, no desktop prompt.
+                    if self.driver || self.hub.is_headless(&session_id).await {
+                        // Headless (`/api/agent/run`, or the driver with no window open): deny outright, no desktop prompt.
                         let conn = self.clone();
                         tokio::spawn(async move {
                             let _ = conn
@@ -627,27 +638,13 @@ impl Conn {
             // The model-callable `refine` tool / REPL `refine` schedule a
             // request that runs at the end of the turn, independent of the
             // checkpoint counter (Prime runs those immediately, too).
-            let scheduled = sovereign_prime::entries::EntryStore::open_cached(Path::new(&conn.config.home))
-                .ok()
-                .and_then(|store| store.refine_pending(&session).ok())
-                .unwrap_or(false);
-            let gate_due = {
-                let mut state = conn.learn_state.lock().await;
-                let turns = state.entry(session.clone()).or_default();
-                *turns += 1;
-                let now = crate::observability::now();
-                let mut last = conn.learn_last_review.lock().await;
+            let store = sovereign_prime::entries::EntryStore::open_cached(Path::new(&conn.config.home)).ok();
+            let scheduled = store.as_ref().and_then(|store| store.refine_pending(&session).ok()).unwrap_or(false);
+            // Counters and the `learning.enabled` switch live in sovereign.db.
+            let gate_due = store.as_ref().filter(|store| store.learning_enabled()).and_then(|store| {
                 let cooldown_ms = learning.cooldown.as_millis() as i64;
-                let cooled = !last.get(&session).is_some_and(|&at| now - at < cooldown_ms);
-                if *turns >= learning.turn_interval && cooled {
-                    let due = *turns;
-                    *turns = 0;
-                    last.insert(session.clone(), now);
-                    Some(due)
-                } else {
-                    None
-                }
-            };
+                store.learn_checkpoint(&session, learning.turn_interval, cooldown_ms, crate::observability::now()).ok().flatten()
+            });
             if gate_due.is_none() && !scheduled {
                 return;
             }
@@ -680,85 +677,11 @@ impl Conn {
         });
     }
 
-    /// After a completed turn, maybe inject goal/autonomous/heartbeat continuation.
-    fn schedule_agent_loop(self: &Arc<Self>, session_id: String, payload: Value) {
-        let conn = self.clone();
-        tokio::spawn(async move {
-            let home = Path::new(&conn.config.home);
-            let store = match sovereign_prime::agent_loop::ControlStore::open_cached(home) {
-                Ok(store) => store,
-                Err(err) => {
-                    eprintln!("sovereign: agent loop store for {session_id}: {err:#}");
-                    return;
-                }
-            };
-            let usage = payload.get("usage").cloned().unwrap_or(json!({}));
-            let tokens = usage["total"]
-                .as_u64()
-                .or_else(|| {
-                    let input = usage["input"].as_u64().unwrap_or(0);
-                    let output = usage["output"].as_u64().unwrap_or(0);
-                    (input + output > 0).then_some(input + output)
-                })
-                .unwrap_or(0) as i64;
-            let interrupted = payload["status"].as_str() == Some("interrupted");
-            let subagents_running = conn.child_sessions_running(&session_id).await;
-            let continuation = match sovereign_prime::agent_loop::after_turn(
-                &store,
-                &session_id,
-                tokens,
-                subagents_running,
-                interrupted,
-            ) {
-                Ok(c) => c,
-                Err(err) => {
-                    eprintln!("sovereign: after_turn for {session_id}: {err:#}");
-                    return;
-                }
-            };
-            let continuation = match continuation {
-                Some(c) => Some(c),
-                None if !interrupted
-                    && !conn
-                        .sessions
-                        .lock()
-                        .await
-                        .get(&session_id)
-                        .is_some_and(SessionState::turn_active) =>
-                {
-                    sovereign_prime::agent_loop::due_heartbeat(&store, &session_id)
-                        .ok()
-                        .flatten()
-                }
-                None => None,
-            };
-            let Some(cont) = continuation else { return };
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            if conn
-                .sessions
-                .lock()
-                .await
-                .get(&session_id)
-                .is_some_and(SessionState::turn_active)
-            {
-                return;
-            }
-            let prompt = match cont {
-                sovereign_prime::agent_loop::Continuation::Goal(p)
-                | sovereign_prime::agent_loop::Continuation::Autonomous(p) => p,
-                sovereign_prime::agent_loop::Continuation::Heartbeat { prompt, .. } => prompt,
-            };
-            if let Err(err) = conn.submit(&session_id, &prompt).await {
-                eprintln!("sovereign: agent loop submit for {session_id}: {err:#}");
-            }
-        });
-    }
-
     /// Deliver a due RLM "steer" heartbeat to a busy session right now, via
     /// the same soft-interrupt primitive `session.steer` uses — not a hard
     /// cancel, and not a wait for the turn to end. Plain `follow_up`
     /// heartbeats are unaffected: they stay on the idle-only path in
-    /// `schedule_agent_loop`. A cheap local SQLite read per tool-call
+    /// `driver::turn_done`. A cheap local SQLite read per tool-call
     /// boundary; a no-op unless this session has a due steer-mode heartbeat.
     fn maybe_steer_heartbeat(self: Arc<Self>, session_id: String) {
         tokio::spawn(async move {
@@ -1015,11 +938,16 @@ impl Conn {
                     ["/loop", "Alias for /autonomous"],
                     ["/heartbeat", "Schedule idle heartbeats for this session"],
                 ]);
-                Ok(json!({
+                let engine = json!({
                     "pairs": pairs, "sub": {}, "canon": {}, "commands": {},
                     "categories": [{ "name": "Harness", "pairs": pairs }],
                     "skills": {}, "skill_count": jcode_base::skill::SkillRegistry::shared_snapshot().list().len(), "warning": "",
-                }))
+                });
+                // Hermes's own commands, skills and quick/plugin commands, when its backend answers.
+                Ok(match self.forward("commands.catalog", &json!({})).await {
+                    Ok(hermes) => crate::slash_forward::merge_catalog(engine, &hermes),
+                    Err(_) => engine,
+                })
             }
             // Hermes desktop's Learning UI, served natively over Continual
             // Harness entries instead of forwarded to the Python backend.
@@ -1200,11 +1128,7 @@ impl Conn {
                     "truncated": truncated,
                 }))
             }
-            "spawn_tree.list" => Ok(json!({ "entries": [] })),
-            "spawn_tree.save" => {
-                Ok(json!({ "ok": true, "path": p["path"].as_str().unwrap_or("") }))
-            }
-            "spawn_tree.load" => Ok(json!({ "session_id": null, "entries": [] })),
+            "spawn_tree.list" | "spawn_tree.save" | "spawn_tree.load" => self.spawn_tree(method, p).await,
             "delegation.pause" => Ok(json!({ "paused": p["paused"].as_bool().unwrap_or(true) })),
             "delegation.status" => {
                 let id = sid()?;
@@ -1255,6 +1179,7 @@ impl Conn {
                 let (control, dispatch) =
                     sovereign_prime::agent_loop::control_action(&store, id, action, &args)
                         .map_err(RpcError::internal)?;
+                driver::poke();
                 Ok(json!({ "control": control, "dispatch": dispatch }))
             }
             "complete.path" => {
@@ -1281,6 +1206,20 @@ impl Conn {
                     return Ok(
                         json!({ "status": "ok", "type": "exec", "output": message, "message": message }),
                     );
+                }
+                // Not the engine's: Hermes answers quick/plugin/bundle/skill commands and prompt
+                // builders without a session. Commands on chat state are never forwarded.
+                let (name, arg) = match command.trim_start_matches('/').split_once(char::is_whitespace) {
+                    Some((name, arg)) => (name, arg.trim()),
+                    None => (command.trim_start_matches('/'), ""),
+                };
+                if !name.is_empty() && !crate::slash_forward::SESSION_BOUND.contains(&name) {
+                    if let Ok(done) = self
+                        .forward("command.dispatch", &json!({ "name": name, "arg": arg }))
+                        .await
+                    {
+                        return Ok(done);
+                    }
                 }
                 crate::note_unsupported("slash", &command);
                 let message = format!(
@@ -1928,8 +1867,13 @@ impl Conn {
                         "model": self.config.model,
                         "provider": self.config.provider,
                     })),
+                    "learning.enabled" => Ok(json!({ "value": crate::learn::learning_enabled(&self.config.home) })),
                     _ => Ok(json!({ "value": null })),
                 }
+            }
+            "config.set" if p["key"] == "learning.enabled" => {
+                let on = crate::learn::set_learning_enabled(&self.config.home, &p["value"]).map_err(RpcError::internal)?;
+                Ok(json!({ "value": on }))
             }
             "config.set"
                 if p["session_id"].as_str().is_some_and(|id| !id.is_empty())
@@ -2171,6 +2115,7 @@ impl Conn {
             }
             _ => return None,
         };
+        driver::poke(); // /goal, /autonomous and /heartbeat may have started work
         Some(match result {
             Ok(message) => message,
             Err(err) => format!("{err:#}"),
@@ -2336,7 +2281,7 @@ fn rpc_error(id: Value, err: RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
 
-/// `/api/agent/run`: one headless prompt on its own hidden session, run to
+/// `/api/agent/run` (`kind` "cron") and the side agents ("background", "preview"): one headless prompt on its own hidden session, run to
 /// completion (or `timeout`), with every tool approval denied outright and no
 /// desktop involved at all. Mirrors [`run`]'s `Conn` setup, minus the
 /// WebSocket: `to_ws` just feeds a channel this function drains itself.
@@ -2371,9 +2316,8 @@ pub async fn replay_run(
         link_tasks: Mutex::new(Vec::new()),
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
-        learn_state: Mutex::new(HashMap::new()),
-        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
+        driver: false,
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
@@ -2485,9 +2429,11 @@ pub(crate) async fn agent_run(
     config: Arc<Config>,
     hub: Arc<Hub>,
     observer: Arc<Observer>,
+    kind: &'static str,
     prompt: &str,
     cwd: Option<&str>,
     title: Option<&str>,
+    session_key: Option<&str>,
     timeout: Duration,
 ) -> Result<Value> {
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
@@ -2504,9 +2450,8 @@ pub(crate) async fn agent_run(
         link_tasks: Mutex::new(Vec::new()),
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
-        learn_state: Mutex::new(HashMap::new()),
-        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
+        driver: false,
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
@@ -2519,7 +2464,7 @@ pub(crate) async fn agent_run(
         hub: hub.clone(),
         client,
         observer,
-        run_kind: "cron",
+        run_kind: kind,
         run_title: title.map(str::to_string),
         replay_of: None,
     });
@@ -2527,21 +2472,41 @@ pub(crate) async fn agent_run(
     let control = conn.open_link().await.context("engine unavailable")?;
     *conn.control.lock().await = Some(control);
 
-    let mut create_params = json!({ "cwd": cwd });
-    if let Some(title) = title {
-        create_params["title"] = json!(title);
-    }
-    let created = conn
-        .dispatch("session.create", &create_params)
-        .await
-        .map_err(|e| anyhow!(e.message))?;
-    let session_id = created["session_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if session_id.is_empty() {
-        bail!("engine did not return a session id");
-    }
+    // A `session_key` (one bot chat) resumes its engine session; otherwise (or on
+    // first use) a fresh one is created and remembered under the key.
+    let resumed = match session_key {
+        Some(key) => hub.bot_session(key).await,
+        None => None,
+    };
+    let resumed = match resumed {
+        Some(id) => conn
+            .dispatch("session.activate", &json!({ "session_id": id, "omit_messages": true }))
+            .await
+            .ok()
+            .map(|_| id),
+        None => None,
+    };
+    let session_id = match resumed {
+        Some(id) => id,
+        None => {
+            let mut create_params = json!({ "cwd": cwd });
+            if let Some(title) = title {
+                create_params["title"] = json!(title);
+            }
+            let created = conn
+                .dispatch("session.create", &create_params)
+                .await
+                .map_err(|e| anyhow!(e.message))?;
+            let id = created["session_id"].as_str().unwrap_or_default().to_string();
+            if id.is_empty() {
+                bail!("engine did not return a session id");
+            }
+            if let Some(key) = session_key {
+                hub.set_bot_session(key, &id).await;
+            }
+            id
+        }
+    };
 
     // Every approval on this session is denied outright, before it can ever
     // reach a desktop prompt (see the two `Out::Approval`/`decide` gates).
@@ -2641,9 +2606,8 @@ pub async fn run(
         link_tasks: Mutex::new(Vec::new()),
         known: Mutex::new(HashMap::new()),
         fresh: Mutex::new(std::collections::HashSet::new()),
-        learn_state: Mutex::new(HashMap::new()),
-        learn_last_review: Mutex::new(HashMap::new()),
         learning_now: Mutex::new(std::collections::HashSet::new()),
+        driver: false,
         next_id: AtomicU64::new(1),
         next_server_request: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),

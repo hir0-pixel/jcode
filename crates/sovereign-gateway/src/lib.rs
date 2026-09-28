@@ -12,12 +12,15 @@ pub mod auth;
 pub mod cron_wake;
 pub mod features;
 pub mod learn;
+mod hermes_env;
 mod learning_rest;
+mod memory_rest;
 pub mod map;
 pub mod observability;
 pub mod profile;
 mod rpc;
 mod sessions_rest;
+mod slash_forward;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -130,6 +133,7 @@ pub struct Gateway {
 
 impl Gateway {
     pub async fn bind(config: Config) -> Result<Self> {
+        hermes_env::register();
         if !config.bind.ip().is_loopback() && !config.allow_non_loopback {
             bail!("refusing to bind {} without --allow-remote", config.bind);
         }
@@ -152,7 +156,7 @@ impl Gateway {
         let alert_hub = hub.clone();
         let alert_loop = AlertLoop(tokio::spawn(async move {
             loop {
-                match alert_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                match alert_rx.try_recv() {
                     Ok(payload) => {
                         let frame = json!({
                             "jsonrpc": "2.0",
@@ -162,8 +166,8 @@ impl Gateway {
                         .to_string();
                         alert_hub.broadcast_text(frame).await;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
             }
         }));
@@ -182,6 +186,7 @@ impl Gateway {
     }
 
     pub async fn serve(self) -> Result<()> {
+        rpc::start_driver(self.config.clone(), self.hub.clone(), self.observer.clone());
         if let Some(features) = self.config.features.clone() {
             let idle = features.clone();
             tokio::spawn(async move {
@@ -612,6 +617,19 @@ async fn handle(
             return result;
         }
     }
+    if req.path == "/api/memory" || req.path.starts_with("/api/memory/") {
+        if !token_ok {
+            return respond(
+                &mut stream,
+                "401 Unauthorized",
+                &json!({"detail": "unauthorized"}),
+            )
+            .await;
+        }
+        if let Some(result) = memory_rest::route(&mut stream, &req).await {
+            return result;
+        }
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/health") => respond(&mut stream, "200 OK", &public).await,
         ("GET", "/api/status") => {
@@ -648,9 +666,11 @@ async fn handle(
                 config.clone(),
                 hub.clone(),
                 observer.clone(),
+                "cron",
                 prompt,
                 body["cwd"].as_str(),
                 body["title"].as_str(),
+                body["session_key"].as_str().filter(|k| !k.is_empty()),
                 Duration::from_secs(timeout_s),
             )
             .await;
@@ -909,14 +929,6 @@ async fn handle(
         ("GET", "/api/mcp/servers" | "/api/mcp/catalog") if bundled_startup_request(&req) => {
             respond(&mut stream, "200 OK", &json!([])).await
         }
-        ("GET", "/api/memory") if bundled_startup_request(&req) => {
-            respond(
-                &mut stream,
-                "200 OK",
-                &json!({"provider": null, "providers": [], "files": {}}),
-            )
-            .await
-        }
         ("GET", "/api/plugins") if bundled_startup_request(&req) => {
             respond(&mut stream, "200 OK", &json!({"plugins": []})).await
         }
@@ -946,7 +958,9 @@ async fn handle(
                 let status = auth::query_param(q, "status");
                 let kind = auth::query_param(q, "kind");
                 let text = auth::query_param(q, "q");
-                observer.list(limit, status.as_deref(), kind.as_deref(), text.as_deref())
+                let outcome = auth::query_param(q, "outcome");
+                let session = auth::query_param(q, "session");
+                observer.list(limit, status.as_deref(), kind.as_deref(), text.as_deref(), outcome.as_deref(), session.as_deref())
             })
             .await?;
             match result {
@@ -968,6 +982,16 @@ async fn handle(
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
                 Err(msg) => respond(&mut stream, "400 Bad Request", &json!({"detail": msg})).await,
+            }
+        }
+        ("GET", path @ ("/api/sovereign/observability/sessions" | "/api/sovereign/observability/facts" | "/api/sovereign/observability/alerts" | "/api/sovereign/observability/memory-audit")) => {
+            let view = path.rsplit('/').next().unwrap_or_default().to_string();
+            let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
+            let days = query_u64(&req, "days").unwrap_or(7).clamp(1, 90);
+            let result = tokio::task::spawn_blocking(move || observer.view(&view, limit, days)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
             }
         }
         ("GET", "/api/sovereign/observability/budget") => {
