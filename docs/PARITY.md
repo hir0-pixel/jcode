@@ -2,11 +2,11 @@
 
 Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; every other Hermes method and route is forwarded to Hermes's own Python backend, which starts only when one of them is first used and stops after 10 idle minutes.
 
-**JSON-RPC methods (235):** 67 working, 0 placeholder, 168 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
+**JSON-RPC methods (235):** 82 working, 0 placeholder, 153 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
 
 | Namespace | Rust (working) | Rust (placeholder) | Forwarded to Hermes (Python) |
 |---|---|---|---|
-| agents | – | – | `agents.list` |
+| agents | `agents.list` | – | – |
 | approval | `approval.pending`, `approval.received`, `approval.respond` | – | – |
 | billing | – | – | `billing.auto_reload`, `billing.charge`, `billing.charge_status`, `billing.state`, `billing.step_up` |
 | bot_relay | – | – | `bot_relay.deliver`, `bot_relay.outbox.drain`, `bot_relay.reply`, `bot_relay.roster.sync` |
@@ -14,7 +14,7 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | clarify | – | – | `clarify.lock` |
 | cli | `cli.exec` | – | – |
 | client | `client.capabilities` | – | – |
-| clipboard | – | – | `clipboard.paste` |
+| clipboard | `clipboard.paste` | – | – |
 | command | – | – | `command.dispatch`, `command.resolve` |
 | commands | `commands.catalog` | – | – |
 | complete | `complete.path` | – | `complete.slash` |
@@ -25,34 +25,34 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | delegation | `delegation.pause`, `delegation.status` | – | – |
 | diagnostics | – | – | `diagnostics.share_nous` |
 | display | – | – | `display.install`, `display.lease.acquire`, `display.lease.release`, `display.observe`, `display.start`, `display.status`, `display.stop`, `display.thumbnail` |
-| file | – | – | `file.attach` |
+| file | `file.attach` | – | – |
 | free_tier | – | – | `free_tier.ack_notice`, `free_tier.provision`, `free_tier.status` |
 | gateway | `gateway.capabilities` | – | – |
 | groups | `groups.capabilities`, `groups.list` | – | `groups.approve`, `groups.create`, `groups.demote`, `groups.disband`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
 | handoff | – | – | `handoff.fail`, `handoff.request`, `handoff.state` |
-| image | – | – | `image.attach`, `image.attach_bytes`, `image.detach`, `image.generate` |
-| input | – | – | `input.detect_drop` |
+| image | `image.attach`, `image.attach_bytes`, `image.detach` | – | `image.generate` |
+| input | `input.detect_drop` | – | – |
 | insights | `insights.get` | – | – |
 | learning | `learning.delete`, `learning.detail`, `learning.edit`, `learning.frames` | – | – |
 | llm | `llm.oneshot` | – | – |
 | mcp | – | – | `mcp.catalog`, `mcp.servers.add`, `mcp.servers.list`, `mcp.servers.oauth.callback`, `mcp.servers.oauth.cancel`, `mcp.servers.oauth.poll`, `mcp.servers.oauth.start`, `mcp.servers.remove`, `mcp.servers.set_api_key`, `mcp.servers.status`, `mcp.servers.test` |
-| message | – | – | `message.react` |
+| message | `message.react` | – | – |
 | model | `model.options` | – | `model.disconnect`, `model.save_key` |
 | onboarding | – | – | `onboarding.ensure_setup_profile`, `onboarding.reset_setup_profile` |
 | paste | – | – | `paste.collapse` |
-| pdf | – | – | `pdf.attach` |
+| pdf | `pdf.attach` | – | – |
 | pet | – | – | `pet.cancel`, `pet.cells`, `pet.disable`, `pet.export`, `pet.gallery`, `pet.generate`, `pet.generate.status`, `pet.hatch`, `pet.info`, `pet.info.meta`, `pet.remove`, `pet.rename`, `pet.scale`, `pet.select`, `pet.thumb` |
 | ping | `ping` | – | – |
 | plugins | – | – | `plugins.list`, `plugins.manage` |
 | preview | `preview.restart` | – | – |
-| process | – | – | `process.kill`, `process.list`, `process.stop` |
+| process | `process.kill`, `process.list`, `process.stop` | – | – |
 | profiles | – | – | `profiles.configure`, `profiles.create`, `profiles.describe`, `profiles.get_asset`, `profiles.list`, `profiles.remember_onboarding`, `profiles.set_asset` |
 | project | – | – | `project.facts` |
 | projects | – | – | `projects.add_folder`, `projects.archive`, `projects.create`, `projects.delete`, `projects.discover_repos`, `projects.for_cwd`, `projects.get`, `projects.list`, `projects.project_sessions`, `projects.record_repos`, `projects.remove_folder`, `projects.set_active`, `projects.set_primary`, `projects.tree`, `projects.update` |
 | prompt | `prompt.background`, `prompt.btw`, `prompt.submit` | – | – |
 | reload | – | – | `reload.env`, `reload.mcp` |
 | request | – | – | `request.answer` |
-| rollback | – | – | `rollback.diff`, `rollback.list`, `rollback.restore` |
+| rollback | `rollback.diff`, `rollback.list`, `rollback.restore` | – | – |
 | session | `session.activate`, `session.active_list`, `session.branch`, `session.close`, `session.compress`, `session.context_breakdown`, `session.control`, `session.control.read`, `session.create`, `session.cwd.set`, `session.delete`, `session.events.since`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.redirect`, `session.resume`, `session.save`, `session.set_hidden`, `session.status`, `session.steer`, `session.title`, `session.undo`, `session.usage`, `session.workspace.move` | – | – |
 | setup | `setup.runtime_check`, `setup.status` | – | – |
 | shell | `shell.exec` | – | – |
