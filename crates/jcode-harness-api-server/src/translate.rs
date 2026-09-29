@@ -504,6 +504,10 @@ impl BridgeState {
                 }
                 let _ = std::fs::remove_file(path.with_extension("journal.jsonl"));
                 let _ = std::fs::remove_file(path.with_extension("bak"));
+                deleted_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string());
+                if let Some(index) = Self::recent_session_index_path().and_then(|path| Connection::open(path).ok()) {
+                    let _ = index.execute("DELETE FROM recent_sessions WHERE session_id = ?1", [session_id]);
+                }
                 let mut archive = Self::load_archive_state();
                 if archive.sessions.remove(session_id).is_some() {
                     let _ = Self::save_archive_state(&archive);
@@ -732,6 +736,12 @@ impl BridgeState {
                 ids.extend(self.known_sessions.iter().cloned());
                 if let Some(attached) = self.session_id.clone() {
                     ids.insert(attached);
+                }
+                // The daemon keeps a recently opened session in memory after its
+                // files are deleted, and its live snapshot kept listing it.
+                {
+                    let deleted = deleted_sessions().lock().unwrap_or_else(|e| e.into_inner());
+                    ids.retain(|id| !deleted.contains(id));
                 }
                 if let Some(limit) = limit {
                     let mut recent: Vec<_> = ids.into_iter().collect();
@@ -3250,3 +3260,11 @@ impl BridgeState {
 #[cfg(test)]
 #[path = "translate_tests.rs"]
 mod tests;
+
+/// Sessions deleted in this process. The daemon has no request to drop a
+/// session it holds in memory, so listings exclude these until it restarts
+/// (after which it no longer knows them).
+fn deleted_sessions() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static DELETED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+    DELETED.get_or_init(Default::default)
+}
