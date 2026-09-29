@@ -205,6 +205,9 @@ impl Gateway {
                 );
                 loop {
                     tick.tick().await;
+                    if let Ok(home) = std::env::var("HERMES_HOME") {
+                        idle.ensure_bots(std::path::Path::new(&home)).await;
+                    }
                     idle.stop_if_idle().await;
                 }
             });
@@ -333,9 +336,11 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &Value) -> Result<(
 async fn proxy_http(
     mut client: TcpStream,
     req: &Request,
-    features: &features::Features,
+    features: &Arc<features::Features>,
     upgrade: bool,
 ) -> Result<()> {
+    // Held for the whole request (or WebSocket): idle-stop must not kill a backend mid-response.
+    let _lease = features.lease();
     if std::env::var_os("SOVEREIGN_TRACE_FORWARD").is_some() {
         eprintln!("sovereign: forward HTTP {} {}", req.method, req.path);
     }

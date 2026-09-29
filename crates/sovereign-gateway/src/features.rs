@@ -192,6 +192,16 @@ impl Features {
         }
     }
 
+    /// Bots only receive messages while the backend runs and nothing else starts it: when the
+    /// config in `home` has a platform enabled, start it if it isn't running (boot, or it died).
+    pub async fn ensure_bots(&self, home: &std::path::Path) {
+        if messaging_enabled(home) && !self.is_running().await {
+            if let Err(err) = self.port().await {
+                eprintln!("sovereign: could not start the messaging backend: {err:#}");
+            }
+        }
+    }
+
     pub async fn stop(&self) {
         if let Some(mut r) = self.running.lock().await.take() {
             kill_backend(&mut r.child).await;
@@ -258,6 +268,29 @@ mod tests {
         let f2 = Features { epoch: Instant::now() - IDLE_STOP_AFTER - Duration::from_secs(1), ..f };
         f2.stop_if_idle().await;
         assert!(!f2.is_running().await, "idle: stopped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bots_start_the_backend_and_a_leased_one_is_never_idle_stopped() {
+        let dir = std::env::temp_dir().join(format!("features-bots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = std::sync::Arc::new(Features::new(fake_backend(&dir, "HERMES_BACKEND_READY port=4243")));
+        f.ensure_bots(&dir).await;
+        assert!(!f.is_running().await, "no bot enabled: stays off");
+        std::fs::write(dir.join("config.yaml"), "platforms:\n  telegram:\n    enabled: true\n").unwrap();
+        f.ensure_bots(&dir).await;
+        assert!(f.is_running().await, "bot enabled: started without any feature call");
+        // A request in flight holds a lease: idle time alone must not stop the backend.
+        let f = std::sync::Arc::new(Features { epoch: Instant::now() - IDLE_STOP_AFTER - Duration::from_secs(9), ..std::sync::Arc::try_unwrap(f).ok().unwrap() });
+        std::fs::remove_file(dir.join("config.yaml")).unwrap();
+        let lease = f.lease();
+        f.stop_if_idle().await;
+        assert!(f.is_running().await, "leased: kept");
+        drop(lease);
+        f.last_used_ms.store(0, Ordering::Relaxed);
+        f.stop_if_idle().await;
+        assert!(!f.is_running().await, "lease released and idle: stopped");
         let _ = std::fs::remove_dir_all(dir);
     }
 
