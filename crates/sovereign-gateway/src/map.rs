@@ -249,8 +249,8 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
             out.push(event("status.update", sid, json!({ "kind": "compress", "text": text("message") })));
         }
         "model_info" | "runtime_info" => {
-            if let Some(model) = ev["model"].as_str() {
-                state.model = Some(model.to_string());
+            if let Some(model) = ev["model"].as_str().and_then(real_model) {
+                state.model = Some(model);
             }
         }
         "permission_request" => out.push(Out::Approval {
@@ -319,7 +319,7 @@ pub fn session_info(info: &Value) -> Value {
         "tool_call_count": stored.as_ref().map(|s| s.messages.iter().flat_map(|m| &m.content).filter(|b| matches!(b, jcode_base::message::ContentBlock::ToolUse { .. })).count()),
         "input_tokens": usage.map(|u| u.input_tokens),
         "output_tokens": stored.as_ref().map(|s| s.token_usage_totals().output_tokens),
-        "model": stored.as_ref().and_then(|s| s.model.clone()),
+        "model": stored.as_ref().and_then(|s| s.model.as_deref()).and_then(real_model),
         "preview": preview.chars().take(200).collect::<String>(),
         "cwd": info["working_dir"],
         "parent_session_id": info["parent_session_id"],
@@ -460,6 +460,15 @@ pub fn prompt_text(text: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// jcode stamps `"unknown"` on a session whose model was never resolved (test
+/// providers, an interrupted start). Reported as a model, the desktop adopted
+/// it as the user's pinned pick; it is the absence of one.
+fn real_model(model: &str) -> Option<String> {
+    let model = model.trim();
+
+    (!model.is_empty() && model != "unknown").then(|| model.to_string())
 }
 
 #[cfg(test)]
