@@ -2,7 +2,7 @@
 //!
 //!   sovereign [--profile P] serve --host H --port N
 //!   sovereign __pre-tool
-//!   sovereign __version      (JSON {version, sha}; read by the desktop packager)
+//!   sovereign __version      (JSON {version, sha, db_schema}; read by the desktop packager)
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -178,7 +178,7 @@ fn main() -> Result<()> {
     // pre_tool gate (spawned by jcode before each tool call): ask a human
     // before risky shell commands. Exit 0 allows, 2 blocks.
     if std::env::args().nth(1).as_deref() == Some("__version") {
-        println!("{}", serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "sha": sovereign_gateway::build_sha() }));
+        println!("{}", serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "sha": sovereign_gateway::build_sha(), "db_schema": sovereign_gateway::db_schema() }));
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("__pre-tool") {

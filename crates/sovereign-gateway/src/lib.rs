@@ -139,6 +139,12 @@ pub fn build_sha() -> &'static str {
     jcode_build_meta::git_hash()
 }
 
+/// The `sovereign.db` schema this engine migrates to (`sovereign __version` `db_schema`; the desktop packager
+/// records it in the manifest so the update script can allow a slower first start when it went up).
+pub fn db_schema() -> u32 {
+    jcode_base::migrate::CURRENT
+}
+
 pub struct Gateway {
     listener: TcpListener,
     local: SocketAddr,
