@@ -82,6 +82,17 @@ impl SessionState {
         self.turn.started
     }
 
+    /// Drop the in-flight turn (its link died, so `message.complete` will never come);
+    /// whether one was running.
+    pub fn end_turn(&mut self) -> bool {
+        std::mem::take(&mut self.turn).started
+    }
+
+    /// The engine says a turn is running that this connection did not see start.
+    pub fn mark_running(&mut self) {
+        self.turn.started = true;
+    }
+
     pub fn usage_json(&self) -> Value {
         let u = &self.usage;
         json!({

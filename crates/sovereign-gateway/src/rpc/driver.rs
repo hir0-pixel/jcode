@@ -39,9 +39,9 @@ pub(crate) fn poke() {
 }
 
 /// A parked goal's sub-agents finished: send its continuation on the next scan.
-fn resume_soon(session_id: &str) {
+pub(super) fn resume_soon(session_id: &str) {
     if let Some(driver) = DRIVER.get() {
-        if let Some(resume) = driver.resume.lock().unwrap().as_mut() {
+        if let Some(resume) = driver.resume.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             resume.insert(session_id.to_string());
         }
     }
@@ -184,7 +184,7 @@ impl Driver {
         let Some(store) = conn.control_store().await else { return false };
         let mut active = store.active_sessions().unwrap_or_default();
         let first = {
-            let mut resume = self.resume.lock().unwrap();
+            let mut resume = self.resume.lock().unwrap_or_else(|e| e.into_inner());
             let first = resume.is_none();
             resume.get_or_insert_with(|| active.iter().cloned().collect());
             first
@@ -203,7 +203,7 @@ impl Driver {
                 Ok(reply) => {
                     let list = reply["sessions"].as_array().map_or(&[][..], Vec::as_slice);
                     let live = conn.sessions.lock().await;
-                    let released = released_waits(&waiting, &mut self.waiting_since.lock().unwrap(), list, &live, WAIT_CAP);
+                    let released = released_waits(&waiting, &mut self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()), list, &live, WAIT_CAP);
                     drop(live);
                     for (sid, timed_out) in released {
                         if store.clear_wait(&sid).unwrap_or(false) {
@@ -245,12 +245,12 @@ impl Driver {
                 .cloned()
                 .collect()
         };
-        let work = due_work(&store, &active, self.resume.lock().unwrap().as_mut().unwrap(), |sid| busy.contains(sid));
+        let work = due_work(&store, &active, self.resume.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap(), |sid| busy.contains(sid));
         for (sid, text) in work {
             let text = format!("{}{text}", notes.remove(&sid).unwrap_or_default());
             match conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
                 Ok(_) => {
-                    self.resume.lock().unwrap().as_mut().unwrap().remove(&sid);
+                    self.resume.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&sid);
                 }
                 Err(err) => eprintln!("sovereign: goal driver submit for {sid}: {}", err.message),
             }
@@ -354,6 +354,38 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
 mod tests {
     use super::*;
     use sovereign_prime::agent_loop::{Heartbeat, SessionGoal};
+
+    #[tokio::test]
+    async fn a_goal_turn_lost_with_its_bridge_is_resumed() {
+        let conn = crate::rpc::tests::test_conn_as("link-lost", true);
+        let store = ControlStore::open_cached(Path::new(&conn.config.home)).unwrap();
+        store.set_goal("s", Some(&SessionGoal::new("ship the parser"))).unwrap();
+        let driver = Arc::new(Driver { conn: conn.clone(), wake: Notify::new(), resume: std::sync::Mutex::new(Some(Default::default())), waiting_since: Default::default() });
+        let _ = DRIVER.set(driver.clone());
+        // Mid-turn on a session link: the turn is running and the observer has a run open.
+        conn.ensure_control().await.unwrap();
+        let link = conn.control.lock().await.clone().unwrap();
+        conn.links.lock().await.insert("s".into(), link);
+        conn.sessions.lock().await.entry("s".into()).or_default().mark_running();
+        conn.observer.start_turn("s", "work", "invoke_agent", None);
+        assert!(conn.sessions.lock().await.get("s").is_some_and(SessionState::turn_active) && conn.observer.has_active_run("s"));
+        conn.link_tasks.lock().await[0].abort(); // the bridge drops; message.complete is lost
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.control.lock().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dead link is forgotten");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let busy = conn.sessions.lock().await.get("s").is_some_and(SessionState::turn_active) || conn.observer.has_active_run("s");
+        assert!(!busy, "the lost turn no longer wedges the session");
+        let mut resume = driver.resume.lock().unwrap().take().unwrap();
+        assert!(resume.contains("s"), "queued for resume");
+        let work = due_work(&store, &["s".to_string()], &mut resume, |_| busy);
+        assert_eq!(work.len(), 1, "the driver resumes the goal");
+        assert!(work[0].1.contains("ship the parser"));
+    }
 
     #[test]
     fn engine_reconnects_back_off_from_one_to_thirty_seconds() {

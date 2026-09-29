@@ -474,11 +474,7 @@ impl Conn {
             }
             // The bridge closed: forget this link so the next attach or tick opens a fresh one.
             if let Some(conn) = weak.upgrade() {
-                conn.links.lock().await.retain(|_, l| !l.same_channel(&mine));
-                let mut control = conn.control.lock().await;
-                if control.as_ref().is_some_and(|l| l.same_channel(&mine)) {
-                    *control = None;
-                }
+                conn.link_lost(&mine).await;
             }
         });
         self.link_tasks.lock().await.extend([
@@ -487,6 +483,38 @@ impl Conn {
             reader.abort_handle(),
         ]);
         Ok(tx)
+    }
+
+    /// A bridge link closed: forget it, and end the turns that were running on it, whose
+    /// `message.complete` is lost. Otherwise `busy` stays set and the driver skips the goal forever.
+    async fn link_lost(&self, link: &mpsc::Sender<String>) {
+        let lost: Vec<String> = {
+            let mut links = self.links.lock().await;
+            let lost = links.iter().filter(|(_, l)| l.same_channel(link)).map(|(sid, _)| sid.clone()).collect();
+            links.retain(|_, l| !l.same_channel(link));
+            lost
+        };
+        {
+            let mut control = self.control.lock().await;
+            if control.as_ref().is_some_and(|l| l.same_channel(link)) {
+                *control = None;
+            }
+        }
+        for sid in lost {
+            let was_running = self.sessions.lock().await.get_mut(&sid).is_some_and(SessionState::end_turn);
+            // A driver that yields the session to a window leaves the run to that window.
+            let closed = !(self.driver && self.hub.has_window(&sid).await) && self.observer.has_active_run(&sid);
+            if closed {
+                self.observer.event(&sid, "message.complete", &json!({ "status": "interrupted", "text": "" }));
+            }
+            if was_running && !self.driver {
+                self.emit("message.complete", Some(&sid), json!({ "status": "interrupted", "text": "" })).await;
+            }
+            if self.driver && (was_running || closed) {
+                driver::resume_soon(&sid);
+            }
+        }
+        driver::poke();
     }
 
     async fn control_store(&self) -> Option<Arc<sovereign_prime::agent_loop::ControlStore>> {
@@ -539,6 +567,10 @@ impl Conn {
                     .lock()
                     .await
                     .insert(session_id.to_string());
+                // A turn the engine still runs (the old link only dropped) must not be doubled.
+                if reply["session"]["status"].as_str() == Some("processing") {
+                    self.sessions.lock().await.entry(session_id.to_string()).or_default().mark_running();
+                }
                 if reply["session"].is_object() {
                     self.known
                         .lock()
@@ -2948,7 +2980,11 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    fn test_conn(name: &str) -> Arc<Conn> {
+    pub(super) fn test_conn(name: &str) -> Arc<Conn> {
+        test_conn_as(name, false)
+    }
+
+    pub(super) fn test_conn_as(name: &str, driver: bool) -> Arc<Conn> {
         let home = std::env::temp_dir().join(format!("c{name}{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         // A stand-in daemon: accepts the bridge's dials and holds them open.
@@ -2980,7 +3016,7 @@ mod tests {
         let hub = Arc::new(Hub::default());
         let (to_ws, _rx) = mpsc::channel::<Message>(8);
         let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
-        Conn::new(config, to_ws, hub, client, observer, false, "invoke_agent", None, None)
+        Conn::new(config, to_ws, hub, client, observer, driver, "invoke_agent", None, None)
     }
 
     #[tokio::test]
