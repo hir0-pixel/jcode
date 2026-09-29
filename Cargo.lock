@@ -5780,6 +5780,7 @@ dependencies = [
  "jcode-storage",
  "rusqlite",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]

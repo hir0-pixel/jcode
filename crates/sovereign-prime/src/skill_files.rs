@@ -90,8 +90,64 @@ pub fn validate_reference(reference: &Value, arguments: &Value) -> Option<String
     None
 }
 
+/// Front-matter field marking a `SKILL.md` as written by the learning loop.
+pub const MARKER: &str = "akira-learned: true";
+
+/// A YAML double-quoted scalar (JSON strings are valid YAML), with `---` broken up so a name or
+/// description can never end the front-matter early.
+fn quote(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()).replace("---", "\\u002d--")
+}
+
+fn path_of(dir: &Path, slug: &str) -> PathBuf {
+    dir.join(slug).join("SKILL.md")
+}
+
+pub fn read(dir: &Path, slug: &str) -> Option<String> {
+    std::fs::read_to_string(path_of(dir, slug)).ok()
+}
+
+/// Whether the learning loop wrote `<slug>/SKILL.md`: it carries the marker (or, for files
+/// written before the marker existed, the `RLM call:` footer only `write` produces).
+pub fn is_learned(dir: &Path, slug: &str) -> bool {
+    read(dir, slug).is_some_and(|text| {
+        text.lines().skip(1).take_while(|l| l.trim() != "---").any(|l| l.trim() == MARKER)
+            || text.trim_end().lines().last().is_some_and(|l| l.starts_with("RLM call: `"))
+    })
+}
+
+/// The skill named `slug` must not be one the user wrote.
+pub fn claim(dir: &Path, slug: &str) -> Result<(), String> {
+    if path_of(dir, slug).exists() && !is_learned(dir, slug) {
+        return Err(format!("a skill named `{slug}` already exists and was not learned by Akira; pick another name"));
+    }
+    Ok(())
+}
+
+/// Delete a learned skill's file (and its directory if that leaves it empty). Anything else in
+/// the directory, and any skill the user wrote, is left alone.
+pub fn remove_learned(dir: &Path, slug: &str) {
+    if is_learned(dir, slug) {
+        let _ = std::fs::remove_file(path_of(dir, slug));
+        let _ = std::fs::remove_dir(dir.join(slug));
+    }
+}
+
+/// Put back what `read` returned before a write (`None`: the file did not exist).
+pub fn restore(dir: &Path, slug: &str, previous: Option<String>) {
+    match previous {
+        Some(text) => {
+            let _ = std::fs::write(path_of(dir, slug), text);
+        }
+        None => {
+            let _ = std::fs::remove_file(path_of(dir, slug));
+            let _ = std::fs::remove_dir(dir.join(slug));
+        }
+    }
+}
+
 /// Write (or overwrite) `~/.jcode/skills/<slug>/SKILL.md` for a gated skill
-/// create/update. The Python import/callable contract is recorded in the
+/// create/update (callers `claim` the slug first, so a user's skill is never overwritten). The Python import/callable contract is recorded in the
 /// body so the model sees exactly how to invoke it (`await <import>(...)`),
 /// alongside the harness row's own `reference`/`arguments` columns.
 pub fn write(dir: &Path, slug: &str, name: &str, description: &str, body: &str, reference: &Value) -> std::io::Result<()> {
@@ -111,7 +167,9 @@ pub fn write(dir: &Path, slug: &str, name: &str, description: &str, body: &str, 
         callable.to_string()
     };
     let content = format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n{}\n\nRLM call: `{call_form}`\n",
+        "---\nname: {}\ndescription: {}\n{MARKER}\n---\n\n{}\n\nRLM call: `{call_form}`\n",
+        quote(name),
+        quote(description),
         body.trim()
     );
     std::fs::write(skill_dir.join("SKILL.md"), content)

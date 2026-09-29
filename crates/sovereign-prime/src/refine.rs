@@ -210,6 +210,8 @@ pub fn apply(
         .join("\n");
     let scope = if global { Scope::Global } else { Scope::Local };
     let mut applied_ops: Vec<AppliedEdit> = Vec::new();
+    // Skill files are written only once the changeset is committed.
+    let mut skill_files: Vec<SkillFile> = Vec::new();
     let (mut created, mut updated, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
     let result: Result<()> = (|| {
         for edit in &edits {
@@ -282,15 +284,8 @@ pub fn apply(
                             bail!("rejected: invalid skill name {:?}", truncate(title, 60));
                         }
                         if let Some(dir) = crate::skill_files::skills_dir() {
-                            crate::skill_files::write(
-                                &dir,
-                                &slug,
-                                title,
-                                truncate(content, 200).as_str(),
-                                content,
-                                reference,
-                            )
-                            .map_err(|e| anyhow::anyhow!("rejected: could not write skill file: {e}"))?;
+                            crate::skill_files::claim(&dir, &slug).map_err(|e| anyhow::anyhow!("rejected: {e}"))?;
+                            skill_files.push(SkillFile { dir, slug, title: title.into(), content: content.into(), reference: reference.clone(), renamed_from: None });
                         }
                     }
                     let after = store.create(new_entry)?;
@@ -337,15 +332,10 @@ pub fn apply(
                             bail!("rejected: invalid skill name {:?}", truncate(title, 60));
                         }
                         if let Some(dir) = crate::skill_files::skills_dir() {
-                            crate::skill_files::write(
-                                &dir,
-                                &slug,
-                                title,
-                                truncate(content, 200).as_str(),
-                                content,
-                                &reference,
-                            )
-                            .map_err(|e| anyhow::anyhow!("rejected: could not write skill file: {e}"))?;
+                            let old = crate::skill_files::slugify(&before.title);
+                            crate::skill_files::claim(&dir, &slug).map_err(|e| anyhow::anyhow!("rejected: {e}"))?;
+                            let renamed_from = (slug != old && !old.is_empty()).then_some(old);
+                            skill_files.push(SkillFile { dir, slug, title: title.into(), content: content.into(), reference, renamed_from });
                         }
                     }
                     let patch = EntryPatch {
@@ -392,7 +382,6 @@ pub fn apply(
                     if let (Some(sink), Some(id)) = (memory, op.after.as_ref().and_then(memory_id)) {
                         (sink.forget)(id);
                     }
-                    undo_skill_file(None, op.after.as_ref());
                 }
                 Action::Delete => {
                     if let Some(before) = &op.before {
@@ -410,7 +399,6 @@ pub fn apply(
                 }
                 Action::Update => {
                     if let Some(before) = &op.before {
-                        undo_skill_file(Some(before), op.after.as_ref());
                         let _ = store.update(
                             &op.id,
                             EntryPatch {
@@ -458,6 +446,11 @@ pub fn apply(
         None,
         source,
     )?;
+    if let Err(err) = write_skill_files(&skill_files) {
+        // The files failed, so the changeset must not stand.
+        let _ = store.rollback(Some(&changeset_id), Some(session));
+        return Err(err);
+    }
     Ok(RefineOutcome {
         changeset_id,
         summary,
@@ -469,19 +462,63 @@ pub fn apply(
     })
 }
 
-/// Undo the `SKILL.md` an applied skill edit wrote: restore `before`'s file
-/// (an update) or remove the new one (a create). No-op for other kinds.
+/// A `SKILL.md` a committed skill edit still has to write.
+struct SkillFile {
+    dir: std::path::PathBuf,
+    slug: String,
+    title: String,
+    content: String,
+    reference: Value,
+    /// The previous slug when a title change moves the skill.
+    renamed_from: Option<String>,
+}
+
+/// Write the skill files; if one fails, put every earlier one back and report it.
+fn write_skill_files(files: &[SkillFile]) -> Result<()> {
+    let mut done: Vec<(&SkillFile, Option<String>, Option<String>)> = Vec::new();
+    for f in files {
+        let (previous, old_previous) = (
+            crate::skill_files::read(&f.dir, &f.slug),
+            f.renamed_from.as_ref().and_then(|old| crate::skill_files::read(&f.dir, old)),
+        );
+        match crate::skill_files::write(&f.dir, &f.slug, &f.title, &truncate(&f.content, 200), &f.content, &f.reference) {
+            Ok(()) => {
+                if let Some(old) = &f.renamed_from {
+                    crate::skill_files::remove_learned(&f.dir, old);
+                }
+                done.push((f, previous, old_previous));
+            }
+            Err(e) => {
+                crate::skill_files::restore(&f.dir, &f.slug, previous);
+                for (f, previous, old_previous) in done.into_iter().rev() {
+                    crate::skill_files::restore(&f.dir, &f.slug, previous);
+                    if let (Some(old), Some(text)) = (&f.renamed_from, old_previous) {
+                        crate::skill_files::restore(&f.dir, old, Some(text));
+                    }
+                }
+                bail!("rejected: could not write skill file: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undo the `SKILL.md` an applied skill edit wrote: remove the new file (only if the learning
+/// loop wrote it) and put `before`'s back (unless the user has since taken that name).
 fn undo_skill_file(before: Option<&crate::entries::HarnessEntry>, after: Option<&crate::entries::HarnessEntry>) {
     let (Some(dir), Some(after)) = (crate::skill_files::skills_dir(), after) else { return };
     if after.kind != EntryKind::Skill {
         return;
     }
     let slug = crate::skill_files::slugify(&after.title);
-    if !slug.is_empty() {
-        let _ = std::fs::remove_dir_all(dir.join(&slug));
+    let old = before.map(|b| crate::skill_files::slugify(&b.title));
+    if old.as_deref() != Some(slug.as_str()) && !slug.is_empty() {
+        crate::skill_files::remove_learned(&dir, &slug);
     }
-    if let Some(b) = before {
-        let _ = crate::skill_files::write(&dir, &crate::skill_files::slugify(&b.title), &b.title, &truncate(&b.content, 200), &b.content, &b.reference);
+    if let (Some(b), Some(old)) = (before, old) {
+        if !old.is_empty() && crate::skill_files::claim(&dir, &old).is_ok() {
+            let _ = crate::skill_files::write(&dir, &old, &b.title, &truncate(&b.content, 200), &b.content, &b.reference);
+        }
     }
 }
 
@@ -673,11 +710,93 @@ mod tests {
         assert_eq!(store.get(&entry.id).unwrap().unwrap().reference["memory_id"], "new");
     }
 
+    /// Skill tests point JCODE_HOME at their own directory, one at a time.
+    fn skills_home() -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("skill-home-{}", uuid::Uuid::new_v4()));
+        // SAFETY: serialized by LOCK; no other test in the crate reads JCODE_HOME.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        (guard, home)
+    }
+
+    fn skill_edit(action: &str, title: &str, content: &str, id: Option<&str>) -> String {
+        let mut edit = json!({"action": action, "kind": "skill", "title": title, "content": content,
+            "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}});
+        if let Some(id) = id {
+            edit["id"] = json!(id);
+        }
+        json!({"summary": "s", "rationale": "r", "expectedOutcome": "e", "edits": [edit]}).to_string()
+    }
+
+    #[test]
+    fn a_learned_skill_never_overwrites_a_users_skill() {
+        let (_lock, home) = skills_home();
+        let mine = home.join("skills/do-thing");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("SKILL.md"), "---\nname: do-thing\ndescription: mine\n---\nmy steps").unwrap();
+        let store = EntryStore::memory().unwrap();
+        let err = apply(&store, "s1", &skill_edit("create", "Do Thing", "steps", None), &turns(), false, "refine", None).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(std::fs::read_to_string(mine.join("SKILL.md")).unwrap().contains("my steps"));
+        assert!(store.list_visible("s1", None).unwrap().is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn undo_removes_only_the_file_the_change_created_and_a_rename_moves_the_skill() {
+        let (_lock, home) = skills_home();
+        let store = EntryStore::memory().unwrap();
+        let created = apply(&store, "s1", &skill_edit("create", "Do Thing", "v1 steps", None), &turns(), false, "refine", None).unwrap();
+        let dir = home.join("skills/do-thing");
+        assert!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap().contains(crate::skill_files::MARKER));
+        std::fs::write(dir.join("notes.txt"), "user notes").unwrap();
+        // Retitling moves the skill: the old file goes, nothing is orphaned.
+        let id = created.created[0].clone();
+        apply(&store, "s1", &skill_edit("update", "Do Other", "v2 steps", Some(&id)), &turns(), false, "refine", None).unwrap();
+        assert!(!dir.join("SKILL.md").exists() && home.join("skills/do-other/SKILL.md").exists());
+        // Rolling the rename back restores the old file and content; the user's extra file survives.
+        rollback(&store, "s1", None, None).unwrap();
+        assert!(!home.join("skills/do-other").exists());
+        assert!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap().contains("v1 steps"));
+        rollback(&store, "s1", None, None).unwrap();
+        assert!(!dir.join("SKILL.md").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("notes.txt")).unwrap(), "user notes");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn a_rejected_edit_writes_no_skill_file() {
+        let (_lock, home) = skills_home();
+        let store = EntryStore::memory().unwrap();
+        let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "e", "edits": [
+            {"action": "create", "kind": "skill", "title": "Fine Skill", "content": "steps",
+             "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}},
+            {"action": "explode"},
+        ]}).to_string();
+        assert!(apply(&store, "s1", &reply, &turns(), false, "refine", None).is_err());
+        assert!(!home.join("skills/fine-skill").exists());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn front_matter_is_escaped() {
+        let (_lock, home) = skills_home();
+        let store = EntryStore::memory().unwrap();
+        let title = "Tricky: \"quoted\" #1 --- x";
+        apply(&store, "s1", &skill_edit("create", title, "line one\nline: two\n---\nthree", None), &turns(), false, "refine", None).unwrap();
+        let text = std::fs::read_to_string(home.join("skills").join(crate::skill_files::slugify(title)).join("SKILL.md")).unwrap();
+        let front = text.strip_prefix("---\n").unwrap().split("\n---\n").next().unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str(front).unwrap();
+        assert_eq!(yaml["name"].as_str().unwrap(), title);
+        assert!(yaml["description"].as_str().unwrap().contains("line: two"));
+        assert_eq!(yaml["akira-learned"], true);
+        std::fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn rollback_removes_the_skill_file_apply_wrote() {
-        let home = std::env::temp_dir().join(format!("skill-rollback-{}", uuid::Uuid::new_v4()));
-        // SAFETY: only this test in the crate reads JCODE_HOME through skills_dir.
-        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        let (_lock, home) = skills_home();
         let store = EntryStore::memory().unwrap();
         let reply = json!({
             "summary": "s", "rationale": "r", "expectedOutcome": "e",
