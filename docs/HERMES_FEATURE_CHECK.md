@@ -2,22 +2,23 @@
 
 CLI-driven evidence for the active desktop feature areas. A row marked **missing** is not accepted as parity; it records the remaining test or implementation work.
 
-| Feature | How tested | Result | Fix commit |
+| Feature | How tested (debug engine, local Ollama `sovereign/bench-hermes-64k:latest`, isolated HOME/JCODE_HOME/HERMES_HOME, private `JCODE_RUNTIME_DIR`) | Result 2026-09-29 | Fix commit |
 |---|---|---|---|
-| Chat | `node crates/sovereign-gateway/e2e/sessions.mjs`; packaged `node ../hermes-agent/apps/desktop/e2e/sovereign-packaged-chat-approval.mjs` | Pass: prompt/history and packaged approval flow. `sessions.mjs` verifies model/provider/reasoning/session prompt behavior. | `003970f` |
-| Sessions | `node crates/sovereign-gateway/e2e/sessions.mjs` | Pass: RPC session lifecycle and all eight repaired REST routes, with and without auth. | `003970f` |
-| Cron | `SOVEREIGN_CRON_AGENT=1 node ../hermes-agent/apps/desktop/e2e/sovereign-packaged-cron-due.mjs` | Pass: packaged cron-due and idle-stop test passed three consecutive times. | `3c13bea` |
-| Bots / messaging | `node crates/sovereign-gateway/e2e/hermes-messaging-loopback.mjs` | Pass: isolated `api_server` config is saved/read with secret redaction, and a loopback message receives a local Ollama response. No external bot account is used. | `6014a73` |
-| Kanban | `node crates/sovereign-gateway/e2e/hermes-kanban-cli.mjs` | Pass: isolated Hermes CLI created a board, claimed and completed a task, and read the persisted result. | `f4569da` |
-| Skills | `node crates/sovereign-gateway/e2e/hermes-skill-hub.mjs`; `node crates/sovereign-gateway/e2e/hermes-mcp-settings.mjs` | Pass: Hermes hub installs/removes a categorized skill while the engine stays running; fresh Rust chat listing reflects both changes. | `6014a73` |
-| MCP | `node crates/sovereign-gateway/e2e/hermes-mcp-settings.mjs` | Pass: Hermes API adds local stdio and OAuth-authenticated HTTP servers; Rust chat calls both tools using the cached Hermes bearer token. | pending commit |
-| Browser controller | `node crates/sovereign-gateway/e2e/hermes-browser-controller.mjs` | Pass: authenticated `browser.manage` connects, reads status and disconnects local Chromium; forwarded `/api/browser/act` navigates to a local page and its full snapshot contains a random page marker. | `85c5503f` |
-| Terminal / shell pane | `node ../hermes-agent/apps/desktop/e2e/hermes-terminal-pty.mjs` | Pass: packaged Electron spawned zsh through the actual PTY IPC, accepted a command, streamed its marker, and disposed the terminal in a temporary home. | `8f0412f` |
-| Voice / wake / TTS | `node crates/sovereign-gateway/e2e/hermes-audio-local.mjs`; `node crates/sovereign-gateway/e2e/hermes-wake-activation.mjs` | Pass: local `say` produced WAV and the TTS lease acquired/released. The real openWakeWord/TFLite detector recognized generated “Hey Hermes” PCM and emitted `wake.detected` to its owning client. This verifies client-capture without physical-microphone hardware. | `85c5503f` |
-| Plugins | `node ../hermes-agent/apps/desktop/e2e/hermes-plugin-install.mjs` | Pass: packaged Electron installed a local Git plugin into the isolated Hermes home and rendered its registered status-bar capability. | `8f0412f` |
-| Profiles | `node crates/sovereign-gateway/e2e/hermes-profile-settings.mjs` | Pass: `--profile research` selected profile model/provider and `SOUL.md` prompt in a live Rust chat using local Ollama. | `6014a73` |
-| Settings | `node crates/sovereign-gateway/e2e/hermes-mcp-settings.mjs`; `node crates/sovereign-gateway/e2e/sessions.mjs` | Pass: live chat request proves stdio/OAuth MCP calls, hub install, tool disablement, memory context injection off/on, model/provider routing (selected profile uses capture proxy; default goes directly to local Ollama), reasoning effort, and system prompt behavior. | this commit |
-| Activity | `node crates/sovereign-gateway/e2e/activity-learning.mjs` | Pass: isolated Activity API lists a completed chat run, its detail, chat span, and approvals. | `f4569da` |
-| Learning / star map | `node crates/sovereign-gateway/e2e/learning.mjs`; `node crates/sovereign-gateway/e2e/activity-learning.mjs` | Pass: learning is applied in a later chat; star-map graph/node APIs list, edit, and delete an isolated learning node. | `f4569da` |
+| Chat | `sessions.mjs`, `refine.mjs`, `accounting.mjs`, `agent-run.mjs`, `replay.mjs`, `repeat-task.mjs` | Pass: all checks; no chat-bound method forwarded to Python; proxy accounting 5/5 with gap 0. | `36f4d72fc` (scripts) |
+| Sessions | `sessions.mjs` | Pass. | `36f4d72fc` |
+| Cron | packaged `sovereign-packaged-cron-due.mjs` (hermes-agent repo) | Not rerun in this pass (needs the packaged app). Last result: pass. | `3c13bea` |
+| Bots / messaging | `hermes-messaging-loopback.mjs` | Pass: `api_server` config saved with key redaction; loopback message answered by local Ollama. A real Telegram/Discord token needs an account, so the loopback stands in. | `36f4d72fc` |
+| Kanban | `hermes-kanban-cli.mjs` | Pass: board, claim, complete, persisted read. | `36f4d72fc` |
+| Skills | `hermes-skill-hub.mjs`; unit `tool::skill::tests::disabled_skill_is_not_listed_or_loadable` | Pass. Found: a skill switched off in Settings (`.disabled` marker) was already dropped from the system prompt but the `skill` tool still listed and loaded it. Fixed. | `36f4d72fc` |
+| MCP | `hermes-mcp-settings.mjs`; unit `hermes_mcp_settings_are_loaded_for_engine_chats`, `mcp_list_mirrors_config_yaml_without_env_values` | Pass live: server added through Hermes's `/api/mcp/servers`, engine chat called its tool (stdio and OAuth HTTP). Owner: `HERMES_HOME/config.yaml` `mcp_servers`; under Hermes the engine also stopped merging `~/.claude.json`, `~/.claude/mcp.json` and project `.mcp.json` (not editable in Settings). Boot-probe `GET /api/mcp/servers` now lists that map (was `[]`, wrong shape, hid real servers). Startup live route check is by unit test only. | `36f4d72fc` |
+| Browser controller | `hermes-browser-controller.mjs` | Pass: connect, status, disconnect, navigate and read a local page. | `36f4d72fc` |
+| Terminal / shell pane | packaged `hermes-terminal-pty.mjs` (hermes-agent repo) | Not rerun in this pass. Last result: pass. | `8f0412f` |
+| Voice / wake / TTS | `hermes-audio-local.mjs`, `hermes-wake-activation.mjs` | Pass: local `say` WAV and TTS lease; real openWakeWord detector recognised synthesized "Hey Hermes" PCM. No physical microphone used. | `36f4d72fc` |
+| Plugins | packaged `hermes-plugin-install.mjs` (hermes-agent repo) | Not rerun in this pass. Last result: pass. | `8f0412f` |
+| Profiles | `hermes-profile-settings.mjs` | Pass: `--profile` model/provider and SOUL.md reach a live chat. | `36f4d72fc` |
+| Settings | `hermes-mcp-settings.mjs`, `sessions.mjs` | Pass: terminal toolset toggle, memory toggle, model/provider and reasoning reach the model request. | `36f4d72fc` |
+| Activity | `activity-learning.mjs` | Pass. | `36f4d72fc` |
+| Learning / star map | `learning.mjs`, `activity-learning.mjs`, `prime-parity.mjs`, `agent-loop.mjs` | Pass, except `learning.mjs` failed once in three runs: the gate approved but the learning pass logged "no durable lesson in this session" (`learn.rs`, model-dependent), then the new chat answered "I need to load the `refine` tool first". Two reruns passed. Left for the learning owner. | none |
 
-All listed desktop feature areas have a CLI-driven passing check. Wake is exercised through Hermes's client-capture feed using locally generated audio; a physical microphone is not available on this host.
+Not run: `live.mjs` (needs an installed Hermes CLI at `~/.hermes/hermes-agent`), `prime-trap.mjs`. Forwarded-to-Python RPCs in engine-owned areas: `skills.manage` (hub install) is proven by the skill-hub script; `tools.list` / toolsets are proven by the terminal-toolset toggle in `hermes-mcp-settings.mjs`.
+
