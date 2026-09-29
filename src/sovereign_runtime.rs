@@ -767,13 +767,21 @@ async fn unload_ollama_model(model: &str) {
 /// Command that starts Hermes's Python backend for the features the Rust
 /// harness does not own: `SOVEREIGN_HERMES_CMD` (empty disables), else the
 /// managed install, else `hermes` on PATH.
+/// `SOVEREIGN_HERMES_CMD`: a program plus leading args, or one path to a program (which may hold spaces).
+fn split_hermes_cmd(cmd: &str) -> Option<Vec<String>> {
+    if std::path::Path::new(cmd).is_file() {
+        return Some(vec![cmd.to_owned()]);
+    }
+    let parts: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
 fn hermes_feature_command() -> Option<Vec<String>> {
     if let Ok(python) = std::env::var("SOVEREIGN_HERMES_PYTHON") {
         return (!python.is_empty()).then(|| vec![python, "-m".into(), "hermes_cli.main".into()]);
     }
     if let Ok(cmd) = std::env::var("SOVEREIGN_HERMES_CMD") {
-        let parts: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
-        return (!parts.is_empty()).then_some(parts);
+        return split_hermes_cmd(&cmd);
     }
     let managed = dirs::home_dir()?.join(".hermes/hermes-agent/venv/bin/hermes");
     if managed.is_file() {
@@ -873,6 +881,19 @@ fn sovereign_learning() -> sovereign_gateway::learn::Learning {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_hermes_command_may_be_a_path_with_spaces_or_a_program_with_args() {
+        let dir = std::env::temp_dir().join(format!("hermes cmd {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("hermes");
+        std::fs::write(&bin, "").unwrap();
+        let bin = bin.to_string_lossy().into_owned();
+        assert_eq!(super::split_hermes_cmd(&bin), Some(vec![bin.clone()]));
+        assert_eq!(super::split_hermes_cmd("python3 -m hermes_cli.main"), Some(vec!["python3".into(), "-m".into(), "hermes_cli.main".into()]));
+        assert_eq!(super::split_hermes_cmd("  "), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_short_supplied_token_is_refused_not_replaced() {
         assert!(super::supplied_token(Some("short".into())).is_err());
