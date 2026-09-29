@@ -1429,7 +1429,7 @@ impl Conn {
                 let selected_model = p["model"]
                     .as_str()
                     .filter(|model| !model.trim().is_empty())
-                    .or(profile.model.as_deref());
+                    .or(profile.model.as_deref().filter(|_| self.config.profile_model_applies));
                 let selected_provider = p["provider"]
                     .as_str()
                     .filter(|provider| !provider.trim().is_empty())
@@ -3060,6 +3060,7 @@ mod tests {
             provider: "p".into(),
             model: "m".into(),
             reasoning_efforts: Vec::new(),
+            profile_model_applies: true,
             home: home.to_string_lossy().into(),
             complete: None,
             approval_secret: String::new(),

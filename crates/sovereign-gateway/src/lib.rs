@@ -104,6 +104,11 @@ pub struct Config {
     /// Reasoning levels the served provider accepts (empty: none), so the model
     /// catalog reports what the engine can actually honour.
     pub reasoning_efforts: Vec<String>,
+    /// Whether the Hermes profile's default model belongs to the served
+    /// provider. False when the engine was started with an explicit provider
+    /// and the profile only says "auto": its model (e.g. a cloud model) is
+    /// then not something this provider can serve.
+    pub profile_model_applies: bool,
     /// Engine state directory, reported as the single profile's path.
     pub home: String,
     /// One-shot model call `(system, user) -> text and usage`, used by learning and `/refine`.
@@ -1331,7 +1336,7 @@ mod auth_notice_tests {
         });
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(), token: "t".repeat(32), version: "test".into(), legacy_socket: socket,
-            default_cwd: "/".into(), allow_non_loopback: false, provider: "p".into(), model: "m".into(), reasoning_efforts: Vec::new(),
+            default_cwd: "/".into(), allow_non_loopback: false, provider: "p".into(), model: "m".into(), reasoning_efforts: Vec::new(), profile_model_applies: true,
             home: dir.to_string_lossy().into(), complete: None, approval_secret: String::new(), features: None, learning: None,
         };
         notify_auth_changed(&config, Some("openrouter")).await;

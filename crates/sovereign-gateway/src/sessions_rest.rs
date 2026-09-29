@@ -332,6 +332,7 @@ mod tests {
             provider: "local".into(),
             model: "test".into(),
             reasoning_efforts: Vec::new(),
+            profile_model_applies: true,
             home: "/tmp".into(),
             complete: None,
             approval_secret: "test".into(),

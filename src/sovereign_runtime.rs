@@ -594,6 +594,7 @@ pub async fn run_gateway(
             provider: provider_name,
             model: provider_model,
             reasoning_efforts,
+            profile_model_applies: !(cli_explicit && profile_provider.is_none()),
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
             complete: Some(complete),
             approval_secret: approval_secret.clone(),
