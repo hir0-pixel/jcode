@@ -55,6 +55,7 @@ Environment (mirrors scripts/sovereign-vs-hermes-bench.mjs):
   BENCH_OUT        results root (default: <engine>/bench-results/abeval)
   BENCH_TURN_TIMEOUT_S  per-task timeout, seconds (default: 600)
   HERMES_VENV_PY   python inside hermes-agent's venv (default: <hermes-agent>/.venv/bin/python3)
+  HERMES_STOCK_SRC pristine upstream Hermes source dir for the hermes arm (PYTHONPATH); unset = the fork
   SOVEREIGN_BIN    sovereign engine binary (default: <engine>/target/release/sovereign)
   PRIME_CLI        Prime Agent CLI bundle (default: /tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js)
 
@@ -128,6 +129,9 @@ def cfg():
         "REPS": int(os.environ.get("BENCH_REPS", "3")),
         "OUT": Path(os.environ.get("BENCH_OUT", str(ENGINE_ROOT / "bench-results" / "abeval"))),
         "HERMES_VENV_PY": os.environ.get("HERMES_VENV_PY", str(HERMES_ROOT / ".venv" / "bin" / "python3")),
+        # Pristine upstream Hermes source (e.g. `git archive <merge-base>`), imported ahead of the
+        # fork's editable install so the hermes arm is stock Hermes, not Akira's fork.
+        "HERMES_STOCK_SRC": os.environ.get("HERMES_STOCK_SRC", ""),
         "SOVEREIGN_BIN": os.environ.get("SOVEREIGN_BIN", str(ENGINE_ROOT / "target" / "release" / "sovereign")),
         "PRIME_CLI": os.environ.get("PRIME_CLI", "/tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js"),
         "PRIME_KERNEL_VENV": os.environ.get("PRIME_AGENT_KERNEL_VENV", "/tmp/prime-agent/kernel-venv"),
@@ -530,6 +534,8 @@ def run_hermes_task(c, proxy, work, run_id, task_name, timeout_s):
     )
     env = {k: v for k, v in os.environ.items() if not any(s in k for s in ("API_KEY", "TOKEN", "SECRET")) and not k.startswith(("HERMES_", "JCODE_", "SOVEREIGN_"))}
     env.update({"HOME": str(home), "HERMES_HOME": str(hermes_home), "OPENAI_API_KEY": c["API_KEY"], "HERMES_NEMO_RELAY_PLUGINS_TOML": str(relay_config)})
+    if c["HERMES_STOCK_SRC"]:
+        env["PYTHONPATH"] = c["HERMES_STOCK_SRC"]
     proxy.tag(run_id)
     q = TASKS[task_name].replace("{WORK}", str(work))
     t0 = time.time()
@@ -750,6 +756,8 @@ def learn_hermes_session(c, proxy, home, cwd, tag, timeout_s):
     )
     env = {k: v for k, v in os.environ.items() if not any(s in k for s in ("API_KEY", "TOKEN", "SECRET")) and not k.startswith(("HERMES_", "JCODE_", "SOVEREIGN_"))}
     env.update({"HOME": str(home), "HERMES_HOME": str(hermes_home), "OPENAI_API_KEY": c["API_KEY"], "HERMES_NEMO_RELAY_PLUGINS_TOML": str(relay_config)})
+    if c["HERMES_STOCK_SRC"]:
+        env["PYTHONPATH"] = c["HERMES_STOCK_SRC"]
     proxy.tag(tag)
     t0 = time.time()
     out, rc, rss_peak, rss_mean = run_with_rss(
