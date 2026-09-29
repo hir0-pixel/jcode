@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 mod driver;
 pub(crate) use driver::start as start_driver;
 mod attach;
+mod local_state;
 mod side_agents;
 mod spawn_tree;
 
@@ -189,6 +190,7 @@ fn send_message_request(session_id: &str, text: &str, reminder: Option<&str>, im
     json!({ "req": "send_message", "session_id": session_id, "content": text, "system_reminder": reminder, "images": images })
 }
 
+#[derive(Debug)]
 struct RpcError {
     code: i64,
     message: String,
@@ -845,6 +847,7 @@ impl Conn {
         let call = |req: Value| async move { self.call(req).await.map_err(RpcError::internal) };
         match method {
             "ping" | "gateway.ping" => Ok(json!({})),
+            m if local_state::handles(m) => self.local_state(m, p).await,
             m if attach::handles(m) => {
                 let cwd = match p["session_id"].as_str() {
                     Some(id) => self.session_cwd(id).await,
