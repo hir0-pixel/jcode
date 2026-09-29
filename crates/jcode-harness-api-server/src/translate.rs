@@ -486,31 +486,33 @@ impl BridgeState {
                 }
             }
             "delete_session" => {
-                // Permanent: the snapshot, its journal, its rolling backup and
-                // any archive entry. The caller refuses sessions that are live
-                // (turn running). A surviving `.bak` kept the chat in the list,
-                // so a deleted chat came back.
+                // Permanent: the snapshot, its journal, its rolling backup, its
+                // recent-sessions index row and any archive entry. The caller
+                // refuses sessions that are live (turn running). Listings are
+                // built from the index (and the daemon's in-memory snapshot), so
+                // the index row and a process-wide tombstone go first, for any
+                // valid id, even when the files are already gone: a stale row or
+                // a surviving `.bak` kept a deleted chat in the list.
                 let session_id = request["session_id"].as_str().unwrap_or_default();
-                let Some(path) = Self::session_record_path(session_id).filter(|path| path.is_file()) else {
-                    return Self::error_reply(
-                        api_id,
-                        ErrorCode::UnknownSession,
-                        "session does not exist",
-                    );
+                let Some(path) = Self::session_record_path(session_id) else {
+                    return Self::error_reply(api_id, ErrorCode::UnknownSession, "session does not exist");
                 };
                 let _write_guard = Self::state_write_guard();
-                if let Err(err) = std::fs::remove_file(&path) {
-                    return Self::error_reply(api_id, ErrorCode::Internal, &err.to_string());
+                deleted_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string());
+                if let Some(index) = Self::recent_session_index_path().and_then(|index| Connection::open(index).ok()) {
+                    let _ = index.execute("DELETE FROM recent_sessions WHERE session_id = ?1", [session_id]);
                 }
                 let _ = std::fs::remove_file(path.with_extension("journal.jsonl"));
                 let _ = std::fs::remove_file(path.with_extension("bak"));
-                deleted_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string());
-                if let Some(index) = Self::recent_session_index_path().and_then(|path| Connection::open(path).ok()) {
-                    let _ = index.execute("DELETE FROM recent_sessions WHERE session_id = ?1", [session_id]);
-                }
                 let mut archive = Self::load_archive_state();
                 if archive.sessions.remove(session_id).is_some() {
                     let _ = Self::save_archive_state(&archive);
+                }
+                if !path.is_file() {
+                    return Self::error_reply(api_id, ErrorCode::UnknownSession, "session does not exist");
+                }
+                if let Err(err) = std::fs::remove_file(&path) {
+                    return Self::error_reply(api_id, ErrorCode::Internal, &err.to_string());
                 }
                 vec![Outbound::Reply(ServerFrame::reply(api_id, ApiEvent::Ok))]
             }
