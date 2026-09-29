@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
 
@@ -124,16 +124,20 @@ impl Features {
             paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
             command.env("PATH", std::env::join_paths(paths)?);
         }
+        // Secrets go on stdin (`--secrets-stdin`), never the environment: `ps eww` prints a child's env.
+        let mut secrets = serde_json::json!({ "session_token": self.token });
         if let Some((url, token)) = self.engine_env.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            command.env("SOVEREIGN_ENGINE_URL", url).env("SOVEREIGN_ENGINE_TOKEN", token);
+            command.env("SOVEREIGN_ENGINE_URL", url);
+            secrets["engine_token"] = token.into();
         }
         // Where the engine's skill registry reads: without it Python's hub installs land in HERMES_HOME.
         if let Ok(dir) = jcode_base::storage::jcode_dir() {
             command.env("JCODE_HOME", dir);
         }
         let mut child = command.args(args)
-            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
-            .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
+            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build", "--secrets-stdin"])
+            .env_remove("HERMES_DASHBOARD_SESSION_TOKEN")
+            .env_remove("SOVEREIGN_ENGINE_TOKEN")
             // Desktop-owned backend. With SOVEREIGN_ENGINE_URL set (below) it runs no cron
             // ticker: the engine's timer fires `POST /api/cron/tick` at the due time.
             .env("HERMES_DESKTOP", "1")
@@ -144,12 +148,16 @@ impl Features {
             .env("HERMES_PARENT_PID", std::process::id().to_string())
             .env_remove("HERMES_PARENT_START_MARKER")
             .env_remove("HERMES_PARENT_NONCE")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting the Hermes feature backend ({program})"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            // A child that already died is reported by the readiness wait below.
+            let _ = stdin.write_all(format!("{secrets}\n").as_bytes()).await;
+        }
         let mut lines = BufReader::new(child.stdout.take().context("backend stdout")?).lines();
         let port = tokio::time::timeout(START_TIMEOUT, async {
             while let Some(line) = lines.next_line().await? {
@@ -259,6 +267,33 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         vec![script.to_string_lossy().into_owned()]
+    }
+
+    /// The backend reads its tokens from stdin; neither is in its environment or argv.
+    #[tokio::test]
+    async fn backend_tokens_arrive_on_stdin_not_env() {
+        let dir = std::env::temp_dir().join(format!("features-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("seen");
+        let script = dir.join("fake-hermes");
+        std::fs::write(&script, format!(
+            "#!/bin/sh\nread line\n{{ echo \"$line\"; env; echo \"$@\"; }} > '{}'\necho 'HERMES_BACKEND_READY port=4244'\nexec sleep 30\n",
+            out.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let f = Features::new(vec![script.to_string_lossy().into_owned()]);
+        f.set_engine_env("http://127.0.0.1:1".into(), "engine-secret".into());
+        assert_eq!(f.port().await.unwrap(), 4244);
+        let seen = std::fs::read_to_string(&out).unwrap();
+        let (stdin_line, rest) = seen.split_once('\n').unwrap();
+        assert!(stdin_line.contains(&f.token) && stdin_line.contains("engine-secret"));
+        assert!(!rest.contains(&f.token) && !rest.contains("engine-secret"), "no token in env or argv");
+        assert!(rest.contains("--secrets-stdin") && rest.contains("SOVEREIGN_ENGINE_URL=http://127.0.0.1:1"));
+        f.stop_if_idle().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

@@ -612,8 +612,9 @@ approval prompts later or repeatedly (a replayed or forged ticket is refused); a
 environment of a hook process during its short life and spend that one ticket first (the real hook then fails
 closed, and the user sees one prompt for a command the model chose); a debugger or `task_for_pid` on the engine
 can read its memory; the model can edit the user's own files, including Hermes config. The Python feature backend
-still receives its own loopback token in its environment (`HERMES_DASHBOARD_SESSION_TOKEN`, set by the engine),
-which a same-user shell can read from `ps eww`; moving that to stdin is future work. Real containment needs the
+gets its loopback session token and the engine callback token (`SOVEREIGN_ENGINE_TOKEN`, used by cron and bots) as one
+JSON line on stdin (`hermes serve --secrets-stdin`), so neither is in its argv or launch environment; the engine also
+strips both from the inherited env. Standalone Hermes, without the flag, still reads them from the environment. Real containment needs the
 bash tool to run under a different uid or a sandbox.
 
 ---
