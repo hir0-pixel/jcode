@@ -1176,6 +1176,15 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Drop everything the loop keeps for a deleted session.
+    pub fn forget_session(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        for table in ["session_goals", "session_autonomous", "session_heartbeats"] {
+            conn.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), [session_id])?;
+        }
+        Ok(())
+    }
+
     /// Sessions with an active goal, autonomous loop or heartbeat: the
     /// gateway driver's work list (empty means it has nothing to wake for).
     pub fn active_sessions(&self) -> Result<Vec<String>> {

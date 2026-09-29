@@ -1418,7 +1418,7 @@ impl Conn {
                 }
                 self.links.lock().await.remove(&id);
                 self.client.sessions.lock().await.remove(&id);
-                call(json!({ "req": "delete_session", "session_id": id })).await?;
+                crate::sessions_rest::delete_everywhere(&self.config, &id).await.map_err(RpcError::internal)?;
                 jcode_app_core::tool::stop_repl_session(&id).await;
                 self.known.lock().await.remove(&id);
                 self.sessions.lock().await.remove(&id);

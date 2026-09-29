@@ -150,20 +150,26 @@ impl Driver {
         let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
             return false;
         };
-        let active = store.active_sessions().unwrap_or_default();
+        let mut active = store.active_sessions().unwrap_or_default();
         let first = {
             let mut resume = self.resume.lock().unwrap();
             let first = resume.is_none();
             resume.get_or_insert_with(|| active.iter().cloned().collect());
             first
         };
+        let mut gone = Vec::new();
         for sid in &active {
             if let Err(err) = conn.ensure_attached(sid).await {
-                if first {
+                // A chat deleted behind our back (its file is gone) has no work left.
+                if !jcode_base::session::session_exists(sid) {
+                    crate::sessions_rest::forget_rows(&conn.config.home, sid);
+                    gone.push(sid.clone());
+                } else if first {
                     eprintln!("sovereign: goal driver cannot attach {sid}: {err:#}");
                 }
             }
         }
+        active.retain(|sid| !gone.contains(sid));
         let stale: Vec<String> = conn.links.lock().await.keys().filter(|k| !active.contains(k)).cloned().collect();
         for sid in stale {
             conn.links.lock().await.remove(&sid);

@@ -887,6 +887,20 @@ impl EntryStore {
             .unwrap_or_default()
     }
 
+    /// Drop the learning state, parked approvals and surface/bot tags of a deleted session.
+    pub fn forget_session(&self, session: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        for table in ["harness_watermark", "harness_learn_state", "harness_pending_refine"] {
+            conn.execute(&format!("DELETE FROM {table} WHERE session = ?1"), [session])?;
+        }
+        conn.execute("DELETE FROM parked_approvals WHERE session_id = ?1", [session])?;
+        conn.execute(
+            "DELETE FROM engine_settings WHERE key = ?1 OR (key LIKE 'bot\\_session:%' ESCAPE '\\' AND value = ?2)",
+            params![format!("session_surface:{session}"), session],
+        )?;
+        Ok(())
+    }
+
     /// Whether Prime's auto-refine runs: on unless the user turned it off.
     pub fn learning_enabled(&self) -> bool {
         self.setting("learning.enabled").is_none_or(|v| v != "false")

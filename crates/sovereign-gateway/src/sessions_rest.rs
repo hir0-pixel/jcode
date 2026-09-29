@@ -8,6 +8,25 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
+/// The one way a chat is deleted: the engine's session, then everything keyed to it (goals,
+/// heartbeats, learning state, parked approvals, tags, traces). A session the engine no longer has
+/// still gets its leftovers cleared.
+pub(crate) async fn delete_everywhere(config: &Config, id: &str) -> Result<()> {
+    if let Err(err) = harness_request(&config.legacy_socket, json!({"req": "delete_session", "session_id": id})).await {
+        if !err.to_string().contains("not found") { return Err(err); }
+    }
+    forget_rows(&config.home, id);
+    Ok(())
+}
+
+/// Just the rows keyed to a session (the engine's session is already gone).
+pub(crate) fn forget_rows(home: &str, id: &str) {
+    let home = std::path::Path::new(home);
+    if let Ok(store) = sovereign_prime::agent_loop::ControlStore::open_cached(home) { let _ = store.forget_session(id); }
+    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(home) { let _ = store.forget_session(id); }
+    let _ = crate::observability::forget_session(home, id);
+}
+
 /// Returns `None` when the path is not under `/api/sessions`.
 pub(super) async fn route(stream: &mut TcpStream, req: &Request, config: &Config) -> Option<Result<()>> {
     let rest = req.path.strip_prefix("/api/sessions")?;
@@ -79,7 +98,7 @@ async fn delete_empty(stream: &mut TcpStream, config: &Config) -> Result<()> {
         if session["is_active"] == true || session["archived"] == true { continue; }
         let Some(id) = session["id"].as_str() else { continue };
         if transcript(config, id).await.is_ok_and(|m| m.is_empty()) {
-            if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session", "session_id":id})).await {
+            if let Err(err) = delete_everywhere(config, id).await {
                 return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "deleted":deleted})).await;
             }
             deleted += 1;
@@ -98,7 +117,7 @@ async fn bulk_delete(stream: &mut TcpStream, req: &Request, config: &Config) -> 
     for id in ids.iter().filter_map(Value::as_str) {
         match find(config, id).await {
             Ok(Some(info)) if info["is_active"] != true => {
-                if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session", "session_id":id})).await {
+                if let Err(err) = delete_everywhere(config, id).await {
                     return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(), "deleted":deleted})).await;
                 }
                 deleted += 1;
@@ -155,7 +174,7 @@ async fn prune(stream: &mut TcpStream, req: &Request, config: &Config) -> Result
     let mut deleted = 0usize;
     if !dry_run {
         for id in &ids {
-            if let Err(err) = harness_request(&config.legacy_socket, json!({"req":"delete_session","session_id":id})).await {
+            if let Err(err) = delete_everywhere(config, id).await {
                 return respond(stream, "503 Service Unavailable", &json!({"detail":err.to_string(),"matched":ids.len(),"deleted":deleted,"session_ids":ids})).await;
             }
             deleted += 1;
@@ -218,6 +237,39 @@ mod tests {
     use crate::{Config, Request};
     use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
     use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
+
+    #[test]
+    fn forgetting_a_session_leaves_nothing_and_the_driver_no_work() {
+        use sovereign_prime::agent_loop::{ControlStore, Heartbeat, SessionGoal};
+        let home = std::env::temp_dir().join(format!("forget-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let observer = crate::observability::Observer::open(&home, "p", "m", None).unwrap();
+        let (control, entries) = (ControlStore::open(&home).unwrap(), sovereign_prime::entries::EntryStore::open(&home).unwrap());
+        for sid in ["gone", "kept"] {
+            control.set_goal(sid, Some(&SessionGoal::new("ship"))).unwrap();
+            control.upsert_heartbeat(&Heartbeat::new(sid, "check", 60)).unwrap();
+            entries.park_save(&format!("req-{sid}"), sid, "{}", 5).unwrap();
+            entries.learn_checkpoint(sid, 5, 0, 1).unwrap();
+            entries.set_watermark(sid, 3).unwrap();
+            entries.set_setting(&format!("session_surface:{sid}"), "cron@1").unwrap();
+            entries.set_setting(&format!("bot_session:chat-{sid}"), sid).unwrap();
+        }
+        let db = rusqlite::Connection::open(home.join("sovereign.db")).unwrap();
+        for sid in ["gone", "kept"] {
+            db.execute("INSERT INTO fact_turn(id,session_id,root_id,kind,model,provider,status,started_at_ms) VALUES(?1,?2,?1,'chat','m','p','complete',1)", [format!("run-{sid}"), sid.into()]).unwrap();
+            db.execute("INSERT INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms) VALUES(?1,?2,?2,?2,'execute_tool','bash','complete',1)", [format!("span-{sid}"), format!("run-{sid}")]).unwrap();
+            db.execute("INSERT INTO span_content(id,input) VALUES(?1,'x'),(?2,'y')", [format!("span-{sid}"), format!("run-{sid}")]).unwrap();
+            db.execute("INSERT INTO approvals(session_id,tool,command_preview,decision,actor,at_ms) VALUES(?1,'bash','rm','allow','u',1)", [sid]).unwrap();
+        }
+        super::forget_rows(home.to_str().unwrap(), "gone");
+        assert_eq!(control.active_sessions().unwrap(), ["kept"]);
+        let count = |sql: &str| db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        // Only "kept" is left: one row each, two for the tables holding two rows per session.
+        for (table, rows) in [("fact_turn", 1), ("spans", 1), ("span_content", 2), ("approvals", 1), ("parked_approvals", 1), ("harness_watermark", 1), ("harness_learn_state", 1), ("engine_settings", 2), ("session_heartbeats", 1), ("session_goals", 1)] {
+            assert_eq!(count(&format!("SELECT COUNT(*) FROM {table}")), rows, "{table}");
+        }
+        drop((observer, db));
+        std::fs::remove_dir_all(home).ok();
+    }
 
     #[test]
     fn session_ids_cannot_escape_the_session_store() {
@@ -423,7 +475,7 @@ async fn delete(stream: &mut TcpStream, config: &Config, id: &str) -> Result<()>
         Ok(Some(info)) if info["is_active"] == true => {
             respond(stream, "409 Conflict", &json!({"detail": "session is running; stop it before deleting"})).await
         }
-        Ok(Some(_)) => match harness_request(&config.legacy_socket, json!({"req": "delete_session", "session_id": id})).await {
+        Ok(Some(_)) => match delete_everywhere(config, id).await {
             Ok(_) => respond(stream, "200 OK", &json!({"ok": true})).await,
             Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
         },

@@ -2,7 +2,7 @@
 //! the surface that made it so the sidebar can list bot and cron transcripts, and
 //! one-shot cron sessions are deleted once they are older than the observability retention.
 
-use super::{Config, harness_request};
+use super::Config;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
@@ -48,9 +48,8 @@ pub(crate) async fn prune_cron(config: &Config, now_ms: i64) {
         return;
     };
     for id in expired {
-        let reply = harness_request(&config.legacy_socket, json!({ "req": "delete_session", "session_id": id })).await;
         // A session already deleted by hand is as gone as one we delete.
-        if reply.is_ok() || reply.is_err_and(|e| e.to_string().contains("not found")) {
+        if crate::sessions_rest::delete_everywhere(config, &id).await.is_ok() {
             let _ = store.delete_setting(&format!("{PREFIX}{id}"));
         }
     }

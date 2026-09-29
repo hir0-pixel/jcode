@@ -980,6 +980,20 @@ pub(crate) fn retention_days() -> i64 {
         .ok().and_then(|raw| raw.parse::<i64>().ok()).filter(|days| (1..=3650).contains(days)).unwrap_or(30)
 }
 
+/// Delete every trace row of a deleted session: its runs, their spans and captured content, and
+/// its approval records.
+pub(crate) fn forget_session(home: &Path, session: &str) -> rusqlite::Result<()> {
+    let mut db = Connection::open(home.join("sovereign.db"))?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    let tx = db.transaction()?;
+    let runs = "SELECT id FROM fact_turn WHERE session_id=?1";
+    tx.execute(&format!("DELETE FROM span_content WHERE id IN ({runs}) OR id IN (SELECT id FROM spans WHERE run_id IN ({runs}))"), [session])?;
+    tx.execute(&format!("DELETE FROM spans WHERE run_id IN ({runs})"), [session])?;
+    tx.execute("DELETE FROM fact_turn WHERE session_id=?1", [session])?;
+    tx.execute("DELETE FROM approvals WHERE session_id=?1", [session])?;
+    tx.commit()
+}
+
 fn prune(db: &Connection, at: i64, retention_days: i64) -> rusqlite::Result<()> {
     let day = 86_400_000_i64;
     db.execute("DELETE FROM span_content WHERE id IN (SELECT id FROM fact_turn WHERE started_at_ms<?1 UNION SELECT id FROM spans WHERE started_at_ms<?1)", [at - retention_days * day])?;
