@@ -16,8 +16,11 @@ use crate::features::Features;
 const RESCAN: Duration = Duration::from_secs(10 * 60);
 /// While the backend runs its agent tools may add jobs, so look again sooner.
 const RESCAN_LIVE: Duration = Duration::from_secs(30);
-/// Never fire twice within this, so a job a tick cannot advance cannot spin the timer.
+/// First retry delay for a job a tick could not advance; it doubles per failure up to `MAX_GAP`.
 const MIN_GAP: Duration = Duration::from_secs(30);
+const MAX_GAP: Duration = Duration::from_secs(3600);
+/// Longest single sleep: tokio's clock stops during macOS system sleep, so re-read the wall clock.
+const CHUNK: Duration = Duration::from_secs(60);
 /// A tick runs every due job to completion.
 const TICK_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
 
@@ -43,8 +46,13 @@ fn job_is_fireable(job: &Value) -> bool {
     job.get("next_run_at").and_then(Value::as_str).is_some()
 }
 
-/// Earliest `next_run_at` among fireable jobs of the home and its profiles.
-pub fn next_due(home: &Path) -> Option<SystemTime> {
+struct Job {
+    id: String,
+    due: SystemTime,
+}
+
+/// Every fireable job of the home and its profiles with its `next_run_at`.
+fn fireable(home: &Path) -> Vec<Job> {
     job_stores(home)
         .iter()
         .filter_map(|store| serde_json::from_str::<Value>(&std::fs::read_to_string(store).ok()?).ok())
@@ -54,15 +62,53 @@ pub fn next_due(home: &Path) -> Option<SystemTime> {
             _ => Vec::new(),
         })
         .filter(job_is_fireable)
-        .filter_map(|job| DateTime::parse_from_rfc3339(job["next_run_at"].as_str()?).ok())
-        .map(|dt| SystemTime::from(dt.with_timezone(&Utc)))
-        .min()
+        .filter_map(|job| {
+            let due = DateTime::parse_from_rfc3339(job["next_run_at"].as_str()?).ok()?;
+            Some(Job { id: job["id"].as_str().unwrap_or_default().to_string(), due: SystemTime::from(due.with_timezone(&Utc)) })
+        })
+        .collect()
+}
+
+/// Per job: a run that left `next_run_at` unchanged waits 30 s, 60 s, 2 min ... (max 1 h) before the
+/// next attempt, so one job a tick cannot advance does not wake Python every 30 s.
+#[derive(Default)]
+struct Backoff(std::collections::HashMap<String, (SystemTime, u32, SystemTime)>); // id -> (stuck due, failures, retry at)
+
+impl Backoff {
+    fn effective(&self, job: &Job) -> SystemTime {
+        match self.0.get(&job.id) {
+            Some((due, _, retry)) if *due == job.due => job.due.max(*retry),
+            _ => job.due,
+        }
+    }
+
+    /// After a tick that ran the jobs in `before` that were due at `now`.
+    fn record(&mut self, before: &[Job], after: &[Job], now: SystemTime) {
+        for job in before.iter().filter(|j| j.due <= now) {
+            if after.iter().any(|a| a.id == job.id && a.due == job.due) {
+                let fails = self.0.get(&job.id).filter(|e| e.0 == job.due).map_or(0, |e| e.1) + 1;
+                let gap = MIN_GAP.saturating_mul(1 << (fails - 1).min(7)).min(MAX_GAP);
+                self.0.insert(job.id.clone(), (job.due, fails, now + gap));
+            }
+        }
+        self.0.retain(|id, e| after.iter().any(|a| a.id == *id && a.due == e.0));
+    }
+}
+
+/// Earliest time any job should run, backoff included.
+fn next_due(jobs: &[Job], backoff: &Backoff) -> Option<SystemTime> {
+    jobs.iter().map(|j| backoff.effective(j)).min()
 }
 
 /// How long to sleep given the next due time.
 fn wait_for(due: Option<SystemTime>, backend_up: bool) -> Duration {
     let cap = if backend_up { RESCAN_LIVE } else { RESCAN };
     due.map_or(cap, |d| d.duration_since(SystemTime::now()).unwrap_or_default().min(cap))
+}
+
+/// The next bounded sleep toward `deadline`, or None once the wall clock has reached it.
+fn next_chunk(deadline: SystemTime, now: SystemTime) -> Option<Duration> {
+    deadline.duration_since(now).ok().filter(|d| !d.is_zero()).map(|d| d.min(CHUNK))
 }
 
 async fn fire(features: &Arc<Features>) -> anyhow::Result<()> {
@@ -79,25 +125,27 @@ async fn fire(features: &Arc<Features>) -> anyhow::Result<()> {
 }
 
 pub async fn run(features: Arc<Features>) {
-    let mut last_fire: Option<std::time::Instant> = None;
+    let mut backoff = Backoff::default();
     loop {
         let home = std::env::var_os("HERMES_HOME").map(PathBuf::from);
-        let due = home.as_deref().and_then(next_due);
-        let wait = wait_for(due, features.is_running().await);
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = features.cron_changed.notified() => continue,
-        }
-        let overdue = due.is_some_and(|d| d <= SystemTime::now());
-        let settled = last_fire.is_none_or(|t| t.elapsed() >= MIN_GAP);
-        if overdue && settled {
-            last_fire = Some(std::time::Instant::now());
-            if let Err(err) = fire(&features).await {
-                eprintln!("sovereign-gateway: cron tick failed: {err}");
+        let jobs = home.as_deref().map(fireable).unwrap_or_default();
+        let due = next_due(&jobs, &backoff);
+        let deadline = SystemTime::now() + wait_for(due, features.is_running().await);
+        let mut changed = false;
+        while let Some(chunk) = next_chunk(deadline, SystemTime::now()) {
+            tokio::select! {
+                _ = tokio::time::sleep(chunk) => {}
+                _ = features.cron_changed.notified() => { changed = true; break }
             }
-        } else if overdue {
-            tokio::time::sleep(MIN_GAP).await;
         }
+        if changed || !due.is_some_and(|d| d <= SystemTime::now()) {
+            continue;
+        }
+        if let Err(err) = fire(&features).await {
+            eprintln!("sovereign-gateway: cron tick failed: {err}");
+        }
+        let after = home.as_deref().map(fireable).unwrap_or_default();
+        backoff.record(&jobs, &after, SystemTime::now());
     }
 }
 
@@ -127,14 +175,41 @@ mod tests {
               {"id":"off","enabled":false,"next_run_at":"2097-01-01T00:00:00+00:00"},
               {"id":"done","state":"completed","next_run_at":"2097-01-01T00:00:00+00:00"}]}"#,
         );
-        assert_eq!(next_due(&dir), Some(at("2099-01-01T00:00:00+00:00")));
+        let due = |dir: &Path| next_due(&fireable(dir), &Backoff::default());
+        assert_eq!(due(&dir), Some(at("2099-01-01T00:00:00+00:00")));
         // Far away: the rescan cap wins; overdue: fire now.
-        assert_eq!(wait_for(next_due(&dir), false), RESCAN);
-        assert_eq!(wait_for(next_due(&dir), true), RESCAN_LIVE);
+        assert_eq!(wait_for(due(&dir), false), RESCAN);
+        assert_eq!(wait_for(due(&dir), true), RESCAN_LIVE);
         assert_eq!(wait_for(Some(at("2000-01-01T00:00:00+00:00")), false), Duration::ZERO);
         assert_eq!(wait_for(None, false), RESCAN);
         std::fs::write(dir.join("cron/jobs.json"), r#"[{"id":"x","state":"error","next_run_at":"2099-01-01T00:00:00+00:00"}]"#).unwrap();
-        assert_eq!(next_due(&dir), None);
+        assert_eq!(due(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sleeps_in_bounded_chunks_and_backs_off_per_stuck_job() {
+        // A long wait is cut into <= 60 s naps; a passed deadline (wall clock jumped in system sleep) ends it.
+        let now = at("2099-01-01T00:00:00+00:00");
+        assert_eq!(next_chunk(now + Duration::from_secs(600), now), Some(CHUNK));
+        assert_eq!(next_chunk(now + Duration::from_secs(5), now), Some(Duration::from_secs(5)));
+        assert_eq!(next_chunk(now, now), None);
+        assert_eq!(next_chunk(now - Duration::from_secs(1), now), None);
+
+        let job = |id: &str, due: SystemTime| Job { id: id.into(), due };
+        let (stuck, fine) = (now - Duration::from_secs(100), now - Duration::from_secs(50));
+        let mut backoff = Backoff::default();
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let before = [job("stuck", stuck), job("fine", fine)];
+            // "fine" advanced, "stuck" did not.
+            backoff.record(&before, &[job("stuck", stuck), job("fine", now + Duration::from_secs(3600))], now);
+            waits.push(backoff.effective(&job("stuck", stuck)).duration_since(now).unwrap());
+        }
+        assert_eq!(waits, [MIN_GAP, MIN_GAP * 2, MIN_GAP * 4]);
+        assert_eq!(backoff.effective(&job("fine", fine)), fine, "a healthy job is not delayed");
+        // Once the job advances its backoff is forgotten.
+        backoff.record(&[job("stuck", stuck)], &[job("stuck", now + Duration::from_secs(60))], now);
+        assert!(backoff.0.is_empty());
     }
 }
