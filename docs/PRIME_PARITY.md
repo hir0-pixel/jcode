@@ -71,8 +71,10 @@ Prime vs Akira, how a goal is driven to completion (Prime source: `core/goals.ts
   continuations, not a desktop window. It holds its own engine link, watches only
   sessions with an active goal, loop or heartbeat (`ControlStore::active_sessions`),
   and yields to any window that has the session open. With no window, goals keep
-  going; after an engine restart active goals and loops resume once at startup
-  (that resume counts as one turn against the budget); due heartbeats fire from a
+  going; after an engine restart active goals and loops resume (retried each tick until
+  the prompt is accepted; a resume records no attempt and counts no turn); a turn that
+  ends in a model error pauses the goal (auth) or retries after 30 s, 2 min, 10 min (429,
+  5xx, network) and never counts toward plateau detection; due heartbeats fire from a
   15 s tick that exists only while something is active (otherwise the task parks
   on a poke: finished turn, `/goal`, `/heartbeat`, `session.control`). Continuations
   go through `prompt.submit`, so tracing and learning see them. With no window,
