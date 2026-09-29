@@ -2721,7 +2721,7 @@ pub(crate) async fn agent_run(
     timeout: Duration,
 ) -> Result<Value> {
     // Queued behind the chat's running turn (its `timeout` starts once this turn does).
-    let _turn = match session_key {
+    let turn = match session_key {
         Some(key) => Some(chat_turn(key).await),
         None => None,
     };
@@ -2829,26 +2829,8 @@ pub(crate) async fn agent_run(
         if opts.surface == "cron" {
             crate::surface_sessions::prune_cron(&conn.config, crate::observability::now()).await;
         }
-        let usage = |payload: &Value| -> Value {
-            let u = &payload["usage"];
-            if u.is_null() {
-                Value::Null
-            } else {
-                json!({ "input_tokens": u["input"], "output_tokens": u["output"], "cached_tokens": u["cache_read"] })
-            }
-        };
         Ok(match outcome {
-            Ok(Ok(payload)) => {
-                let ok = payload["status"] == "complete";
-                let text = payload["text"].as_str().unwrap_or_default().to_string();
-                json!({
-                    "ok": ok,
-                    "text": text,
-                    "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({})", payload["status"].as_str().unwrap_or("unknown"))) },
-                    "session_id": session_id,
-                    "usage": usage(&payload),
-                })
-            }
+            Ok(Ok(payload)) => turn_reply(&payload, &session_id, opts.surface),
             Ok(Err(err)) => {
                 json!({ "ok": false, "text": "", "error": err.to_string(), "session_id": session_id })
             }
@@ -2859,7 +2841,37 @@ pub(crate) async fn agent_run(
     }
     .await;
     end_run(&conn, session_key).await;
+    drop(turn);
+    if let Some(key) = session_key {
+        prune_chat_turn(key);
+    }
     result
+}
+
+/// The `/api/agent/run` reply for a finished turn. A bot chat's `/stop` interrupts the turn: Hermes
+/// takes `interrupted: true` (with `ok`) as "stopped" and posts nothing; every other surface
+/// keeps it a failed run, since a cron job that was cut short did not do its work.
+fn turn_reply(payload: &Value, session_id: &str, surface: &str) -> Value {
+    let status = payload["status"].as_str().unwrap_or("unknown");
+    let interrupted = status == "interrupted";
+    let ok = status == "complete" || (interrupted && surface == "bot");
+    let usage = &payload["usage"];
+    json!({
+        "ok": ok,
+        "interrupted": interrupted,
+        "text": payload["text"].as_str().unwrap_or_default(),
+        "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({status})")) },
+        "session_id": session_id,
+        "usage": if usage.is_null() { Value::Null } else { json!({ "input_tokens": usage["input"], "output_tokens": usage["output"], "cached_tokens": usage["cache_read"] }) },
+    })
+}
+
+/// Forget an idle chat's turn lock (nothing holds or awaits it), so the map does not grow with every chat.
+fn prune_chat_turn(key: &str) {
+    let mut turns = CHAT_TURNS.lock().unwrap_or_else(|e| e.into_inner());
+    if turns.get(key).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+        turns.remove(key);
+    }
 }
 
 /// End a headless run's registration and link tasks, whatever way it ended.
@@ -3198,6 +3210,33 @@ mod tests {
         assert!(!second.is_finished(), "the second message waits for the first turn");
         drop(first);
         tokio::time::timeout(Duration::from_secs(2), second).await.expect("released").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_bot_turn_replies_stopped_not_failed_and_the_queued_message_still_runs() {
+        let stopped = json!({ "status": "interrupted", "text": "partial", "usage": null });
+        let bot = turn_reply(&stopped, "s", "bot");
+        assert_eq!((bot["ok"].clone(), bot["interrupted"].clone(), bot["error"].clone()), (json!(true), json!(true), Value::Null));
+        let cron = turn_reply(&stopped, "s", "cron");
+        assert_eq!((cron["ok"].clone(), cron["interrupted"].clone()), (json!(false), json!(true)));
+        assert!(cron["error"].as_str().unwrap().contains("interrupted"));
+        let done = turn_reply(&json!({ "status": "complete", "text": "hi" }), "s", "bot");
+        assert_eq!((done["ok"].clone(), done["interrupted"].clone(), done["text"].clone()), (json!(true), json!(false), json!("hi")));
+        // The next message for the chat waits for the stopped turn, then gets the lock; idle chats are pruned.
+        let key = "telegram:stop-queue";
+        let first = chat_turn(key).await;
+        let second = tokio::spawn(async move { drop(chat_turn(key).await) });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(first);
+        prune_chat_turn(key);
+        tokio::time::timeout(Duration::from_secs(2), second).await.expect("the queued turn runs").unwrap();
+        prune_chat_turn(key);
+        assert!(!CHAT_TURNS.lock().unwrap().contains_key(key), "idle chat pruned");
+        let held = chat_turn(key).await;
+        prune_chat_turn(key);
+        assert!(CHAT_TURNS.lock().unwrap().contains_key(key), "a held lock is kept");
+        drop(held);
+        prune_chat_turn(key);
     }
 
     #[tokio::test]
