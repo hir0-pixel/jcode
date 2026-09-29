@@ -47,6 +47,7 @@
  */
 import { spawn, spawnSync, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
+import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -492,14 +493,30 @@ function stopSovereign(sv) {
   }).then(() => fs.rmSync(sv.runtimeDir, { recursive: true, force: true }))
 }
 
+// fetch() (undici) aborts after 300 s with no response headers, and /api/agent/run only
+// answers when the turn ends; use node:http with the benchmark's own turn limit instead.
+function postJson(port, pathName, token, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: pathName, method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), authorization: `Bearer ${token}` } },
+    res => {
+      let data = ''
+      res.setEncoding('utf8')
+      res.on('data', chunk => { data += chunk })
+      res.on('end', () => { try { resolve(JSON.parse(data)) } catch (err) { reject(err) } })
+    })
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`no reply within ${timeoutMs} ms`)))
+    req.on('error', reject)
+    req.end(body)
+  })
+}
+
 async function runSovereignTurn(sv, token, dir, prompt, title) {
   const stop = startSampler(sv.child.pid, (_p, cmd) => cmd.includes(sv.homeDir))
   const t0 = Date.now()
-  const res = await fetch(`http://127.0.0.1:${sv.port}/api/agent/run`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-    body: JSON.stringify({ prompt, cwd: dir, title, timeout_s: Math.round(cfg.TURN_TIMEOUT_MS / 1000) }),
-  }).then(r => r.json()).catch(err => ({ ok: false, error: String(err) }))
+  const body = JSON.stringify({ prompt, cwd: dir, title, timeout_s: Math.round(cfg.TURN_TIMEOUT_MS / 1000) })
+  const res = await postJson(sv.port, '/api/agent/run', token, body, cfg.TURN_TIMEOUT_MS + 60_000)
+    .catch(err => ({ ok: false, error: String(err) }))
   const wall_ms = Date.now() - t0
   return { ok: Boolean(res.ok), wall_ms, samples: stop(), session_id: res.session_id, ...sovereignToolMetrics(sv.jcodeHome, res.session_id) }
 }
