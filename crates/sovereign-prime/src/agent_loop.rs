@@ -307,7 +307,7 @@ pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
     let failed = result.starts_with("Error:") || nonzero_exit;
     let cmd = args["command"].as_str().unwrap_or("").to_lowercase();
     let verify_cmd = name == "bash" && crate::goal_ratchet::is_verify_command(&cmd);
-    let mut map = turn_obs().lock().unwrap();
+    let mut map = turn_obs().lock().unwrap_or_else(|e| e.into_inner());
     let obs = map.entry(session_id.to_string()).or_default();
     obs.tools += 1;
     if verify_cmd {
@@ -1324,8 +1324,8 @@ pub fn after_turn_in(
     user_interrupted: bool,
     cwd: Option<&Path>,
 ) -> Result<Option<Continuation>> {
-    let obs = turn_obs().lock().unwrap().remove(session_id);
-    error_retries().lock().unwrap().remove(session_id);
+    let obs = turn_obs().lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+    error_retries().lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
     if user_interrupted {
         if let Some(mut goal) = store.get_goal(session_id)? {
             if goal.status == GoalStatus::Active {
@@ -1504,19 +1504,19 @@ pub enum ErrorAction {
 /// supervisor call): auth and unknown errors pause the goal / loop at once, transient ones (429, 5xx,
 /// network) retry after 30 s, 2 min, 10 min and then pause.
 pub fn after_error_turn(store: &ControlStore, session_id: &str, error: &str) -> Result<Option<ErrorAction>> {
-    turn_obs().lock().unwrap().remove(session_id);
+    turn_obs().lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
     let mut goal = store.get_goal(session_id)?.filter(|g| g.status == GoalStatus::Active);
     let mut auto = if goal.is_none() { store.get_autonomous(session_id)?.filter(|a| a.status == AutonomousStatus::Active) } else { None };
     if goal.is_none() && auto.is_none() {
-        error_retries().lock().unwrap().remove(session_id);
+        error_retries().lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
         return Ok(None);
     }
     let short: String = error.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
-    let tries = error_retries().lock().unwrap().get(session_id).copied().unwrap_or(0);
+    let tries = error_retries().lock().unwrap_or_else(|e| e.into_inner()).get(session_id).copied().unwrap_or(0);
     let delay = (!is_auth_error(error) && is_transient_error(error)).then(|| ERROR_BACKOFF.get(tries).copied()).flatten();
     let now = now_ms();
     if let Some(after) = delay {
-        error_retries().lock().unwrap().insert(session_id.to_string(), tries + 1);
+        error_retries().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string(), tries + 1);
         let note = format!("model error, retrying in {}s ({}/{}): {short}", after.as_secs(), tries + 1, ERROR_BACKOFF.len());
         let prompt = if let Some(g) = goal.as_mut() {
             g.updated_at_ms = now;
@@ -1530,7 +1530,7 @@ pub fn after_error_turn(store: &ControlStore, session_id: &str, error: &str) -> 
         };
         return Ok(Some(ErrorAction::Retry { after, stamp: now, prompt, note }));
     }
-    error_retries().lock().unwrap().remove(session_id);
+    error_retries().lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
     let reason = format!("model error: {short}");
     if let Some(g) = goal.as_mut() {
         g.status = GoalStatus::Paused;
@@ -2361,11 +2361,24 @@ mod tests {
     }
 
     #[test]
+    fn a_poisoned_turn_lock_does_not_take_the_agent_loop_down() {
+        let _ = std::thread::spawn(|| {
+            let _held = turn_obs().lock().unwrap();
+            let _retries = error_retries().lock().unwrap();
+            panic!("poison both");
+        })
+        .join();
+        assert!(turn_obs().is_poisoned() && error_retries().is_poisoned());
+        observe_tool("poisoned-lock-test", "bash", &serde_json::json!({"command": "ls"}), "ok");
+        assert_eq!(turn_obs().lock().unwrap_or_else(|e| e.into_inner())["poisoned-lock-test"].tools, 1);
+    }
+
+    #[test]
     fn nonzero_bash_exit_is_a_failed_verification() {
         let sid = "nonzero-exit-test";
         observe_tool(sid, "bash", &serde_json::json!({"command": "cargo test"}), "1 failed\n\nExit code: 101");
         observe_tool(sid, "bash", &serde_json::json!({"command": "npm test"}), "ok\n--- Command finished with exit code: 0 ---");
-        let map = turn_obs().lock().unwrap();
+        let map = turn_obs().lock().unwrap_or_else(|e| e.into_inner());
         let obs = &map[sid];
         assert_eq!((obs.tools, obs.failed), (2, 1));
         assert!(obs.verified, "the exit-0 test run still counts as a passing verification");
