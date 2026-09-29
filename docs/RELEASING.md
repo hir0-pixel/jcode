@@ -76,3 +76,8 @@ and run `sovereign-update.sh`.
   run on a newer schema). To go back: quit, copy the matching `sovereign.db.pre-v*.bak` over `sovereign.db`
   (delete `sovereign.db-wal` / `-shm`), start the old bundle. Anything written since the update is lost;
   the observability and memory tables opened by other components are additive and carry no separate version.
+- routine backup: at most once per 24 h, in a background thread on the first open, the engine runs
+  `PRAGMA quick_check` and, if it passes, writes `sovereign.db.daily.bak` (`VACUUM INTO` a temp file, then rename,
+  0600; one copy). A db that fails the check never replaces the backup; `jcode_base::migrate::backup_error()` holds
+  the reason for the gateway to report. Restore: quit the app, copy `sovereign.db.daily.bak` over `sovereign.db`,
+  delete `sovereign.db-wal` / `-shm`, start. Anything written since the backup's timestamp is lost.

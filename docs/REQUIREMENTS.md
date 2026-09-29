@@ -29,6 +29,7 @@ it is measured and what the last measurement was, so a change that moves one has
 | REPL latency | warm p95 < 5 ms; run timeout 20 s; kernel RSS watchdog 128 MiB; idle reap 10 min | Rust dispatch test and REPL tests (`PRIME_PARITY.md`) | Dispatch p95 88.8 us |
 | Cron punctuality | a due job fires within 60 s of its time, including after macOS system sleep; a job a tick cannot advance backs off 30 s, 60 s, 2 min ... 1 h | `cron_tick.rs` sleeps in chunks of <= 60 s and re-reads the wall clock | Tests `sleeps_in_bounded_chunks_and_backs_off_per_stuck_job` |
 | `sovereign.db` growth | <= 150 MB at the default 30-day retention for a heavy user (100 turns a day) | See below | Estimate, not yet measured on a populated file |
+| Session and attachment growth | not auto-deleted; see below | `du -sh ~/.jcode/sessions <home>/attachments` | Unmeasured; bounded per image only (25 MB) |
 | Update safety | a failed update leaves the old build bootable | `sovereign-update.sh` restores the old bundle and the `sovereign.db.pre-v*.bak` taken during the update (`docs/RELEASING.md`) | Test `a rollback restores the sovereign.db backup taken during the update and nothing older` |
 
 ### `sovereign.db` growth and retention
@@ -55,7 +56,24 @@ select count(*), sum(length(coalesce(input,''))+length(coalesce(output,''))) fro
 select name, sum(pgsize) from dbstat group by 1 order by 2 desc limit 5;
 ```
 
+### Session and attachment growth
+
+jcode stores each chat as JSON under `~/.jcode/sessions`, and an image part (`ContentBlock::Image`) is kept
+inline as base64 in that file (about 1.33x the image bytes, and once more as the staged copy in
+`<home>/attachments/<session>/`). One attached image is capped at 25 MB (`BYTES_MAX` in `rpc/attach.rs`), so
+a single chat message can add up to about 33 MB to its session file; plain text turns add a few KiB. Moving
+the bytes out of the session JSON would touch every provider's message conversion, so it is not done; the
+lever is a lower per-image cap or downscaling at attach time. Chats are the user's data: there is no
+automatic retention. The user removes them per chat (delete everywhere also removes the chat's
+`attachments/` directory). Check sizes with `du -sh ~/.jcode/sessions <home>/attachments`.
+
 ## Availability and recovery
+
+- No window: goals, loops, cron jobs and bots run without any window, but only while the app process
+  lives. The engine exits when its parent (`HERMES_PARENT_PID`) goes away (watchdog in `src/bin/sovereign.rs`),
+  and `window-all-closed` keeps the app running, so closing every window does not stop them; quitting the
+  app or a force-kill does.
+- Backup: `sovereign.db.daily.bak`, at most once per 24 h after an integrity check; restore in `docs/RELEASING.md`.
 
 - Engine restart: active goals and loops resume once per process, retrying every 15 s until the
   continuation is accepted; the resume records no attempt and no turn. Unattended approvals parked for a

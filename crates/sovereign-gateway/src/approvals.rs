@@ -196,8 +196,9 @@ pub struct Hub {
     /// Exact commands the user approved after the fact: consumed by the next unattended run needing
     /// it (`once`), or good until the engine restarts (`session`; `always` only when Hermes's config
     /// can't take it, see [`allow_permanently`]).
-    once_grants: Mutex<HashSet<String>>,
-    sticky_grants: Mutex<HashSet<String>>,
+    // (session, command); an empty session is the in-memory stand-in for an "always" Hermes can't store.
+    once_grants: Mutex<HashSet<(String, String)>>,
+    sticky_grants: Mutex<HashSet<(String, String)>>,
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
     /// Where parked unattended prompts persist (sovereign.db), so a restart keeps them.
     store: std::sync::Mutex<Option<Arc<sovereign_prime::entries::EntryStore>>>,
@@ -292,12 +293,17 @@ impl Hub {
         self.headless.lock().await.contains_key(session_id)
     }
 
+    async fn sticky(&self, session_id: &str, command: &str) -> bool {
+        let grants = self.sticky_grants.lock().await;
+        grants.contains(&(session_id.to_string(), command.to_string())) || grants.contains(&(String::new(), command.to_string()))
+    }
+
     /// An approval nobody can answer now (a cron / bot turn, or a goal with no desktop): allowed by
     /// the user's Hermes config or an earlier late approval (`once`), otherwise denied and parked as
     /// a normal desktop `approval` prompt so the user can approve it later.
     pub(crate) async fn unattended(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
         let surface = self.headless.lock().await.get(session_id).copied().unwrap_or("goal");
-        let granted = self.once_grants.lock().await.remove(command) || self.sticky_grants.lock().await.contains(command);
+        let granted = self.once_grants.lock().await.remove(&(session_id.to_string(), command.to_string())) || self.sticky(session_id, command).await;
         let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
         let allowlisted = home.as_deref().is_some_and(|home| allowlisted(home, command));
         if granted || allowlisted || home.is_some_and(|home| policy_allows(&home, surface)) {
@@ -368,13 +374,13 @@ impl Hub {
                 store.park_delete(&request_id);
             }
             match choice.as_str() {
-                "once" => drop(hub.once_grants.lock().await.insert(command.clone())),
-                "session" => drop(hub.sticky_grants.lock().await.insert(command.clone())),
+                "once" => drop(hub.once_grants.lock().await.insert((session.clone(), command.clone()))),
+                "session" => drop(hub.sticky_grants.lock().await.insert((session.clone(), command.clone()))),
                 // Permanent grants belong to Hermes's config; in memory only if it can't take them.
                 "always" => {
                     let saved = std::env::var_os("HERMES_HOME").is_some_and(|home| allow_permanently(Path::new(&home), &command));
                     if !saved {
-                        hub.sticky_grants.lock().await.insert(command.clone());
+                        hub.sticky_grants.lock().await.insert((String::new(), command.clone()));
                     }
                 }
                 _ => return,
@@ -393,7 +399,7 @@ impl Hub {
         // "always" is per command, as in Hermes: its permanent allowlist (or, when the config
         // can't take the grant, a sticky in-memory one) — never a blanket allow-everything.
         let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
-        if home.as_deref().is_some_and(|home| allowlisted(home, command)) || self.sticky_grants.lock().await.contains(command) {
+        if home.as_deref().is_some_and(|home| allowlisted(home, command)) || self.sticky(session_id, command).await {
             self.audit(session_id, tool, command, "always", "allowlist");
             return "always".into();
         }
@@ -447,19 +453,17 @@ impl Hub {
             "always" => {
                 let saved = home.as_deref().is_some_and(|home| allow_permanently(home, command));
                 if !saved {
-                    self.sticky_grants.lock().await.insert(command.to_string());
+                    self.sticky_grants.lock().await.insert((String::new(), command.to_string()));
                 }
             }
             _ => {}
         }
-        let timed_out = choice == "deny";
         let final_choice = if matches!(choice.as_str(), "once" | "session" | "always") {
             choice
         } else {
             "deny".into()
         };
-        let actor = if final_choice == "deny" && timed_out { "user" } else { "user" };
-        self.audit(session_id, tool, command, &final_choice, actor);
+        self.audit(session_id, tool, command, &final_choice, "user");
         final_choice
     }
 
@@ -773,13 +777,23 @@ mod tests {
         // The user approves it once: the next unattended run passes, exactly once.
         assert!(hub.answer(frame["id"].as_str().unwrap(), "once").await);
         for _ in 0..50 {
-            if hub.once_grants.lock().await.contains("rm -rf build") {
+            if hub.once_grants.lock().await.contains(&("cron-run".to_string(), "rm -rf build".to_string())) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "once");
         assert_eq!(hub.decide("cron-run", "bash", "rm -rf build", "r").await, "deny");
+    }
+
+    #[tokio::test]
+    async fn a_session_grant_belongs_to_its_session_not_the_process() {
+        let hub = Arc::new(Hub::default());
+        hub.mark_headless("a", "cron").await;
+        hub.mark_headless("b", "cron").await;
+        hub.sticky_grants.lock().await.insert(("a".into(), "rm -rf build".into()));
+        assert_eq!(hub.decide("a", "bash", "rm -rf build", "r").await, "once");
+        assert_eq!(hub.decide("b", "bash", "rm -rf build", "r").await, "deny");
     }
 
     #[test]

@@ -66,6 +66,32 @@ pub(crate) fn with_sink<R>(
     f(Some(&MemorySink { remember: &remember, forget: &forget }))
 }
 
+const MAX_TOOL_LINES: usize = 40;
+
+/// Tool rows carry whole outputs and no verdict; Prime's transcript shows `[Tool result (name, error)]`
+/// per call. Reduce each to one line (`ok`/`fail`, first line <= 120 chars) and keep the newest
+/// [`MAX_TOOL_LINES`] so the gate sees outcomes, not file dumps. Only user turns feed the apply gate.
+fn compact_tools(turns: Vec<Turn>) -> Vec<Turn> {
+    let mut left = turns.iter().filter(|t| t.role == "tool").count().saturating_sub(MAX_TOOL_LINES);
+    turns
+        .into_iter()
+        .filter_map(|t| {
+            if t.role != "tool" {
+                return Some(t);
+            }
+            if left > 0 {
+                left -= 1;
+                return None;
+            }
+            let first = t.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+            let lower = first.to_lowercase();
+            let failed = ["error", "failed", "traceback", "panicked", "no such file", "permission denied"].iter().any(|k| lower.contains(k));
+            let line: String = first.chars().take(120).collect();
+            Some(Turn { role: "tool".into(), text: format!("{} {line}", if failed { "fail:" } else { "ok:" }) })
+        })
+        .collect()
+}
+
 /// Prime's `AUTO_REFINE_REVIEW_SYSTEM_PROMPT` / `parseAutoRefineReview`: one
 /// cheap call that decides whether a `/refine` pass is worth its cost.
 struct GateReview {
@@ -113,22 +139,33 @@ pub(crate) async fn pass(
 ) -> anyhow::Result<Option<String>> {
     let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
     let history = conn.history(session).await?;
-    let turns: Vec<Turn> = history["messages"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .map(|m| Turn {
-                    role: m["role"].as_str().unwrap_or_default().to_string(),
-                    text: m["content"].as_str().unwrap_or_default().to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let turns = compact_tools(
+        history["messages"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|m| Turn {
+                        role: m["role"].as_str().unwrap_or_default().to_string(),
+                        text: m["content"].as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     // The model-callable `refine` tool (and the REPL's `refine` host
     // function) never apply mid-turn: they only schedule a request, run here
     // once the turn has actually ended. At most one pending request survives
     // per session (a later call before turn-end just replaces it).
-    let store = sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&conn.config().home)).ok();
+    let store = match sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(&conn.config().home)) {
+        Ok(store) => Some(store),
+        Err(err) => {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("learning is off: cannot open the entry store: {err:#}");
+            }
+            return Err(anyhow::anyhow!("learning is off: cannot open the entry store ({err:#})"));
+        }
+    };
     let mut refine_summary = None;
     if let Some(store) = &store {
         if let Ok(Some((instructions, global))) = store.take_pending_refine(session) {
@@ -212,6 +249,22 @@ mod tests {
         assert!(set_learning_enabled(home, &serde_json::json!(true)).unwrap());
         assert!(learning_enabled(home));
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tool_rows_become_one_bounded_outcome_line_and_only_the_newest_are_kept() {
+        let mut turns = vec![Turn { role: "user".into(), text: "fix it".into() }];
+        turns.push(Turn { role: "tool".into(), text: format!("\nerror: cannot find x {}\nmore", "y".repeat(300)) });
+        for i in 0..MAX_TOOL_LINES {
+            turns.push(Turn { role: "tool".into(), text: format!("done {i}\n{}", "z".repeat(5000)) });
+        }
+        let out = compact_tools(turns);
+        let tools: Vec<_> = out.iter().filter(|t| t.role == "tool").collect();
+        assert_eq!(tools.len(), MAX_TOOL_LINES, "the oldest (the failure) fell off the cap");
+        assert_eq!(tools[0].text, "ok: done 0");
+        let one = compact_tools(vec![Turn { role: "tool".into(), text: format!("Error: boom {}", "q".repeat(300)) }]);
+        assert!(one[0].text.starts_with("fail: Error: boom") && one[0].text.len() <= 126);
+        assert_eq!(out[0].text, "fix it");
     }
 
     #[test]

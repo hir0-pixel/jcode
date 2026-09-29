@@ -12,6 +12,8 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 enum Step {
     Sql(&'static str),
@@ -157,7 +159,61 @@ pub fn open(path: &Path, schema: &str) -> Result<Connection> {
     conn.execute_batch(schema)?;
     run(&conn, had_data.then_some(path))?;
     private(path);
+    spawn_daily_backup(path);
     Ok(conn)
+}
+
+const DAILY: Duration = Duration::from_secs(24 * 3600);
+static BACKUP_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static BACKUP_STARTED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// Why the last routine backup failed (None: fine or not yet run); the gateway reports it as a status.
+pub fn backup_error() -> Option<String> {
+    BACKUP_ERROR.lock().ok().and_then(|e| e.clone())
+}
+
+/// Once per process and file, off the hot path: refresh `sovereign.db.daily.bak` if it is over a day old.
+fn spawn_daily_backup(path: &Path) {
+    let Ok(mut started) = BACKUP_STARTED.lock() else { return };
+    if started.iter().any(|p| p == path) {
+        return;
+    }
+    started.push(path.to_path_buf());
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let result = daily_backup(&path, DAILY);
+        if let Ok(mut e) = BACKUP_ERROR.lock() {
+            *e = result.as_ref().err().map(|e| e.to_string());
+        }
+        if let Err(e) = result {
+            eprintln!("sovereign.db daily backup: {e}");
+        }
+    });
+}
+
+/// `PRAGMA quick_check`, then `VACUUM INTO sovereign.db.daily.bak` (one copy, 0600, temp then rename)
+/// when that backup is missing or older than `max_age`. A db that fails the check is reported and
+/// never replaces a good backup. Returns whether a new backup was written.
+pub fn daily_backup(path: &Path, max_age: Duration) -> Result<bool> {
+    let backup = path.with_file_name("sovereign.db.daily.bak");
+    let fresh = std::fs::metadata(&backup).and_then(|m| m.modified()).ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok()).is_some_and(|age| age < max_age);
+    if fresh || !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| anyhow::anyhow!("integrity check could not open sovereign.db (backup kept): {e}"))?;
+    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .unwrap_or_else(|e| e.to_string());
+    if check != "ok" {
+        bail!("sovereign.db failed quick_check (backup kept): {check}");
+    }
+    let tmp = backup.with_extension("bak.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])?;
+    private(&tmp);
+    std::fs::rename(&tmp, &backup)?;
+    Ok(true)
 }
 
 /// Bring `conn` to [`CURRENT`]; `backup_of` is the file to copy first (None: nothing worth keeping).
@@ -218,6 +274,25 @@ mod tests {
             assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "{}", file.display());
         }
         drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn daily_backup_is_made_once_a_day_and_never_replaced_by_a_corrupt_db() {
+        let dir = std::env::temp_dir().join(format!("migrate-daily-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES(1);").unwrap();
+        drop(conn);
+        let bak = dir.join("sovereign.db.daily.bak");
+        assert!(daily_backup(&path, DAILY).unwrap());
+        assert!(!daily_backup(&path, DAILY).unwrap(), "fresh backup is not redone");
+        assert_eq!(Connection::open(&bak).unwrap().query_row("SELECT a FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        std::fs::write(&path, vec![0x5a; 8192]).unwrap();
+        assert!(daily_backup(&path, Duration::ZERO).is_err());
+        assert_eq!(Connection::open(&bak).unwrap().query_row("SELECT a FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "the good backup survives");
         let _ = std::fs::remove_dir_all(dir);
     }
 

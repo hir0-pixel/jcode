@@ -193,6 +193,10 @@ One data flow, all Prime's design (`refinement.ts` `reviewAutoRefine`,
    keyword pre-filter.
 2. **Gate** (`learn.rs`): one cheap model call over the unexamined messages
    (watermark in `EntryStore`); `shouldRefine=false` costs only that call.
+   Tool rows reach it as one line each (`ok:`/`fail:` plus the first output line, at most 120 chars,
+   newest 40 kept), as Prime's transcript labels results by outcome. History carries no tool name.
+   Token impact: lower, since whole tool outputs no longer fill the 60k-char transcript. A store that
+   cannot open is logged once and returned as an error status instead of silently disabling learning.
 3. **Refine CRUD** (`sovereign-prime/src/refine.rs`): one call producing
    create/update/delete edits for prompt, memory, skill and subagent entries,
    applied as a changeset (rollback via `/refine rollback`). Skill edits must
