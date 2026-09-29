@@ -5,27 +5,35 @@
 //! or reorder. Before the first migration of a file that already holds data, a consistent copy is
 //! written next to it (`sovereign.db.pre-vN.bak`, the version it is going TO) so a bad update or a
 //! rollback of the app bundle can restore it. A file from a NEWER engine is refused, not touched.
+//! This is the only place that versions the file: jcode's memory tables (`jcode-base` `memory_store`)
+//! call [`run`] too, and their legacy layout upgrade is migration 4 below.
 
 use anyhow::{Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use serde_json::Value;
 use std::path::Path;
 
+enum Step {
+    Sql(&'static str),
+    Code(fn(&Connection) -> Result<()>),
+}
+
 /// `MIGRATIONS[n]` moves the schema to version `n + 1`.
-const MIGRATIONS: &[&str] = &[
+const MIGRATIONS: &[Step] = &[
     // 1: baseline. The stores' own IF NOT EXISTS schemas define it; this only stamps the version.
-    "",
+    Step::Sql(""),
     // 2: unattended approvals parked for a late answer survive an engine restart.
-    "CREATE TABLE IF NOT EXISTS parked_approvals(
+    Step::Sql("CREATE TABLE IF NOT EXISTS parked_approvals(
         request_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         params TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL
-    );",
+    );"),
     // 3: observability tables take EveStack's names. A file that never had the old tables gets them
     // as empty shells first so the renames always apply; the observability baseline
     // (`gateway/observability/schema.rs`) adds the newer columns and recreates views, indexes and the
     // memory-deletion trigger. Must run before that baseline creates the new names.
-    "DROP VIEW IF EXISTS obs_fact_turn; DROP VIEW IF EXISTS obs_fact_tool_call; DROP VIEW IF EXISTS obs_alert_state;
+    Step::Sql("DROP VIEW IF EXISTS obs_fact_turn; DROP VIEW IF EXISTS obs_fact_tool_call; DROP VIEW IF EXISTS obs_alert_state;
     DROP TRIGGER IF EXISTS obs_memory_audit;
     DROP INDEX IF EXISTS obs_runs_recent; DROP INDEX IF EXISTS obs_runs_session; DROP INDEX IF EXISTS obs_runs_kind_recent;
     DROP INDEX IF EXISTS obs_runs_outcome_recent; DROP INDEX IF EXISTS obs_runs_status_started; DROP INDEX IF EXISTS obs_runs_root;
@@ -66,8 +74,33 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE obs_runs RENAME TO fact_turn; ALTER TABLE obs_spans RENAME TO spans;
     ALTER TABLE obs_content RENAME TO span_content; ALTER TABLE obs_approvals RENAME TO approvals;
-    ALTER TABLE obs_alerts RENAME TO alert_state; ALTER TABLE obs_memory_deletions RENAME TO memory_deletions;",
+    ALTER TABLE obs_alerts RENAME TO alert_state; ALTER TABLE obs_memory_deletions RENAME TO memory_deletions;"),
+    // 4: memory tables (owned by jcode-base `memory_store`, which re-applies its own IF NOT EXISTS schema
+    // after this): the v1 layout kept each entry's JSON inline in `memories`; it moves to `memory_entries`
+    // with the embedding as little-endian f32 bytes. Formerly memory's private schema_version 1 -> 2.
+    Step::Code(memory_entry_layout),
 ];
+
+fn memory_entry_layout(conn: &Connection) -> Result<()> {
+    if !conn.prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name='entry'")?.exists([])? {
+        return Ok(());
+    }
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS memory_entries(rid INTEGER PRIMARY KEY, entry TEXT NOT NULL, embedding BLOB);")?;
+    let rows: Vec<(i64, String)> = conn
+        .prepare("SELECT rid, entry FROM memories")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (rid, entry) in rows {
+        let mut entry: Value = serde_json::from_str(&entry)?;
+        let embedding: Option<Vec<u8>> = entry
+            .as_object_mut()
+            .and_then(|o| o.remove("embedding"))
+            .and_then(|e| e.as_array().map(|a| a.iter().filter_map(Value::as_f64).flat_map(|f| (f as f32).to_le_bytes()).collect()));
+        conn.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, entry.to_string(), embedding])?;
+    }
+    conn.execute_batch("DROP TRIGGER IF EXISTS memories_ad; ALTER TABLE memories DROP COLUMN entry;")?;
+    Ok(())
+}
 
 /// The schema version this engine writes.
 pub const CURRENT: u32 = MIGRATIONS.len() as u32;
@@ -108,8 +141,11 @@ pub fn run(conn: &Connection, backup_of: Option<&Path>) -> Result<()> {
     // Another opener may have migrated meanwhile: re-read the version under the write lock.
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version(conn)? as usize) {
-            conn.execute_batch(sql)?;
+        for (i, step) in MIGRATIONS.iter().enumerate().skip(version(conn)? as usize) {
+            match step {
+                Step::Sql(sql) => conn.execute_batch(sql)?,
+                Step::Code(f) => f(conn)?,
+            }
             conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
         }
         Ok(())

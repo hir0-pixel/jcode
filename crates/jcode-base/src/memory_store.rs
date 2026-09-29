@@ -102,37 +102,19 @@ fn with_db<R>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<R>) -> Resu
     f(map.get_mut(path).expect("inserted above"))
 }
 
-const SCHEMA_VERSION: i64 = 4;
-
 /// Gateway startup uses the same versioned schema migration as memory.
 pub fn migrate_sovereign_db(db: &mut Connection) -> Result<()> {
     migrate(db)
 }
 
-/// Bring an existing database to `SCHEMA_VERSION`, then ensure the schema.
-/// v1 kept the entry JSON (with the embedding as JSON numbers) inline in
-/// `memories`; v2 moves it to `memory_entries`.
+/// Version and upgrade the file through `sovereign_prime::migrate` (the one owner of `user_version`:
+/// backup before migrating a file with data, refusal of a newer file), then ensure this store's schema.
 fn migrate(db: &mut Connection) -> Result<()> {
-    let has_inline_entry = db
-        .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name='entry'")?
-        .exists([])?;
-    if has_inline_entry {
-        let tx = db.transaction()?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS memory_entries(rid INTEGER PRIMARY KEY, entry TEXT NOT NULL, embedding BLOB);")?;
-        let rows: Vec<(i64, String)> = tx
-            .prepare("SELECT rid, entry FROM memories")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        for (rid, entry) in rows {
-            let entry: MemoryEntry = serde_json::from_str(&entry)?;
-            let (entry, embedding) = split_embedding(&entry)?;
-            tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, entry, embedding])?;
-        }
-        tx.execute_batch("DROP TRIGGER IF EXISTS memories_ad; ALTER TABLE memories DROP COLUMN entry;")?;
-        tx.commit()?;
-    }
+    db.execute_batch("PRAGMA busy_timeout=5000")?;
+    let path = db.path().filter(|p| !p.is_empty()).map(PathBuf::from);
+    let had_data: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')", [], |r| r.get(0))?;
+    sovereign_prime::migrate::run(db, path.as_deref().filter(|_| had_data))?;
     db.execute_batch(SCHEMA)?;
-    db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES ('schema_version', ?1)", [SCHEMA_VERSION.to_string()])?;
     Ok(())
 }
 
@@ -477,6 +459,31 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert!(!columns.contains(&"entry".to_string()));
+    }
+
+    #[test]
+    fn a_v4_memory_database_is_versioned_backed_up_and_a_newer_file_is_refused() {
+        let (_d, path) = db();
+        let entry = MemoryEntry::new(MemoryCategory::Fact, "Deploys go out on Fridays");
+        let mut g = MemoryGraph::new();
+        g.add_memory(entry.clone());
+        save_graph(&path, "global", &g, None).unwrap();
+        close(&path);
+        {
+            // What the previous release left behind: memory's own schema_version 4 in a file at user_version 3.
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch("PRAGMA user_version = 3; INSERT OR REPLACE INTO memory_meta VALUES('schema_version','4');").unwrap();
+        }
+        assert_eq!(load_graph(&path, "global").unwrap().unwrap().memories.get(&entry.id), Some(&entry));
+        assert_eq!(recall(&path, &["global"], "deploys friday", 5).len(), 1);
+        let version: u32 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, sovereign_prime::migrate::CURRENT);
+        let backup = path.with_file_name(format!("sovereign.db.pre-v{}.bak", sovereign_prime::migrate::CURRENT));
+        assert!(Connection::open(backup).unwrap().query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap() == 1);
+        // A file written by a newer engine is refused, not opened.
+        close(&path);
+        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {}", sovereign_prime::migrate::CURRENT + 1)).unwrap();
+        assert!(load_graph(&path, "global").unwrap_err().to_string().contains("newer than this engine"));
     }
 
     /// `cargo test -p jcode-base --release --lib memory_store::tests::scaling -- --ignored --nocapture`
