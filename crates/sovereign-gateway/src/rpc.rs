@@ -1955,6 +1955,17 @@ impl Conn {
                 }
                 Ok(json!({ "resolved": resolved }))
             }
+            // Python would run these outside the approval hook: ask first.
+            "shell.exec" | "cli.exec" => {
+                if let Some(command) = ungated_exec_command(method, p) {
+                    let session = p["session_id"].as_str().unwrap_or("");
+                    let choice = self.hub.decide(session, method, &command, "runs a command outside the agent loop").await;
+                    if !matches!(choice.as_str(), "once" | "session" | "always") {
+                        return Err(RpcError::params("denied: the command was not approved"));
+                    }
+                }
+                self.forward(method, p).await
+            }
             _ => self.forward(method, p).await,
         }
     }
@@ -2444,6 +2455,25 @@ impl Default for RunOpts<'_> {
 
 /// Bot chat key -> engine session, persisted in `sovereign.db` (`engine_settings`) so a bot
 /// conversation survives an engine restart.
+/// The command text to put in front of the approval gate, or None for the fixed
+/// profile edits the desktop's own dialogs issue (`profile delete|describe`,
+/// `config unset model`). Anything else Hermes's CLI can do, `chat -q` included,
+/// drives an agent or a shell, so it needs a yes.
+fn ungated_exec_command(method: &str, p: &Value) -> Option<String> {
+    if method == "shell.exec" {
+        return Some(p["command"].as_str().unwrap_or("").to_string());
+    }
+    let argv: Vec<&str> = p["argv"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let rest = match argv.as_slice() {
+        ["--profile", _, rest @ ..] => rest,
+        rest => rest,
+    };
+    match rest {
+        ["profile", "delete" | "describe", ..] | ["config", "unset", "model"] => None,
+        _ => Some(format!("hermes {}", argv.join(" "))),
+    }
+}
+
 fn bot_session_setting(key: &str) -> String {
     format!("bot_session:{key}")
 }
@@ -2767,6 +2797,16 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_rpcs_are_gated_unless_they_are_the_desktops_profile_edits() {
+        let cli = |argv: Value| ungated_exec_command("cli.exec", &json!({ "argv": argv }));
+        assert_eq!(cli(json!(["profile", "delete", "w", "--yes"])), None);
+        assert_eq!(cli(json!(["--profile", "w", "config", "unset", "model"])), None);
+        assert_eq!(cli(json!(["chat", "-q", "rm -rf /"])).as_deref(), Some("hermes chat -q rm -rf /"));
+        assert_eq!(cli(json!([])).as_deref(), Some("hermes "));
+        assert_eq!(ungated_exec_command("shell.exec", &json!({ "command": "ls" })).as_deref(), Some("ls"));
+    }
 
     #[test]
     fn a_bot_chat_keeps_its_engine_session_across_an_engine_restart() {
