@@ -7,14 +7,102 @@
 use std::path::Path;
 use std::sync::Once;
 
-/// `KEY=value` from dotenv text (optional `export `, one layer of quotes); empty means unset.
+/// Every binding in dotenv text, parsed like python-dotenv (which Hermes loads `.env` with):
+/// `export ` prefix, `'quoted'` / `"quoted"` values (multi-line, with dotenv's escapes), a ` # comment`
+/// stripped from unquoted values, a key alone is unset. Later duplicates come later in the list.
+/// Not done: `${VAR}` interpolation.
+fn parse_all(content: &str) -> Vec<(String, Option<String>)> {
+    let c: Vec<char> = content.strip_prefix('\u{feff}').unwrap_or(content).chars().collect();
+    let (mut i, mut out) = (0, Vec::new());
+    let blank = |c: char| c.is_whitespace() && c != '\n' && c != '\r';
+    let skip = |i: &mut usize, f: &dyn Fn(char) -> bool| while *i < c.len() && f(c[*i]) { *i += 1 };
+    let eol = |i: &mut usize| {
+        while *i < c.len() && !matches!(c[*i], '\n' | '\r') { *i += 1 }
+        if c.get(*i) == Some(&'\r') && c.get(*i + 1) == Some(&'\n') { *i += 1 }
+        *i = (*i + 1).min(c.len());
+    };
+    // The text between quotes starting at c[i] (a quote), with its escapes decoded; i ends past the quote.
+    let quoted = |i: &mut usize| -> Option<String> {
+        let q = c[*i];
+        let close = |literal: bool| {
+            let mut j = *i + 1;
+            while j < c.len() {
+                if c[j] == '\\' && c.get(j + 1) == Some(&q) && !literal { j += 2 } else if c[j] == q { return Some(j) } else { j += 1 }
+            }
+            None
+        };
+        let end = close(false).or_else(|| close(true))?;
+        let raw: Vec<char> = c[*i + 1..end].to_vec();
+        *i = end + 1;
+        let (mut text, mut k) = (String::new(), 0);
+        while k < raw.len() {
+            let esc = raw.get(k + 1).and_then(|n| match (q, *n) {
+                (_, '\\') | (_, '\'') => Some(*n),
+                ('"', '"') => Some('"'),
+                ('"', 'a') => Some('\x07'), ('"', 'b') => Some('\x08'), ('"', 'f') => Some('\x0c'),
+                ('"', 'n') => Some('\n'), ('"', 'r') => Some('\r'), ('"', 't') => Some('\t'), ('"', 'v') => Some('\x0b'),
+                _ => None,
+            });
+            match (raw[k], esc) {
+                ('\\', Some(e)) => { text.push(e); k += 2 }
+                (ch, _) => { text.push(ch); k += 1 }
+            }
+        }
+        Some(text)
+    };
+    loop {
+        skip(&mut i, &|ch| ch.is_whitespace());
+        if i >= c.len() { break }
+        let word: String = c[i..].iter().take(7).collect();
+        if word.strip_prefix("export").is_some_and(|r| r.chars().next().is_some_and(blank)) {
+            i += 6;
+            skip(&mut i, &blank);
+        }
+        let key = match c[i] {
+            '#' => None,
+            '\'' => quoted(&mut i),
+            _ => {
+                let start = i;
+                skip(&mut i, &|ch| !ch.is_whitespace() && ch != '=' && ch != '#');
+                (i > start).then(|| c[start..i].iter().collect::<String>())
+            }
+        };
+        skip(&mut i, &blank);
+        let mut value = None;
+        let mut ok = key.is_some();
+        if ok && c.get(i) == Some(&'=') {
+            i += 1;
+            skip(&mut i, &blank);
+            value = Some(match c.get(i) {
+                Some('\'' | '"') => match quoted(&mut i) { Some(v) => v, None => { ok = false; String::new() } },
+                None | Some('\n' | '\r') => String::new(),
+                _ => {
+                    let start = i;
+                    skip(&mut i, &|ch| !matches!(ch, '\n' | '\r'));
+                    let part: String = c[start..i].iter().collect();
+                    // python-dotenv: re.sub(r"\s+#.*", "", part).rstrip()
+                    let cut = part.char_indices().find(|&(at, ch)| ch == '#' && part[..at].ends_with(char::is_whitespace)).map_or(part.len(), |(at, _)| at);
+                    part[..cut].trim_end().to_string()
+                }
+            });
+        }
+        skip(&mut i, &blank);
+        if c.get(i) == Some(&'#') {
+            skip(&mut i, &|ch| !matches!(ch, '\n' | '\r'));
+        }
+        skip(&mut i, &blank);
+        let clean = i >= c.len() || matches!(c[i], '\n' | '\r');
+        eol(&mut i);
+        if let (Some(key), true, true) = (key, ok, clean) {
+            out.push((key, value));
+        }
+    }
+    out
+}
+
+/// `KEY`'s value in dotenv text (the last definition wins, as in Hermes); empty means unset.
 fn parse(content: &str, key: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        let rest = line.trim().trim_start_matches("export ").trim_start();
-        let value = rest.strip_prefix(key)?.trim_start().strip_prefix('=')?;
-        let value = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-        (!value.is_empty()).then(|| value.to_string())
-    })
+    parse_all(content).into_iter().rev().find(|(k, _)| k == key).and_then(|(_, v)| v).filter(|v| !v.is_empty())
 }
 
 fn resolve_in(home: &Path, key: &str) -> Option<String> {
@@ -51,6 +139,39 @@ mod tests {
         assert_eq!(resolve_in(&dir, "FAKE_PROVIDER_API_KEY").as_deref(), Some("fake-key-123"));
         assert_eq!(resolve_in(&dir, "FAKE_PROVIDER_API_KEY_2").as_deref(), Some("x"));
         assert_eq!(resolve_in(&dir, "EMPTY_API_KEY"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The fixture as both parsers read it: python-dotenv (Hermes's own venv) and `parse_all`.
+    #[test]
+    fn dotenv_parsing_agrees_with_python_dotenv_on_a_fixture() {
+        let fixture = concat!(
+            "\u{feff}# comment\n\nPLAIN=abc\nSPACED = spaced value  \nINLINE=value # trailing comment\nHASH=a#b\nHASHFIRST=#notacomment\n",
+            "export EXPORTED=yes\nexport  TWO=2\nexporter=notexport\nDUP=first\nDUP=last\nEMPTY=\nBARE\n",
+            "SQ='single # kept' # comment\nDQ=\"dq # kept\" # comment\nESC=\"tab\\there \\\"q\\\" back\\\\slash \\$\"\nSESC='it\\'s \\n raw'\n",
+            "MULTI=\"line1\nline2\"\nCRLF=windows\r\nAFTER=1\nBAD=\"x\" junk\nUNCLOSED=\"never\nLAST=end",
+        );
+        let ours: std::collections::BTreeMap<String, Option<String>> = parse_all(fixture).into_iter().collect();
+        let dir = std::env::temp_dir().join(format!("hermes-env-dotenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(".env");
+        std::fs::write(&file, fixture).unwrap();
+        let python = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../hermes-agent/.venv/bin/python");
+        if !python.exists() {
+            eprintln!("skipped: no Hermes venv at {}", python.display());
+            assert_eq!(ours["DUP"].as_deref(), Some("last"));
+            return;
+        }
+        let out = std::process::Command::new(python)
+            .args(["-c", "import sys,json\nfrom dotenv import dotenv_values\nprint(json.dumps(dotenv_values(sys.argv[1], encoding='utf-8-sig')))", file.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let theirs: std::collections::BTreeMap<String, Option<String>> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(ours, theirs);
+        assert_eq!(ours["DUP"].as_deref(), Some("last"));
+        assert_eq!(parse(fixture, "INLINE").as_deref(), Some("value"));
+        assert_eq!(parse(fixture, "EMPTY"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
