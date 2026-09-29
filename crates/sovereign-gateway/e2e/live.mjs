@@ -393,7 +393,7 @@ if (process.env.E2E_SKIP_CHAT !== '1') {
   if (echoed) check(/TOKEN=\[(UNSET)?\]/.test(echoed), "the model's shell sees an empty desktop token")
   else console.log("     skipped: the model did not run the token probe")
   const approvalFile = path.join(home, 'sovereign-approval.json')
-  check(fs.existsSync(approvalFile) && (fs.statSync(approvalFile).mode & 0o077) === 0, 'approval endpoint file is owner-only')
+  check(!fs.existsSync(approvalFile), 'no approval secret file exists for the model to read')
   await ask(asid, 'Run exactly this shell command with the bash tool: echo safe-command')
   check(approvals.length === n2, 'safe commands ran without a prompt')
 }

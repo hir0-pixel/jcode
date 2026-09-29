@@ -135,6 +135,7 @@ fn parse_gateway_args(args: &[String]) -> anyhow::Result<GatewayArgs> {
                 }
             }
             v if v.starts_with("--profile=") => {}
+            "--token-stdin" => {}
             "--provider" | "-p" => {
                 provider = ValueEnum::from_str(take(&mut i, value)?, true)
                     .map_err(|e| anyhow::anyhow!(e))?;
@@ -156,6 +157,23 @@ fn parse_gateway_args(args: &[String]) -> anyhow::Result<GatewayArgs> {
     })
 }
 
+/// `--token-stdin`: the first stdin line is the token (an empty one is an error, not a silent fallback
+/// to a generated token the desktop does not know). Otherwise the dev env var, if any.
+fn launch_token(
+    args: &[String],
+    mut stdin: impl std::io::BufRead,
+    env_token: Option<String>,
+) -> Result<Option<String>> {
+    if !args.iter().any(|a| a == "--token-stdin") {
+        return Ok(env_token);
+    }
+    let mut line = String::new();
+    stdin.read_line(&mut line)?;
+    let token = line.trim();
+    anyhow::ensure!(!token.is_empty(), "--token-stdin: no token on stdin");
+    Ok(Some(token.to_owned()))
+}
+
 fn main() -> Result<()> {
     // pre_tool gate (spawned by jcode before each tool call): ask a human
     // before risky shell commands. Exit 0 allows, 2 blocks.
@@ -164,10 +182,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("__pre-tool") {
-        let file = jcode::storage::jcode_dir()
-            .map(|d| d.join("sovereign-approval.json"))
-            .unwrap_or_default();
-        std::process::exit(sovereign_gateway::approvals::hook::run(&file));
+        std::process::exit(sovereign_gateway::approvals::hook::run());
     }
 
     // Always unload a warmed Ollama alias on process exit (including SIGTERM),
@@ -191,9 +206,11 @@ fn main() -> Result<()> {
             }
         });
     }
-    // Keep the desktop's session token out of the environment that tool
-    // subprocesses (including the model's shell commands) inherit.
-    if let Ok(token) = std::env::var("HERMES_DASHBOARD_SESSION_TOKEN") {
+    // The desktop's session token arrives on stdin (`--token-stdin`), so it is never in this process's
+    // environment or argv, both of which `ps` shows to the model's shell commands. The env var is the
+    // dev path (running `sovereign serve` by hand): read, then removed for tool subprocesses.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(token) = launch_token(&argv, std::io::stdin().lock(), std::env::var("HERMES_DASHBOARD_SESSION_TOKEN").ok())? {
         // SAFETY: single-threaded here, before the runtime starts.
         unsafe { std::env::remove_var("HERMES_DASHBOARD_SESSION_TOKEN") };
         sovereign_gateway::auth::set_launch_token(token);
@@ -301,8 +318,19 @@ fn install_ollama_signal_unload() {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_default_hermes_home, parse_gateway_args, profile_home, sticky_profile};
+    use super::{export_default_hermes_home, launch_token, parse_gateway_args, profile_home, sticky_profile};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn launch_token_comes_from_stdin_when_asked_else_the_dev_env() {
+        let flag = ["serve".to_string(), "--token-stdin".to_string()];
+        let env = Some("from-env".to_string());
+        assert_eq!(launch_token(&flag, &b"from-pipe\n"[..], env.clone()).unwrap().as_deref(), Some("from-pipe"));
+        assert!(launch_token(&flag, &b"\n"[..], env.clone()).is_err(), "no silent fallback");
+        assert_eq!(launch_token(&["serve".to_string()], &b"ignored\n"[..], env).unwrap().as_deref(), Some("from-env"));
+        assert_eq!(launch_token(&[], &b""[..], None).unwrap(), None);
+        assert!(parse_gateway_args(&["serve".to_string(), "--token-stdin".to_string()]).is_ok());
+    }
 
     #[test]
     fn desktop_gateway_arguments_parse_without_cli_dispatch() {

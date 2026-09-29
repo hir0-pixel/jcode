@@ -575,12 +575,10 @@ pub async fn run_gateway(
                 token.clone(),
             );
         }
-        // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval.
-        let approval = serde_json::json!({ "addr": gateway.local_addr().to_string(), "secret": approval_secret });
-        write_private_file(
-            &crate::storage::jcode_dir()?.join("sovereign-approval.json"),
-            &approval.to_string(),
-        )?;
+        // Where the pre_tool hook (`sovereign __pre-tool`) asks for approval: handed to each hook
+        // process as env plus a single-use ticket, never written to a file or this process's env.
+        sovereign_gateway::approvals::init_tickets(gateway.local_addr().to_string(), approval_secret);
+        crate::hooks::set_pre_tool_env(sovereign_gateway::approvals::ticket_env);
         if let Ok(ready_file) = std::env::var("HERMES_DESKTOP_READY_FILE") {
             write_private_file(
                 std::path::Path::new(&ready_file),

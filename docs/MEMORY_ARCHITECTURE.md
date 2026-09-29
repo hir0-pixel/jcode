@@ -38,7 +38,7 @@ There is one `PRAGMA user_version` for the whole file, owned by `crates/sovereig
 The memory store calls it when it opens the file, so memory gets the same rules as every other table: a
 backup `sovereign.db.pre-v<N>.bak` before migrating a file with data, and refusal of a file from a newer
 engine. The legacy inline-entry to `memory_entries` layout change is migration 4. After migrating, the
-store re-applies its own `CREATE ... IF NOT EXISTS` schema. Update rollback: `RELEASING.md`.
+store re-applies its own `CREATE ... IF NOT EXISTS` schema. Update rollback: `docs/RELEASING.md`.
 
 ## Legacy import
 

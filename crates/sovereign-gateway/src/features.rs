@@ -127,6 +127,10 @@ impl Features {
         if let Some((url, token)) = self.engine_env.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             command.env("SOVEREIGN_ENGINE_URL", url).env("SOVEREIGN_ENGINE_TOKEN", token);
         }
+        // Where the engine's skill registry reads: without it Python's hub installs land in HERMES_HOME.
+        if let Ok(dir) = jcode_base::storage::jcode_dir() {
+            command.env("JCODE_HOME", dir);
+        }
         let mut child = command.args(args)
             .args(["serve", "--host", "127.0.0.1", "--port", "0", "--skip-build"])
             .env("HERMES_DASHBOARD_SESSION_TOKEN", &self.token)
@@ -230,8 +234,12 @@ async fn kill_backend(child: &mut Child) {
     if let Some(pid) = child.id() {
         // The Python backend can leave worker subprocesses behind; own a process
         // group so idle-stop reclaims the entire feature service tree.
-        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        let _ = child.wait().await;
+        // SIGTERM first so it can finish a write; SIGKILL the group if it lingers.
+        let _ = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            let _ = child.wait().await;
+        }
         return;
     }
     let _ = child.kill().await;
@@ -303,6 +311,28 @@ mod tests {
         assert!(!messaging_enabled(&dir));
         std::fs::write(dir.join("profiles/work/config.yaml"), "platforms:\n  whatsapp:\n    enabled: true\n").unwrap();
         assert!(messaging_enabled(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn backend_gets_the_engine_jcode_dir_and_a_sigterm_first() {
+        let dir = std::env::temp_dir().join(format!("features-term-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (env_out, term_out) = (dir.join("home"), dir.join("term"));
+        let script = dir.join("fake-hermes");
+        std::fs::write(&script, format!(
+            "#!/bin/sh\nprintf %s \"$JCODE_HOME\" > '{}'\ntrap 'echo t > \"{}\"; exit 0' TERM\necho HERMES_BACKEND_READY port=4244\nwhile :; do sleep 0.1; done\n",
+            env_out.display(), term_out.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let f = Features::new(vec![script.to_string_lossy().into_owned()]);
+        f.port().await.unwrap();
+        f.stop().await;
+        assert_eq!(std::fs::read_to_string(&env_out).unwrap(), jcode_base::storage::jcode_dir().unwrap().to_string_lossy());
+        assert!(term_out.exists(), "stopped with SIGTERM, not straight SIGKILL");
         let _ = std::fs::remove_dir_all(dir);
     }
 

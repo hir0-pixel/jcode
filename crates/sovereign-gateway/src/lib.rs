@@ -584,7 +584,7 @@ async fn handle(
         .await;
     }
     if req.method == "POST" && req.path == "/api/sovereign/approve" {
-        let secret_ok = auth::token_matches(
+        let secret_ok = approvals::redeem_ticket(
             &config.approval_secret,
             req.header("x-sovereign-approval-secret"),
         );
@@ -891,8 +891,9 @@ async fn handle(
         }
         // The engine owns skills end-to-end: real list/view/enable-disable
         // over the jcode skill registry (~/.jcode/skills + project overlays).
-        // Hub browse/install stays refused — that surface has no jcode
-        // backing and Hermes Python must not run its own skill maintenance.
+        // Hub browse/install is forwarded to Hermes Python, which installs into
+        // the same skills dir (the engine passes it JCODE_HOME); the registry
+        // here only reads and toggles what is installed.
         ("GET", "/api/skills") => {
             let registry = jcode_base::skill::SkillRegistry::shared_snapshot();
             let skills: Vec<Value> = registry

@@ -486,7 +486,7 @@ pub mod hook {
     /// Below jcode's configured hook timeout so we, not jcode, decide.
     const HOOK_TIMEOUT: Duration = Duration::from_secs(270);
 
-    pub fn run(approval_file: &std::path::Path) -> i32 {
+    pub fn run() -> i32 {
         let tool = std::env::var("JCODE_HOOK_TOOL_NAME").unwrap_or_default();
         if tool != "bash" {
             return 0;
@@ -511,7 +511,7 @@ pub mod hook {
             .first()
             .map(|f| format!("{f:?}"))
             .unwrap_or_else(|| "potentially destructive command".into());
-        match ask(approval_file, &session, &command, &reason) {
+        match ask(&session, &command, &reason) {
             Ok(choice) if matches!(choice.as_str(), "once" | "session" | "always") => 0,
             Ok(_) => block("The user declined this command. Do not retry it; ask the user how to proceed."),
             Err(err) => block(&format!("approval unavailable ({err}); the command was not run")),
@@ -523,15 +523,12 @@ pub mod hook {
         BLOCK
     }
 
-    fn ask(approval_file: &std::path::Path, session: &str, command: &str, reason: &str) -> Result<String, String> {
-        let config: Value = std::fs::read_to_string(approval_file)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .ok_or("no approval endpoint")?;
-        let addr = config["addr"].as_str().ok_or("no address")?;
-        let secret = config["secret"].as_str().ok_or("no secret")?;
+    fn ask(session: &str, command: &str, reason: &str) -> Result<String, String> {
+        // Both set by the engine on this process alone (see [`super::ticket_env`]).
+        let addr = std::env::var(super::ADDR_ENV).map_err(|_| "no approval endpoint")?;
+        let secret = std::env::var(super::TICKET_ENV).map_err(|_| "no approval ticket")?;
         let body = json!({ "session_id": session, "tool": "bash", "command": command, "reason": reason }).to_string();
-        let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let mut stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
         stream.set_read_timeout(Some(HOOK_TIMEOUT)).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         let request = format!(
@@ -585,6 +582,51 @@ mod tests {
         let h = hub.clone();
         let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf build", "r").await });
         let id = request_id(rx.recv().await.unwrap());
+pub(crate) const ADDR_ENV: &str = "SOVEREIGN_APPROVAL_ADDR";
+pub(crate) const TICKET_ENV: &str = "SOVEREIGN_APPROVAL_TICKET";
+/// A ticket is good for one request within this window.
+const TICKET_TTL_MS: i64 = 5 * 60 * 1000;
+
+static TICKET_KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+static TICKETS_USED: std::sync::Mutex<Option<HashMap<String, i64>>> = std::sync::Mutex::new(None);
+
+/// Remember where the approval endpoint listens and the process-memory key tickets are signed with.
+/// Nothing is written to disk or to the process environment, so the model's shell commands (same
+/// user) have nothing to read; see docs/SAFETY_SYSTEM.md.
+pub fn init_tickets(addr: String, key: String) {
+    let _ = TICKET_KEY.set((addr, key));
+}
+
+fn ticket_mac(key: &str, stamp: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{key}:{stamp}")).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Env for one `pre_tool` hook process: the endpoint and a fresh single-use ticket. Registered with
+/// jcode's hook runner, which sets it on that child only, never on the engine's own environment.
+pub fn ticket_env() -> Vec<(String, String)> {
+    let Some((addr, key)) = TICKET_KEY.get() else { return Vec::new() };
+    let stamp = format!("{}.{}", now_ms(), crate::auth::generate_token());
+    vec![(ADDR_ENV.into(), addr.clone()), (TICKET_ENV.into(), format!("{stamp}.{}", ticket_mac(key, &stamp)))]
+}
+
+/// True once per unexpired ticket minted with `key`.
+pub fn redeem_ticket(key: &str, ticket: Option<&str>) -> bool {
+    redeem_ticket_at(key, ticket, now_ms())
+}
+
+fn redeem_ticket_at(key: &str, ticket: Option<&str>, now: i64) -> bool {
+    let Some((stamp, mac)) = ticket.and_then(|t| t.rsplit_once('.')) else { return false };
+    let Some(issued) = stamp.split('.').next().and_then(|ms| ms.parse::<i64>().ok()) else { return false };
+    if !crate::auth::token_matches(&ticket_mac(key, stamp), Some(mac)) || now - issued > TICKET_TTL_MS || issued > now + 1000 {
+        return false;
+    }
+    let mut used = TICKETS_USED.lock().unwrap_or_else(|e| e.into_inner());
+    let used = used.get_or_insert_with(HashMap::new);
+    used.retain(|_, issued| now - *issued <= TICKET_TTL_MS);
+    used.insert(stamp.to_owned(), issued).is_none()
+}
+
         assert!(hub.answer(&id, "session").await);
         assert_eq!(asked.await.unwrap(), "session");
         // Granted for the session: no second prompt.
@@ -592,6 +634,27 @@ mod tests {
         // "always" covers that exact command in every session, never other commands.
         let (_c3, mut rx3) = client(&hub, "u").await;
         let h = hub.clone();
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+
+    #[test]
+    fn a_ticket_is_signed_single_use_and_expires() {
+        let key = "process-memory-key";
+        let stamp = format!("{}.abc", now_ms());
+        let ticket = format!("{stamp}.{}", ticket_mac(key, &stamp));
+        assert!(!redeem_ticket(key, None));
+        assert!(!redeem_ticket("other-key", Some(&ticket)), "signed with a different key");
+        assert!(!redeem_ticket(key, Some(&format!("{stamp}.{}", "0".repeat(64)))), "forged mac");
+        assert!(redeem_ticket(key, Some(&ticket)));
+        assert!(!redeem_ticket(key, Some(&ticket)), "replay");
+        let old = format!("1000.abc");
+        let expired = format!("{old}.{}", ticket_mac(key, &old));
+        assert!(!redeem_ticket(key, Some(&expired)), "expired");
+        assert!(!redeem_ticket(key, Some(&format!("{old}.x"))));
+    }
+}
+
         let asked = tokio::spawn(async move { h.decide("u", "bash", "cargo publish", "r").await });
         let id = request_id(rx3.recv().await.unwrap());
         assert!(hub.answer(&id, "always").await);

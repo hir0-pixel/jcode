@@ -1,6 +1,6 @@
 # Releasing and updating the Akira desktop bundle
 
-(The root `RELEASING.md` is the upstream jcode release process; this file is the desktop bundle.)
+(This file is the desktop bundle release process; upstream jcode's tag/brew/AUR one was removed.)
 
 ## What ships together
 
@@ -47,15 +47,21 @@ If that doesn't happen within 120 s (`SOVEREIGN_UPDATE_WAIT`) it quits the new a
 same swap by hand. The rollback also restores `sovereign.db`: the new engine migrates it (and takes
 `sovereign.db.pre-v<N>.bak`) before the app can report healthy, and an older engine refuses a newer file, so the
 script copies the newest `sovereign.db.pre-v*.bak` created after the update started over `<JCODE_HOME>/sovereign.db`
-(default `~/.jcode`, override `SOVEREIGN_UPDATE_DBDIR`) and removes `-wal`/`-shm`. No backup newer than the start
+(default `~/.jcode`, override `SOVEREIGN_UPDATE_DBDIR`) and removes `-wal`/`-shm`. Before restoring it quits the new app and its engine (`Resources/sovereign/sovereign`) and waits until both are gone, so nothing can checkpoint over the restored file. The used backup is then deleted: the engine writes `pre-v<N>.bak` only when none exists, so a stale one would leave a second failed attempt with nothing to roll back to. No backup newer than the start
 means no migration ran and the file is left alone. Data written after the update started is lost; nothing else is touched.
 
 Windows has no script. Manual rollback: quit Hermes, reinstall the previous NSIS build over the new one, then in
 `%USERPROFILE%\.jcode` (or `%JCODE_HOME%`) delete `sovereign.db-wal` and `sovereign.db-shm` and copy the newest
 `sovereign.db.pre-v*.bak` made during the failed update over `sovereign.db`. Skip the copy if there is none.
 
-The Hermes source-checkout updater (`hermes update`, `scripts/desktop-update/`) is a different path (dev
-installs that rebuild from git) and is untouched.
+The desktop has no updater of its own. The stock Hermes git-based one (check via GitHub, `hermes update`,
+the detached `posix.sh` hand-off) was removed from the app: "Check for updates" now reports "Updates are
+installed by replacing the app" through the existing install-method notice, and points here. Only the Windows
+bootstrap-recovery hand-off (`scripts/desktop-update/windows.ps1`) remains, for unpackaged Windows installs.
+
+Future work: an update feed. Nothing publishes bundles yet, so there is nothing for the app to check; when one
+exists, `hermes:updates:check` should read its manifest (compare `id`), and `apply` should download the bundle
+and run `sovereign-update.sh`.
 
 ## User data is never touched
 

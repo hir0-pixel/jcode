@@ -587,6 +587,35 @@ Not mapped: Hermes's dangerous-pattern keys in `command_allowlist` (the engine c
 `jcode-command-risk`, not Hermes's pattern table). An attended `always` answer still means "allow everything
 until the engine restarts" (a blanket flag), unlike the late unattended `always`.
 
+## Threat model: the model's shell versus the approval gate
+
+The model's `bash` tool runs as the same OS user as the engine. Two secrets decide whether it can bypass or
+spoof the human approval gate, and neither may be reachable from a same-user shell.
+
+**Desktop session token.** It authenticates `/api/ws`, where `approval.respond` and `shell.exec` live. Removing it
+from the engine's environment after startup is not enough: the kernel keeps the launch environment and
+`ps eww -p <engine pid>` prints it. So the packaged desktop starts the engine with `--token-stdin` and writes the
+token as one line on the engine's stdin (then closes it); the token is in neither argv nor env, and the desktop
+strips `HERMES_DASHBOARD_SESSION_TOKEN` from the engine's env. Dev path: running `sovereign serve` by hand (and
+the e2e scripts) may still set `HERMES_DASHBOARD_SESSION_TOKEN`; the engine reads and removes it, but the launch
+environment stays readable, so that path is for development only.
+
+**Pre-tool hook.** `sovereign __pre-tool` asks `/api/sovereign/approve` for a prompt. There is no secret file any
+more (`~/.jcode/sovereign-approval.json` is gone). For each hook call jcode's hook runner sets
+`SOVEREIGN_APPROVAL_ADDR` and `SOVEREIGN_APPROVAL_TICKET` on that one child. A ticket is
+`<ms>.<nonce>.<sha256(key:<ms>.<nonce>)>`, signed with a key held only in engine memory, valid 5 minutes, and
+accepted once. The engine's own environment, which tool subprocesses inherit, never contains them.
+
+**Protected:** reading the token or a reusable approval secret from the engine's env, argv or disk; forging
+approval prompts later or repeatedly (a replayed or forged ticket is refused); answering prompts.
+**Not protected:** same-user code execution is not contained. A shell that polls `ps eww` can catch the
+environment of a hook process during its short life and spend that one ticket first (the real hook then fails
+closed, and the user sees one prompt for a command the model chose); a debugger or `task_for_pid` on the engine
+can read its memory; the model can edit the user's own files, including Hermes config. The Python feature backend
+still receives its own loopback token in its environment (`HERMES_DASHBOARD_SESSION_TOKEN`, set by the engine),
+which a same-user shell can read from `ps eww`; moving that to stdin is future work. Real containment needs the
+bash tool to run under a different uid or a sandbox.
+
 ---
 
 *Last updated: 2026-02-08*

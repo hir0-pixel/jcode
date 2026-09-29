@@ -17,7 +17,7 @@ it is measured and what the last measurement was, so a change that moves one has
 
 | Budget | Limit | How measured | Last measured |
 | --- | --- | --- | --- |
-| Idle engine memory | physical footprint <= 50 MB | Engine running, no window, 30 s idle: `footprint -p <pid>` (macOS). `ps` RSS counts shared library pages and reads about 4x higher, so it is not the budget | 25 MB footprint (peak 83 MB during start), 103 MB `ps` RSS, release build, 2026-09-29. Audit: 29-30 MB. Benchmark median with a chat session: 34 idle, 43 after a session, 45 peak (`BENCHMARK.md`, RAM table) |
+| Idle engine memory | physical footprint <= 50 MB | Engine running, no window, 30 s idle: `footprint -p <pid>` (macOS). `ps` RSS counts shared library pages and reads about 4x higher, so it is not the budget | 25 MB footprint (peak 83 MB during start), 103 MB `ps` RSS, release build, 2026-09-29; method: start `sovereign serve` on a release build, wait 30 s with no client, `footprint -p <pid>` (re-measure on a fresh release build). Audit: 29-30 MB. Benchmark median with a chat session: 34 idle, 43 after a session, 45 peak (`BENCHMARK.md`, RAM table) |
 | Python backend | off by default | Starts only for a forwarded feature, a due cron job, or an enabled messaging platform (`features.rs`: `port()`, `ensure_bots`); stops after 10 min idle unless bots are enabled or a request is in flight (lease). Check: no child process of the engine after boot with no bots | 0 MB Python in every benchmark run; unit tests `starts_on_demand_reuses_and_stops_when_idle`, `bots_start_the_backend_and_a_leased_one_is_never_idle_stopped` |
 | Tool-schema tokens per call | see `BENCHMARK.md` section "Tool schema budget (2026-09-29)" | Counting proxy (`scripts/sovereign-counting-proxy.mjs`) on the first model call; guard test `agent_tests/tool_schema_budget.rs` | Value and history live in that section, which the lazy-tool-loading work owns; this row follows it. Before it: 7,896 tokens with 26 tools |
 | Prompt cache hit | >= 80% of prompt tokens on a new session's first call | Proxy `calls.jsonl` cached vs prompt tokens (`BENCHMARK.md`, "What explains the gap") | 88% on the first call of a new session, 66 main calls (Ollama KV cache; hosted providers differ in TTL and minimum prefix) |
@@ -29,7 +29,7 @@ it is measured and what the last measurement was, so a change that moves one has
 | REPL latency | warm p95 < 5 ms; run timeout 20 s; kernel RSS watchdog 128 MiB; idle reap 10 min | Rust dispatch test and REPL tests (`PRIME_PARITY.md`) | Dispatch p95 88.8 us |
 | Cron punctuality | a due job fires within 60 s of its time, including after macOS system sleep; a job a tick cannot advance backs off 30 s, 60 s, 2 min ... 1 h | `cron_tick.rs` sleeps in chunks of <= 60 s and re-reads the wall clock | Tests `sleeps_in_bounded_chunks_and_backs_off_per_stuck_job` |
 | `sovereign.db` growth | <= 150 MB at the default 30-day retention for a heavy user (100 turns a day) | See below | Estimate, not yet measured on a populated file |
-| Update safety | a failed update leaves the old build bootable | `sovereign-update.sh` restores the old bundle and the `sovereign.db.pre-v*.bak` taken during the update (`RELEASING.md`) | Test `a rollback restores the sovereign.db backup taken during the update and nothing older` |
+| Update safety | a failed update leaves the old build bootable | `sovereign-update.sh` restores the old bundle and the `sovereign.db.pre-v*.bak` taken during the update (`docs/RELEASING.md`) | Test `a rollback restores the sovereign.db backup taken during the update and nothing older` |
 
 ### `sovereign.db` growth and retention
 
@@ -60,4 +60,4 @@ select name, sum(pgsize) from dbstat group by 1 order by 2 desc limit 5;
   it dies (checked on the idle-stop tick, at most every 60 s).
 - Schema: one `PRAGMA user_version` owned by `sovereign-prime/src/migrate.rs`, covering the memory
   tables too; a backup `sovereign.db.pre-v<N>.bak` is written before migrating a file with data; a file
-  from a newer engine is refused. Rollback: `RELEASING.md`.
+  from a newer engine is refused. Rollback: `docs/RELEASING.md`.
