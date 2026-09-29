@@ -1118,6 +1118,8 @@ impl BashTool {
                                     }
 
                                     match response_rx.await {
+                                        // Ctrl-D: the client cannot supply input, so close stdin (EOF).
+                                        Ok(input) if input == "\u{4}" => break,
                                         Ok(input) => {
                                             let line = if input.ends_with('\n') {
                                                 input

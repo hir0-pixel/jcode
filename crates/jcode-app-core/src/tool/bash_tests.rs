@@ -182,6 +182,20 @@ async fn test_basic_command_with_unused_stdin_channel() {
 }
 
 #[tokio::test]
+async fn ctrl_d_stdin_response_closes_stdin() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StdinInputRequest>();
+    let tool = BashTool::new();
+    let ctx = make_ctx(Some(tx));
+    let handle = tokio::spawn(async move {
+        tool.execute(json!({"command": "cat; echo done", "timeout": 20000}), ctx).await
+    });
+    let req = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    req.response_tx.send("\u{4}".to_string()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), handle).await.unwrap().unwrap().unwrap();
+    assert!(result.output.contains("done"));
+}
+
+#[tokio::test]
 async fn test_stdin_forwarding_single_line() {
     let (tx, mut rx) = mpsc::unbounded_channel::<StdinInputRequest>();
     let tool = BashTool::new();

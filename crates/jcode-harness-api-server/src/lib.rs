@@ -446,6 +446,16 @@ where
                         continue;
                     }
                 };
+                // The harness API has no stdin channel, so nobody can answer a
+                // command that reads stdin: send EOF (Ctrl-D) instead of leaving
+                // it blocked until the tool timeout.
+                if event["type"] == "stdin_request" {
+                    if let Some(request_id) = event["request_id"].as_str() {
+                        let eof = serde_json::json!({"type": "stdin_response", "id": 0, "request_id": request_id, "input": "\u{4}"});
+                        write_json_line(&mut legacy_write, &eof).await?;
+                    }
+                    continue;
+                }
                 // Only a few replies read persisted session files. Streaming
                 // deltas are pure translation, and routing each one through
                 // block_in_place handed the worker core to a fresh blocking
