@@ -60,6 +60,11 @@ async fn prefix_test_provider() -> OpenAIProvider {
     *provider.credentials.write().await = prewarm_test_credentials();
     provider.set_model("gpt-5.6-sol").unwrap();
     provider.set_transport("websocket").unwrap();
+    // An unknown account catalog makes the first request kick a background
+    // `GET /v1/models` at the loopback fixture, which panics its websocket
+    // accept. Mark the refresh as just attempted so the fixture only sees the
+    // completion traffic under test, regardless of test order.
+    jcode_base::provider::note_openai_model_catalog_refresh_attempt();
     provider
 }
 
