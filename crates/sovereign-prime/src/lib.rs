@@ -8,7 +8,7 @@ mod bundled_skills;
 pub mod goal_ratchet;
 pub mod entries;
 pub mod host;
-pub mod migrate;
+pub use jcode_base::migrate;
 pub mod refine;
 pub mod skill_files;
 mod worker;

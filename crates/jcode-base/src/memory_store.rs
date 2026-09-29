@@ -107,13 +107,13 @@ pub fn migrate_sovereign_db(db: &mut Connection) -> Result<()> {
     migrate(db)
 }
 
-/// Version and upgrade the file through `sovereign_prime::migrate` (the one owner of `user_version`:
+/// Version and upgrade the file through `crate::migrate` (the one owner of `user_version`:
 /// backup before migrating a file with data, refusal of a newer file), then ensure this store's schema.
 fn migrate(db: &mut Connection) -> Result<()> {
     db.execute_batch("PRAGMA busy_timeout=5000")?;
     let path = db.path().filter(|p| !p.is_empty()).map(PathBuf::from);
     let had_data: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')", [], |r| r.get(0))?;
-    sovereign_prime::migrate::run(db, path.as_deref().filter(|_| had_data))?;
+    crate::migrate::run(db, path.as_deref().filter(|_| had_data))?;
     db.execute_batch(SCHEMA)?;
     Ok(())
 }
@@ -477,12 +477,12 @@ mod tests {
         assert_eq!(load_graph(&path, "global").unwrap().unwrap().memories.get(&entry.id), Some(&entry));
         assert_eq!(recall(&path, &["global"], "deploys friday", 5).len(), 1);
         let version: u32 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, sovereign_prime::migrate::CURRENT);
-        let backup = path.with_file_name(format!("sovereign.db.pre-v{}.bak", sovereign_prime::migrate::CURRENT));
+        assert_eq!(version, crate::migrate::CURRENT);
+        let backup = path.with_file_name(format!("sovereign.db.pre-v{}.bak", crate::migrate::CURRENT));
         assert!(Connection::open(backup).unwrap().query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap() == 1);
         // A file written by a newer engine is refused, not opened.
         close(&path);
-        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {}", sovereign_prime::migrate::CURRENT + 1)).unwrap();
+        Connection::open(&path).unwrap().execute_batch(&format!("PRAGMA user_version = {}", crate::migrate::CURRENT + 1)).unwrap();
         assert!(load_graph(&path, "global").unwrap_err().to_string().contains("newer than this engine"));
     }
 

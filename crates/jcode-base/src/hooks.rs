@@ -389,6 +389,14 @@ pub async fn run_pre_tool_gate(
     decision
 }
 
+static PRE_TOOL_ENV: std::sync::OnceLock<fn() -> Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Extra env for each `pre_tool` hook process, minted per call and set on that child only (never on
+/// this process's own environment, which tool subprocesses inherit).
+pub fn set_pre_tool_env(provider: fn() -> Vec<(String, String)>) {
+    let _ = PRE_TOOL_ENV.set(provider);
+}
+
 async fn run_pre_tool_command(
     command_line: &str,
     event: &HookEvent,
@@ -397,7 +405,12 @@ async fn run_pre_tool_command(
 ) -> GateDecision {
     let session_id = event.session_id.as_deref().unwrap_or("unknown");
     let std_cmd = match build_hook_process(command_line, event) {
-        Ok(cmd) => cmd,
+        Ok(mut cmd) => {
+            for (key, value) in PRE_TOOL_ENV.get().map(|f| f()).unwrap_or_default() {
+                cmd.env(key, value);
+            }
+            cmd
+        }
         Err(error) => {
             crate::logging::warn(&format!(
                 "Hook 'pre_tool' command '{command_line}' is invalid: {error} (allowing tool call)"

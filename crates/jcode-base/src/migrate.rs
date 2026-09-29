@@ -5,7 +5,7 @@
 //! or reorder. Before the first migration of a file that already holds data, a consistent copy is
 //! written next to it (`sovereign.db.pre-vN.bak`, the version it is going TO) so a bad update or a
 //! rollback of the app bundle can restore it. A file from a NEWER engine is refused, not touched.
-//! This is the only place that versions the file: jcode's memory tables (`jcode-base` `memory_store`)
+//! This is the only place that versions the file (it lives in `jcode-base`, the lowest crate that needs it, so the forked layer never depends on sovereign-prime): jcode's memory tables (`memory_store`)
 //! call [`run`] too, and their legacy layout upgrade is migration 4 below.
 
 use anyhow::{Result, bail};

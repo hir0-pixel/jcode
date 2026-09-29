@@ -2994,7 +2994,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
- "sovereign-prime",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemalloc-sys",
@@ -5777,6 +5776,7 @@ name = "sovereign-prime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jcode-base",
  "jcode-storage",
  "rusqlite",
  "serde_json",
