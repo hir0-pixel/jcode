@@ -709,17 +709,18 @@ async fn handle(
                 .await;
             };
             let timeout_s = body["timeout_s"].as_u64().unwrap_or(600).clamp(1, 3600);
+            let surface = if body["surface"] == "bot" { "bot" } else { "cron" };
             let result = rpc::agent_run(
                 config.clone(),
                 hub.clone(),
                 observer.clone(),
-                "cron",
+                surface,
                 prompt,
                 body["cwd"].as_str(),
                 body["title"].as_str(),
                 body["session_key"].as_str().filter(|k| !k.is_empty()),
                 rpc::RunOpts {
-                    surface: if body["surface"] == "bot" { "bot" } else { "cron" },
+                    surface,
                     instructions: body["instructions"].as_str().filter(|i| !i.trim().is_empty()),
                     model: body["model"].as_str().filter(|m| !m.trim().is_empty()),
                     provider: body["provider"].as_str().filter(|p| !p.trim().is_empty()),
