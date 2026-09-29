@@ -978,11 +978,12 @@ fn gate_ctx(working_dir: &str) -> ToolContext {
 
 #[tokio::test]
 async fn bash_refuses_to_delete_the_home_directory() {
+    let _env_lock = crate::storage::lock_test_env();
     // The #604 incident, at the real tool boundary.
     let temp = tempfile::tempdir().expect("temp home");
     let home = temp.path().to_string_lossy().to_string();
     let previous = std::env::var("HOME").ok();
-    // SAFETY: single-threaded test setup; restored below.
+    // SAFETY: serialized by the shared test env lock; restored below.
     unsafe { std::env::set_var("HOME", &home) };
 
     let canary = temp.path().join("precious.txt");
@@ -1084,6 +1085,7 @@ async fn bash_does_not_interfere_with_ordinary_commands() {
 
 #[tokio::test]
 async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
+    let _env_lock = crate::storage::lock_test_env();
     // batch, and every other caller, dispatch through Tool::execute rather than
     // reimplementing it, so the gate lives at the only chokepoint. Assert that
     // directly: calling execute for a background job (the one path that returns
@@ -1091,7 +1093,7 @@ async fn indirect_dispatch_paths_cannot_bypass_the_gate() {
     let temp = tempfile::tempdir().expect("temp home");
     let home = temp.path().to_string_lossy().to_string();
     let previous = std::env::var("HOME").ok();
-    // SAFETY: single-threaded test setup; restored below.
+    // SAFETY: serialized by the shared test env lock; restored below.
     unsafe { std::env::set_var("HOME", &home) };
     let canary = temp.path().join("precious.txt");
     std::fs::write(&canary, "user data").expect("canary");
