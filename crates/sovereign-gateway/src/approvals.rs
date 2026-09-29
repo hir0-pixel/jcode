@@ -31,6 +31,8 @@ pub const DECISION_TIMEOUT: Duration = Duration::from_secs(240);
 /// How long a denied unattended command stays open for a late approval.
 const PARK_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_PARKED: usize = 50;
+/// Internal answer: the window showing a prompt closed, so it is parked like an unattended one.
+const PARK: &str = "\0park";
 
 /// Whether the user's Hermes config (`$HERMES_HOME/config.yaml`) lets an unattended `surface`
 /// ("cron", "bot", "goal") run approval-gated commands: `approvals.mode: off`, or `cron_mode`
@@ -275,6 +277,19 @@ impl Hub {
 
     pub async fn remove(&self, id: u64) {
         self.clients.lock().await.retain(|c| c.id != id);
+        // A prompt only the closed window showed would time out to a plain deny: hand its waiter to
+        // the unattended path instead, so the command is parked and can be approved later.
+        let open: Vec<(String, String)> = {
+            let shown = self.shown.lock().await;
+            self.pending.lock().await.iter().filter(|(rid, _)| shown.get(*rid).is_some_and(|(_, p)| p["unattended"] != true)).map(|(rid, (sid, _))| (rid.clone(), sid.clone())).collect()
+        };
+        for (rid, sid) in open {
+            if !self.has_window(&sid).await {
+                if let Some((_, tx)) = self.pending.lock().await.remove(&rid) {
+                    let _ = tx.send(PARK.into());
+                }
+            }
+        }
     }
 
     pub fn next_client_id(&self) -> u64 {
@@ -454,6 +469,9 @@ impl Hub {
         };
         self.pending.lock().await.remove(&request_id);
         self.shown.lock().await.remove(&request_id);
+        if choice == PARK {
+            return self.unattended(session_id, tool, command, reason).await;
+        }
         match choice.as_str() {
             "session" => {
                 self.session_grants.lock().await.insert((session_id.to_string(), category));
@@ -727,6 +745,23 @@ mod tests {
         // A later unattended attempt gets no leftover grant.
         hub.mark_headless("goal", "cron").await;
         assert_eq!(hub.decide("goal", "bash", "rm -rf build", "r").await, "deny");
+    }
+
+    #[tokio::test]
+    async fn closing_the_window_showing_a_prompt_parks_it_instead_of_timing_out() {
+        let hub = Arc::new(Hub::default());
+        let (win, mut rx) = client(&hub, "chat").await;
+        let asker = { let hub = hub.clone(); tokio::spawn(async move { hub.decide("chat", "bash", "rm -rf build", "r").await }) };
+        let prompt = request_id(rx.recv().await.unwrap());
+        hub.remove(win.id).await;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), asker).await.unwrap().unwrap(), "deny");
+        let (_w2, mut rx2) = client(&hub, "other").await; // a later window is replayed the parked prompt
+        let Message::Text(frame) = rx2.recv().await.unwrap() else { panic!() };
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["params"]["unattended"], true);
+        assert_ne!(frame["id"].as_str().unwrap(), prompt);
+        assert_eq!(frame["params"]["command"], "rm -rf build");
+        assert!(hub.pending_for("chat").await.iter().all(|p| p["unattended"] == true), "the live prompt is gone");
     }
 
     #[tokio::test]
