@@ -280,6 +280,17 @@ fn register_external_provider_runtimes() {
 }
 
 
+/// A token the launcher supplied (stdin or dev env) must be usable: a short one would lock the
+/// caller out of a gateway that quietly used another token, so refuse to start instead.
+fn supplied_token(launch: Option<String>) -> anyhow::Result<Option<String>> {
+    match launch {
+        Some(token) if token.len() < 32 => {
+            anyhow::bail!("the supplied gateway token is {} characters; it must be at least 32", token.len())
+        }
+        other => Ok(other),
+    }
+}
+
 async fn server_is_running_at(path: &std::path::Path) -> bool {
     // Check liveness before performing a protocol handshake. On Windows the
     // named pipe may be busy while another client is connecting; that already
@@ -462,9 +473,9 @@ pub async fn run_gateway(
     let launch = sovereign_gateway::auth::launch_token()
         .map(str::to_owned)
         .or_else(|| std::env::var("HERMES_DASHBOARD_SESSION_TOKEN").ok());
-    let token = match launch {
-        Some(token) if token.len() >= 32 => token,
-        _ => {
+    let token = match supplied_token(launch)? {
+        Some(token) => token,
+        None => {
             let token = sovereign_gateway::auth::generate_token();
             let path = crate::storage::jcode_dir()?.join("sovereign-gateway.token");
             write_private_file(&path, &token)?;
@@ -862,6 +873,14 @@ fn sovereign_learning() -> sovereign_gateway::learn::Learning {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_short_supplied_token_is_refused_not_replaced() {
+        assert!(super::supplied_token(Some("short".into())).is_err());
+        assert_eq!(super::supplied_token(None).unwrap(), None);
+        let ok = "x".repeat(32);
+        assert_eq!(super::supplied_token(Some(ok.clone())).unwrap(), Some(ok));
+    }
+
     use super::*;
 
     #[test]
