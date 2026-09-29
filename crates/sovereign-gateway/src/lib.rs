@@ -440,6 +440,13 @@ async fn harness_request(legacy_socket: &std::path::Path, request: Value) -> Res
 /// Send requests in order on one bridge connection (e.g. attach, then act);
 /// returns the reply to the last one.
 async fn harness_requests(legacy_socket: &std::path::Path, requests: &[Value]) -> Result<Value> {
+    harness_requests_with(legacy_socket, requests, None).await
+}
+
+/// [`harness_requests`], but the last request is fire-and-linger: its reply is waited for at most
+/// `last_wait` (it may never come) and the connection then closes. For requests whose work carries
+/// on inside the engine after it has been sent.
+async fn harness_requests_with(legacy_socket: &std::path::Path, requests: &[Value], last_wait: Option<Duration>) -> Result<Value> {
     let (ours, theirs) = tokio::io::duplex(MAX_FRAME_BYTES);
     let (their_read, their_write) = tokio::io::split(theirs);
     let bridge = tokio::spawn(jcode_harness_api_server::run_bridge_stream(
@@ -460,15 +467,21 @@ async fn harness_requests(legacy_socket: &std::path::Path, requests: &[Value]) -
             frame["v"] = json!(1);
             frame["id"] = json!(id);
             our_write.write_all(format!("{frame}\n").as_bytes()).await?;
-            last = loop {
-                let line = lines.next_line().await?.context("engine closed")?;
-                let reply: Value = serde_json::from_str(&line)?;
-                if reply["reply_to"] == id {
-                    if reply["ev"] == "error" {
-                        bail!("{}", reply["message"].as_str().unwrap_or("engine error"));
+            let reply = async {
+                loop {
+                    let line = lines.next_line().await?.context("engine closed")?;
+                    let reply: Value = serde_json::from_str(&line)?;
+                    if reply["reply_to"] == id {
+                        if reply["ev"] == "error" {
+                            bail!("{}", reply["message"].as_str().unwrap_or("engine error"));
+                        }
+                        return Ok::<Value, anyhow::Error>(reply);
                     }
-                    break reply;
                 }
+            };
+            last = match last_wait.filter(|_| i + 1 == requests.len()) {
+                Some(wait) => tokio::time::timeout(wait, reply).await.unwrap_or(Ok(Value::Null))?,
+                None => reply.await?,
             };
         }
         Ok(last)
@@ -478,6 +491,28 @@ async fn harness_requests(legacy_socket: &std::path::Path, requests: &[Value]) -
         .context("engine timed out")?;
     bridge.abort();
     result
+}
+
+/// Whether a forwarded Hermes RPC changes a provider credential (it wrote `$HERMES_HOME/.env`).
+pub(crate) fn changes_credentials(method: &str) -> bool {
+    matches!(method, "model.save_key" | "model.disconnect" | "reload.env")
+}
+
+/// Tell the engine a credential changed, so its providers re-resolve their keys: one that had no
+/// key starts, one whose key was removed stops using it. (A rotated key already applies per request.)
+/// The engine only takes this from a subscribed connection, so it rides on a throwaway empty session,
+/// which is never saved. Failures are logged; the change then applies at the next restart.
+pub(crate) async fn notify_auth_changed(config: &Config, provider: Option<&str>) {
+    let provider = provider
+        .filter(|p| !p.is_empty() && p.len() <= 64 && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        .unwrap_or("hermes");
+    let requests = [
+        json!({"req": "create_session", "working_dir": config.default_cwd}),
+        json!({"req": "notify_auth_changed", "provider": provider}),
+    ];
+    if let Err(err) = harness_requests_with(&config.legacy_socket, &requests, Some(Duration::from_secs(3))).await {
+        eprintln!("sovereign: could not tell the engine a key changed (it applies after a restart): {err:#}");
+    }
 }
 
 async fn session_infos(config: &Config, limit: u64, include_archived: bool) -> Result<Vec<Value>> {
@@ -1197,7 +1232,13 @@ async fn handle(
                 .await;
             }
             let features = config.features.clone().expect("checked");
-            proxy_http(stream, &req, &features, false).await
+            let sets_key = matches!(req.method.as_str(), "PUT" | "DELETE") && path == "/api/env";
+            let proxied = proxy_http(stream, &req, &features, false).await;
+            if sets_key {
+                let config = config.clone();
+                tokio::spawn(async move { notify_auth_changed(&config, None).await });
+            }
+            proxied
         }
         (method, path) => {
             note_unsupported("http", &format!("{method} {path}"));
@@ -1216,5 +1257,65 @@ mod contract_gate_tests {
         assert_eq!(methods.len(), 235);
         assert!(methods.contains("cron.manage") && methods.contains("config.show"));
         assert!(!methods.contains("definitely.not.a.method"));
+    }
+}
+
+#[cfg(test)]
+mod auth_notice_tests {
+    use super::*;
+
+    #[test]
+    fn only_key_writing_hermes_rpcs_signal_an_auth_change() {
+        for method in ["model.save_key", "model.disconnect", "reload.env"] {
+            assert!(changes_credentials(method), "{method}");
+        }
+        assert!(!changes_credentials("model.options") && !changes_credentials("config.set"));
+    }
+
+    /// A stand-in engine daemon that answers `subscribe`/`state`/`notify_auth_changed` and records what it was sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_change_reaches_the_engine_as_notify_auth_changed_on_a_subscribed_link() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("auth-notice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("d.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let Ok(request) = serde_json::from_str::<Value>(&line) else { continue };
+                        log.lock().unwrap().push(request.clone());
+                        let reply = match request["type"].as_str() {
+                            Some("state") => json!({ "type": "state", "id": request["id"], "session_id": "session_throwaway", "is_processing": false }),
+                            Some("notify_auth_changed") => json!({ "type": "done", "id": request["id"] }),
+                            _ => continue,
+                        };
+                        let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(), token: "t".repeat(32), version: "test".into(), legacy_socket: socket,
+            default_cwd: "/".into(), allow_non_loopback: false, provider: "p".into(), model: "m".into(),
+            home: dir.to_string_lossy().into(), complete: None, approval_secret: String::new(), features: None, learning: None,
+        };
+        notify_auth_changed(&config, Some("openrouter")).await;
+        let sent: Vec<String> = seen.lock().unwrap().iter().map(|r| r["type"].as_str().unwrap_or("").to_string()).collect();
+        let (subscribe, notify) = (sent.iter().position(|t| t == "subscribe"), sent.iter().position(|t| t == "notify_auth_changed"));
+        assert!(subscribe.is_some() && notify > subscribe, "subscribed first, then notified: {sent:?}");
+        let notice = seen.lock().unwrap().iter().find(|r| r["type"] == "notify_auth_changed").cloned().unwrap();
+        assert_eq!(notice["provider"], "openrouter");
+        // A provider name that is not a plain identifier falls back to the generic hint.
+        notify_auth_changed(&config, Some("bad name\n")).await;
+        assert_eq!(seen.lock().unwrap().iter().rev().find(|r| r["type"] == "notify_auth_changed").unwrap()["provider"], "hermes");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

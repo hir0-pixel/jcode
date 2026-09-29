@@ -512,9 +512,11 @@ enum ProviderAuth {
 impl ProviderAuth {
     async fn apply(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         match self {
-            // Read per request so a key rotated in Hermes's `.env` applies to the next call.
+            // Read per request so a key rotated in Hermes's `.env` applies to the next call, and a key
+            // removed there (disconnected) stops working instead of falling back to the one built with.
             Self::AuthorizationBearer { token, label } => Ok(req.bearer_auth(
-                jcode_base::provider_catalog::env_secret(label).unwrap_or_else(|| token.clone()),
+                jcode_base::provider_catalog::current_secret(label, token)
+                    .ok_or_else(|| anyhow::anyhow!("{label} was removed; add the key again"))?,
             )),
             Self::HeaderValue {
                 header_name,
@@ -522,7 +524,8 @@ impl ProviderAuth {
                 label,
             } => Ok(req.header(
                 header_name,
-                jcode_base::provider_catalog::env_secret(label).unwrap_or_else(|| value.clone()),
+                jcode_base::provider_catalog::current_secret(label, value)
+                    .ok_or_else(|| anyhow::anyhow!("{label} was removed; add the key again"))?,
             )),
             Self::AzureEntra { .. } => {
                 let token = jcode_base::auth::azure::get_bearer_token().await?;

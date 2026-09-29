@@ -22,10 +22,19 @@ pub(super) async fn openai_access_token(
         let tokens = credentials.read().await;
         tokens.refresh_token.is_empty() && tokens.id_token.is_none() && tokens.expires_at.is_none()
     };
-    if stale && let Ok(fresh) = jcode_base::auth::codex::load_api_key_credentials() {
-        let mut tokens = credentials.write().await;
-        if tokens.access_token != fresh.access_token {
-            tokens.access_token = fresh.access_token;
+    if stale {
+        match jcode_base::auth::codex::load_api_key_credentials() {
+            Ok(fresh) => {
+                let mut tokens = credentials.write().await;
+                if tokens.access_token != fresh.access_token {
+                    tokens.access_token = fresh.access_token;
+                }
+            }
+            // A key removed from Hermes's `.env` (disconnected) stops working rather than lingering.
+            Err(_) if jcode_base::provider_catalog::was_live("OPENAI_API_KEY", &credentials.read().await.access_token) => {
+                anyhow::bail!("OPENAI_API_KEY was removed; add the key again");
+            }
+            Err(_) => {}
         }
     }
     let (access_token, refresh_token, needs_refresh) = {

@@ -2356,6 +2356,10 @@ impl Conn {
             .map_err(|_| RpcError::internal(anyhow!("{method} timed out in the feature backend")))?
             .map_err(|_| RpcError::internal(anyhow!("the feature backend restarted; try again")))?;
         features.touch(method, "forwarded-rpc");
+        if reply.get("error").is_none() && crate::changes_credentials(method) {
+            let (config, provider) = (self.config.clone(), params["provider"].as_str().map(str::to_string));
+            tokio::spawn(async move { crate::notify_auth_changed(&config, provider.as_deref()).await });
+        }
         match reply.get("error") {
             Some(err) => Err(RpcError {
                 code: err["code"].as_i64().unwrap_or(INTERNAL),

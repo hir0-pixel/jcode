@@ -1,4 +1,4 @@
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, Mutex, RwLock};
 
 use jcode_provider_metadata::{is_safe_env_file_name, is_safe_env_key_name};
 
@@ -83,6 +83,33 @@ fn clean_loaded_value(raw: &str, env_key: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
+/// `(variable, value)` pairs that were once served from the override owner or the process environment,
+/// hashed (no secrets kept). Such a key can be re-read later, so its absence means it was removed.
+static LIVE_VALUES: LazyLock<Mutex<std::collections::HashSet<u64>>> = LazyLock::new(Default::default);
+
+fn live_hash(env_key: &str, value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (env_key, value).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn note_live(env_key: &str, value: &str) {
+    LIVE_VALUES.lock().unwrap_or_else(|e| e.into_inner()).insert(live_hash(env_key, value));
+}
+
+/// Whether `value` was ever read for `env_key` from the override owner / process env (so it can be re-read).
+pub fn was_live(env_key: &str, value: &str) -> bool {
+    LIVE_VALUES.lock().unwrap_or_else(|e| e.into_inner()).contains(&live_hash(env_key, value))
+}
+
+/// The key to use now for a runtime that was built with `built`: the live value, else `built` -
+/// unless `built` itself came from a live source that has since been removed (a disconnected key
+/// must stop authenticating), which is `None`.
+pub fn current_secret(env_key: &str, built: &str) -> Option<String> {
+    env_secret(env_key).or_else(|| (!was_live(env_key, built)).then(|| built.to_string()))
+}
+
 /// A credential variable as the engine sees it: the override owner's value (Hermes `.env`), else the
 /// process environment. For direct reads and auth-status probes that have no env file of their own;
 /// everything else goes through [`load_api_key_from_env_or_config`].
@@ -90,8 +117,10 @@ pub fn env_secret(env_key: &str) -> Option<String> {
     if !is_safe_env_key_name(env_key) {
         return None;
     }
-    resolve_api_key_override(env_key)
-        .or_else(|| std::env::var(env_key).ok().and_then(|value| clean_loaded_value(&value, env_key)))
+    let value = resolve_api_key_override(env_key)
+        .or_else(|| std::env::var(env_key).ok().and_then(|value| clean_loaded_value(&value, env_key)))?;
+    note_live(env_key, &value);
+    Some(value)
 }
 
 pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option<String> {
@@ -111,12 +140,14 @@ pub fn load_api_key_from_env_or_config(env_key: &str, file_name: &str) -> Option
     }
 
     if let Some(key) = resolve_api_key_override(env_key) {
+        note_live(env_key, &key);
         return Some(key);
     }
 
     if let Ok(key) = std::env::var(env_key)
         && let Some(key) = clean_loaded_value(&key, env_key)
     {
+        note_live(env_key, &key);
         return Some(key);
     }
 

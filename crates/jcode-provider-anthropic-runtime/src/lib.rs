@@ -672,7 +672,11 @@ impl AnthropicProvider {
     fn direct_api_key(&self) -> Result<String> {
         match &self.profile_api_key {
             // Re-read per request so a rotated key applies; the build-time key is the fallback.
-            Some(Ok(key)) => Ok(load_anthropic_api_key().unwrap_or_else(|_| key.clone())),
+            // A key that came from Hermes's `.env` and was removed there stops working instead.
+            Some(Ok(key)) => load_anthropic_api_key().or_else(|err| {
+                let name = std::env::var("JCODE_ANTHROPIC_API_KEY_NAME").unwrap_or_else(|_| "ANTHROPIC_API_KEY".into());
+                if jcode_base::provider_catalog::was_live(name.trim(), key) { Err(err) } else { Ok(key.clone()) }
+            }),
             Some(Err(err)) => anyhow::bail!(err.clone()),
             None => load_anthropic_api_key(),
         }
