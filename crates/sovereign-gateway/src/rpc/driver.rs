@@ -13,7 +13,7 @@
 //! for a poke (a finished turn, `/goal`, `/heartbeat`, `session.control`).
 
 use super::*;
-use sovereign_prime::agent_loop::{Continuation, ControlStore, after_turn, after_turn_in, apply_supervisor, due_heartbeat};
+use sovereign_prime::agent_loop::{Continuation, ControlStore, ErrorAction, after_error_turn, after_turn_in, apply_supervisor, due_heartbeat, resume_prompt, retry_due};
 use std::sync::OnceLock;
 use tokio::sync::Notify;
 
@@ -23,6 +23,8 @@ const TICK: Duration = Duration::from_secs(15);
 struct Driver {
     conn: Arc<Conn>,
     wake: Notify,
+    /// Sessions found active when this process started, until their resume prompt is accepted.
+    resume: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
 static DRIVER: OnceLock<Arc<Driver>> = OnceLock::new();
@@ -74,12 +76,10 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
             Ok(link) => *conn.control.lock().await = Some(link),
             Err(err) => return eprintln!("sovereign: goal driver could not reach the engine: {err:#}"),
         }
-        let driver = Arc::new(Driver { conn, wake: Notify::new() });
+        let driver = Arc::new(Driver { conn, wake: Notify::new(), resume: Default::default() });
         let _ = DRIVER.set(driver.clone());
-        let mut first = true;
         loop {
-            let active = driver.tick(first).await;
-            first = false;
+            let active = driver.tick().await;
             if active {
                 tokio::select! {
                     _ = tokio::time::sleep(TICK) => {}
@@ -118,15 +118,24 @@ fn prompt_of(continuation: Continuation) -> String {
     }
 }
 
-/// Prompts to send now: for each idle active session a due heartbeat, and on
-/// the first pass (after an engine restart nothing is running) the goal or
-/// loop continuation, so work resumes where it stopped.
-fn due_work(store: &ControlStore, active: &[String], first: bool, busy: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+/// Prompts to send now: for each idle active session a due heartbeat, and for the sessions in
+/// `resume` (active at process start, so nothing is running) the goal or loop continuation, so
+/// work resumes where it stopped. A session stays in `resume` until the caller has sent its prompt.
+fn due_work(store: &ControlStore, active: &[String], resume: &mut std::collections::HashSet<String>, busy: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    resume.retain(|sid| active.contains(sid) && !busy(sid));
     active
         .iter()
         .filter(|sid| !busy(sid))
         .filter_map(|sid| {
-            let resumed = if first { after_turn(store, sid, 0, false, false).ok().flatten() } else { None };
+            let resumed = if resume.contains(sid) {
+                let cont = resume_prompt(store, sid).ok().flatten();
+                if cont.is_none() {
+                    resume.remove(sid);
+                }
+                cont
+            } else {
+                None
+            };
             let cont = resumed.or_else(|| due_heartbeat(store, sid).ok().flatten())?;
             Some((sid.clone(), prompt_of(cont)))
         })
@@ -136,12 +145,18 @@ fn due_work(store: &ControlStore, active: &[String], first: bool, busy: impl Fn(
 impl Driver {
     /// One scan: watch the active sessions, send due work. `false` when
     /// nothing is active (the task then sleeps until poked).
-    async fn tick(&self, first: bool) -> bool {
+    async fn tick(&self) -> bool {
         let conn = &self.conn;
         let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
             return false;
         };
         let active = store.active_sessions().unwrap_or_default();
+        let first = {
+            let mut resume = self.resume.lock().unwrap();
+            let first = resume.is_none();
+            resume.get_or_insert_with(|| active.iter().cloned().collect());
+            first
+        };
         for sid in &active {
             if let Err(err) = conn.ensure_attached(sid).await {
                 if first {
@@ -164,9 +179,13 @@ impl Driver {
                 .cloned()
                 .collect()
         };
-        for (sid, text) in due_work(&store, &active, first, |sid| busy.contains(sid)) {
-            if let Err(err) = conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
-                eprintln!("sovereign: goal driver submit for {sid}: {}", err.message);
+        let work = due_work(&store, &active, self.resume.lock().unwrap().as_mut().unwrap(), |sid| busy.contains(sid));
+        for (sid, text) in work {
+            match conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
+                Ok(_) => {
+                    self.resume.lock().unwrap().as_mut().unwrap().remove(&sid);
+                }
+                Err(err) => eprintln!("sovereign: goal driver submit for {sid}: {}", err.message),
             }
         }
         !active.is_empty()
@@ -208,6 +227,25 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
             .unwrap_or_else(|| usage["input"].as_u64().unwrap_or(0) + usage["output"].as_u64().unwrap_or(0)) as i64;
         let interrupted = payload["status"].as_str() == Some("interrupted");
         let busy = || async { conn.sessions.lock().await.get(&session_id).is_some_and(SessionState::turn_active) };
+        if payload["status"].as_str() == Some("error") {
+            let error = payload["error"].as_str().unwrap_or("model error");
+            match after_error_turn(&store, &session_id, error) {
+                Ok(Some(ErrorAction::Paused(text))) => conn.emit("status.update", Some(&session_id), json!({ "kind": "status", "text": format!("Goal paused: {text}") })).await,
+                Ok(Some(ErrorAction::Retry { after, stamp, prompt, note })) => {
+                    conn.emit("status.update", Some(&session_id), json!({ "kind": "status", "text": note })).await;
+                    tokio::time::sleep(after).await;
+                    if retry_due(&store, &session_id, stamp) && !busy().await {
+                        let text = prompt_of(prompt);
+                        if let Err(err) = conn.dispatch("prompt.submit", &json!({ "session_id": session_id, "text": text })).await {
+                            eprintln!("sovereign: error retry for {session_id}: {}", err.message);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("sovereign: after_error_turn for {session_id}: {err:#}"),
+            }
+            return poke();
+        }
         let subagents_running = conn.child_sessions_running(&session_id).await;
         let cwd = conn.session_cwd(&session_id).await;
         let continuation = match after_turn_in(&store, &session_id, tokens, subagents_running, interrupted, cwd.as_deref().map(Path::new)) {
@@ -248,15 +286,26 @@ mod tests {
         let active = store.active_sessions().unwrap();
         assert_eq!(active, ["beat", "goal"]);
 
+        let mut resume: std::collections::HashSet<String> = active.iter().cloned().collect();
+
         // A busy session is left alone (and its heartbeat stays due).
-        assert!(due_work(&store, &active, false, |sid| sid == "beat").is_empty());
+        assert!(due_work(&store, &active, &mut resume, |_| true).is_empty());
+        let mut resume: std::collections::HashSet<String> = active.iter().cloned().collect();
         // After a restart: the goal resumes and the due heartbeat fires.
-        let work = due_work(&store, &active, true, |_| false);
+        let work = due_work(&store, &active, &mut resume, |_| false);
         assert_eq!(work.len(), 2);
         assert!(work.iter().any(|(sid, p)| sid == "goal" && p.contains("ship the parser")));
         assert!(work.iter().any(|(sid, p)| sid == "beat" && p.contains("check the build")));
-        // The heartbeat fired once; goals are not re-sent by later ticks.
-        assert!(due_work(&store, &active, false, |_| false).is_empty());
+        // A failed submit is retried: the goal stays queued until the caller drops it, and resuming
+        // recorded no turn and no attempt.
+        let again = due_work(&store, &active, &mut resume, |_| false);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].0, "goal");
+        let goal = store.get_goal("goal").unwrap().unwrap();
+        assert_eq!((goal.turns_used, goal.attempt_log.len()), (0, 0));
+        // Once submitted (caller drops it) goals are not re-sent by later ticks.
+        resume.remove("goal");
+        assert!(due_work(&store, &active, &mut resume, |_| false).is_empty());
         std::fs::remove_dir_all(home).ok();
     }
 }

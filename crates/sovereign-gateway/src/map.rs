@@ -22,6 +22,8 @@ struct Turn {
     text: String,
     reasoning: String,
     stop: Option<&'static str>,
+    /// The model error text of an `error` stop, for goal error handling.
+    error: String,
     tools: HashMap<String, Tool>,
 }
 
@@ -209,6 +211,7 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
             state.turn.stop = Some(status);
             let message = text("message");
             if status == "error" && !message.is_empty() {
+                state.turn.error = message.clone();
                 out.push(event("error", sid, json!({ "message": message })));
             }
         }
@@ -221,6 +224,7 @@ pub fn map_event(ev: &Value, sessions: &mut HashMap<String, SessionState>) -> Ve
                 json!({
                     "text": turn.text,
                     "status": turn.stop.unwrap_or("complete"),
+                    "error": (!turn.error.is_empty()).then_some(turn.error),
                     "reasoning": reasoning,
                     "usage": state.usage_json(),
                 }),
@@ -511,6 +515,7 @@ mod tests {
         assert_eq!(types(&out), ["message.start", "message.delta", "error", "message.complete"]);
         let Out::Event { payload, .. } = out.last().unwrap() else { panic!() };
         assert_eq!(payload["status"], "error");
+        assert_eq!(payload["error"], "rate limited", "the goal driver classifies errors from this");
 
         let out = run(&[
             json!({"ev":"turn_stopped","session_id":"s","reason":"interrupted","message":""}),

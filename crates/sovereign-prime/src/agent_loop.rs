@@ -1271,6 +1271,7 @@ pub fn after_turn_in(
     cwd: Option<&Path>,
 ) -> Result<Option<Continuation>> {
     let obs = turn_obs().lock().unwrap().remove(session_id);
+    error_retries().lock().unwrap().remove(session_id);
     if user_interrupted {
         if let Some(mut goal) = store.get_goal(session_id)? {
             if goal.status == GoalStatus::Active {
@@ -1399,6 +1400,102 @@ pub fn after_turn_in(
     }
 
     Ok(None)
+}
+
+/// Goal or loop continuation for a session found active after an engine restart. Unlike `after_turn`
+/// it records nothing: no turn ran, so no attempt line, turn count or budget change.
+pub fn resume_prompt(store: &ControlStore, session_id: &str) -> Result<Option<Continuation>> {
+    if let Some(goal) = store.get_goal(session_id)?.filter(|g| g.status == GoalStatus::Active && g.out_of_budget().is_none()) {
+        return Ok(Some(Continuation::Goal(goal.continuation_prompt())));
+    }
+    Ok(store
+        .get_autonomous(session_id)?
+        .filter(|a| a.status == AutonomousStatus::Active)
+        .map(|a| Continuation::Autonomous(a.continuation_prompt())))
+}
+
+/// Waits before re-sending a goal turn that failed with a transient model error; then it pauses.
+const ERROR_BACKOFF: [Duration; 3] = [Duration::from_secs(30), Duration::from_secs(120), Duration::from_secs(600)];
+
+fn error_retries() -> &'static Mutex<HashMap<String, usize>> {
+    static R: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// True if `err` contains one of the numeric HTTP `codes` as a whole number.
+fn has_code(err: &str, codes: &[&str]) -> bool {
+    err.split(|c: char| !c.is_ascii_digit()).any(|n| codes.contains(&n))
+}
+
+fn is_auth_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    has_code(&e, &["401", "403"]) || ["unauthorized", "forbidden", "invalid api key", "invalid x-api-key", "authentication", "expired token", "no credentials"].iter().any(|k| e.contains(k))
+}
+
+fn is_transient_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    has_code(&e, &["429", "500", "502", "503", "504", "529"])
+        || ["rate limit", "overloaded", "timed out", "timeout", "connection", "network", "temporarily", "unavailable"].iter().any(|k| e.contains(k))
+}
+
+#[derive(Debug)]
+pub enum ErrorAction {
+    /// The goal / loop is now paused; the text says why.
+    Paused(String),
+    /// Transient failure: re-send `prompt` after `after` if `retry_due(stamp)` still holds.
+    Retry { after: Duration, stamp: i64, prompt: Continuation, note: String },
+}
+
+/// A turn that ended in a model error. Never counts as a turn, an attempt, or plateau evidence (so no
+/// supervisor call): auth and unknown errors pause the goal / loop at once, transient ones (429, 5xx,
+/// network) retry after 30 s, 2 min, 10 min and then pause.
+pub fn after_error_turn(store: &ControlStore, session_id: &str, error: &str) -> Result<Option<ErrorAction>> {
+    turn_obs().lock().unwrap().remove(session_id);
+    let mut goal = store.get_goal(session_id)?.filter(|g| g.status == GoalStatus::Active);
+    let mut auto = if goal.is_none() { store.get_autonomous(session_id)?.filter(|a| a.status == AutonomousStatus::Active) } else { None };
+    if goal.is_none() && auto.is_none() {
+        error_retries().lock().unwrap().remove(session_id);
+        return Ok(None);
+    }
+    let short: String = error.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+    let tries = error_retries().lock().unwrap().get(session_id).copied().unwrap_or(0);
+    let delay = (!is_auth_error(error) && is_transient_error(error)).then(|| ERROR_BACKOFF.get(tries).copied()).flatten();
+    let now = now_ms();
+    if let Some(after) = delay {
+        error_retries().lock().unwrap().insert(session_id.to_string(), tries + 1);
+        let note = format!("model error, retrying in {}s ({}/{}): {short}", after.as_secs(), tries + 1, ERROR_BACKOFF.len());
+        let prompt = if let Some(g) = goal.as_mut() {
+            g.updated_at_ms = now;
+            store.set_goal(session_id, Some(g))?;
+            Continuation::Goal(g.continuation_prompt())
+        } else {
+            let a = auto.as_mut().unwrap();
+            a.updated_at_ms = now;
+            store.set_autonomous(session_id, Some(a))?;
+            Continuation::Autonomous(a.continuation_prompt())
+        };
+        return Ok(Some(ErrorAction::Retry { after, stamp: now, prompt, note }));
+    }
+    error_retries().lock().unwrap().remove(session_id);
+    let reason = format!("model error: {short}");
+    if let Some(g) = goal.as_mut() {
+        g.status = GoalStatus::Paused;
+        g.paused_reason = Some(reason.clone());
+        g.updated_at_ms = now;
+        store.set_goal(session_id, Some(g))?;
+    } else if let Some(a) = auto.as_mut() {
+        a.status = AutonomousStatus::Paused;
+        a.paused_reason = Some(reason.clone());
+        a.updated_at_ms = now;
+        store.set_autonomous(session_id, Some(a))?;
+    }
+    Ok(Some(ErrorAction::Paused(reason)))
+}
+
+/// Still the goal / loop state `after_error_turn` scheduled the retry for: active and untouched since.
+pub fn retry_due(store: &ControlStore, session_id: &str, stamp: i64) -> bool {
+    store.get_goal(session_id).ok().flatten().is_some_and(|g| g.status == GoalStatus::Active && g.updated_at_ms == stamp)
+        || store.get_autonomous(session_id).ok().flatten().is_some_and(|a| a.status == AutonomousStatus::Active && a.updated_at_ms == stamp)
 }
 
 /// Poll due heartbeats for a session (idle only — caller gates on idle).
@@ -2024,6 +2121,32 @@ mod tests {
         let last = goal.attempt_log.last().unwrap();
         assert!(last.chars().count() <= MAX_ATTEMPT_LEN);
         assert!(last.ends_with('…'));
+    }
+
+    #[test]
+    fn error_turns_back_off_then_pause_and_never_count() {
+        let dir = std::env::temp_dir().join(format!("errturn-{}", std::process::id()));
+        let store = ControlStore::open(&dir).unwrap();
+        store.set_goal("e1", Some(&SessionGoal::new("g"))).unwrap();
+        // Auth errors pause at once.
+        let Some(ErrorAction::Paused(why)) = after_error_turn(&store, "e1", "HTTP 401 Unauthorized").unwrap() else { panic!() };
+        assert!(why.contains("401"));
+        let g = store.get_goal("e1").unwrap().unwrap();
+        assert_eq!((g.status, g.turns_used, g.attempt_log.len()), (GoalStatus::Paused, 0, 0));
+        // Transient errors retry 30 s, 2 min, 10 min, then pause; a healthy turn resets the count.
+        store.set_goal("e2", Some(&SessionGoal::new("g"))).unwrap();
+        for secs in [30, 120, 600] {
+            let Some(ErrorAction::Retry { after, stamp, .. }) = after_error_turn(&store, "e2", "429 rate limit").unwrap() else { panic!() };
+            assert_eq!(after.as_secs(), secs);
+            assert!(retry_due(&store, "e2", stamp));
+        }
+        assert!(matches!(after_error_turn(&store, "e2", "503 overloaded").unwrap(), Some(ErrorAction::Paused(_))));
+        assert_eq!(store.get_goal("e2").unwrap().unwrap().turns_used, 0);
+        // Resume records nothing.
+        store.set_goal("e3", Some(&SessionGoal::new("g"))).unwrap();
+        assert!(resume_prompt(&store, "e3").unwrap().is_some());
+        assert_eq!(store.get_goal("e3").unwrap().unwrap().turns_used, 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
