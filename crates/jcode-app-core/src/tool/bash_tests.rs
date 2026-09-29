@@ -160,6 +160,18 @@ async fn test_basic_command_no_stdin() {
 }
 
 #[tokio::test]
+async fn foreground_command_reading_stdin_gets_eof_instead_of_hanging() {
+    let tool = BashTool::new();
+    let ctx = make_ctx(None);
+    let run = tool.execute(json!({"command": "cat; echo done"}), ctx);
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("stdin must be closed, not inherited")
+        .unwrap();
+    assert!(result.output.contains("done"));
+}
+
+#[tokio::test]
 async fn test_basic_command_with_unused_stdin_channel() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let tool = BashTool::new();

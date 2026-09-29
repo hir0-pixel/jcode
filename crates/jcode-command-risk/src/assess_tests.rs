@@ -665,3 +665,26 @@ fn find_output_actions_write_only_their_destinations() {
         assert_eq!(level(command), RiskLevel::Safe, "{command}");
     }
 }
+
+#[test]
+fn huge_inline_one_liners_assess_quickly() {
+    // Regression: a ~30 KB `python3 -c` one-liner must not stall the gate.
+    let list = (1..=4000).map(|i| format!("{i}**2")).collect::<Vec<_>>().join(", ");
+    let plus = (1..=4000).map(|i| format!("{i}*{i}")).collect::<Vec<_>>().join(" + ");
+    let stmts = (1..=4000).map(|i| format!("s+={i}*{i}")).collect::<Vec<_>>().join("; ");
+    for body in [
+        format!("print(sum([{list}]))"),
+        format!("print({plus})"),
+        format!("s=0; {stmts}; print(s)"),
+    ] {
+        for command in [
+            format!("python3 -c \"{body}\""),
+            format!("python3 -c '{body}'"),
+            format!("python3 - <<'EOF'\n{body}\nEOF"),
+        ] {
+            let start = std::time::Instant::now();
+            assert!(level(&command).runs_immediately());
+            assert!(start.elapsed().as_secs() < 2, "{} bytes took {:?}", command.len(), start.elapsed());
+        }
+    }
+}

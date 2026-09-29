@@ -25,7 +25,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
-const MAX_OUTPUT_LEN: usize = 30000;
+const MAX_OUTPUT_LEN: usize = 12000;
+const HEAD_OUTPUT_LEN: usize = 4000;
 const DEFAULT_TIMEOUT_MS: u64 = 120000;
 const STDIN_POLL_INTERVAL_MS: u64 = 500;
 const STDIN_INITIAL_DELAY_MS: u64 = 300;
@@ -702,10 +703,45 @@ fn build_detached_shell_wrapper(command: &str) -> StdCommand {
     cmd
 }
 
+/// Save `output` under the tool scratch dir so the model can grep the part the
+/// inline view drops. Returns the path, or None if it could not be written.
+fn save_full_output(output: &str) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let dir = std::env::temp_dir();
+    #[cfg(not(windows))]
+    let dir = tool_scratch_dir()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = dir.join(format!("bash-output-{stamp}.txt"));
+    std::fs::write(&path, output).ok()?;
+    Some(path)
+}
+
+/// Large output is never an error: keep the head and the tail (errors and
+/// results usually live at the end), drop the middle, and point at a file
+/// holding the full text.
 fn format_command_output(mut output: String, exit_code: Option<i32>) -> String {
     if output.len() > MAX_OUTPUT_LEN {
-        output = truncate_str(&output, MAX_OUTPUT_LEN).to_string();
-        output.push_str("\n... (output truncated)");
+        let (total_lines, total_bytes) = (output.lines().count(), output.len());
+        let mut head = HEAD_OUTPUT_LEN;
+        while !output.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = output.len() - (MAX_OUTPUT_LEN - HEAD_OUTPUT_LEN);
+        while !output.is_char_boundary(tail) {
+            tail += 1;
+        }
+        let note = match save_full_output(&output) {
+            Some(path) => format!(
+                "\n... [output truncated: {total_lines} lines, {total_bytes} bytes; middle omitted. \
+                 Full output saved to {p}. Recover it with grep -n PATTERN {p} or sed -n 'START,ENDp' {p}] ...\n",
+                p = path.display()
+            ),
+            None => format!("\n... [output truncated: {total_lines} lines, {total_bytes} bytes; middle omitted] ...\n"),
+        };
+        output = format!("{}{note}{}", &output[..head], &output[tail..]);
     }
 
     if let Some(code) = exit_code.filter(|code| *code != 0) {
@@ -726,11 +762,18 @@ mod utf8_truncation_tests {
     use super::format_command_output;
 
     #[test]
-    fn format_command_output_truncates_on_utf8_boundary() {
-        let input = format!("{}é", "a".repeat(29_999));
-        let output = format_command_output(input, None);
-        assert!(output.ends_with("\n... (output truncated)"));
-        assert!(output.starts_with(&"a".repeat(29_999)));
+    fn large_output_keeps_head_and_tail_and_saves_full_file() {
+        let input: String = (0..4000)
+            .map(|i| if i == 2000 { "UNIQUE_TOKEN=tok_mid\n".to_string() } else { format!("[build] step {i} é\n") })
+            .collect();
+        let output = format_command_output(input.clone(), Some(1));
+        assert!(output.len() < 13_000, "{}", output.len());
+        assert!(output.starts_with("[build] step 0 "));
+        assert!(output.contains("step 3999") && !output.contains("UNIQUE_TOKEN"));
+        assert!(output.ends_with("Exit code: 1"));
+        let path = output.split("Full output saved to ").nth(1).unwrap().split(". Recover").next().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), input);
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(windows)]
@@ -1000,9 +1043,9 @@ impl BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if has_stdin_channel {
-            command.stdin(Stdio::piped());
-        }
+        // Never inherit the host's stdin: a command that reads it would block
+        // until the timeout. Only pipe it when an interactive bridge answers.
+        command.stdin(if has_stdin_channel { Stdio::piped() } else { Stdio::null() });
 
         if let Some(ref dir) = ctx.working_dir {
             command.current_dir(dir);
