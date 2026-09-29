@@ -32,7 +32,6 @@ pub fn window_ms(window: &str) -> Option<i64> {
 #[derive(Clone, Debug)]
 pub struct ObsConfig {
     pub budget_daily_usd: Option<f64>,
-    pub budget_by_kind: std::collections::HashMap<String, f64>,
     pub alert_p95_run_ms: i64,
     pub alert_error_rate_pct: f64,
     pub alert_webhook_url: String,
@@ -48,17 +47,8 @@ impl ObsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .or_else(|| file["budget_daily_usd"].as_f64());
-        let mut budget_by_kind = std::collections::HashMap::new();
-        if let Some(map) = file["budget_by_kind"].as_object() {
-            for (k, v) in map {
-                if let Some(n) = v.as_f64() {
-                    budget_by_kind.insert(k.clone(), n);
-                }
-            }
-        }
         Self {
             budget_daily_usd,
-            budget_by_kind,
             alert_p95_run_ms: file["alert_p95_run_ms"].as_i64().unwrap_or(120_000),
             alert_error_rate_pct: file["alert_error_rate_pct"].as_f64().unwrap_or(25.0),
             alert_webhook_url: std::env::var("SOVEREIGN_ALERT_WEBHOOK_URL")

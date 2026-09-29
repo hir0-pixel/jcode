@@ -221,9 +221,6 @@ fn main() -> Result<()> {
         // SAFETY: as above.
         unsafe { std::env::set_var("JCODE_MESSAGE_TIMESTAMPS", "0") };
     }
-    // Token budget: tool definitions are ~97% of every request. Drop tools
-    // that reach third parties or that the desktop cannot render. Override
-    // with JCODE_DISABLED_TOOLS (set it to empty to keep everything).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args: Vec<String> = std::env::args().skip(1).collect();
     select_profile(&args)?;
@@ -266,7 +263,7 @@ fn unload_ollama_from_warm_file() {
     let Some(model) = meta.get("model").and_then(|v| v.as_str()) else {
         return;
     };
-    let body = format!(r#"{{"model":"{model}","keep_alive":0}}"#);
+    let body = serde_json::json!({ "model": model, "keep_alive": 0 }).to_string();
     let _ = std::process::Command::new("curl")
         .args([
             "-s",
