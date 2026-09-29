@@ -249,6 +249,10 @@ pub struct SessionGoal {
     pub sup_episode: bool,
     /// Repo the checkpoint refs were written in (so clear/complete can delete them).
     pub ref_cwd: Option<String>,
+    /// Verification commands run for this goal (pass or fail), whatever `best` holds, and whether
+    /// the latest verifying turn passed them all.
+    pub verify_runs: u32,
+    pub verify_ok: bool,
 }
 
 /// Attempt-log bounds (NVIDIA AVO long-horizon harness: a small, bounded
@@ -302,8 +306,7 @@ pub fn observe_tool(session_id: &str, name: &str, args: &Value, result: &str) {
     });
     let failed = result.starts_with("Error:") || nonzero_exit;
     let cmd = args["command"].as_str().unwrap_or("").to_lowercase();
-    let verify_cmd = name == "bash"
-        && ["test", "build", "check", "lint", "clippy", "pytest", "tsc"].iter().any(|k| cmd.contains(k));
+    let verify_cmd = name == "bash" && crate::goal_ratchet::is_verify_command(&cmd);
     let mut map = turn_obs().lock().unwrap();
     let obs = map.entry(session_id.to_string()).or_default();
     obs.tools += 1;
@@ -353,6 +356,8 @@ impl SessionGoal {
             sup_turn: None,
             sup_episode: false,
             ref_cwd: None,
+            verify_runs: 0,
+            verify_ok: false,
         }
     }
 
@@ -488,6 +493,8 @@ impl SessionGoal {
             "sup_turn": self.sup_turn,
             "sup_episode": self.sup_episode,
             "ref_cwd": self.ref_cwd,
+            "verify_runs": self.verify_runs,
+            "verify_ok": self.verify_ok,
         })
     }
 
@@ -542,6 +549,8 @@ impl SessionGoal {
             sup_turn: v["sup_turn"].as_i64(),
             sup_episode: v["sup_episode"].as_bool().unwrap_or(false),
             ref_cwd: v["ref_cwd"].as_str().map(str::to_string),
+            verify_runs: v["verify_runs"].as_u64().unwrap_or(0) as u32,
+            verify_ok: v["verify_ok"].as_bool().unwrap_or(false),
         })
     }
 
@@ -2268,6 +2277,52 @@ mod tests {
         let paused = store.get_goal("s1").unwrap().unwrap();
         assert_eq!(paused.status, GoalStatus::Paused);
         assert_eq!(paused.attempt_log[0], "fail: verification failed");
+    }
+
+    #[test]
+    fn verification_is_matched_by_program_and_subcommand_not_substring() {
+        use crate::goal_ratchet::is_verify_command as v;
+        for yes in [
+            "cargo test -p foo", "cargo +nightly clippy --all", "cd app && cargo build 2>&1 | tail", "RUST_LOG=x cargo check",
+            "npm test", "npm run test:unit", "pnpm run build", "yarn lint", "yarn test --watch=false", "pytest -x", "python3 -m pytest tests/",
+            "go test ./...", "npx jest", "pnpm exec vitest run", "vitest", "tsc --noEmit", "make test", "make check", "./gradlew test", "mvn -q test",
+            "swift test", "bun test", "deno test -A", "echo hi; cargo test", "sudo -n go test",
+        ] {
+            assert!(v(yes), "should verify: {yes}");
+        }
+        for no in [
+            "echo test", "git checkout main", "ls tests", "cat build.log", "git commit -m 'cargo test'", "echo 'a && cargo test'",
+            "npm install", "cargo fmt", "python script.py test", "grep -r lint src", "make install", "cargo run -- test",
+        ] {
+            assert!(!v(no), "should not verify: {no}");
+        }
+    }
+
+    #[test]
+    fn a_goal_whose_verification_only_ever_failed_cannot_complete_on_free_text() {
+        use crate::agent_loop_host::goal_host;
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("f", Some(&SessionGoal::new("x"))).unwrap();
+        let cargo = json!({"command": "cargo test"});
+        let complete = r#"{"op":"complete","verification":"I checked it by hand"}"#;
+        run_auto_turn(&store, "f", &[("edit", json!({}), "ok"), ("bash", cargo.clone(), "1 failed\n\nExit code: 101")]);
+        let goal = store.get_goal("f").unwrap().unwrap();
+        assert!(goal.best.is_empty(), "a failing run never reaches best");
+        assert_eq!((goal.verify_runs, goal.verify_ok), (1, false));
+        assert!(goal_host(&store, "f", complete).is_err(), "free text after only failures");
+        run_auto_turn(&store, "f", &[("bash", cargo, "test result: ok. 3 passed; 0 failed\n\nExit code: 0")]);
+        assert!(store.get_goal("f").unwrap().unwrap().verify_ok);
+        assert!(goal_host(&store, "f", complete).is_ok(), "a recorded pass unlocks completion");
+    }
+
+    #[test]
+    fn a_non_verification_command_does_not_lock_completion() {
+        use crate::agent_loop_host::goal_host;
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("n", Some(&SessionGoal::new("x"))).unwrap();
+        run_auto_turn(&store, "n", &[("bash", json!({"command": "echo test"}), "test\n\nExit code: 0")]);
+        assert_eq!(store.get_goal("n").unwrap().unwrap().verify_runs, 0);
+        assert!(goal_host(&store, "n", r#"{"op":"complete","verification":"nothing to run"}"#).is_ok());
     }
 
     fn run_auto_turn(store: &ControlStore, sid: &str, calls: &[(&str, Value, &str)]) {

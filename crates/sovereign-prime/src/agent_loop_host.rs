@@ -45,14 +45,25 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
             // completed on the engine's own record: a passing `auto` turn and no open regression.
             // Free text is accepted only for goals with nothing to execute. Prime's bare
             // `goal.complete()` takes no arguments, so it rides on the same recorded line.
-            let engine_pass = goal
+            let logged_pass = goal
                 .attempt_log
                 .iter()
                 .rev()
                 .find(|line| line.starts_with("auto ") && line.split(" | ").any(|f| f == "ver=pass"))
                 .cloned();
+            // Verification runs are counted pass or fail, so a goal whose tests always failed
+            // (nothing ever reached `best`) is still held to a passing run. Goals stored before
+            // the counter fall back to the logged line.
+            let ran_verification = goal.verify_runs > 0 || !goal.best.is_empty();
+            let engine_pass = if goal.verify_runs == 0 {
+                logged_pass
+            } else if goal.verify_ok {
+                logged_pass.or_else(|| Some(format!("engine-recorded pass ({} verification runs)", goal.verify_runs)))
+            } else {
+                None
+            };
             let cited = op["verification"].as_str().map(str::trim).filter(|v| !v.is_empty());
-            let verification = if goal.best.is_empty() {
+            let verification = if !ran_verification {
                 cited.map(str::to_string).or(engine_pass)
             } else {
                 if let Some(why) = &goal.regressed {

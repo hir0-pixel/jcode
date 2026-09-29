@@ -48,6 +48,79 @@ pub fn score_from_json(v: &Value) -> Score {
         .unwrap_or_default()
 }
 
+/// Split a shell line into simple commands at unquoted `&&`, `||`, `;`, `|`, `&` and newlines.
+fn simple_commands(line: &str) -> Vec<Vec<String>> {
+    let (mut cmds, mut words, mut word) = (Vec::new(), Vec::new(), String::new());
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    let flush = |word: &mut String, words: &mut Vec<String>| {
+        if !word.is_empty() {
+            words.push(std::mem::take(word));
+        }
+    };
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'') | (None, '"') => quote = Some(c),
+            (None, '\\') => word.extend(chars.next()),
+            (None, ';' | '|' | '&' | '\n') => {
+                flush(&mut word, &mut words);
+                while chars.next_if(|n| matches!(n, '|' | '&')).is_some() {}
+                cmds.push(std::mem::take(&mut words));
+            }
+            (None, c) if c.is_whitespace() => flush(&mut word, &mut words),
+            (None, c) => word.push(c),
+        }
+    }
+    flush(&mut word, &mut words);
+    cmds.push(words);
+    cmds.retain(|w| !w.is_empty());
+    cmds
+}
+
+/// Whether one simple command (program and arguments) runs a known test/build/check/lint runner.
+fn runs_verifier(words: &[String]) -> bool {
+    let mut i = 0;
+    // Leading `VAR=value` assignments and transparent wrappers.
+    while i < words.len() && ((words[i].contains('=') && !words[i].starts_with('-')) || matches!(words[i].as_str(), "sudo" | "time" | "env" | "command" | "exec" | "nice")) {
+        let wrapper = !words[i].contains('=');
+        i += 1;
+        while wrapper && words.get(i).is_some_and(|w| w.starts_with('-')) {
+            i += 1;
+        }
+    }
+    let Some(program) = words.get(i) else { return false };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let args: Vec<&str> = words[i + 1..].iter().map(String::as_str).collect();
+    let plain: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-') && !a.starts_with('+')).collect();
+    let script = |name: &str| ["test", "build", "lint"].iter().any(|k| name == *k || name.strip_prefix(k).is_some_and(|rest| rest.starts_with(':')));
+    let rest = |n: usize| words[(i + n).min(words.len())..].to_vec();
+    match program {
+        "cargo" => plain.first().is_some_and(|s| matches!(*s, "test" | "build" | "check" | "clippy")),
+        "npm" | "pnpm" | "yarn" | "bun" => match plain.as_slice() {
+            ["test" | "build" | "lint", ..] => true,
+            ["run" | "run-script", name, ..] => script(name),
+            ["exec" | "dlx" | "x", ..] => runs_verifier(&rest(args.iter().position(|a| !a.starts_with('-')).map_or(1, |p| p + 2))),
+            [name] if program == "yarn" => script(name),
+            _ => false,
+        },
+        "npx" | "bunx" | "pnpx" => runs_verifier(&rest(1 + args.iter().take_while(|a| a.starts_with('-')).count())),
+        "pytest" | "py.test" | "jest" | "vitest" | "tsc" => true,
+        "python" | "python3" => args.windows(2).any(|w| w == ["-m", "pytest"]),
+        "go" | "swift" | "deno" => plain.first() == Some(&"test"),
+        "make" | "gmake" => plain.iter().any(|t| matches!(*t, "test" | "check")),
+        "gradle" | "gradlew" | "mvn" | "mvnw" => plain.iter().any(|t| *t == "test"),
+        _ => false,
+    }
+}
+
+/// Whether a bash command line runs a real test/build/check/lint runner (by program and
+/// subcommand, not by a substring: `echo test`, `git checkout` and `ls tests` are not verification).
+pub fn is_verify_command(line: &str) -> bool {
+    simple_commands(line).iter().any(|words| runs_verifier(words))
+}
+
 pub fn command_key(cmd: &str) -> String {
     cmd.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect()
 }
@@ -163,6 +236,10 @@ impl SessionGoal {
     /// or better + files changed) a ratchet checkpoint. Failed attempts stay
     /// only in the attempt log.
     pub(crate) fn ratchet(&mut self, turn: &Score, files_changed: bool, cwd: Option<&Path>, session: &str, line: &str) {
+        if !turn.is_empty() {
+            self.verify_runs += turn.len() as u32;
+            self.verify_ok = turn.values().all(|&(_, f)| f == 0);
+        }
         if let Some(msg) = regression(&self.best, turn) {
             self.regressed = Some(msg);
         } else if accepts(&self.best, turn) {
