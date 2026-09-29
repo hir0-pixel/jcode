@@ -109,13 +109,34 @@ fn version(conn: &Connection) -> Result<u32> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
+/// Make `sovereign.db` and its `-wal`/`-shm` owner-only: it holds chats, memories and goals. A new
+/// file is created 0600 (so SQLite gives its sidecars the same mode); existing ones are tightened.
+pub fn private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if !path.exists() {
+            let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.as_os_str().to_owned();
+            file.push(suffix);
+            let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Open `path`, apply the store's idempotent `schema`, then migrate. A file that already held a
 /// version or tables before `schema` ran is backed up first.
 pub fn open(path: &Path, schema: &str) -> Result<Connection> {
+    private(path);
     let conn = Connection::open(path)?;
     let had_data: bool = version(&conn)? > 0 || conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')", [], |r| r.get(0))?;
     conn.execute_batch(schema)?;
     run(&conn, had_data.then_some(path))?;
+    private(path);
     Ok(conn)
 }
 
@@ -136,6 +157,7 @@ pub fn run(conn: &Connection, backup_of: Option<&Path>) -> Result<()> {
             let _ = std::fs::remove_file(&tmp);
             conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])?;
             std::fs::rename(&tmp, &backup)?;
+            private(&backup);
         }
     }
     // Another opener may have migrated meanwhile: re-read the version under the write lock.
@@ -157,6 +179,27 @@ pub fn run(conn: &Connection, backup_of: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_database_and_its_sidecars_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("migrate-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let conn = open(&path, "CREATE TABLE IF NOT EXISTS t(a);").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO t VALUES(1);").unwrap();
+        private(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let file = dir.join(format!("sovereign.db{suffix}"));
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600, "{}", file.display());
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn migrates_forward_once_backs_up_existing_data_and_refuses_a_newer_file() {

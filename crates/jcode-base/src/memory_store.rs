@@ -95,6 +95,7 @@ fn with_db<R>(path: &Path, f: impl FnOnce(&mut Connection) -> Result<R>) -> Resu
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        crate::migrate::private(path);
         let mut db = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         migrate(&mut db)?;
         map.insert(path.to_path_buf(), db);

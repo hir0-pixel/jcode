@@ -173,10 +173,12 @@ impl Observer {
     ) -> rusqlite::Result<Arc<Self>> {
         std::fs::create_dir_all(home).map_err(|_| rusqlite::Error::InvalidPath(home.into()))?;
         let path = home.join("sovereign.db");
+        jcode_base::migrate::private(&path);
         let mut db = Connection::open(&path)?;
         schema::open(&mut db)?;
         setup(&mut db)?;
         let read_db = Connection::open(&path)?;
+        jcode_base::migrate::private(&path);
         read_db.busy_timeout(Duration::from_secs(5))?;
         let retention_days = retention_days();
         let capture_content = std::fs::read(home.join("observability.json"))
