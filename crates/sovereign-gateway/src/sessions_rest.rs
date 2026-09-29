@@ -13,7 +13,9 @@ use tokio::net::TcpStream;
 /// still gets its leftovers cleared.
 pub(crate) async fn delete_everywhere(config: &Config, id: &str) -> Result<()> {
     if let Err(err) = harness_request(&config.legacy_socket, json!({"req": "delete_session", "session_id": id})).await {
-        if !err.to_string().contains("not found") { return Err(err); }
+        // The engine's cleanup still ran; a missing file is not a failure here.
+        let message = err.to_string();
+        if !message.contains("not found") && !message.contains("does not exist") { return Err(err); }
     }
     forget_rows(&config.home, id)
 }
@@ -507,6 +509,12 @@ async fn delete(stream: &mut TcpStream, config: &Config, id: &str) -> Result<()>
         }
         Ok(Some(_)) => match delete_everywhere(config, id).await {
             Ok(_) => respond(stream, "200 OK", &json!({"ok": true})).await,
+            Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
+        },
+        // No file, but an index row (or the daemon's memory) can still list
+        // it: run the idempotent cleanup so a deleted chat leaves the list.
+        Ok(None) if valid_id(id) => match delete_everywhere(config, id).await {
+            Ok(_) => respond(stream, "200 OK", &json!({"ok": true, "already_absent": true})).await,
             Err(err) => respond(stream, "503 Service Unavailable", &json!({"detail": err.to_string()})).await,
         },
         Ok(None) => respond(stream, "200 OK", &json!({"ok": true, "already_absent": true})).await,
