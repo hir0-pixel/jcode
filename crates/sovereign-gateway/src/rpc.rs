@@ -1963,9 +1963,9 @@ impl Conn {
                 };
                 if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str(), images).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
+                    attach::restore_staged(&self.config.home, &id, &staged, &unreadable);
                     return Err(RpcError::internal(err));
                 }
-                attach::clear_staged(&self.config.home, &id, &staged);
                 let mut response = json!({ "status": if busy { "queued" } else { "streaming" } });
                 if !unreadable.is_empty() {
                     response["dropped_images"] = json!(unreadable);

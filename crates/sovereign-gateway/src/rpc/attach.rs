@@ -140,9 +140,15 @@ fn attached_image(path: &Path, count: usize, extra: Value) -> Value {
 }
 
 fn decode(raw: &str, max: usize, label: &str) -> Result<Vec<u8>, Failure> {
-    let cleaned: String = raw.trim().split_once(";base64,").map_or(raw.trim(), |(_, b)| b).split_whitespace().collect();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(cleaned)
+    let payload = raw.trim().split_once(";base64,").map_or(raw.trim(), |(_, b)| b);
+    // Size first, from the encoded length: a huge payload is refused before any buffer is made.
+    let encoded = payload.bytes().filter(|b| !b.is_ascii_whitespace()).count();
+    if encoded * 3 / 4 > max {
+        return fail(4018, format!("{label} too large (about {} bytes; cap is {} MB)", encoded * 3 / 4, max / (1024 * 1024)));
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    // Decode straight from the request's own string unless whitespace forces a cleaned copy.
+    let bytes = if encoded == payload.len() { engine.decode(payload) } else { engine.decode(payload.split_whitespace().collect::<String>()) }
         .or_else(|_| fail(4017, "data is not valid base64"))?;
     if bytes.is_empty() {
         return fail(4017, format!("{label} is empty"));
@@ -170,7 +176,8 @@ fn sniff_ext(bytes: &[u8], filename: &str) -> String {
 }
 
 fn unique(dir: &Path, prefix: &str, ext: &str) -> PathBuf {
-    let n = pending(dir).len() + 1;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     dir.join("images").join(format!("{prefix}_{}_{n}.{ext}", chrono::Local::now().format("%Y%m%d_%H%M%S%3f")))
 }
 
@@ -400,11 +407,23 @@ fn react(dir: &Path, p: &Value) -> Reply {
     Ok(json!({ "row_id": row_id.unwrap_or(0), "reactions": reactions }))
 }
 
-/// Staged image paths, the same images as `(media_type, base64)` for `send_message`, and the paths
-/// that could not be read (they are dropped from the turn; the caller reports them). Nothing is
-/// cleared here (see `clear_staged`). Blocking file reads and encoding: call off the async workers.
+/// Claim the session's staged images: the paths are taken off the queue under the stage lock (so a
+/// second submit cannot send them again), returned with the same images as `(media_type, base64)`
+/// for `send_message`, and the paths that could not be read (dropped from the turn; the caller
+/// reports them). If the submit then fails, `restore_staged` puts them back. Blocking file reads and
+/// encoding: call off the async workers.
 pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
-    let paths = stage_dir(home, session).map(|dir| pending(&dir)).unwrap_or_default();
+    let paths = stage_dir(home, session)
+        .map(|dir| {
+            let lock = stage_lock(&dir);
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let claimed = pending(&dir);
+            if !claimed.is_empty() {
+                let _ = std::fs::remove_file(dir.join("pending.json"));
+            }
+            claimed
+        })
+        .unwrap_or_default();
     let (mut images, mut unreadable) = (Vec::new(), Vec::new());
     for p in &paths {
         match std::fs::read(p) {
@@ -415,17 +434,15 @@ pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(Str
     (paths, images, unreadable)
 }
 
-/// Drop only the `sent` paths from the queue: an image attached while the submit was in flight
-/// stays for the next turn.
-pub(super) fn clear_staged(home: &str, session: &str, sent: &[String]) {
+/// Return claimed paths to the front of the queue after a failed submit (unreadable ones stay dropped).
+pub(super) fn restore_staged(home: &str, session: &str, claimed: &[String], unreadable: &[String]) {
     let Some(dir) = stage_dir(home, session) else { return };
     let lock = stage_lock(&dir);
     let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let left: Vec<String> = pending(&dir).into_iter().filter(|p| !sent.contains(p)).collect();
-    if left.is_empty() {
-        let _ = std::fs::remove_file(dir.join("pending.json"));
-    } else {
-        let _ = write_json(&dir.join("pending.json"), &left);
+    let mut list: Vec<String> = claimed.iter().filter(|p| !unreadable.contains(p)).cloned().collect();
+    list.extend(pending(&dir));
+    if !list.is_empty() {
+        let _ = write_json(&dir.join("pending.json"), &list);
     }
 }
 
@@ -469,12 +486,14 @@ mod tests {
         let Some(Outbound::Legacy(message)) = out.first() else { panic!("no legacy message") };
         assert_eq!(message["images"], json!([["image/png", b64]]));
 
-        // An image attached while the submit was in flight survives clearing what was sent.
+        // Claimed: a second (double) submit finds nothing, and an image attached while the first was
+        // in flight stays for the next turn.
+        assert!(staged_images(&home, "s1").0.is_empty(), "a second submit does not resend it");
         let late = call("image.attach_bytes", &home, json!({ "content_base64": format!("data:image/png;base64,{b64}") })).unwrap();
-        clear_staged(&home, "s1", &sent);
+        // A failed submit gives the claimed images back, ahead of the late one.
+        restore_staged(&home, "s1", &sent, &[]);
         let (left, _, _) = staged_images(&home, "s1");
-        assert_eq!(left, vec![late["path"].as_str().unwrap().to_string()]);
-        clear_staged(&home, "s1", &left);
+        assert_eq!(left, vec![sent[0].clone(), late["path"].as_str().unwrap().to_string()]);
         assert!(staged_images(&home, "s1").0.is_empty(), "consumed by the submit");
     }
 
@@ -559,9 +578,22 @@ mod tests {
         let (a, b) = (a["path"].as_str().unwrap().to_string(), b["path"].as_str().unwrap().to_string());
         std::fs::remove_file(&b).unwrap(); // vanished before the turn was sent
         let (paths, images, unreadable) = staged_images(&home, "s1");
-        assert_eq!((paths.len(), images.len(), unreadable), (2, 1, vec![b]));
+        assert_eq!((paths.len(), images.len(), unreadable.clone()), (2, 1, vec![b]));
+        restore_staged(&home, "s1", &paths, &unreadable); // failed submit: the readable one is back
         assert_eq!(call("image.detach", &home, json!({ "path": a })).unwrap()["detached"], true);
         assert!(!Path::new(&a).exists(), "detach removes the staged file");
+    }
+
+    #[test]
+    fn staged_names_never_collide_and_an_oversized_payload_is_refused_before_decoding() {
+        let dir = Path::new("/x");
+        let names: std::collections::HashSet<_> = (0..1000).map(|_| unique(dir, "upload", "png")).collect();
+        assert_eq!(names.len(), 1000, "same millisecond, same queue length: still distinct");
+        // Not even valid base64, but too long to be under the cap: refused on length alone (4018, not 4017).
+        let junk = "!".repeat(IMAGE_MAX * 4 / 3 + 64);
+        assert_eq!(decode(&junk, IMAGE_MAX, "image").unwrap_err().0, 4018);
+        assert_eq!(decode("aGk=\n", 10, "x").unwrap(), b"hi");
+        assert_eq!(decode("aG\nk=", 10, "x").unwrap(), b"hi", "whitespace inside is tolerated");
     }
 
     #[test]
