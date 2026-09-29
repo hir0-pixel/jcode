@@ -29,6 +29,7 @@ mod local_state;
 mod provider_state;
 mod side_agents;
 mod spawn_tree;
+mod toolsets;
 
 const HARNESS_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `prompt.submit` waits for jcode to acknowledge the message. The
@@ -2467,11 +2468,14 @@ pub(crate) struct RunOpts<'a> {
     /// A cron job's own model / provider, applied when the run creates its session.
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
+    /// Hermes toolset policy for the run: a per-job allowlist and the always-on denylist.
+    pub enabled_toolsets: Option<Vec<String>>,
+    pub disabled_toolsets: Vec<String>,
 }
 
 impl Default for RunOpts<'_> {
     fn default() -> Self {
-        Self { surface: "goal", instructions: None, model: None, provider: None }
+        Self { surface: "goal", instructions: None, model: None, provider: None, enabled_toolsets: None, disabled_toolsets: Vec::new() }
     }
 }
 
@@ -2628,6 +2632,10 @@ pub(crate) async fn agent_run(
 
     if let Some(key) = session_key {
         ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), (conn.clone(), session_id.clone()));
+    }
+    // A cron job's toolset policy holds for the whole run (fails closed: no policy, no run).
+    if let Some(request) = toolsets::request(&session_id, opts.enabled_toolsets.as_deref(), &opts.disabled_toolsets) {
+        conn.call(request).await.context("could not apply the job's tool policy")?;
     }
     // Nobody waits on an approval here: both gates (`Out::Approval`, `decide`) apply
     // the unattended policy (Hermes config, else deny and park for the desktop).

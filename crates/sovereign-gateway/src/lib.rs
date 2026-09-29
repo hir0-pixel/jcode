@@ -723,6 +723,8 @@ async fn handle(
                     instructions: body["instructions"].as_str().filter(|i| !i.trim().is_empty()),
                     model: body["model"].as_str().filter(|m| !m.trim().is_empty()),
                     provider: body["provider"].as_str().filter(|p| !p.trim().is_empty()),
+                    enabled_toolsets: body["enabled_toolsets"].as_array().map(|l| l.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect()),
+                    disabled_toolsets: body["disabled_toolsets"].as_array().map(|l| l.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
                 },
                 Duration::from_secs(timeout_s),
             )
