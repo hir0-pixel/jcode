@@ -264,17 +264,15 @@ pub fn new_memorable_session_id_avoiding(used_names: &HashSet<String>) -> (Strin
     let ts = Utc::now().timestamp_millis();
     let rand: u64 = rand::random();
 
-    let cursor = session_name_cursor();
-    let word = (0..SESSION_NAMES.len())
-        .find_map(|_| {
-            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
-            let (word, _) = SESSION_NAMES[idx];
-            (!used_names.contains(word)).then_some(word)
-        })
-        .unwrap_or_else(|| {
-            let idx = cursor.fetch_add(1, Ordering::Relaxed) % SESSION_NAMES.len();
-            SESSION_NAMES[idx].0
-        });
+    // One fetch_add per call: concurrent creators get distinct starting points,
+    // and the scan itself is private, so another thread advancing the cursor
+    // can never make it skip an available identity.
+    let n = SESSION_NAMES.len();
+    let start = session_name_cursor().fetch_add(1, Ordering::Relaxed) % n;
+    let word = (0..n)
+        .map(|i| SESSION_NAMES[(start + i) % n].0)
+        .find(|w| !used_names.contains(*w))
+        .unwrap_or(SESSION_NAMES[start].0);
 
     let short_name = word.to_string();
     let full_id = format!("session_{}_{ts}_{rand:016x}", word);
