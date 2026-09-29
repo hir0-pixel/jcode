@@ -12,11 +12,11 @@ const jcodeHome = path.join(root, '.jcode')
 for (const directory of [home, hermesHome, jcodeHome]) fs.mkdirSync(directory, { recursive: true })
 const token = crypto.randomBytes(24).toString('hex')
 const env = { ...process.env, HOME: home, HERMES_HOME: hermesHome, JCODE_HOME: jcodeHome,
-  HERMES_DASHBOARD_SESSION_TOKEN: token, PYTHONDONTWRITEBYTECODE: '1' }
+  HERMES_DASHBOARD_SESSION_TOKEN: token, PYTHONDONTWRITEBYTECODE: '1', PORCUPINE_ACCESS_KEY: '' }
 const hermesRoot = process.env.HERMES_REPO || path.resolve('../hermes-agent')
 const python = process.env.HERMES_PYTHON || path.join(hermesRoot, '.venv/bin/python')
 const command = '/usr/bin/say -o {output_path}.aiff -f {input_path} && /usr/bin/afconvert {output_path}.aiff -o {output_path} -f WAVE -d LEI16 && /bin/rm {output_path}.aiff'
-fs.writeFileSync(path.join(hermesHome, 'config.yaml'), `security:\n  allow_lazy_installs: false\ntts:\n  provider: local-say\n  providers:\n    local-say:\n      type: command\n      format: wav\n      command: "${command}"\n`)
+fs.writeFileSync(path.join(hermesHome, 'config.yaml'), `security:\n  allow_lazy_installs: false\n# Porcupine with no access key is unavailable on any host; openWakeWord is installed now and would open a real mic.\nwake_word:\n  provider: porcupine\ntts:\n  provider: local-say\n  providers:\n    local-say:\n      type: command\n      format: wav\n      command: "${command}"\n`)
 let child
 try {
   child = spawn(python, ['-m', 'hermes_cli.main', 'serve', '--host', '127.0.0.1', '--port', '0', '--skip-build'], {
