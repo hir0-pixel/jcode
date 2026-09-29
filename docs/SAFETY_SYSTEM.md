@@ -617,6 +617,13 @@ JSON line on stdin (`hermes serve --secrets-stdin`), so neither is in its argv o
 strips both from the inherited env. Standalone Hermes, without the flag, still reads them from the environment. Real containment needs the
 bash tool to run under a different uid or a sandbox.
 
+**Goal checkpoints (git).** Every git call Akira makes in a user's repo (`goal_ratchet::SAFE_GIT`) runs with
+`core.fsmonitor=false`, `core.hooksPath=/dev/null`, `core.attributesFile=/dev/null` and `GIT_ATTR_NOSYSTEM=1`, so
+hooks, fsmonitor and global or system attributes files cannot attach a clean/smudge filter; the checkpoint snapshot
+(`git add -A` into a throwaway index) is killed after 30 s and that checkpoint is skipped with a note on stderr.
+**Residual:** a repo's own `.gitattributes` can still name a filter, and it runs if the user's global or system git
+config defines that filter driver (for example Git LFS); a repo cannot define the driver command itself.
+
 ---
 
 *Last updated: 2026-02-08*

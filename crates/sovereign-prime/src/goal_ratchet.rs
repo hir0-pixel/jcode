@@ -184,18 +184,60 @@ pub fn fmt_score(s: &Score) -> String {
     out.join("; ")
 }
 
-/// Options for every git call in a user's repo: its config must not run anything (fsmonitor, hooks)
-/// outside the approval gate.
-pub const SAFE_GIT: [&str; 4] = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+/// Options for every git call in a user's repo: its config must not run anything (fsmonitor, hooks),
+/// and no global attributes file may attach a clean/smudge filter. Callers also set `GIT_ATTR_NOSYSTEM=1`
+/// (see [`safe_git_env`]) for the system-wide attributes file.
+pub const SAFE_GIT: [&str; 6] = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null"];
+
+/// The environment half of [`SAFE_GIT`].
+pub fn safe_git_env(c: &mut Command) -> &mut Command {
+    c.env("GIT_ATTR_NOSYSTEM", "1")
+}
+
+/// A git call in the repo may not take longer than this (a huge tree, a hung filter).
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run `c`, killing it after `limit`; its stdout when it succeeded in time.
+fn bounded(c: &mut Command, limit: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    let mut child = c.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    match status {
+        Some(status) if status.success() => Some(String::from_utf8_lossy(&out).trim().to_string()),
+        Some(_) => None,
+        None => {
+            eprintln!("akira: a git call ran over {}s and was stopped; the goal checkpoint is skipped", limit.as_secs());
+            None
+        }
+    }
+}
 
 fn git(cwd: &Path, envs: &[(&str, &Path)], args: &[&str]) -> Option<String> {
     let mut c = Command::new("git");
-    c.current_dir(cwd).args(SAFE_GIT).args(args).stdin(Stdio::null()).stderr(Stdio::null());
+    c.current_dir(cwd).args(SAFE_GIT).args(args).stdin(Stdio::null());
+    safe_git_env(&mut c);
     for (k, v) in envs {
         c.env(k, v);
     }
-    let out = c.output().ok().filter(|o| o.status.success())?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    bounded(&mut c, GIT_TIMEOUT)
 }
 
 /// Snapshot the working tree (incl. untracked, honoring .gitignore) into a
@@ -326,5 +368,46 @@ impl SessionGoal {
             "You supervise a long-running coding agent that has stalled. Review its trajectory and reply with 2-3 DISTINCT alternative strategies, one short line each, no preamble.".into(),
             u.chars().take(4500).collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stuck_git_call_is_killed_at_the_limit_and_skips_the_checkpoint() {
+        let started = std::time::Instant::now();
+        assert_eq!(bounded(Command::new("sleep").arg("30"), std::time::Duration::from_millis(200)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(bounded(Command::new("echo").arg("ok"), std::time::Duration::from_secs(5)).as_deref(), Some("ok"));
+    }
+
+    /// A global attributes file naming a clean filter must not run when Akira snapshots.
+    #[test]
+    fn global_attribute_filters_do_not_run_during_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!("ratchet-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "hi").unwrap();
+        assert!(Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        let (attrs, marker, config) = (dir.join("attrs"), dir.join("ran"), dir.join("gitconfig"));
+        std::fs::write(&attrs, "* filter=boom\n").unwrap();
+        std::fs::write(&config, format!("[core]\n\tattributesFile = {}\n[filter \"boom\"]\n\tclean = touch {} && cat\n", attrs.display(), marker.display())).unwrap();
+        let run = |safe: bool, args: &[&str]| {
+            let mut c = Command::new("git");
+            c.current_dir(&repo).env("GIT_CONFIG_GLOBAL", &config).env("GIT_INDEX_FILE", dir.join(if safe { "i1" } else { "i2" }));
+            if safe {
+                c.args(SAFE_GIT);
+                safe_git_env(&mut c);
+            }
+            c.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success()
+        };
+        assert!(run(true, &["add", "-A"]));
+        assert!(!marker.exists(), "the global filter must not run");
+        assert!(run(false, &["add", "-A"]));
+        assert!(marker.exists(), "control: plain git does run it, so this test can fail");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

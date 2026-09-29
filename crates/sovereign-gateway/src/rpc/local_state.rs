@@ -69,10 +69,10 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 /// output (a huge diff is cut off, not read whole).
 fn git_capped(cwd: &str, args: &[&str], max: usize) -> Option<String> {
     use std::io::Read;
-    let mut child = std::process::Command::new("git")
-        .current_dir(cwd)
-        .args(sovereign_prime::goal_ratchet::SAFE_GIT)
-        .args(args)
+    let mut command = std::process::Command::new("git");
+    command.current_dir(cwd).args(sovereign_prime::goal_ratchet::SAFE_GIT).args(args);
+    sovereign_prime::goal_ratchet::safe_git_env(&mut command);
+    let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
