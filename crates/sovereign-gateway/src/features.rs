@@ -97,6 +97,13 @@ pub struct Features {
     /// can call `/api/agent/run` instead of its own `AIAgent`. `None` until
     /// `set_engine_env` runs, right after the gateway binds its port.
     engine_env: std::sync::Mutex<Option<(String, String)>>,
+    /// Consecutive failed bot-backend starts and when the last one failed (see [`Features::ensure_bots`]).
+    bot_failures: std::sync::Mutex<(u32, Option<Instant>)>,
+}
+
+/// Wait after `failures` failed bot-backend starts: 1 minute, doubling, capped at 30.
+fn bot_retry_after(failures: u32) -> Duration {
+    Duration::from_secs(60 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30 * 60))
 }
 
 impl Features {
@@ -110,6 +117,7 @@ impl Features {
             leases: AtomicUsize::new(0),
             cron_changed: Notify::new(),
             engine_env: std::sync::Mutex::new(None),
+            bot_failures: std::sync::Mutex::new((0, None)),
         }
     }
 
@@ -249,8 +257,18 @@ impl Features {
     /// config in `home` has a platform enabled, start it if it isn't running (boot, or it died).
     pub async fn ensure_bots(&self, home: &std::path::Path) {
         if messaging_enabled(home) && !self.is_running().await {
-            if let Err(err) = self.port().await {
-                eprintln!("sovereign: could not start the messaging backend: {err:#}");
+            let (failures, last) = *self.bot_failures.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < bot_retry_after(failures)) {
+                return; // a backend that cannot start is not retried every tick
+            }
+            let started = self.port().await;
+            let mut state = self.bot_failures.lock().unwrap_or_else(|e| e.into_inner());
+            match started {
+                Ok(_) => *state = (0, None),
+                Err(err) => {
+                    *state = (failures + 1, Some(Instant::now()));
+                    eprintln!("sovereign: could not start the messaging backend (next try in {}s): {err:#}", bot_retry_after(failures + 1).as_secs());
+                }
             }
         }
     }
@@ -392,6 +410,33 @@ mod tests {
         f.last_used_ms.store(0, Ordering::Relaxed);
         f.stop_if_idle().await;
         assert!(!f.is_running().await, "lease released and idle: stopped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_bot_backend_that_cannot_start_is_retried_with_growing_backoff_then_reset() {
+        let dir = std::env::temp_dir().join(format!("features-backoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "platforms:\n  telegram:\n    enabled: true\n").unwrap();
+        let (script, tries) = (dir.join("dies"), dir.join("tries"));
+        std::fs::write(&script, format!("#!/bin/sh\necho x >> '{}'\nexit 1\n", tries.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let count = || std::fs::read_to_string(&tries).map_or(0, |t| t.lines().count());
+        let f = Features::new(vec![script.to_string_lossy().into_owned()]);
+        f.ensure_bots(&dir).await;
+        f.ensure_bots(&dir).await;
+        assert_eq!(count(), 1, "second tick is inside the 1 minute backoff");
+        f.bot_failures.lock().unwrap().1 = Some(Instant::now() - Duration::from_secs(61));
+        f.ensure_bots(&dir).await;
+        assert_eq!(count(), 2);
+        f.bot_failures.lock().unwrap().1 = Some(Instant::now() - Duration::from_secs(61));
+        f.ensure_bots(&dir).await;
+        assert_eq!(count(), 2, "the second failure waits 2 minutes");
+        assert_eq!([1, 2, 3, 6, 7, 40].map(|n| bot_retry_after(n).as_secs()), [60, 120, 240, 1800, 1800, 1800]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
