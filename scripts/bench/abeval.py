@@ -404,7 +404,14 @@ def start_sovereign(c, home, token):
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if not any(s in k for s in ("API_KEY", "TOKEN", "SECRET")) and not k.startswith(("HERMES_", "JCODE_", "SOVEREIGN_"))}
-    env.update({"HOME": str(home), "JCODE_HOME": str(jcode_home), "HERMES_DASHBOARD_SESSION_TOKEN": token, "SOVEREIGN_PRICE_TABLE": c["PRICE_TABLE"]})
+    # Private HERMES_HOME (the engine otherwise falls back to the real ~/.hermes: its config,
+    # keys and cron jobs) and a short private runtime dir (the default one is shared, so two
+    # concurrent engines refuse to start; AF_UNIX paths are capped at 104 bytes on macOS).
+    hermes_home = home / ".hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    env.update({"HOME": str(home), "JCODE_HOME": str(jcode_home), "HERMES_HOME": str(hermes_home),
+                "JCODE_RUNTIME_DIR": tempfile.mkdtemp(prefix="jr-", dir="/tmp"),
+                "HERMES_DASHBOARD_SESSION_TOKEN": token, "SOVEREIGN_PRICE_TABLE": c["PRICE_TABLE"]})
     args = [c["SOVEREIGN_BIN"], "--provider", "openai-compatible", "--model", c["MODEL"], "serve", "--host", "127.0.0.1", "--port", "0"]
     proc = subprocess.Popen(args, env=env, cwd=str(home), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True, text=True)
     port = None
