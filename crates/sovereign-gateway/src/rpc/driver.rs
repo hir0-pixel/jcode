@@ -248,7 +248,14 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
         }
         let subagents_running = conn.child_sessions_running(&session_id).await;
         let cwd = conn.session_cwd(&session_id).await;
-        let continuation = match after_turn_in(&store, &session_id, tokens, subagents_running, interrupted, cwd.as_deref().map(Path::new)) {
+        // Ratchet checkpoints shell out to git: keep that off the async workers.
+        let turn = {
+            let (store, sid, cwd) = (store.clone(), session_id.clone(), cwd.clone());
+            tokio::task::spawn_blocking(move || after_turn_in(&store, &sid, tokens, subagents_running, interrupted, cwd.as_deref().map(Path::new)))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+        };
+        let continuation = match turn {
             Ok(None) if !interrupted && !busy().await => due_heartbeat(&store, &session_id).ok().flatten(),
             Ok(next) => next,
             Err(err) => return eprintln!("sovereign: after_turn for {session_id}: {err:#}"),

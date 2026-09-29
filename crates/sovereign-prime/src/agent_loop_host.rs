@@ -73,6 +73,7 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
             } else {
                 format!("{verification} | best score: {}", crate::goal_ratchet::fmt_score(&goal.best))
             };
+            goal.prune_refs(goal.final_ref());
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
             goal.completion_verification = Some(verification);

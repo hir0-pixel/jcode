@@ -247,6 +247,8 @@ pub struct SessionGoal {
     pub regressed: Option<String>,
     pub sup_turn: Option<i64>,
     pub sup_episode: bool,
+    /// Repo the checkpoint refs were written in (so clear/complete can delete them).
+    pub ref_cwd: Option<String>,
 }
 
 /// Attempt-log bounds (NVIDIA AVO long-horizon harness: a small, bounded
@@ -350,6 +352,7 @@ impl SessionGoal {
             regressed: None,
             sup_turn: None,
             sup_episode: false,
+            ref_cwd: None,
         }
     }
 
@@ -484,6 +487,7 @@ impl SessionGoal {
             "regressed": self.regressed,
             "sup_turn": self.sup_turn,
             "sup_episode": self.sup_episode,
+            "ref_cwd": self.ref_cwd,
         })
     }
 
@@ -537,6 +541,7 @@ impl SessionGoal {
             regressed: v["regressed"].as_str().map(str::to_string),
             sup_turn: v["sup_turn"].as_i64(),
             sup_episode: v["sup_episode"].as_bool().unwrap_or(false),
+            ref_cwd: v["ref_cwd"].as_str().map(str::to_string),
         })
     }
 
@@ -1553,6 +1558,9 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             .map(|g| g.status_text())
             .unwrap_or_else(|| "No active goal. Set one with /goal <text>.".into())),
         "clear" => {
+            if let Some(goal) = store.get_goal(session_id)? {
+                goal.prune_refs(None);
+            }
             store.set_goal(session_id, None)?;
             Ok("✓ Goal cleared.".into())
         }
@@ -1580,6 +1588,7 @@ pub fn handle_goal_command(store: &ControlStore, session_id: &str, args: &str) -
             let mut goal = store
                 .get_goal(session_id)?
                 .ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
+            goal.prune_refs(goal.final_ref());
             goal.status = GoalStatus::Done;
             goal.last_verdict = Some("done".into());
             goal.updated_at_ms = now_ms();
@@ -2353,6 +2362,32 @@ mod tests {
         assert_eq!(store.get_goal("rt").unwrap().unwrap().lineage[0].git_ref, "no-vcs");
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(plain).ok();
+    }
+
+    #[test]
+    fn removed_tests_do_not_freeze_the_ratchet_and_refs_are_pruned_on_complete_and_clear() {
+        let dir = std::env::temp_dir().join(format!("ratchet-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_ok(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        git_ok(&dir, &["add", "a.txt"]);
+        git_ok(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("rt", Some(&SessionGoal::new("x"))).unwrap();
+        test_run(&store, &dir, "test result: ok. 7 passed; 0 failed", 0);
+        test_run(&store, &dir, "test result: ok. 5 passed; 0 failed", 0); // tests deleted, none failing
+        let g = store.get_goal("rt").unwrap().unwrap();
+        assert_eq!(g.lineage.len(), 2, "fewer passes with no failures still checkpoints");
+        let refs = || git_ok(&dir, &["for-each-ref", "--format=%(refname)", "refs/akira/goals/rt/"]);
+        assert_eq!(refs().lines().count(), 2);
+        let last = g.lineage[1].git_ref.clone();
+        handle_goal_command(&store, "rt", "complete").unwrap();
+        assert_eq!(refs(), last, "completion keeps only the final best ref");
+        store.set_goal("rt", Some(&g)).unwrap();
+        handle_goal_command(&store, "rt", "clear").unwrap();
+        assert_eq!(refs(), "");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

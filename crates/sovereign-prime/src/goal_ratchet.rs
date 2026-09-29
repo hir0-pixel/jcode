@@ -88,7 +88,9 @@ pub fn score_of(ok: bool, out: &str) -> (u32, u32) {
 pub fn accepts(best: &Score, turn: &Score) -> bool {
     !turn.is_empty()
         && turn.iter().all(|(k, &(p, f))| match best.get(k) {
-            Some(&(bp, bf)) => f <= bf && p >= bp,
+            // Fewer passes with no failures is removed tests, not a regression: it must not
+            // freeze every later checkpoint. `regression()` still catches new failures.
+            Some(&(bp, bf)) => f <= bf && (p >= bp || f == 0),
             None => p > 0,
         })
 }
@@ -124,7 +126,14 @@ fn git(cwd: &Path, envs: &[(&str, &Path)], args: &[&str]) -> Option<String> {
 /// HEAD or index. None outside a git repo.
 pub fn snapshot(cwd: &Path, session: &str, n: u32) -> Option<String> {
     git(cwd, &[], &["rev-parse", "--is-inside-work-tree"])?;
-    let idx = std::env::temp_dir().join(format!("akira-idx-{}-{n}-{}", std::process::id(), session.len()));
+    // Unique per call: concurrent sessions (and retries) never share a scratch index.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let idx = std::env::temp_dir().join(format!(
+        "akira-idx-{}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    ));
     let _ = std::fs::remove_file(&idx);
     // Seed from a copy of the real index so `add -A` reuses its stat cache and
     // only re-hashes changed files (the real index itself is never written).
@@ -163,6 +172,9 @@ impl SessionGoal {
                 self.checkpoint_seq += 1;
                 let n = self.checkpoint_seq;
                 let git_ref = cwd.and_then(|c| snapshot(c, session, n)).unwrap_or_else(|| "no-vcs".into());
+                if git_ref != "no-vcs" {
+                    self.ref_cwd = cwd.map(|c| c.to_string_lossy().into_owned());
+                }
                 self.lineage.push(Checkpoint { n, git_ref, score: fmt_score(&self.best), line: line.into() });
                 while self.lineage.len() > MAX_LINEAGE {
                     let old = self.lineage.remove(0);
@@ -172,6 +184,20 @@ impl SessionGoal {
                 }
             }
         }
+    }
+
+    /// Delete this goal's hidden checkpoint refs from the repo they were taken in,
+    /// except `keep` (completion keeps the final best ref; `/goal clear` keeps none).
+    pub(crate) fn prune_refs(&self, keep: Option<&str>) {
+        let Some(cwd) = self.ref_cwd.as_deref().map(Path::new) else { return };
+        for c in self.lineage.iter().filter(|c| c.git_ref != "no-vcs" && Some(c.git_ref.as_str()) != keep) {
+            git(cwd, &[], &["update-ref", "-d", &c.git_ref]);
+        }
+    }
+
+    /// The final best checkpoint ref, kept when a goal completes.
+    pub(crate) fn final_ref(&self) -> Option<&str> {
+        self.last_good_ref().map(|c| c.git_ref.as_str())
     }
 
     fn last_good_ref(&self) -> Option<&Checkpoint> {
