@@ -17,6 +17,17 @@ use self::openai_stream_timeout::{
 pub(super) async fn openai_access_token(
     credentials: &Arc<RwLock<CodexCredentials>>,
 ) -> anyhow::Result<String> {
+    // A plain API key has no refresh path: re-read it so a rotation lands on the next request.
+    let stale = {
+        let tokens = credentials.read().await;
+        tokens.refresh_token.is_empty() && tokens.id_token.is_none() && tokens.expires_at.is_none()
+    };
+    if stale && let Ok(fresh) = jcode_base::auth::codex::load_api_key_credentials() {
+        let mut tokens = credentials.write().await;
+        if tokens.access_token != fresh.access_token {
+            tokens.access_token = fresh.access_token;
+        }
+    }
     let (access_token, refresh_token, needs_refresh) = {
         let tokens = credentials.read().await;
         if tokens.access_token.is_empty() {
@@ -1772,5 +1783,32 @@ mod stream_runtime_tests {
     fn auth_errors_remain_non_retryable() {
         assert!(!is_retryable_error("401 unauthorized"));
         assert!(!is_retryable_error("invalid api key"));
+    }
+}
+
+#[cfg(test)]
+mod key_rotation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_rotated_api_key_is_used_by_the_next_request() {
+        let _lock = jcode_base::storage::lock_test_env();
+        let creds = |key: &str| CodexCredentials {
+            access_token: key.into(),
+            refresh_token: String::new(),
+            id_token: None,
+            account_id: None,
+            expires_at: None,
+        };
+        let store = Arc::new(RwLock::new(creds("sk-stored")));
+        let old = std::env::var_os("OPENAI_API_KEY");
+        jcode_base::env::set_var("OPENAI_API_KEY", "sk-one");
+        assert_eq!(openai_access_token(&store).await.unwrap(), "sk-one");
+        jcode_base::env::set_var("OPENAI_API_KEY", "sk-two");
+        assert_eq!(openai_access_token(&store).await.unwrap(), "sk-two");
+        match old {
+            Some(v) => jcode_base::env::set_var("OPENAI_API_KEY", v),
+            None => jcode_base::env::remove_var("OPENAI_API_KEY"),
+        }
     }
 }

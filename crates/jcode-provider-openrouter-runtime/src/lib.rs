@@ -512,10 +512,18 @@ enum ProviderAuth {
 impl ProviderAuth {
     async fn apply(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
         match self {
-            Self::AuthorizationBearer { token, .. } => Ok(req.bearer_auth(token)),
+            // Read per request so a key rotated in Hermes's `.env` applies to the next call.
+            Self::AuthorizationBearer { token, label } => Ok(req.bearer_auth(
+                jcode_base::provider_catalog::env_secret(label).unwrap_or_else(|| token.clone()),
+            )),
             Self::HeaderValue {
-                header_name, value, ..
-            } => Ok(req.header(header_name, value)),
+                header_name,
+                value,
+                label,
+            } => Ok(req.header(
+                header_name,
+                jcode_base::provider_catalog::env_secret(label).unwrap_or_else(|| value.clone()),
+            )),
             Self::AzureEntra { .. } => {
                 let token = jcode_base::auth::azure::get_bearer_token().await?;
                 Ok(req.bearer_auth(token))

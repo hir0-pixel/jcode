@@ -3887,3 +3887,39 @@ fn grok_build_subscription_request_spoofs_grok_cli_and_uses_oidc_bearer() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert!(body.get("reasoning_effort").is_none());
 }
+
+#[tokio::test]
+async fn a_rotated_key_reaches_the_next_request_without_rebuilding_the_provider() {
+    let _lock = ENV_LOCK.lock();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (seen_tx, seen_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let auth = head.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).unwrap_or("").to_string();
+            seen_tx.send(auth).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        }
+    });
+    let auth = ProviderAuth::AuthorizationBearer {
+        token: "stored-old".to_string(),
+        label: "FAKE_ROTATING_API_KEY".to_string(),
+    };
+    let client = reqwest::Client::new();
+    let old = std::env::var_os("FAKE_ROTATING_API_KEY");
+    // SAFETY: serialized by the shared test env lock; name unique to this test.
+    unsafe { std::env::set_var("FAKE_ROTATING_API_KEY", "key-one") };
+    auth.apply(client.get(&url)).await.unwrap().send().await.unwrap();
+    unsafe { std::env::set_var("FAKE_ROTATING_API_KEY", "key-two") };
+    auth.apply(client.get(&url)).await.unwrap().send().await.unwrap();
+    unsafe { std::env::remove_var("FAKE_ROTATING_API_KEY") };
+    if let Some(v) = old {
+        unsafe { std::env::set_var("FAKE_ROTATING_API_KEY", v) };
+    }
+    assert!(seen_rx.recv().unwrap().ends_with("Bearer key-one"));
+    assert!(seen_rx.recv().unwrap().ends_with("Bearer key-two"));
+}

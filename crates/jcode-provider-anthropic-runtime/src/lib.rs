@@ -671,7 +671,8 @@ impl AnthropicProvider {
 
     fn direct_api_key(&self) -> Result<String> {
         match &self.profile_api_key {
-            Some(Ok(key)) => Ok(key.clone()),
+            // Re-read per request so a rotated key applies; the build-time key is the fallback.
+            Some(Ok(key)) => Ok(load_anthropic_api_key().unwrap_or_else(|_| key.clone())),
             Some(Err(err)) => anyhow::bail!(err.clone()),
             None => load_anthropic_api_key(),
         }

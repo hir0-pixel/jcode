@@ -91,6 +91,8 @@ fn named_profile_runtime_captures_transport_and_credential_immutably() {
         provider.profile_api_key.as_ref().unwrap().as_ref().unwrap(),
         "one-secret"
     );
+    // The transport is fixed at build time, but a rotated key reaches the next request.
+    assert_eq!(provider.direct_api_key().unwrap(), "two-secret");
 }
 
 #[test]
