@@ -2445,16 +2445,17 @@ pub(crate) struct RunOpts<'a> {
     /// Per-turn system context (a bot's platform, user and formatting rules), sent as the turn's
     /// system reminder so it never enters the cached static prefix or the transcript.
     pub instructions: Option<&'a str>,
+    /// A cron job's own model / provider, applied when the run creates its session.
+    pub model: Option<&'a str>,
+    pub provider: Option<&'a str>,
 }
 
 impl Default for RunOpts<'_> {
     fn default() -> Self {
-        Self { surface: "goal", instructions: None }
+        Self { surface: "goal", instructions: None, model: None, provider: None }
     }
 }
 
-/// Bot chat key -> engine session, persisted in `sovereign.db` (`engine_settings`) so a bot
-/// conversation survives an engine restart.
 /// The command text to put in front of the approval gate, or None for the fixed
 /// profile edits the desktop's own dialogs issue (`profile delete|describe`,
 /// `config unset model`). Anything else Hermes's CLI can do, `chat -q` included,
@@ -2474,6 +2475,8 @@ fn ungated_exec_command(method: &str, p: &Value) -> Option<String> {
     }
 }
 
+/// Bot chat key -> engine session, persisted in `sovereign.db` (`engine_settings`) so a bot
+/// conversation survives an engine restart.
 fn bot_session_setting(key: &str) -> String {
     format!("bot_session:{key}")
 }
@@ -2488,9 +2491,41 @@ fn save_bot_session(home: &str, key: &str, session_id: &str) {
     }
 }
 
+/// Bot chat key -> the connection and engine session of the turn it is running now, so
+/// `/stop` from the chat can interrupt it.
+static ACTIVE_RUNS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Arc<Conn>, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Interrupt the turn a chat is running (Hermes `/stop`); false when it has none.
+pub(crate) async fn interrupt_run(session_key: &str) -> bool {
+    let entry = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).get(session_key).cloned();
+    let Some((conn, session)) = entry else { return false };
+    conn.dispatch("session.interrupt", &json!({ "session_id": session })).await.is_ok()
+}
+
+/// Hermes `/new`: stop what the chat is running and forget its engine session, so the next
+/// message starts a fresh conversation. The old transcript stays in the sidebar.
+pub(crate) async fn reset_bot_session(home: &str, key: &str) {
+    interrupt_run(key).await;
+    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(home)) {
+        let _ = store.delete_setting(&bot_session_setting(key));
+    }
+}
+
 /// The user approved a command an unattended run was denied: a goal session picks its work back up.
 pub(crate) fn resume_after_approval(session_id: &str, command: &str) {
     driver::resume(session_id, command);
+}
+
+/// `session.create` params for a headless run, carrying a cron job's model / provider override.
+fn run_session_params(cwd: Option<&str>, title: Option<&str>, opts: &RunOpts<'_>) -> Value {
+    let mut params = json!({ "cwd": cwd });
+    for (field, value) in [("title", title), ("model", opts.model), ("provider", opts.provider)] {
+        if let Some(value) = value {
+            params[field] = json!(value);
+        }
+    }
+    params
 }
 
 pub(crate) async fn agent_run(
@@ -2556,10 +2591,7 @@ pub(crate) async fn agent_run(
     let session_id = match resumed {
         Some(id) => id,
         None => {
-            let mut create_params = json!({ "cwd": cwd });
-            if let Some(title) = title {
-                create_params["title"] = json!(title);
-            }
+            let create_params = run_session_params(cwd, title, &opts);
             let created = conn
                 .dispatch("session.create", &create_params)
                 .await
@@ -2575,6 +2607,9 @@ pub(crate) async fn agent_run(
         }
     };
 
+    if let Some(key) = session_key {
+        ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), (conn.clone(), session_id.clone()));
+    }
     // Nobody waits on an approval here: both gates (`Out::Approval`, `decide`) apply
     // the unattended policy (Hermes config, else deny and park for the desktop).
     hub.mark_headless(&session_id, opts.surface).await;
@@ -2604,6 +2639,12 @@ pub(crate) async fn agent_run(
     .await;
 
     hub.unmark_headless(&session_id).await;
+    if let Some(key) = session_key {
+        let mut runs = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.get(key).is_some_and(|(_, id)| *id == session_id) {
+            runs.remove(key);
+        }
+    }
     // Only now is the session guaranteed persisted (jcode does not write a
     // session record until its first turn), so hide it from session.list
     // here rather than before the turn — the same mechanism a user's own
@@ -2615,6 +2656,13 @@ pub(crate) async fn agent_run(
             &json!({ "session_id": session_id, "hidden": true }),
         )
         .await;
+    // Tag it so the sidebar lists the transcript, and let old one-shot cron ones expire.
+    if matches!(opts.surface, "cron" | "bot") {
+        crate::surface_sessions::tag(&home, &session_id, opts.surface, crate::observability::now());
+    }
+    if opts.surface == "cron" {
+        crate::surface_sessions::prune_cron(&conn.config, crate::observability::now()).await;
+    }
     for task in conn.link_tasks.lock().await.drain(..) {
         task.abort();
     }
@@ -2797,6 +2845,27 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cron_jobs_model_and_provider_reach_the_run_session() {
+        let opts = RunOpts { model: Some("llama-3.3-70b"), provider: Some("groq"), ..RunOpts::default() };
+        let params = run_session_params(Some("/w"), Some("nightly"), &opts);
+        assert_eq!((params["model"].as_str(), params["provider"].as_str(), params["title"].as_str()), (Some("llama-3.3-70b"), Some("groq"), Some("nightly")));
+        assert!(run_session_params(None, None, &RunOpts::default()).get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn new_in_a_bot_chat_starts_a_fresh_engine_session() {
+        let home = std::env::temp_dir().join(format!("bot-reset-{}", std::process::id()));
+        let home_str = home.to_string_lossy().to_string();
+        save_bot_session(&home_str, "telegram:9", "session_old");
+        save_bot_session(&home_str, "telegram:8", "session_other");
+        assert!(!interrupt_run("telegram:9").await, "nothing running");
+        reset_bot_session(&home_str, "telegram:9").await;
+        assert_eq!(load_bot_session(&home_str, "telegram:9"), None, "the next message creates a new session");
+        assert_eq!(load_bot_session(&home_str, "telegram:8").as_deref(), Some("session_other"));
+        let _ = std::fs::remove_dir_all(home);
+    }
 
     #[test]
     fn exec_rpcs_are_gated_unless_they_are_the_desktops_profile_edits() {

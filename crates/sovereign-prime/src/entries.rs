@@ -844,6 +844,22 @@ impl EntryStore {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM engine_settings WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Every setting whose key starts with `prefix`, as (key without the prefix, value).
+    pub fn settings_with_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut stmt) = conn.prepare("SELECT key, value FROM engine_settings WHERE substr(key, 1, length(?1)) = ?1") else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map([prefix], |r| Ok((r.get::<_, String>(0)?[prefix.len()..].to_string(), r.get::<_, String>(1)?)));
+        rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
     /// Unattended approvals parked for a late answer, so a restart keeps them.
     pub fn park_save(&self, request_id: &str, session_id: &str, params: &str, created_at_ms: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());

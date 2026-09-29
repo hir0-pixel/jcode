@@ -20,6 +20,7 @@ pub mod observability;
 pub mod profile;
 mod rpc;
 mod sessions_rest;
+mod surface_sessions;
 mod slash_forward;
 
 use anyhow::{Context, Result, bail};
@@ -675,6 +676,18 @@ async fn handle(
             )
             .await
         }
+        ("POST", "/api/agent/reset" | "/api/agent/interrupt") => {
+            let body: Value = serde_json::from_slice(&read_body(&mut stream, &req).await?).unwrap_or(Value::Null);
+            let Some(key) = body["session_key"].as_str().filter(|k| !k.is_empty()) else {
+                return respond(&mut stream, "400 Bad Request", &json!({"detail": "session_key is required"})).await;
+            };
+            if req.path.ends_with("/reset") {
+                rpc::reset_bot_session(&config.home, key).await;
+                respond(&mut stream, "200 OK", &json!({"ok": true})).await
+            } else {
+                respond(&mut stream, "200 OK", &json!({"interrupted": rpc::interrupt_run(key).await})).await
+            }
+        }
         ("POST", "/api/agent/run") => {
             if declared_len(&req) > MAX_RUN_BODY_BYTES {
                 return respond(
@@ -707,6 +720,8 @@ async fn handle(
                 rpc::RunOpts {
                     surface: if body["surface"] == "bot" { "bot" } else { "cron" },
                     instructions: body["instructions"].as_str().filter(|i| !i.trim().is_empty()),
+                    model: body["model"].as_str().filter(|m| !m.trim().is_empty()),
+                    provider: body["provider"].as_str().filter(|p| !p.trim().is_empty()),
                 },
                 Duration::from_secs(timeout_s),
             )
@@ -823,13 +838,18 @@ async fn handle(
             }
         }
         ("GET", "/api/profiles/sessions/sidebar") => {
-            let limit = query_u64(&req, "recents_limit")
-                .unwrap_or(50)
-                .clamp(1, 1000);
-            match session_infos(&config, limit, false).await {
-                Ok(sessions) => {
-                    let empty = json!({"sessions": []});
-                    let body = json!({"recents": {"sessions": sessions}, "cron": empty, "messaging": empty});
+            let limit = |name: &str| query_u64(&req, name).unwrap_or(50).clamp(1, 1000) as usize;
+            let limits = (limit("recents_limit"), limit("cron_limit"), limit("messaging_limit"));
+            let reply = harness_request(
+                &config.legacy_socket,
+                json!({"req": "list_sessions", "limit": u64::MAX, "include_archived": true}),
+            )
+            .await;
+            match reply {
+                Ok(reply) => {
+                    let sessions = reply["sessions"].as_array().cloned().unwrap_or_default();
+                    let tags = surface_sessions::tags(&config.home);
+                    let body = surface_sessions::sidebar(&sessions, &tags, limits, map::session_info);
                     respond(&mut stream, "200 OK", &body).await
                 }
                 Err(err) => {

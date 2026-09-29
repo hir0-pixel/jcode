@@ -178,8 +178,7 @@ impl Observer {
         setup(&mut db)?;
         let read_db = Connection::open(&path)?;
         read_db.busy_timeout(Duration::from_secs(5))?;
-        let retention_days = std::env::var("SOVEREIGN_OBSERVABILITY_RETENTION_DAYS")
-            .ok().and_then(|raw| raw.parse::<i64>().ok()).filter(|days| (1..=3650).contains(days)).unwrap_or(30);
+        let retention_days = retention_days();
         let capture_content = std::fs::read(home.join("observability.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -973,6 +972,12 @@ fn setup(db: &mut Connection) -> rusqlite::Result<()> {
         [now()],
     )?;
     Ok(())
+}
+
+/// How long observability rows (and hidden one-shot cron sessions) are kept.
+pub(crate) fn retention_days() -> i64 {
+    std::env::var("SOVEREIGN_OBSERVABILITY_RETENTION_DAYS")
+        .ok().and_then(|raw| raw.parse::<i64>().ok()).filter(|days| (1..=3650).contains(days)).unwrap_or(30)
 }
 
 fn prune(db: &Connection, at: i64, retention_days: i64) -> rusqlite::Result<()> {
