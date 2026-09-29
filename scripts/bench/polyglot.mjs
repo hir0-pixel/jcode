@@ -1,44 +1,45 @@
 #!/usr/bin/env node
 /**
- * Aider-polyglot-exercises driver: stock Hermes vs Sovereign, same model.
+ * Aider-polyglot-exercises driver: stock Hermes vs Akira (sovereign) vs Prime, same model.
  *
- * For each exercise in scripts/bench/polyglot-exercises.json (a fixed-seed
- * selection of 40 exercises across python/rust/cpp - see
- * select_polyglot_exercises.py for why java/javascript/go are excluded):
+ * For each exercise in scripts/bench/polyglot-exercises.json (fixed-seed, 40
+ * exercises across python/rust/cpp; see select_polyglot_exercises.py for why
+ * go/java/javascript are excluded):
  *
  *   1. Copy the exercise to a throwaway sandbox.
  *   2. Give the agent the instructions + current stub file(s), mirroring
- *      Aider's own benchmark prompt style ("implement the stubs, don't touch
- *      the tests"). One turn.
- *   3. Run the language's OWN test command independently (never through the
- *      agent) and record pass/fail.
- *   4. On failure, ONE retry: a second turn carrying the test output,
- *      identical in shape for both arms. Re-run the tests independently.
+ *      Aider's benchmark prompt ("implement the stubs, don't touch the tests").
+ *   3. Run the language's OWN test command independently (never via the agent):
+ *      pass@1.
+ *   4. On failure, ONE retry turn carrying the test output; re-run tests: pass@2.
  *
- * Both arms:
- *   - go through the shared counting proxy (scripts/sovereign-counting-proxy.mjs)
- *     for token/cache/cost/wall metrics, exactly like scripts/bench/abeval.py
- *     and scripts/sovereign-vs-hermes-bench.mjs.
- *   - run every exercise through ONE persistent engine home for the whole
- *     arm-run (HERMES_HOME for hermes, JCODE_HOME + one long-lived `sovereign
- *     serve` process for sovereign), so Prime/memory learning can carry over
- *     between exercises, same as a real user's session.
- *   - run the exercises in the SAME fixed order (the order they appear in
- *     polyglot-exercises.json).
+ * All arms mirror scripts/bench/abeval.py's hardened setup:
+ *   - every model call goes through the shared counting proxy
+ *     (scripts/sovereign-counting-proxy.mjs): tokens, dummy cost
+ *     (BENCH_PRICE_IN/_CACHED/_OUT), model calls;
+ *   - process-tree RSS (peak/mean MiB) sampled per exercise; proxy and Ollama
+ *     are excluded because the walk only goes down from the arm's own process;
+ *   - one persistent private home per arm-run (learning can carry across
+ *     exercises), same fixed exercise order;
+ *   hermes     `hermes_cli.main chat`, private HERMES_HOME, pristine upstream
+ *              source when HERMES_STOCK_SRC is set.
+ *   sovereign  Akira: one long-lived `sovereign serve` with private HOME,
+ *              JCODE_HOME, HERMES_HOME and a short JCODE_RUNTIME_DIR,
+ *              `--provider openai-compatible` + generated jcode config.
+ *   prime      Prime Agent `--mode rpc` (one process per turn, skills and
+ *              extensions on), short /tmp/pd-* daemon socket dir, the renamed
+ *              `prime-agent` daemon counted then reaped.
  *
  * Usage:
  *   node scripts/bench/polyglot.mjs --dry-run
- *   node scripts/bench/polyglot.mjs run --arm hermes
- *   node scripts/bench/polyglot.mjs run --arm sovereign
+ *   node scripts/bench/polyglot.mjs run --arm hermes|sovereign|prime [--only name,lang]
  *   node scripts/bench/polyglot.mjs report
  *
- * Environment: same BENCH_* variables as scripts/bench/abeval.py and
- * scripts/sovereign-vs-hermes-bench.mjs (BENCH_BASE_URL, BENCH_MODEL,
- * BENCH_API_KEY, BENCH_CONTEXT, BENCH_PROXY, BENCH_OUT, BENCH_TURN_TIMEOUT_MS,
- * HERMES_VENV_PY, SOVEREIGN_BIN).
+ * Environment: BENCH_BASE_URL, BENCH_MODEL, BENCH_API_KEY, BENCH_CONTEXT,
+ * BENCH_PROXY, BENCH_OUT, BENCH_TURN_TIMEOUT_MS, BENCH_PRICE_*, HERMES_VENV_PY,
+ * HERMES_STOCK_SRC, SOVEREIGN_BIN, PRIME_CLI, PRIME_AGENT_KERNEL_VENV.
  *
- * This script only BUILDS/verifies via --dry-run; it never starts Ollama or
- * any model server itself.
+ * Never starts Ollama or any model server itself.
  */
 import { spawn, spawnSync, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
@@ -69,6 +70,9 @@ const cfg = {
   OUT: process.env.BENCH_OUT || path.join(engineRoot, 'bench-results', 'polyglot'),
   HERMES_VENV_PY: process.env.HERMES_VENV_PY || path.join(engineRoot, '..', 'hermes-agent', '.venv', 'bin', 'python3'),
   SOVEREIGN_BIN: process.env.SOVEREIGN_BIN || path.join(engineRoot, 'target', 'release', 'sovereign'),
+  HERMES_STOCK_SRC: process.env.HERMES_STOCK_SRC || '', // pristine upstream Hermes source (PYTHONPATH); unset = the fork
+  PRIME_CLI: process.env.PRIME_CLI || '/tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js',
+  PRIME_KERNEL_VENV: process.env.PRIME_AGENT_KERNEL_VENV || '/tmp/prime-agent/kernel-venv',
   PRICE_TABLE: process.env.SOVEREIGN_PRICE_TABLE || path.join(engineRoot, 'scripts', 'sovereign-prices.json'),
 }
 const baseUrlParsed = new URL(cfg.BASE_URL)
@@ -130,7 +134,7 @@ function runTests(lang, dir) {
     return { pass: r.status === 0, output: `${r.stdout || ''}\n${r.stderr || ''}`.trim() }
   }
   if (lang === 'rust') {
-    const r = spawnSync('cargo', ['test'], { cwd: dir, encoding: 'utf8', timeout: 300_000 })
+    const r = spawnSync('cargo', ['test', '--offline'], { cwd: dir, encoding: 'utf8', timeout: 300_000 })
     return { pass: r.status === 0, output: `${r.stdout || ''}\n${r.stderr || ''}`.trim() }
   }
   if (lang === 'cpp') {
@@ -194,6 +198,77 @@ function proxyMetrics(rows) {
   }
 }
 
+// ---------------------------------------------------------------- process-tree RSS sampling (port of abeval.py)
+function psSnapshot() {
+  try {
+    const out = execFileSync('ps', ['-ww', '-o', 'pid=,ppid=,rss=,command=', '-A'], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20 })
+    const table = new Map()
+    for (const line of out.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s*(.*)$/)
+      if (m) table.set(Number(m[1]), { ppid: Number(m[2]), rss: Number(m[3]), cmd: m[4] })
+    }
+    return table
+  } catch { return new Map() }
+}
+function descendants(root, table) {
+  if (!table.has(root)) return new Set()
+  const kids = new Map()
+  for (const [pid, { ppid }] of table) kids.set(ppid, [...(kids.get(ppid) || []), pid])
+  const seen = new Set([root])
+  for (let frontier = [root]; frontier.length;) {
+    frontier = frontier.flatMap(p => kids.get(p) || []).filter(c => !seen.has(c) && seen.add(c))
+  }
+  return seen
+}
+/** Summed RSS (MiB) of root's tree (walks DOWN only, so proxy and Ollama are excluded by construction),
+ *  plus detached helpers whose command line satisfies `marker(pid, cmd)`. */
+function treeRssMib(root, table, marker) {
+  const pids = descendants(root, table)
+  if (marker) for (const [pid, { cmd }] of table) if (marker(pid, cmd)) descendants(pid, table).forEach(p => pids.add(p))
+  let kib = 0
+  for (const p of pids) kib += table.get(p).rss
+  return kib / 1024
+}
+function startSampler(root, marker) {
+  const samples = []
+  const tick = () => samples.push(treeRssMib(root, psSnapshot(), marker))
+  tick()
+  const t = setInterval(tick, 200)
+  return () => { clearInterval(t); return samples }
+}
+const namedPids = (table, name) => new Set([...table].filter(([, v]) => v.cmd.trim().startsWith(name)).map(([p]) => p))
+
+/** Async spawn with RSS sampling. daemonName: a detached helper that renames itself (Prime's
+ *  `prime-agent` daemon) is counted while the run lasts and reaped afterwards. */
+async function runWithRss(bin, argv, { cwd, env, timeoutMs, input, marker, daemonName }) {
+  const before = daemonName ? namedPids(psSnapshot(), daemonName) : null
+  const mark = daemonName ? (pid, cmd) => !before.has(pid) && cmd.trim().startsWith(daemonName) : marker
+  const child = spawn(bin, argv, { cwd, env, stdio: ['pipe', 'pipe', 'ignore'] })
+  const stop = startSampler(child.pid, mark)
+  let out = ''
+  child.stdout.on('data', d => { out += d })
+  child.stdin.on('error', () => {})
+  child.stdin.end(input ?? '')
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
+  const code = await new Promise(res => child.on('close', c => res(c ?? -9)))
+  clearTimeout(timer)
+  const samples = stop()
+  if (daemonName) for (const pid of [...namedPids(psSnapshot(), daemonName)].filter(p => !before.has(p))) { try { process.kill(pid, 'SIGTERM') } catch {} }
+  return { code, out, samples }
+}
+
+// ---------------------------------------------------------------- shared env / bench config
+/** Strip credentials from the inherited env; `strict` also drops engine-specific vars. */
+function cleanEnv(home, strict = true) {
+  const env = { ...process.env }
+  for (const k of Object.keys(env)) {
+    if (/API_KEY|TOKEN|SECRET/.test(k) || (strict && /^(HERMES_|JCODE_|SOVEREIGN_)/.test(k))) delete env[k]
+  }
+  return Object.assign(env, { HOME: home })
+}
+const shortDir = prefix => fs.mkdtempSync(path.join('/tmp', prefix))
+const proxyUrl = () => `http://${cfg.PROXY}${cfg.PROXY_PATH}`
+
 // ---------------------------------------------------------------- hermes arm (persistent HERMES_HOME, one-shot CLI turns)
 function ensureHermesHome(homeDir) {
   const hermesHome = path.join(homeDir, '.hermes')
@@ -201,63 +276,85 @@ function ensureHermesHome(homeDir) {
   fs.writeFileSync(
     path.join(hermesHome, 'config.yaml'),
     [
-      'model:',
-      `  default: "${cfg.MODEL}"`,
-      '  provider: custom',
-      `  base_url: "http://${cfg.PROXY}${cfg.PROXY_PATH}"`,
-      `  api_key: "${cfg.API_KEY}"`,
-      `  context_length: ${cfg.NUM_CTX}`,
-      `  ollama_num_ctx: ${cfg.NUM_CTX}`,
-      'terminal:',
-      '  backend: local',
-      '',
+      'model:', `  default: "${cfg.MODEL}"`, '  provider: custom', `  base_url: "${proxyUrl()}"`,
+      `  api_key: "${cfg.API_KEY}"`, `  context_length: ${cfg.NUM_CTX}`, `  ollama_num_ctx: ${cfg.NUM_CTX}`,
+      'terminal:', '  backend: local', '',
     ].join('\n')
   )
   fs.writeFileSync(path.join(hermesHome, '.env'), `OPENAI_API_KEY=${cfg.API_KEY}\n`)
   return hermesHome
 }
 
-function cleanEnv(home) {
-  const env = { ...process.env }
-  for (const k of Object.keys(env)) if (/API_KEY|TOKEN|SECRET|^HERMES_|^JCODE_|^SOVEREIGN_/.test(k)) delete env[k]
-  return Object.assign(env, { HOME: home })
-}
-
-function runHermesTurn(hermesHome, dir, prompt) {
-  const env = cleanEnv(path.dirname(hermesHome))
-  Object.assign(env, { HERMES_HOME: hermesHome, OPENAI_API_KEY: cfg.API_KEY })
+async function runHermesTurn(hermesHome, dir, prompt) {
+  const homeDir = path.dirname(hermesHome)
+  const env = Object.assign(cleanEnv(homeDir), { HERMES_HOME: hermesHome, OPENAI_API_KEY: cfg.API_KEY })
+  // Pristine upstream Hermes ahead of the fork's editable install, as abeval's hermes arm.
+  if (cfg.HERMES_STOCK_SRC) env.PYTHONPATH = cfg.HERMES_STOCK_SRC
   const t0 = Date.now()
-  const r = spawnSync(
+  const r = await runWithRss(
     cfg.HERMES_VENV_PY,
     ['-m', 'hermes_cli.main', 'chat', '--query', prompt, '--quiet', '--max-turns', '30', '--accept-hooks', '--model', cfg.MODEL],
-    { cwd: dir, env, encoding: 'utf8', timeout: cfg.TURN_TIMEOUT_MS }
+    { cwd: dir, env, timeoutMs: cfg.TURN_TIMEOUT_MS, marker: (_p, cmd) => cmd.includes(homeDir) }
   )
-  return { ok: r.status === 0, wall_ms: Date.now() - t0, text: (r.stdout || '').trim() }
+  return { ok: r.code === 0, wall_ms: Date.now() - t0, samples: r.samples }
 }
 
-// ---------------------------------------------------------------- sovereign arm (one persistent engine for the whole run)
+// ---------------------------------------------------------------- prime arm (one `--mode rpc` process per turn, persistent home)
+function ensurePrimeHome(homeDir) {
+  const agentDir = path.join(homeDir, '.prime', 'agent')
+  fs.mkdirSync(agentDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(agentDir, 'models.json'),
+    JSON.stringify({
+      providers: { bench: { baseUrl: proxyUrl(), api: 'openai-completions', apiKey: cfg.API_KEY, models: [{ id: cfg.MODEL, contextWindow: cfg.NUM_CTX, maxTokens: 4096 }] } },
+    })
+  )
+  return agentDir
+}
+
+async function runPrimeTurn(agentDir, dir, prompt) {
+  const homeDir = path.resolve(agentDir, '..', '..')
+  const env = Object.assign(cleanEnv(homeDir, false), { PRIME_AGENT_CODING_AGENT_DIR: agentDir, PRIME_AGENT_KERNEL_VENV: cfg.PRIME_KERNEL_VENV })
+  const sockDir = shortDir('pd-') // AF_UNIX paths are capped at 104 bytes on macOS
+  const t0 = Date.now()
+  const r = await runWithRss(
+    'node',
+    [cfg.PRIME_CLI, '--mode', 'rpc', '--provider', 'bench', '--model', `bench/${cfg.MODEL}`, '--cwd', dir, '--daemon-socket', `${sockDir}/d.sock`, '--offline'],
+    { cwd: dir, env, timeoutMs: cfg.TURN_TIMEOUT_MS, input: JSON.stringify({ type: 'prompt', message: prompt }) + '\n', daemonName: 'prime-agent' }
+  )
+  fs.rmSync(sockDir, { recursive: true, force: true })
+  let tool_calls = 0, tool_errors = 0
+  for (const line of r.out.split('\n')) {
+    try {
+      const ev = JSON.parse(line)
+      if (ev.type === 'tool_execution_end') { tool_calls++; tool_errors += ev.isError ? 1 : 0 }
+    } catch {}
+  }
+  return { ok: r.code === 0, wall_ms: Date.now() - t0, samples: r.samples, tool_calls, tool_errors }
+}
+
+// ---------------------------------------------------------------- sovereign arm (Akira: one persistent engine for the whole run)
 async function startSovereign(homeDir, token) {
   const jcodeHome = path.join(homeDir, '.jcode')
+  const hermesHome = path.join(homeDir, '.hermes')
   fs.mkdirSync(jcodeHome, { recursive: true })
+  fs.mkdirSync(hermesHome, { recursive: true })
   fs.writeFileSync(
     path.join(jcodeHome, 'config.toml'),
     [
-      '[providers.bench]',
-      'type = "openai-compatible"',
-      `base_url = "http://${cfg.PROXY}${cfg.PROXY_PATH}"`,
-      `api_key = "${cfg.API_KEY}"`,
-      'requires_api_key = false',
-      `default_model = "${cfg.MODEL}"`,
-      '',
-      '[[providers.bench.models]]',
-      `id = "${cfg.MODEL}"`,
-      `context_window = ${cfg.NUM_CTX}`,
-      '',
+      '[provider]', 'default_provider = "bench"', '',
+      '[providers.bench]', 'type = "openai-compatible"', `base_url = "${proxyUrl()}"`, `api_key = "${cfg.API_KEY}"`,
+      'requires_api_key = false', `default_model = "${cfg.MODEL}"`, '',
+      '[[providers.bench.models]]', `id = "${cfg.MODEL}"`, `context_window = ${cfg.NUM_CTX}`, '',
     ].join('\n')
   )
-  const env = cleanEnv(homeDir)
-  Object.assign(env, { JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_PRICE_TABLE: cfg.PRICE_TABLE })
-  const child = spawn(cfg.SOVEREIGN_BIN, ['--provider-profile', 'bench', '--model', cfg.MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], {
+  // Private HERMES_HOME (else the engine reads the real ~/.hermes) and a short private runtime dir
+  // (the default is shared across engines; AF_UNIX paths are capped at 104 bytes on macOS).
+  const env = Object.assign(cleanEnv(homeDir), {
+    JCODE_HOME: jcodeHome, HERMES_HOME: hermesHome, JCODE_RUNTIME_DIR: shortDir('jr-'),
+    HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_PRICE_TABLE: cfg.PRICE_TABLE,
+  })
+  const child = spawn(cfg.SOVEREIGN_BIN, ['--provider', 'openai-compatible', '--model', cfg.MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], {
     env, cwd: homeDir, stdio: ['ignore', 'pipe', 'ignore'], detached: true,
   })
   const port = await new Promise((resolve, reject) => {
@@ -271,25 +368,27 @@ async function startSovereign(homeDir, token) {
     child.on('exit', code => { clearTimeout(timer); reject(new Error(`sovereign exited ${code}`)) })
   })
   child.stdout.resume()
-  return { child, port, jcodeHome }
+  return { child, port, jcodeHome, homeDir, runtimeDir: env.JCODE_RUNTIME_DIR }
 }
 
-function stopSovereign(child) {
-  try { process.kill(-child.pid, 'SIGTERM') } catch {}
+function stopSovereign(sv) {
+  try { process.kill(-sv.child.pid, 'SIGTERM') } catch {}
   return new Promise(resolve => {
-    const t = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL') } catch {} ; resolve() }, 10_000)
-    child.on('exit', () => { clearTimeout(t); resolve() })
-  })
+    const t = setTimeout(() => { try { process.kill(-sv.child.pid, 'SIGKILL') } catch {} ; resolve() }, 10_000)
+    sv.child.on('exit', () => { clearTimeout(t); resolve() })
+  }).then(() => fs.rmSync(sv.runtimeDir, { recursive: true, force: true }))
 }
 
-async function runSovereignTurn(port, token, dir, prompt, title) {
+async function runSovereignTurn(sv, token, dir, prompt, title) {
+  const stop = startSampler(sv.child.pid, (_p, cmd) => cmd.includes(sv.homeDir))
   const t0 = Date.now()
-  const res = await fetch(`http://127.0.0.1:${port}/api/agent/run`, {
+  const res = await fetch(`http://127.0.0.1:${sv.port}/api/agent/run`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
     body: JSON.stringify({ prompt, cwd: dir, title, timeout_s: Math.round(cfg.TURN_TIMEOUT_MS / 1000) }),
   }).then(r => r.json()).catch(err => ({ ok: false, error: String(err) }))
-  return { ok: Boolean(res.ok), wall_ms: Date.now() - t0, text: res.text || '', session_id: res.session_id }
+  const wall_ms = Date.now() - t0
+  return { ok: Boolean(res.ok), wall_ms, samples: stop(), session_id: res.session_id, ...sovereignToolMetrics(sv.jcodeHome, res.session_id) }
 }
 
 function sovereignToolMetrics(jcodeHome, sessionId) {
@@ -325,6 +424,10 @@ function loadDone(metaPath) {
   return done
 }
 
+const ARMS = ['hermes', 'sovereign', 'prime']
+const sum = xs => xs.reduce((s, x) => s + (x || 0), 0)
+const addNullable = (a, b) => (a === null || b === null || a === undefined || b === undefined ? null : a + b)
+
 async function runArm(arm, only) {
   const outDir = path.join(cfg.OUT, 'results', arm)
   fs.mkdirSync(outDir, { recursive: true })
@@ -335,13 +438,19 @@ async function runArm(arm, only) {
   const proxy = startProxy(cfg.OUT)
   await sleep(800)
 
-  let hermesHome, sovereign, token
-  if (arm === 'hermes') {
-    hermesHome = ensureHermesHome(homeDir)
+  let handle, sovereign, token
+  if (arm === 'hermes') handle = ensureHermesHome(homeDir)
+  else if (arm === 'prime') {
+    if (!fs.existsSync(cfg.PRIME_CLI)) throw new Error(`Prime CLI missing at ${cfg.PRIME_CLI}`)
+    handle = ensurePrimeHome(homeDir)
   } else {
     token = crypto.randomBytes(24).toString('hex')
     sovereign = await startSovereign(homeDir, token)
   }
+  const turnFn = (dir, prompt, title) =>
+    arm === 'hermes' ? runHermesTurn(handle, dir, prompt)
+    : arm === 'prime' ? runPrimeTurn(handle, dir, prompt)
+    : runSovereignTurn(sovereign, token, dir, prompt, title)
 
   try {
     for (const { lang, name } of EXERCISES) {
@@ -354,84 +463,74 @@ async function runArm(arm, only) {
       await tagProxy(tag)
       say(arm, run_id, 'turn 1...')
 
-      let prompt = buildPrompt(sandbox, null)
-      let turn =
-        arm === 'hermes'
-          ? runHermesTurn(hermesHome, sandbox, prompt)
-          : await runSovereignTurn(sovereign.port, token, sandbox, prompt, run_id)
-      let test = runTests(lang, sandbox)
-      let retries = 0
-      if (!test.pass) {
-        retries = 1
+      const turns = [await turnFn(sandbox, buildPrompt(sandbox, null), run_id)]
+      const test1 = runTests(lang, sandbox)
+      let test = test1
+      if (!test1.pass) {
         say(arm, run_id, 'turn 2 (retry with test output)...')
-        prompt = buildPrompt(sandbox, test.output)
-        turn =
-          arm === 'hermes'
-            ? runHermesTurn(hermesHome, sandbox, prompt)
-            : await runSovereignTurn(sovereign.port, token, sandbox, prompt, `${run_id}-retry`)
+        turns.push(await turnFn(sandbox, buildPrompt(sandbox, test1.output), `${run_id}-retry`))
         test = runTests(lang, sandbox)
       }
 
-      const rows = callsFor(proxy.callsPath, tag)
-      const pm = proxyMetrics(rows)
-      const toolMetrics = arm === 'sovereign' ? sovereignToolMetrics(sovereign.jcodeHome, turn.session_id) : { tool_calls: null, tool_errors: null }
+      const samples = turns.flatMap(t => t.samples)
+      const pm = proxyMetrics(callsFor(proxy.callsPath, tag))
+      const toolSum = k => turns.reduce((s, t) => addNullable(s, t[k] ?? null), 0)
       const rec = {
-        run_id, lang, name, arm, retries,
-        pass: test.pass, agent_ok: turn.ok,
-        ...pm, ...toolMetrics,
-        wall_ms: turn.wall_ms,
+        run_id, lang, name, arm, retries: turns.length - 1,
+        pass1: test1.pass, pass: test.pass, agent_ok: turns.every(t => t.ok),
+        ...pm,
+        tool_calls: arm === 'hermes' ? null : toolSum('tool_calls'),
+        tool_errors: arm === 'hermes' ? null : toolSum('tool_errors'),
+        wall_ms: sum(turns.map(t => t.wall_ms)),
+        rss_peak_mib: samples.length ? Math.round(Math.max(...samples) * 10) / 10 : null,
+        rss_mean_mib: samples.length ? Math.round((sum(samples) / samples.length) * 10) / 10 : null,
       }
       fs.appendFileSync(metaPath, JSON.stringify(rec) + '\n')
-      say(arm, run_id, `pass=${rec.pass} retries=${retries} calls=${pm.model_calls} ${rec.wall_ms}ms`)
+      say(arm, run_id, `pass@1=${rec.pass1} pass@2=${rec.pass} calls=${pm.model_calls} ${rec.wall_ms}ms rss=${rec.rss_peak_mib}/${rec.rss_mean_mib}MiB`)
       fs.rmSync(sandbox, { recursive: true, force: true })
     }
   } finally {
     proxy.proc.kill('SIGTERM')
-    if (sovereign) await stopSovereign(sovereign.child)
+    if (sovereign) await stopSovereign(sovereign)
   }
 }
 
 // ---------------------------------------------------------------- report
-function median(nums) {
-  const xs = nums.filter(n => n !== null && n !== undefined).sort((a, b) => a - b)
-  if (!xs.length) return null
-  const mid = Math.floor(xs.length / 2)
-  return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2
+function summarize(rows) {
+  const n = rows.length
+  const pct = k => `${((100 * rows.filter(r => r[k]).length) / n).toFixed(0)}% (${rows.filter(r => r[k]).length}/${n})`
+  const cost = rows.every(r => r.cost_usd !== null && r.cost_usd !== undefined) ? sum(rows.map(r => r.cost_usd)).toFixed(4) : 'n/a'
+  const rss = rows.filter(r => r.rss_peak_mib !== null && r.rss_peak_mib !== undefined)
+  return {
+    n, pass1: pct('pass1'), pass2: pct('pass'),
+    calls: sum(rows.map(r => r.model_calls)), prompt: sum(rows.map(r => r.prompt_tokens)),
+    cached: sum(rows.map(r => r.cached_tokens)), completion: sum(rows.map(r => r.completion_tokens)),
+    cost, wall_s: (sum(rows.map(r => r.wall_ms)) / 1000).toFixed(0),
+    rss_peak: rss.length ? Math.max(...rss.map(r => r.rss_peak_mib)).toFixed(0) : 'n/a',
+    rss_mean: rss.length ? (sum(rss.map(r => r.rss_mean_mib)) / rss.length).toFixed(0) : 'n/a',
+  }
 }
 
 function report() {
-  const arms = ['hermes', 'sovereign']
   const rowsByArm = {}
-  for (const arm of arms) {
+  for (const arm of ARMS) {
     const metaPath = path.join(cfg.OUT, 'results', arm, 'meta.jsonl')
     rowsByArm[arm] = fs.existsSync(metaPath)
-      ? fs.readFileSync(metaPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))
+      ? fs.readFileSync(metaPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).map(r => ({ pass1: r.pass, ...r }))
       : []
   }
-  console.log('| lang | arm | n | pass% | model_calls | prompt_tok | cached_tok | completion_tok | cost_usd | tool_calls | tool_errors | wall_ms |')
-  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|')
+  const head = '| arm | n | pass@1 | pass@2 | model_calls | prompt_tok | cached_tok | completion_tok | cost_usd | wall_s | rss_peak_MiB | rss_mean_MiB |\n|---|---|---|---|---|---|---|---|---|---|---|---|'
+  const line = (label, s) => `| ${label} | ${s.n} | ${s.pass1} | ${s.pass2} | ${s.calls} | ${s.prompt} | ${s.cached} | ${s.completion} | ${s.cost} | ${s.wall_s} | ${s.rss_peak} | ${s.rss_mean} |`
+  console.log('Summary (totals over all exercises; rss_peak = max, rss_mean = mean of per-exercise means)\n')
+  console.log(head)
+  for (const arm of ARMS) if (rowsByArm[arm].length) console.log(line(arm, summarize(rowsByArm[arm])))
+  console.log('\nPer language\n')
+  console.log(head.replace('| arm |', '| lang / arm |'))
   for (const lang of selection.languages) {
-    for (const arm of arms) {
+    for (const arm of ARMS) {
       const rows = rowsByArm[arm].filter(r => r.lang === lang)
-      if (!rows.length) continue
-      const n = rows.length
-      const passPct = (100 * rows.filter(r => r.pass).length) / n
-      const cost = median(rows.map(r => r.cost_usd).filter(c => c !== null && c !== undefined))
-      console.log(
-        `| ${lang} | ${arm} | ${n} | ${passPct.toFixed(0)}% | ${median(rows.map(r => r.model_calls))} | ` +
-        `${median(rows.map(r => r.prompt_tokens))} | ${median(rows.map(r => r.cached_tokens))} | ` +
-        `${median(rows.map(r => r.completion_tokens))} | ${cost === null ? 'n/a' : cost.toFixed(4)} | ` +
-        `${median(rows.map(r => r.tool_calls)) ?? 'n/a'} | ${median(rows.map(r => r.tool_errors)) ?? 'n/a'} | ${median(rows.map(r => r.wall_ms))} |`
-      )
+      if (rows.length) console.log(line(`${lang} / ${arm}`, summarize(rows)))
     }
-  }
-  console.log('|---|---|---|---|---|---|---|---|---|---|---|---|')
-  for (const arm of arms) {
-    const rows = rowsByArm[arm]
-    if (!rows.length) continue
-    const n = rows.length
-    const passPct = (100 * rows.filter(r => r.pass).length) / n
-    console.log(`| TOTAL | ${arm} | ${n} | ${passPct.toFixed(0)}% | ${median(rows.map(r => r.model_calls))} | | | | | | | ${median(rows.map(r => r.wall_ms))} |`)
   }
 }
 
@@ -441,7 +540,12 @@ function resolvedConfig() {
     ...cfg,
     exercise_count: EXERCISES.length,
     order: EXERCISES.map(e => `${e.lang}/${e.name}`),
-    arms: ['hermes', 'sovereign'],
+    arms: ARMS,
+    hermes_source: cfg.HERMES_STOCK_SRC || 'fork (HERMES_STOCK_SRC unset)',
+    prime_cli_present: fs.existsSync(cfg.PRIME_CLI),
+    toolchains: Object.fromEntries(
+      ['python3', 'cargo', 'g++', 'clang++', 'cmake', 'go', 'java'].map(t => [t, spawnSync(t, [t === 'java' ? '-version' : t === 'go' ? 'version' : '--version'], { stdio: 'ignore' }).status === 0])
+    ),
   }
 }
 
@@ -452,8 +556,9 @@ async function main() {
   }
   if (cmd === 'run') {
     const arm = flag('arm', null)
-    if (!['hermes', 'sovereign'].includes(arm)) throw new Error('usage: polyglot.mjs run --arm hermes|sovereign [--only name1,name2]')
+    if (!ARMS.includes(arm)) throw new Error(`usage: polyglot.mjs run --arm ${ARMS.join('|')} [--only name1,lang,...]`)
     const only = flag('only', null)?.split(',') || null
+    if (only && !EXERCISES.some(e => only.includes(e.name) || only.includes(e.lang))) throw new Error(`--only matched no exercise: ${only}`)
     fs.mkdirSync(cfg.OUT, { recursive: true })
     fs.writeFileSync(path.join(cfg.OUT, 'config.json'), JSON.stringify({ ...resolvedConfig(), started: new Date().toISOString() }, null, 2))
     await runArm(arm, only)
@@ -463,7 +568,7 @@ async function main() {
     report()
     return
   }
-  console.log('usage: polyglot.mjs [--dry-run] | run --arm <hermes|sovereign> [--only a,b] | report')
+  console.log(`usage: polyglot.mjs [--dry-run] | run --arm <${ARMS.join('|')}> [--only a,b] | report`)
   process.exitCode = 2
 }
 

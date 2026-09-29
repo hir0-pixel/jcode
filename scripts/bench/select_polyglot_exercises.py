@@ -58,7 +58,7 @@ def main():
         "actual_count": total,
         "languages": LANGUAGES,
         "excluded_languages": {
-            "go": "not installed (per task brief)",
+            "go": "not installed (re-verified 2026-09-29)",
             "java": "no JVM installed and gradle/gradlew would need a download",
             "javascript": "jest/babel devDependencies not vendored; npm test needs npm install (network)",
         },
