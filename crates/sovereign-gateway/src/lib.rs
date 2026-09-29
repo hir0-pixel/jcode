@@ -101,6 +101,9 @@ pub struct Config {
     /// Provider and model the engine started with (reported to setup screens).
     pub provider: String,
     pub model: String,
+    /// Reasoning levels the served provider accepts (empty: none), so the model
+    /// catalog reports what the engine can actually honour.
+    pub reasoning_efforts: Vec<String>,
     /// Engine state directory, reported as the single profile's path.
     pub home: String,
     /// One-shot model call `(system, user) -> text and usage`, used by learning and `/refine`.
@@ -1328,7 +1331,7 @@ mod auth_notice_tests {
         });
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(), token: "t".repeat(32), version: "test".into(), legacy_socket: socket,
-            default_cwd: "/".into(), allow_non_loopback: false, provider: "p".into(), model: "m".into(),
+            default_cwd: "/".into(), allow_non_loopback: false, provider: "p".into(), model: "m".into(), reasoning_efforts: Vec::new(),
             home: dir.to_string_lossy().into(), complete: None, approval_secret: String::new(), features: None, learning: None,
         };
         notify_auth_changed(&config, Some("openrouter")).await;

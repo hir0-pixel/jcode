@@ -331,6 +331,7 @@ mod tests {
             allow_non_loopback: false,
             provider: "local".into(),
             model: "test".into(),
+            reasoning_efforts: Vec::new(),
             home: "/tmp".into(),
             complete: None,
             approval_secret: "test".into(),

@@ -1030,7 +1030,7 @@ impl Conn {
                     None => None,
                 };
                 let models = listed.as_ref().and_then(|r| r["models"].as_array()).map(|m| m.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-                Ok(provider_state::model_options(&self.config.provider, &self.config.model, models, p["include_unconfigured"] == true))
+                Ok(provider_state::model_options(&self.config.provider, &self.config.model, models, p["include_unconfigured"] == true, &self.config.reasoning_efforts))
             }
             "session.active_list" => {
                 let stored = super::session_infos(&self.config, 1000, false)
@@ -1458,14 +1458,21 @@ impl Conn {
                     .await
                     .map_err(RpcError::internal)?;
                 }
+                // A remembered effort the served model cannot take (a local Ollama
+                // model has no effort levels) is a preference that does not apply
+                // here, not a reason to refuse the chat: skip it and say so.
+                let mut applied_effort = None;
                 if let Some(effort) = selected_effort {
                     let session_link =
                         self.links.lock().await.get(&id).cloned().ok_or_else(|| {
                             RpcError::internal(anyhow!("new session link was lost"))
                         })?;
-                    self.call_on(&session_link, json!({
+                    match self.call_on(&session_link, json!({
                         "req": "set_reasoning_effort", "session_id": id.clone(), "effort": effort,
-                    })).await.map_err(RpcError::internal)?;
+                    })).await {
+                        Ok(_) => applied_effort = Some(effort),
+                        Err(err) => eprintln!("sovereign: reasoning effort {effort:?} not applied to {id}: {err:#}"),
+                    }
                 }
                 if let Some(title) = p["title"].as_str().filter(|t| !t.is_empty()) {
                     let _ = self
@@ -1488,7 +1495,7 @@ impl Conn {
                     info["provider"] = json!(provider);
                 }
                 info["memory_enabled"] = json!(jcode_base::config::memory_enabled());
-                if let Some(effort) = selected_effort {
+                if let Some(effort) = applied_effort {
                     info["reasoning_effort"] = json!(effort);
                 }
                 Ok(json!({
@@ -3052,6 +3059,7 @@ mod tests {
             allow_non_loopback: false,
             provider: "p".into(),
             model: "m".into(),
+            reasoning_efforts: Vec::new(),
             home: home.to_string_lossy().into(),
             complete: None,
             approval_secret: String::new(),

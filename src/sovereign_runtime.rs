@@ -556,6 +556,8 @@ pub async fn run_gateway(
             Box::pin(async move { provider.complete_simple_with_usage(&user, &system).await })
         });
     let learning = Some(sovereign_learning());
+    // Read before the server takes the provider: the catalog reports these.
+    let reasoning_efforts: Vec<String> = provider.available_efforts().into_iter().map(str::to_owned).collect();
     let server = server::Server::new_with_name(provider, Some("sovereign".to_string()));
 
     let default_cwd = std::env::var("HERMES_DESKTOP_CWD")
@@ -591,6 +593,7 @@ pub async fn run_gateway(
             allow_non_loopback: allow_remote,
             provider: provider_name,
             model: provider_model,
+            reasoning_efforts,
             home: crate::storage::jcode_dir()?.to_string_lossy().into_owned(),
             complete: Some(complete),
             approval_secret: approval_secret.clone(),
