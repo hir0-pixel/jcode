@@ -666,6 +666,8 @@ async fn handle(
                 "gateway_running": true,
                 "gateway_state": "running",
                 "auth_required": false,
+                // Why the last daily database backup failed (null: fine or not yet run).
+                "backup_error": jcode_base::migrate::backup_error(),
             });
             respond(&mut stream, "200 OK", &body).await
         }

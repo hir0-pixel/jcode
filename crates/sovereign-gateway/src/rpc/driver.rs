@@ -107,6 +107,7 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
                 continue;
             }
             (failures, last_error) = (0, String::new());
+            report_backup_error(&driver.conn.hub, jcode_base::migrate::backup_error()).await;
             let active = driver.tick().await;
             if active {
                 tokio::select! {

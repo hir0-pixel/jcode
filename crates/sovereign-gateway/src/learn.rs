@@ -68,26 +68,30 @@ pub(crate) fn with_sink<R>(
 
 const MAX_TOOL_LINES: usize = 40;
 
-/// Tool rows carry whole outputs and no verdict; Prime's transcript shows `[Tool result (name, error)]`
-/// per call. Reduce each to one line (`ok`/`fail`, first line <= 120 chars) and keep the newest
-/// [`MAX_TOOL_LINES`] so the gate sees outcomes, not file dumps. Only user turns feed the apply gate.
-fn compact_tools(turns: Vec<Turn>) -> Vec<Turn> {
-    let mut left = turns.iter().filter(|t| t.role == "tool").count().saturating_sub(MAX_TOOL_LINES);
-    turns
-        .into_iter()
-        .filter_map(|t| {
-            if t.role != "tool" {
-                return Some(t);
+/// Tool rows carry whole outputs; Prime's transcript shows `[Tool result (name, error)]` per call.
+/// Reduce each to one line, `ok: <tool> <first line>` or `fail: ...` (first line <= 120 chars), and
+/// keep the newest [`MAX_TOOL_LINES`] so the gate sees outcomes, not file dumps. The engine's
+/// `tool_name` / `is_error` are used when present, else a text heuristic. Only user turns feed the apply gate.
+fn compact_tools(rows: &[serde_json::Value]) -> Vec<Turn> {
+    let mut left = rows.iter().filter(|m| m["role"] == "tool").count().saturating_sub(MAX_TOOL_LINES);
+    rows.iter()
+        .filter_map(|m| {
+            let text = m["content"].as_str().unwrap_or_default();
+            if m["role"] != "tool" {
+                return Some(Turn { role: m["role"].as_str().unwrap_or_default().to_string(), text: text.to_string() });
             }
             if left > 0 {
                 left -= 1;
                 return None;
             }
-            let first = t.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+            let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
             let lower = first.to_lowercase();
-            let failed = ["error", "failed", "traceback", "panicked", "no such file", "permission denied"].iter().any(|k| lower.contains(k));
+            let failed = m["is_error"].as_bool().unwrap_or_else(|| {
+                ["error", "failed", "traceback", "panicked", "no such file", "permission denied"].iter().any(|k| lower.contains(k))
+            });
             let line: String = first.chars().take(120).collect();
-            Some(Turn { role: "tool".into(), text: format!("{} {line}", if failed { "fail:" } else { "ok:" }) })
+            let name = m["tool_name"].as_str().filter(|n| !n.is_empty()).map(|n| format!("{n} ")).unwrap_or_default();
+            Some(Turn { role: "tool".into(), text: format!("{} {name}{line}", if failed { "fail:" } else { "ok:" }) })
         })
         .collect()
 }
@@ -139,19 +143,7 @@ pub(crate) async fn pass(
 ) -> anyhow::Result<Option<String>> {
     let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
     let history = conn.history(session).await?;
-    let turns = compact_tools(
-        history["messages"]
-            .as_array()
-            .map(|list| {
-                list.iter()
-                    .map(|m| Turn {
-                        role: m["role"].as_str().unwrap_or_default().to_string(),
-                        text: m["content"].as_str().unwrap_or_default().to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    );
+    let turns = compact_tools(history["messages"].as_array().map(Vec::as_slice).unwrap_or_default());
     // The model-callable `refine` tool (and the REPL's `refine` host
     // function) never apply mid-turn: they only schedule a request, run here
     // once the turn has actually ended. At most one pending request survives
@@ -253,18 +245,26 @@ mod tests {
 
     #[test]
     fn tool_rows_become_one_bounded_outcome_line_and_only_the_newest_are_kept() {
-        let mut turns = vec![Turn { role: "user".into(), text: "fix it".into() }];
-        turns.push(Turn { role: "tool".into(), text: format!("\nerror: cannot find x {}\nmore", "y".repeat(300)) });
+        use serde_json::json;
+        let row = |role: &str, text: String| json!({ "role": role, "content": text });
+        let mut rows = vec![row("user", "fix it".into())];
+        rows.push(row("tool", format!("\nerror: cannot find x {}\nmore", "y".repeat(300))));
         for i in 0..MAX_TOOL_LINES {
-            turns.push(Turn { role: "tool".into(), text: format!("done {i}\n{}", "z".repeat(5000)) });
+            rows.push(row("tool", format!("done {i}\n{}", "z".repeat(5000))));
         }
-        let out = compact_tools(turns);
+        let out = compact_tools(&rows);
         let tools: Vec<_> = out.iter().filter(|t| t.role == "tool").collect();
         assert_eq!(tools.len(), MAX_TOOL_LINES, "the oldest (the failure) fell off the cap");
         assert_eq!(tools[0].text, "ok: done 0");
-        let one = compact_tools(vec![Turn { role: "tool".into(), text: format!("Error: boom {}", "q".repeat(300)) }]);
+        let one = compact_tools(&[row("tool", format!("Error: boom {}", "q".repeat(300)))]);
         assert!(one[0].text.starts_with("fail: Error: boom") && one[0].text.len() <= 126);
         assert_eq!(out[0].text, "fix it");
+        // The engine's tool name and error flag win over the text heuristic.
+        let named = compact_tools(&[
+            json!({ "role": "tool", "content": "Error: not really\n", "tool_name": "bash", "is_error": false }),
+            json!({ "role": "tool", "content": "exit 2", "tool_name": "grep", "is_error": true }),
+        ]);
+        assert_eq!((named[0].text.as_str(), named[1].text.as_str()), ("ok: bash Error: not really", "fail: grep exit 2"));
     }
 
     #[test]

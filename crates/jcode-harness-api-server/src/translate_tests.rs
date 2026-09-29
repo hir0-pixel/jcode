@@ -2508,6 +2508,8 @@ fn history_image_boundaries_survive_loss_of_tool_data() {
     };
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[1].role, "tool");
+    assert_eq!((messages[1].tool_name.as_deref(), messages[1].is_error), (Some("read"), None));
+    assert_eq!(messages[0].tool_name, None);
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].history_message_index, Some(2));
     assert_eq!(

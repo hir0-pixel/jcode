@@ -22,8 +22,8 @@ pub(crate) async fn delete_everywhere(config: &Config, id: &str) -> Result<()> {
 /// Just the rows keyed to a session (the engine's session is already gone).
 pub(crate) fn forget_rows(home: &str, id: &str) {
     let home = std::path::Path::new(home);
-    if let Ok(store) = sovereign_prime::agent_loop::ControlStore::open_cached(home) { let _ = store.forget_session(id); }
-    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(home) { let _ = store.forget_session(id); }
+    if let Some(store) = crate::rpc::control_or_log(&home.to_string_lossy()) { let _ = store.forget_session(id); }
+    if let Some(store) = crate::rpc::entries_or_log(&home.to_string_lossy()) { let _ = store.forget_session(id); }
     let _ = crate::observability::forget_session(home, id);
     let _ = std::fs::remove_dir_all(crate::rpc::attach::stage_dir(&home.to_string_lossy(), id));
 }

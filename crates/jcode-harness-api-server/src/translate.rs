@@ -1825,6 +1825,8 @@ impl BridgeState {
                                     .unwrap_or(None),
                                 role: m["role"].as_str().unwrap_or("").to_string(),
                                 content: m["content"].as_str().unwrap_or("").to_string(),
+                                tool_name: m["tool_data"]["name"].as_str().map(str::to_string),
+                                is_error: m["is_error"].as_bool(),
                             })
                             .collect()
                     })
@@ -3200,6 +3202,8 @@ impl BridgeState {
                     response_stats: None,
                     role: role.to_string(),
                     content,
+                    tool_name: None,
+                    is_error: None,
                 })
             })
             .take(limit)

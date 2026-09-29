@@ -249,13 +249,44 @@ static STORE_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::Hash
 /// A store failed to open: say so once (log line plus an error `status.update` to every window),
 /// not on every retry. Goals and learning stay off until it opens again.
 async fn store_unavailable(hub: &Hub, what: &'static str, err: &anyhow::Error) {
-    if !STORE_WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(what) {
+    error_once(hub, what, format!("The {what} store could not be opened, so those features are off: {err:#}")).await;
+}
+
+/// One log line and one error `status.update` per `key` per process.
+async fn error_once(hub: &Hub, key: &'static str, text: String) {
+    if !STORE_WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
         return;
     }
-    eprintln!("sovereign: {what} store unavailable: {err:#}");
-    let text = format!("The {what} store could not be opened, so those features are off: {err:#}");
+    eprintln!("sovereign: {text}");
     let event = json!({ "jsonrpc": "2.0", "method": "event", "params": { "type": "status.update", "payload": { "kind": "error", "text": text } } });
     hub.broadcast_text(event.to_string()).await;
+}
+
+/// Log `what` failing to open once per process (no window to tell: callers without a `Conn`).
+/// True the first time.
+fn log_once(what: &'static str, err: &anyhow::Error) -> bool {
+    let first = STORE_WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(what);
+    if first {
+        eprintln!("sovereign: {what} unavailable: {err:#}");
+    }
+    first
+}
+
+/// The entry store, or None after logging once why (for callers that have no `Conn` to report through).
+pub(crate) fn entries_or_log(home: &str) -> Option<Arc<sovereign_prime::entries::EntryStore>> {
+    sovereign_prime::entries::EntryStore::open_cached(Path::new(home)).map_err(|e| log_once("learning store (no window)", &e)).ok()
+}
+
+/// The goal-control store, or None after logging once why.
+pub(crate) fn control_or_log(home: &str) -> Option<Arc<sovereign_prime::agent_loop::ControlStore>> {
+    sovereign_prime::agent_loop::ControlStore::open_cached(Path::new(home)).map_err(|e| log_once("goal control store (no window)", &e)).ok()
+}
+
+/// The daily database backup failed (`migrate::backup_error`): say so once.
+pub(crate) async fn report_backup_error(hub: &Hub, err: Option<String>) {
+    if let Some(err) = err {
+        error_once(hub, "backup", format!("The daily database backup failed: {err}")).await;
+    }
 }
 
 /// Whether any child of `parent` (other than `except`) is running: the engine's own status
@@ -2573,11 +2604,11 @@ fn bot_session_setting(key: &str) -> String {
 }
 
 fn load_bot_session(home: &str, key: &str) -> Option<String> {
-    sovereign_prime::entries::EntryStore::open_cached(Path::new(home)).ok()?.setting(&bot_session_setting(key))
+    entries_or_log(home)?.setting(&bot_session_setting(key))
 }
 
 fn save_bot_session(home: &str, key: &str, session_id: &str) {
-    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(home)) {
+    if let Some(store) = entries_or_log(home) {
         let _ = store.set_setting(&bot_session_setting(key), session_id);
     }
 }
@@ -2999,6 +3030,32 @@ mod tests {
         let event: Value = serde_json::from_str(&text).unwrap();
         assert_eq!((event["params"]["type"].as_str(), event["params"]["payload"]["kind"].as_str()), (Some("status.update"), Some("error")));
         assert!(rx.try_recv().is_err(), "the second failure is silent");
+    }
+
+    #[test]
+    fn an_unopenable_store_without_a_window_is_logged_once() {
+        let file = std::env::temp_dir().join(format!("not-a-dir-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let home = file.to_string_lossy().to_string();
+        assert!(entries_or_log(&home).is_none() && control_or_log(&home).is_none());
+        assert!(!log_once("learning store (no window)", &anyhow!("again")), "already logged");
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn a_failed_backup_is_reported_once() {
+        let conn = test_conn("backup-warn");
+        let (to_ws, mut rx) = mpsc::channel::<Message>(8);
+        conn.hub.add(Arc::new(Client { id: 98, to_ws, sessions: Mutex::new(Default::default()) })).await;
+        report_backup_error(&conn.hub, None).await;
+        assert!(rx.try_recv().is_err(), "nothing to report");
+        report_backup_error(&conn.hub, Some("disk full".into())).await;
+        report_backup_error(&conn.hub, Some("disk full".into())).await;
+        let Message::Text(text) = rx.try_recv().unwrap() else { panic!("text frame") };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["params"]["payload"]["kind"], "error");
+        assert!(event["params"]["payload"]["text"].as_str().unwrap().contains("disk full"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

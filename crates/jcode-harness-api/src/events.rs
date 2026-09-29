@@ -456,6 +456,12 @@ pub struct HistoryMessage {
     /// "user" | "assistant" | "tool".
     pub role: String,
     pub content: String,
+    /// On a "tool" row: the tool that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// On a "tool" row: whether the call failed, when the engine says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

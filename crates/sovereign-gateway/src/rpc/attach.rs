@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 
 const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 const BYTES_MAX: usize = 25 * 1024 * 1024;
+/// Raw bytes per image. jcode keeps images as base64 in the session JSON (x4/3) and Anthropic
+/// rejects any image over 10 MB of base64 (`provider/image_clamp.rs`), so 7 MB raw (~9.3 MB
+/// encoded) is what every provider takes. Hermes caps attaches at 25 MB and never downscales.
+const IMAGE_MAX: usize = 7 * 1024 * 1024;
 const PDF_MAX: u64 = 50 * 1024 * 1024;
 
 pub(super) type Failure = (i64, String);
@@ -47,7 +51,21 @@ fn pending(dir: &Path) -> Vec<String> {
     read_list(&dir.join("pending.json"))
 }
 
+/// One lock per session's staged files, so a read-modify-write of `pending.json` never loses a
+/// concurrent attach.
+fn stage_lock(dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    LOCKS.lock().unwrap_or_else(|e| e.into_inner()).entry(dir.to_path_buf()).or_default().clone()
+}
+
 fn queue_image(dir: &Path, path: &Path) -> Result<usize, Failure> {
+    let size = path.metadata().map_or(0, |m| m.len() as usize);
+    if size > IMAGE_MAX {
+        return fail(4018, format!("image too large ({size} bytes; cap is {} MB)", IMAGE_MAX / (1024 * 1024)));
+    }
+    let lock = stage_lock(dir);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut list = pending(dir);
     list.push(path.to_string_lossy().into_owned());
     write_json(&dir.join("pending.json"), &list).or_else(|e| fail(5027, e.to_string()))?;
@@ -219,7 +237,7 @@ pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
             if b64.is_empty() {
                 return fail(4015, "content_base64 required");
             }
-            let bytes = decode(b64, BYTES_MAX, "image")?;
+            let bytes = decode(b64, IMAGE_MAX, "image")?;
             let hint = match (text_of(p, &["filename"]), text_of(p, &["ext"]).trim_start_matches('.')) {
                 ("", "") => String::new(),
                 ("", ext) => format!("x.{ext}"),
@@ -240,6 +258,8 @@ pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
             if raw.is_empty() {
                 return fail(4015, "path required");
             }
+            let lock = stage_lock(&dir);
+            let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
             let before = pending(&dir);
             let after: Vec<String> = before.iter().filter(|x| x.as_str() != raw).cloned().collect();
             write_json(&dir.join("pending.json"), &after).or_else(|e| fail(5027, e.to_string()))?;
@@ -380,6 +400,8 @@ pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(Str
 /// stays for the next turn.
 pub(super) fn clear_staged(home: &str, session: &str, sent: &[String]) {
     let dir = stage_dir(home, session);
+    let lock = stage_lock(&dir);
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
     let left: Vec<String> = pending(&dir).into_iter().filter(|p| !sent.contains(p)).collect();
     if left.is_empty() {
         let _ = std::fs::remove_file(dir.join("pending.json"));
@@ -435,6 +457,25 @@ mod tests {
         assert_eq!(left, vec![late["path"].as_str().unwrap().to_string()]);
         clear_staged(&home, "s1", &left);
         assert!(staged_images(&home, "s1").0.is_empty(), "consumed by the submit");
+    }
+
+    #[test]
+    fn oversized_images_are_refused_and_concurrent_attaches_are_all_kept() {
+        let (home, _) = setup("limits");
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; IMAGE_MAX + 1]);
+        assert_eq!(call("image.attach_bytes", &home, json!({ "content_base64": big, "ext": "png" })).unwrap_err().0, 4018);
+        let file = Path::new(&home).join("big.png");
+        std::fs::write(&file, vec![0u8; IMAGE_MAX + 1]).unwrap();
+        assert_eq!(call("image.attach", &home, json!({ "path": file.to_string_lossy() })).unwrap_err().0, 4018);
+
+        let dir = stage_dir(&home, "s1");
+        std::thread::scope(|s| {
+            for i in 0..16 {
+                let dir = &dir;
+                s.spawn(move || queue_image(dir, Path::new(&format!("/x/{i}.png"))).unwrap());
+            }
+        });
+        assert_eq!(pending(&dir).len(), 16);
     }
 
     #[test]

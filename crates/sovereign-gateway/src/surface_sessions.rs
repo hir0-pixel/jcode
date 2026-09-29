@@ -5,20 +5,19 @@
 use super::Config;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::Path;
 
 const PREFIX: &str = "session_surface:";
 
 /// Mark `session_id` as made by `surface` ("cron" | "bot") at `at_ms`.
 pub(crate) fn tag(home: &str, session_id: &str, surface: &str, at_ms: i64) {
-    if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(home)) {
+    if let Some(store) = crate::rpc::entries_or_log(home) {
         let _ = store.set_setting(&format!("{PREFIX}{session_id}"), &format!("{surface}@{at_ms}"));
     }
 }
 
 /// session id -> (surface, last tagged ms).
 pub(crate) fn tags(home: &str) -> HashMap<String, (String, i64)> {
-    let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(home)) else {
+    let Some(store) = crate::rpc::entries_or_log(home) else {
         return HashMap::new();
     };
     store
@@ -44,7 +43,7 @@ fn expired_cron(tags: &HashMap<String, (String, i64)>, now_ms: i64, retention_da
 /// Delete expired one-shot cron sessions (and their tags).
 pub(crate) async fn prune_cron(config: &Config, now_ms: i64) {
     let expired = expired_cron(&tags(&config.home), now_ms, crate::observability::retention_days());
-    let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(Path::new(&config.home)) else {
+    let Some(store) = crate::rpc::entries_or_log(&config.home) else {
         return;
     };
     for id in expired {
