@@ -336,7 +336,7 @@ pub fn list_approvals(db: &Connection, limit: u64) -> rusqlite::Result<Value> {
 /// evestack.memory_deletions, newest first.
 pub fn list_memory_deletions(db: &Connection, limit: u64) -> rusqlite::Result<Value> {
     let mut stmt = db.prepare(
-        "SELECT id,deleted_at_ms,memory_id,scope,content,tags,actor,actor_via FROM memory_deletions ORDER BY deleted_at_ms DESC, id DESC LIMIT ?1",
+        "SELECT id,deleted_at_ms,memory_id,scope,category,length,actor,actor_via FROM memory_deletions ORDER BY deleted_at_ms DESC, id DESC LIMIT ?1",
     )?;
     let rows = stmt
         .query_map([limit.min(500)], |r| {
@@ -345,8 +345,8 @@ pub fn list_memory_deletions(db: &Connection, limit: u64) -> rusqlite::Result<Va
                 "deleted_at_ms": r.get::<_, i64>(1)?,
                 "memory_id": r.get::<_, String>(2)?,
                 "scope": r.get::<_, Option<String>>(3)?,
-                "content": r.get::<_, String>(4)?,
-                "tags": r.get::<_, String>(5)?.split_whitespace().collect::<Vec<_>>(),
+                "category": r.get::<_, Option<String>>(4)?,
+                "length": r.get::<_, i64>(5)?,
                 "actor": r.get::<_, Option<String>>(6)?,
                 "actor_via": r.get::<_, String>(7)?,
             }))

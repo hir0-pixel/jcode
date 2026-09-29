@@ -37,8 +37,12 @@ Observability keeps one `fact_turn` row per turn, one `spans` row per model or t
 `span_content` (input and output text) per span, each side capped at 4,096 characters
 (`CONTENT_LIMIT` in `observability.rs`). Rows older than the retention window are deleted once a day
 (`prune`, default 30 days, `SOVEREIGN_OBSERVABILITY_RETENTION_DAYS` 1 to 3650). Deleted pages are reused
-by SQLite, so the file stops growing at its peak size and does not shrink. Memory, learning entries and
-parked approvals are small and not pruned.
+by SQLite, so the file stops growing at its peak size and does not shrink. The same prune expires the
+`approvals` log (command previews) and the `memory_deletions` audit. Memory and learning entries are small and
+not pruned; parked approvals are dropped after a day. Deleting a chat deletes everything keyed to it (goals,
+heartbeats, learning state, parked approvals, tags, traces). "Forget" keeps no text: the memory audit holds
+only the memory id, scope, category (when still known) and length. `sovereign.db`, its `-wal`/`-shm` and its
+`.bak` are created owner-only (0600).
 
 Estimate per turn with one model call and four tool calls: about 0.3 KiB for the turn row, 5 x 0.4 KiB
 of span rows, and 5 x (typically 2 KiB, at most 8 KiB) of content, so about 12 KiB typical and 42 KiB

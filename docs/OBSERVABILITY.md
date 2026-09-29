@@ -45,6 +45,8 @@ the input count and are not added twice. This comparison is not an API charge.
 
 ## Writer and retention
 
+The daily prune deletes `spans`, `span_content`, `fact_turn`, `approvals` (command previews) and `memory_deletions` older than the retention window (30 days by default). Deleting a session deletes its `fact_turn`, `spans`, `span_content` and `approvals` rows at once.
+
 SQLite uses WAL, `synchronous=FULL`, one writer, 4 KiB pages, and transactions of at most 128
 events or 100 ms. `busy_timeout` is confined to the writer. The chat path does
 one bounded `try_send`; no `await`, SQLite call, network call, or model call is
@@ -114,7 +116,7 @@ JSON is `TEXT`. The DDL beyond the shared tables lives in
 | `spans.resolved_session_id` / `resolved_turn_id`, `resolve_span_ancestry` | not needed | EveStack must infer ownership from partially attributed OTLP spans. Akira writes `run_id` and `root_id` on every span at emission. |
 | `spans` prompt and result content | `span_content(id, input, output)` | Off by default, as before. |
 | `approvals` | `approvals` | `decided_at`=`at_ms`, `turn_id`=`run_id`, `tool_name`=`tool`, `option_id`=`decision`, `approver`=`actor`, `approver_via`, `request_kind` (always `tool-approval`), `command_preview` in place of `answer_text`. No `request_id`, `remote_addr` or `user_agent`: the approver is the local desktop session. |
-| `memory_deletions` | `memory_deletions`, filled by an `AFTER DELETE` trigger on `memories` | Catches every deletion path with nothing added to the memory code or the chat path. `actor` is NULL and `actor_via` is `unidentified` (the trigger cannot know the caller), which EveStack also records rather than inventing. No `session_id`, `created_at`. |
+| `memory_deletions` | `memory_deletions`, filled by an `AFTER DELETE` trigger on `memories` | Catches every deletion path with nothing added to the memory code or the chat path. Unlike EveStack, which keeps the deleted content verbatim, this keeps no text: only `memory_id`, `scope`, `category` (best effort; NULL when the entry row is already gone) and `length` (no hash: SQLite has no built-in one, a trigger calling a custom function would break memory deletes on any connection without it, and a hash of short text is guessable anyway). `actor` is NULL and `actor_via` is `unidentified` (the trigger cannot know the caller), which EveStack also records rather than inventing. No `session_id`, `created_at`. |
 | `alert_state` | `alert_state` (`monitor_key`=`id`, `message`=`detail`) | `since` is `updated_at_ms` (rows are only rewritten on a transition). No `notified_state` per sink or `delivery_error`: delivery is a fire-and-forget webhook and the desktop event. |
 | `alert_deliveries`, `alert_lease` | none | Single process, so no lease; webhook delivery is not recorded. |
 | Alert ids `turn_failure_rate`, `turn_latency_p95`, `daily_spend`, `unpriced_spend`, `wedged` | same ids | Thresholds come from Akira's `observability.json`, not EveStack's environment variables. `turn_failure_rate` divides by finished turns; with none it is `not_checked`, not 0%. Akira adds `silent_failures`. Not ported: `no_spans_while_active` (Akira writes its spans in-process, so a missing-span gap cannot happen the way it does over OTLP), `sandbox_networked`, `sandbox_long_lived`, `schedule_failing` (no sandboxes; cron failures already show as failed runs). |

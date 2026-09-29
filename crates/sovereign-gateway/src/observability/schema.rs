@@ -100,16 +100,19 @@ const DDL: &str = "
 
     -- evestack.memory_deletions, filled by a trigger so every deletion path
     -- (tool, consolidation, desktop) is caught with no hook in the memory
-    -- code and nothing added to the chat path.
+    -- code and nothing added to the chat path. Unlike evestack it keeps no
+    -- text: forgetting a memory must not keep what it said (id, scope,
+    -- category when still known, and length only).
     CREATE TABLE IF NOT EXISTS memory_deletions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, deleted_at_ms INTEGER NOT NULL,
-        memory_id TEXT NOT NULL, scope TEXT, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '',
+        memory_id TEXT NOT NULL, scope TEXT, category TEXT, length INTEGER NOT NULL DEFAULT 0,
         actor TEXT, actor_via TEXT NOT NULL DEFAULT 'unidentified'
     );
     CREATE INDEX IF NOT EXISTS memory_deletions_recent ON memory_deletions(deleted_at_ms DESC);
     CREATE TRIGGER IF NOT EXISTS memory_audit AFTER DELETE ON memories BEGIN
-        INSERT INTO memory_deletions(deleted_at_ms, memory_id, scope, content, tags)
-        VALUES (CAST(strftime('%s','now') AS INTEGER) * 1000, old.id, old.scope, old.content, old.tags);
+        INSERT INTO memory_deletions(deleted_at_ms, memory_id, scope, category, length)
+        VALUES (CAST(strftime('%s','now') AS INTEGER) * 1000, old.id, old.scope,
+                (SELECT json_extract(entry, '$.category') FROM memory_entries WHERE rid = old.rid), length(old.content));
     END;
 ";
 

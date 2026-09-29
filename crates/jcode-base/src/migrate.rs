@@ -79,7 +79,27 @@ const MIGRATIONS: &[Step] = &[
     // after this): the v1 layout kept each entry's JSON inline in `memories`; it moves to `memory_entries`
     // with the embedding as little-endian f32 bytes. Formerly memory's private schema_version 1 -> 2.
     Step::Code(memory_entry_layout),
+    // 5: "forget" keeps no content: the memory audit records id, scope, category and length only.
+    // (The old text of already-deleted memories is dropped with the columns.)
+    Step::Code(memory_audit_without_content),
 ];
+
+fn memory_audit_without_content(conn: &Connection) -> Result<()> {
+    if !conn.prepare("SELECT 1 FROM pragma_table_info('memory_deletions') WHERE name='content'")?.exists([])? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memory_audit;
+         ALTER TABLE memory_deletions ADD COLUMN category TEXT;
+         ALTER TABLE memory_deletions ADD COLUMN length INTEGER NOT NULL DEFAULT 0;
+         UPDATE memory_deletions SET length = length(content);
+         DROP INDEX IF EXISTS memory_deletions_recent;
+         ALTER TABLE memory_deletions DROP COLUMN content;
+         ALTER TABLE memory_deletions DROP COLUMN tags;
+         CREATE INDEX IF NOT EXISTS memory_deletions_recent ON memory_deletions(deleted_at_ms DESC);",
+    )?;
+    Ok(())
+}
 
 fn memory_entry_layout(conn: &Connection) -> Result<()> {
     if !conn.prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name='entry'")?.exists([])? {
@@ -199,6 +219,25 @@ mod tests {
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_memory_audit_loses_the_text_of_already_deleted_memories() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memory_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT, deleted_at_ms INTEGER NOT NULL,
+                memory_id TEXT NOT NULL, scope TEXT, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '',
+                actor TEXT, actor_via TEXT NOT NULL DEFAULT 'unidentified');
+             CREATE INDEX memory_deletions_recent ON memory_deletions(deleted_at_ms DESC);
+             INSERT INTO memory_deletions(deleted_at_ms,memory_id,content) VALUES(1,'m','secret text');",
+        )
+        .unwrap();
+        memory_audit_without_content(&conn).unwrap();
+        memory_audit_without_content(&conn).unwrap();
+        let columns: Vec<String> = conn.prepare("SELECT name FROM pragma_table_info('memory_deletions')").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(!columns.iter().any(|c| c == "content" || c == "tags"), "{columns:?}");
+        assert_eq!(conn.query_row("SELECT length FROM memory_deletions", [], |r| r.get::<_, i64>(0)).unwrap(), 11);
     }
 
     #[test]

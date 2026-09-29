@@ -1004,6 +1004,9 @@ fn prune(db: &Connection, at: i64, retention_days: i64) -> rusqlite::Result<()> 
         [at - retention_days * day],
     )?;
     db.execute("DELETE FROM fact_turn WHERE ended_at_ms IS NOT NULL AND ended_at_ms<?1", [at - retention_days * day])?;
+    // Command previews and the memory audit expire with everything else.
+    db.execute("DELETE FROM approvals WHERE at_ms<?1", [at - retention_days * day])?;
+    db.execute("DELETE FROM memory_deletions WHERE deleted_at_ms<?1", [at - retention_days * day])?;
     Ok(())
 }
 
@@ -1416,8 +1419,8 @@ mod tests {
         db.execute("DELETE FROM memories WHERE id='m1'", []).unwrap();
         let audit = observer.view("memory-audit", 10, 1).unwrap();
         assert_eq!(audit["deletions"][0]["memory_id"], "m1");
-        assert_eq!(audit["deletions"][0]["content"], "remember this");
-        assert_eq!(audit["deletions"][0]["tags"], json!(["a", "b"]));
+        assert_eq!(audit["deletions"][0]["length"], 13);
+        assert!(audit["deletions"][0].get("content").is_none(), "forgetting keeps no text");
         drop((observer, db));
         // Re-opening is idempotent and keeps the rows.
         let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
@@ -1506,7 +1509,15 @@ mod tests {
             [now() - 31 * 86_400_000_i64],
         )
         .unwrap();
+        for ago in [31, 1] {
+            let at = now() - ago * 86_400_000_i64;
+            db.execute("INSERT INTO approvals(session_id,tool,command_preview,decision,actor,at_ms) VALUES('s','bash','rm x','deny','u',?1)", [at]).unwrap();
+            db.execute("INSERT INTO memory_deletions(deleted_at_ms,memory_id,length) VALUES(?1,'m',5)", [at]).unwrap();
+        }
         prune(&db, now(), 30).unwrap();
+        for table in ["approvals", "memory_deletions"] {
+            assert_eq!(db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 1, "{table} keeps only the recent row");
+        }
         assert_eq!(
             db.query_row("SELECT count(*) FROM spans", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
