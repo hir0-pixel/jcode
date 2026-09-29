@@ -168,6 +168,19 @@ fn main() {
         repo_root.join("Cargo.toml").display()
     );
     println!("cargo:rerun-if-env-changed=JCODE_RELEASE_BUILD");
+    // A release build must embed the commit it was built from, and the env var alone only
+    // reruns when its value changes. Watch HEAD (and the ref it points to) for release builds
+    // only, so dev builds stay incremental.
+    if std::env::var("JCODE_RELEASE_BUILD").as_deref() == Ok("1") {
+        let git = repo_root.join(".git");
+        println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
+        if let Ok(head) = std::fs::read_to_string(git.join("HEAD"))
+            && let Some(reference) = head.trim().strip_prefix("ref: ")
+        {
+            println!("cargo:rerun-if-changed={}", git.join(reference).display());
+        }
+        println!("cargo:rerun-if-changed={}", git.join("packed-refs").display());
+    }
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_SEMVER");
     // Allow callers to force a metadata refresh (e.g. install scripts) without a
     // full clean, by bumping this env var.
