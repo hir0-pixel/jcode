@@ -203,8 +203,7 @@ fn memory_body(entry: &sovereign_prime::entries::HarnessEntry) -> String {
     entry.reference["memory_id"]
         .as_str()
         .and_then(|id| {
-            let graph = jcode_base::memory::MemoryManager::new().load_global_graph().ok()?;
-            graph.get_memory(id).map(|m| m.content.clone())
+            super::memory_rest::find(id).map(|m| m.content)
         })
         .unwrap_or_else(|| entry.content.clone())
 }
@@ -322,9 +321,7 @@ fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Valu
 
 pub(crate) fn node(home: &Path, id: &str) -> Result<Option<Value>> {
     if let Some(mid) = id.strip_prefix(MEM_PREFIX) {
-        return Ok(jcode_base::memory::MemoryManager::new()
-            .load_global_graph()?
-            .get_memory(mid)
+        return Ok(super::memory_rest::find(mid)
             .map(|m| json!({"ok": true, "kind": "memory", "label": m.content.chars().take(60).collect::<String>(), "content": m.content})));
     }
     let store = store(home)?;
@@ -351,8 +348,7 @@ fn node_from_store(
 
 pub(crate) fn delete(home: &Path, id: &str) -> Result<Option<Value>> {
     if let Some(mid) = id.strip_prefix(MEM_PREFIX) {
-        return Ok(jcode_base::memory::MemoryManager::new()
-            .forget(mid)?
+        return Ok(super::memory_rest::forget(mid)?
             .then(|| json!({"ok": true, "message": "deleted memory"})));
     }
     let store = store(home)?;
@@ -374,7 +370,7 @@ fn delete_from_store(
     }
     store.delete(id)?;
     if let Some(memory_id) = entry.reference["memory_id"].as_str() {
-        let _ = jcode_base::memory::MemoryManager::new().forget(memory_id);
+        let _ = super::memory_rest::forget(memory_id);
     }
     Ok(Some(
         json!({"ok": true, "message": format!("deleted '{}'", entry.title)}),

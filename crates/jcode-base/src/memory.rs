@@ -898,6 +898,28 @@ impl MemoryManager {
         }
     }
 
+    /// Every stored scope's graph: `global` plus each `project:<hash>`, whatever
+    /// this manager's own project is. For the maintenance screen, which acts on all of them.
+    pub fn every_scope_graph(&self) -> Result<Vec<(String, MemoryGraph)>> {
+        let db = self.db_path()?;
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        let mut scopes = crate::memory_store::scopes(&db)?;
+        if !scopes.iter().any(|s| s == "global") {
+            scopes.push("global".to_string());
+        }
+        scopes
+            .into_iter()
+            .map(|scope| Ok((scope.clone(), self.load_scope_graph(&scope, false)?)))
+            .collect()
+    }
+
+    /// Save a graph loaded by [`Self::every_scope_graph`] back to its scope.
+    pub fn save_graph_for_scope(&self, scope: &str, graph: &MemoryGraph) -> Result<()> {
+        self.save_scope_graph(scope, graph)
+    }
+
     /// Load global memories as a MemoryGraph
     pub fn load_global_graph(&self) -> Result<MemoryGraph> {
         self.load_scope_graph("global", false)

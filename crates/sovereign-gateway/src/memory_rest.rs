@@ -6,7 +6,7 @@
 
 use super::{Request, read_body, respond};
 use anyhow::{Context, Result};
-use jcode_base::memory::{MemoryCategory, MemoryEntry, MemoryManager, MemoryScope};
+use jcode_base::memory::{MemoryCategory, MemoryEntry, MemoryManager};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
@@ -15,8 +15,36 @@ fn is_user(entry: &MemoryEntry) -> bool {
     matches!(entry.category, MemoryCategory::Preference)
 }
 
+/// Every memory in every scope (global and each project), as recall sees them,
+/// tagged with its scope (`global` | `project:<hash>`).
+fn scoped() -> Result<Vec<(String, MemoryEntry)>> {
+    let mut rows: Vec<_> = MemoryManager::new()
+        .every_scope_graph()?
+        .into_iter()
+        .flat_map(|(scope, graph)| graph.all_memories().map(|m| (scope.clone(), m.clone())).collect::<Vec<_>>())
+        .collect();
+    rows.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+    Ok(rows)
+}
+
 fn all() -> Result<Vec<MemoryEntry>> {
-    MemoryManager::new().list_all_scoped(MemoryScope::Global)
+    Ok(scoped()?.into_iter().map(|(_, entry)| entry).collect())
+}
+
+pub(crate) fn find(id: &str) -> Option<MemoryEntry> {
+    all().ok()?.into_iter().find(|m| m.id == id)
+}
+
+/// Remove `id` from whichever scope holds it.
+pub(crate) fn forget(id: &str) -> Result<bool> {
+    let manager = MemoryManager::new();
+    for (scope, mut graph) in manager.every_scope_graph()? {
+        if graph.remove_memory(id).is_some() {
+            manager.save_graph_for_scope(&scope, &graph)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn status() -> Result<Value> {
@@ -33,7 +61,6 @@ fn status() -> Result<Value> {
 
 /// Forget every memory in `target` (`memory` | `user` | `all`); returns the labels cleared.
 fn reset(target: &str) -> Result<Value> {
-    let manager = MemoryManager::new();
     let mut deleted = Vec::new();
     for entry in all()? {
         let hit = match target {
@@ -41,16 +68,16 @@ fn reset(target: &str) -> Result<Value> {
             "user" => is_user(&entry),
             _ => !is_user(&entry),
         };
-        if hit && manager.forget(&entry.id)? {
+        if hit && forget(&entry.id)? {
             deleted.push(entry.id);
         }
     }
     Ok(json!({ "ok": true, "deleted": deleted }))
 }
 
-fn row(entry: &MemoryEntry) -> Value {
+fn row(scope: &str, entry: &MemoryEntry) -> Value {
     json!({
-        "id": entry.id, "content": entry.content, "category": entry.category.to_string(),
+        "scope": scope, "id": entry.id, "content": entry.content, "category": entry.category.to_string(),
         "source": entry.source, "updated_at": entry.updated_at.timestamp(),
     })
 }
@@ -64,19 +91,21 @@ pub(crate) fn add(content: &str, category: &str, source: &str) -> Result<String>
 /// Replace one memory's text; `false` when the id is unknown.
 pub(crate) fn edit(id: &str, content: &str) -> Result<bool> {
     let manager = MemoryManager::new();
-    let mut graph = manager.load_global_graph()?;
-    let Some(memory) = graph.get_memory_mut(id) else {
-        return Ok(false);
-    };
-    memory.content = content.to_string();
-    memory.updated_at = chrono::Utc::now();
-    memory.refresh_search_text();
-    memory.embedding = None; // stale for the new text; recomputed by backfill
-    manager.save_global_graph(&graph)?;
-    Ok(true)
+    for (scope, mut graph) in manager.every_scope_graph()? {
+        let Some(memory) = graph.get_memory_mut(id) else {
+            continue;
+        };
+        memory.content = content.to_string();
+        memory.updated_at = chrono::Utc::now();
+        memory.refresh_search_text();
+        memory.embedding = None; // stale for the new text; recomputed by backfill
+        manager.save_graph_for_scope(&scope, &graph)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
-/// Global memories no harness entry points at (the model's own `memory` tool
+/// Memories (any scope) no harness entry points at (the model's own `memory` tool
 /// writes), for the learning graph.
 pub(crate) fn unreferenced(referenced: &std::collections::HashSet<String>) -> Result<Vec<MemoryEntry>> {
     Ok(all()?.into_iter().filter(|m| !referenced.contains(&m.id)).collect())
@@ -105,7 +134,7 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request) -> Option<Resul
             let target = body["target"].as_str().unwrap_or("all").to_string();
             blocking(move || reset(&target).map(Some)).await
         }
-        ("GET", ["entries"]) => blocking(|| Ok(Some(json!({ "entries": all()?.iter().map(row).collect::<Vec<_>>() })))).await,
+        ("GET", ["entries"]) => blocking(|| Ok(Some(json!({ "entries": scoped()?.iter().map(|(scope, m)| row(scope, m)).collect::<Vec<_>>() })))).await,
         ("POST", ["entries"]) if !text.is_empty() => {
             let category = body["category"].as_str().unwrap_or("fact").to_string();
             blocking(move || Ok(Some(json!({ "ok": true, "id": add(&text, &category, "desktop")? })))).await
@@ -116,7 +145,7 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request) -> Option<Resul
         }
         ("DELETE", ["entries", id]) => {
             let id = id.to_string();
-            blocking(move || Ok(MemoryManager::new().forget(&id)?.then(|| json!({ "ok": true })))).await
+            blocking(move || Ok(forget(&id)?.then(|| json!({ "ok": true })))).await
         }
         ("POST" | "PUT", ["entries", ..]) => {
             return Some(respond(stream, "400 Bad Request", &json!({"detail": "content is required"})).await);
@@ -162,6 +191,19 @@ mod tests {
         assert_eq!(reset("user").unwrap()["deleted"], json!([pref]));
         assert_eq!(all().unwrap().len(), 1);
         assert_eq!(reset("all").unwrap()["deleted"].as_array().unwrap().len(), 1);
+        // a project memory shows up, edits, and forgets like a global one
+        let project = MemoryManager::new().with_project_dir("/tmp/some-project");
+        let id = project.remember_project(MemoryEntry::new(MemoryCategory::Fact, "project uses pnpm")).unwrap();
+        let listed = scoped().unwrap();
+        let (scope, _) = listed.iter().find(|(_, m)| m.id == id).unwrap();
+        assert!(scope.starts_with("project:"));
+        assert_eq!(status().unwrap()["builtin_files"]["memory"], json!(17));
+        assert!(edit(&id, "project uses yarn").unwrap());
+        assert!(all().unwrap().iter().any(|m| m.content == "project uses yarn"));
+        assert!(forget(&id).unwrap());
+        assert!(!forget(&id).unwrap());
+        let id = project.remember_project(MemoryEntry::new(MemoryCategory::Fact, "again")).unwrap();
+        assert_eq!(reset("all").unwrap()["deleted"], json!([id]));
         let _ = std::fs::remove_dir_all(home);
     }
 }

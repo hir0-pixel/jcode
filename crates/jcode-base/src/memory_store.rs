@@ -163,6 +163,14 @@ pub(crate) fn data_version(path: &Path) -> Result<i64> {
     with_db(path, |db| Ok(db.query_row("PRAGMA data_version", [], |r| r.get(0))?))
 }
 
+/// Every scope with a stored graph (`global`, `project:<hash>`).
+pub(crate) fn scopes(path: &Path) -> Result<Vec<String>> {
+    with_db(path, |db| {
+        let mut stmt = db.prepare("SELECT scope FROM memory_graphs ORDER BY scope")?;
+        Ok(stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    })
+}
+
 /// The stored graph for `scope`, or `None` if nothing was ever saved there.
 pub(crate) fn load_graph(path: &Path, scope: &str) -> Result<Option<MemoryGraph>> {
     with_db(path, |db| {
