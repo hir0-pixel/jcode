@@ -486,8 +486,10 @@ impl BridgeState {
                 }
             }
             "delete_session" => {
-                // Permanent: the snapshot, its journal and any archive entry.
-                // The caller refuses sessions that are live (turn running).
+                // Permanent: the snapshot, its journal, its rolling backup and
+                // any archive entry. The caller refuses sessions that are live
+                // (turn running). A surviving `.bak` kept the chat in the list,
+                // so a deleted chat came back.
                 let session_id = request["session_id"].as_str().unwrap_or_default();
                 let Some(path) = Self::session_record_path(session_id).filter(|path| path.is_file()) else {
                     return Self::error_reply(
@@ -501,6 +503,7 @@ impl BridgeState {
                     return Self::error_reply(api_id, ErrorCode::Internal, &err.to_string());
                 }
                 let _ = std::fs::remove_file(path.with_extension("journal.jsonl"));
+                let _ = std::fs::remove_file(path.with_extension("bak"));
                 let mut archive = Self::load_archive_state();
                 if archive.sessions.remove(session_id).is_some() {
                     let _ = Self::save_archive_state(&archive);
