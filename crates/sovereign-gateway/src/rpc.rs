@@ -1955,6 +1955,19 @@ impl Conn {
                 }
                 Ok(json!({ "resolved": resolved }))
             }
+            // One model path: the engine's own provider and key, traced like any other call.
+            "llm.oneshot" => {
+                let (system, user) = crate::oneshot::prompts(p).map_err(|(code, message)| RpcError { code, message, data: None })?;
+                let complete = self.config.complete.clone().ok_or_else(|| RpcError::internal(anyhow!("no model available")))?;
+                let started = crate::observability::now();
+                let reply = complete(system, user).await;
+                self.observer.record_aux(
+                    p["session_id"].as_str().unwrap_or(""), "other", Some("One-shot"), None, None, started,
+                    reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
+                );
+                let done = reply.map_err(|e| RpcError { code: 5030, message: format!("one-shot generation failed: {e}"), data: None })?;
+                Ok(json!({ "text": crate::oneshot::strip_code_fence(&done.text) }))
+            }
             // Python would run these outside the approval hook: ask first.
             "shell.exec" | "cli.exec" => {
                 if let Some(command) = ungated_exec_command(method, p) {

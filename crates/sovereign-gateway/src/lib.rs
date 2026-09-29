@@ -15,6 +15,7 @@ pub mod learn;
 mod hermes_env;
 mod learning_rest;
 mod memory_rest;
+mod oneshot;
 pub mod map;
 pub mod observability;
 pub mod profile;
