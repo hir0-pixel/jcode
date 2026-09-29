@@ -934,13 +934,15 @@ async fn handle(
         {
             respond(&mut stream, "200 OK", &json!([])).await
         }
-        // The engine owns skills end-to-end: real list/view/enable-disable
-        // over the jcode skill registry (~/.jcode/skills + project overlays).
-        // Hub browse/install is forwarded to Hermes Python, which installs into
+        // The engine lists and views skills from the jcode skill registry
+        // (~/.jcode/skills + project overlays). On/off is `skills.disabled` in
+        // config.yaml, owned by Hermes: the toggle PUT is forwarded to it and
+        // this list (and the model's skill list) reads the same key. Hub browse/install is forwarded to Hermes Python, which installs into
         // the same skills dir (the engine passes it JCODE_HOME); the registry
         // here only reads and toggles what is installed.
         ("GET", "/api/skills") => {
             let registry = jcode_base::skill::SkillRegistry::shared_snapshot();
+            let disabled = jcode_base::skill::disabled_skill_names();
             let skills: Vec<Value> = registry
                 .list()
                 .iter()
@@ -949,7 +951,7 @@ async fn handle(
                         "name": skill.name,
                         "description": skill.description,
                         "category": "general",
-                        "enabled": skill.enabled,
+                        "enabled": !disabled.contains(&skill.name),
                         "provenance": "agent",
                     })
                 })
@@ -983,47 +985,6 @@ async fn handle(
                         &mut stream,
                         "404 Not Found",
                         &json!({"detail": "skill not found"}),
-                    )
-                    .await
-                }
-            }
-        }
-        ("PUT", "/api/skills/toggle") => {
-            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
-            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let (Some(name), Some(enabled)) = (body["name"].as_str(), body["enabled"].as_bool())
-            else {
-                return respond(
-                    &mut stream,
-                    "400 Bad Request",
-                    &json!({"detail": "name and enabled are required"}),
-                )
-                .await;
-            };
-            let registry = jcode_base::skill::SkillRegistry::shared_registry();
-            let mut registry = registry.write().await;
-            match registry.set_enabled(name, enabled) {
-                Ok(true) => {
-                    respond(
-                        &mut stream,
-                        "200 OK",
-                        &json!({"ok": true, "name": name, "enabled": enabled}),
-                    )
-                    .await
-                }
-                Ok(false) => {
-                    respond(
-                        &mut stream,
-                        "404 Not Found",
-                        &json!({"detail": "skill not found"}),
-                    )
-                    .await
-                }
-                Err(err) => {
-                    respond(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        &json!({"detail": err.to_string()}),
                     )
                     .await
                 }

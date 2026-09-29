@@ -11,6 +11,39 @@ use tokio::sync::RwLock;
 mod invocation;
 pub use invocation::SkillInvocation;
 
+/// Skills switched off in Settings: `skills.disabled` in `$HERMES_HOME/config.yaml`,
+/// the one list Hermes (desktop toggle, bots, cron) reads and writes. Read fresh on
+/// every call so a toggle applies without a restart. Empty outside Hermes.
+pub fn disabled_skill_names() -> std::collections::HashSet<String> {
+    match std::env::var_os("HERMES_HOME") {
+        Some(home) => disabled_skill_names_in(Path::new(&home)),
+        None => Default::default(),
+    }
+}
+
+fn disabled_skill_names_in(home: &Path) -> std::collections::HashSet<String> {
+    let config: serde_yaml::Value = std::fs::read_to_string(home.join("config.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str(&raw).ok())
+        .unwrap_or_default();
+    let names: Vec<String> = match &config["skills"]["disabled"] {
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        // `hermes config set` stores a list as a quoted JSON array; a bare string is one name.
+        serde_yaml::Value::String(raw) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| vec![raw.clone()])
+        }
+        _ => Vec::new(),
+    };
+    names
+        .into_iter()
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty() && n != "hermes-agent") // Hermes never lets its essential skill be disabled
+        .collect()
+}
+
 /// A skill definition from SKILL.md
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -19,11 +52,6 @@ pub struct Skill {
     pub allowed_tools: Option<Vec<String>>,
     pub content: String,
     pub path: PathBuf,
-    /// Whether this skill is currently active in the prompt. Persisted as a
-    /// sibling `.disabled` marker file next to `SKILL.md` (see `set_enabled`),
-    /// so disabling survives a `reload_global`/process restart without needing
-    /// any new schema.
-    pub enabled: bool,
     search_text: String,
 }
 
@@ -572,7 +600,6 @@ impl SkillRegistry {
             AllowedTools::Sequence(tools) => tools,
         });
         let search_text = build_skill_search_text(&name, &description, &body);
-        let enabled = !Self::disabled_marker_path(path).exists();
 
         Ok(Skill {
             name,
@@ -580,38 +607,8 @@ impl SkillRegistry {
             allowed_tools,
             content: body,
             path: path.to_path_buf(),
-            enabled,
             search_text,
         })
-    }
-
-    /// Path of the `.disabled` marker sitting beside a skill's `SKILL.md`.
-    fn disabled_marker_path(skill_md_path: &Path) -> PathBuf {
-        skill_md_path
-            .parent()
-            .map(|dir| dir.join(".disabled"))
-            .unwrap_or_else(|| skill_md_path.with_extension("disabled"))
-    }
-
-    /// Enable or disable a skill by writing/removing its `.disabled` marker
-    /// file, and update the in-memory copy to match. Returns `Ok(false)` if
-    /// no skill with that name is loaded.
-    pub fn set_enabled(&mut self, name: &str, enabled: bool) -> Result<bool> {
-        let Some(skill) = self.skills.get(name) else {
-            return Ok(false);
-        };
-        let marker = Self::disabled_marker_path(&skill.path);
-        if enabled {
-            if marker.exists() {
-                std::fs::remove_file(&marker)?;
-            }
-        } else {
-            std::fs::write(&marker, "")?;
-        }
-        if let Some(skill) = self.skills.get_mut(name) {
-            skill.enabled = enabled;
-        }
-        Ok(true)
     }
 
     /// Parse YAML frontmatter from markdown
@@ -1052,9 +1049,26 @@ mod tests {
             allowed_tools: None,
             content: content.to_string(),
             path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
-            enabled: true,
             search_text: build_skill_search_text(name, description, content),
         }
+    }
+
+    #[test]
+    fn disabled_names_come_from_hermes_config() {
+        let home = tempfile::tempdir().unwrap();
+        let read = |yaml: &str| {
+            std::fs::write(home.path().join("config.yaml"), yaml).unwrap();
+            let mut names: Vec<_> = disabled_skill_names_in(home.path()).into_iter().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            read("skills:\n  disabled: [b, a, hermes-agent]\n"),
+            ["a", "b"]
+        );
+        assert_eq!(read("skills:\n  disabled: '[\"x\", \"y\"]'\n"), ["x", "y"]);
+        assert_eq!(read("skills:\n  disabled: solo\n"), ["solo"]);
+        assert!(read("model: {}\n").is_empty());
     }
 
     fn write_test_skill(root: &Path, scope: &str, name: &str) {

@@ -61,7 +61,6 @@ mod tests {
                     allowed_tools: None,
                     content: "content".to_string(),
                     path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
-                    enabled: true,
                     search_text: build_skill_search_text(name, "Test skill", "content"),
                 },
             );

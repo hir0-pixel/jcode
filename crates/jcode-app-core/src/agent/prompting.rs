@@ -122,11 +122,12 @@ impl Agent {
             .as_ref()
             .and_then(|name| skills.get(name).map(|skill| skill.get_prompt().to_string()));
 
+        let disabled = jcode_base::skill::disabled_skill_names();
         let available_skills: Vec<crate::prompt::SkillInfo> = self
             .current_skills_snapshot()
             .list()
             .iter()
-            .filter(|skill| skill.enabled)
+            .filter(|skill| !disabled.contains(&skill.name))
             .map(|skill| crate::prompt::SkillInfo {
                 name: skill.name.clone(),
                 description: skill.description.clone(),

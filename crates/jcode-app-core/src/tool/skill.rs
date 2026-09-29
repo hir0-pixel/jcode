@@ -141,7 +141,9 @@ impl SkillTool {
 
         let registry = self.effective_registry(working_dir).await;
         // A skill switched off in Settings is not offered to the model.
-        let skill = registry.get(&name).filter(|s| s.enabled).ok_or_else(|| {
+        let skill = registry
+            .get(&name)
+            .filter(|s| !crate::skill::disabled_skill_names().contains(&s.name)).ok_or_else(|| {
             // Endorsed skills are advertised in `list` but are not bundled;
             // a bare "not found" here reads like a bug (issue #445). Point at
             // the actual install command instead.
@@ -189,7 +191,8 @@ impl SkillTool {
 
         let installed: std::collections::HashSet<&str> =
             skills.iter().map(|s| s.name.as_str()).collect();
-        skills.retain(|s| s.enabled);
+        let disabled = crate::skill::disabled_skill_names();
+        skills.retain(|s| !disabled.contains(&s.name));
 
         let mut output = if skills.is_empty() {
             "No skills loaded.\n\n\
@@ -670,14 +673,43 @@ mod tests {
     #[tokio::test]
     async fn disabled_skill_is_not_listed_or_loadable() {
         let (_, temp_dir) = create_test_tool_with_skill("optimization");
-        std::fs::write(temp_dir.path().join(".jcode/skills/optimization/.disabled"), "").unwrap();
+        let _env = jcode_base::storage::lock_test_env();
+        let hermes = tempfile::tempdir().unwrap();
+        std::fs::write(
+            hermes.path().join("config.yaml"),
+            "skills:\n  disabled: [optimization]\n",
+        )
+        .unwrap();
+        // SAFETY: serialized by lock_test_env; restored below.
+        unsafe { std::env::set_var("HERMES_HOME", hermes.path()) };
         let registry = SkillRegistry::load_for_working_dir(Some(temp_dir.path())).unwrap();
         let tool = SkillTool::new(Arc::new(RwLock::new(registry)));
 
-        let listed = tool.execute(json!({"action": "list"}), create_test_context()).await.unwrap();
+        let listed = tool
+            .execute(json!({"action": "list"}), create_test_context())
+            .await
+            .unwrap();
         assert!(!listed.output.contains("## /optimization"));
-        let loaded = tool.execute(json!({"action": "load", "name": "optimization"}), create_test_context()).await;
+        let loaded = tool
+            .execute(
+                json!({"action": "load", "name": "optimization"}),
+                create_test_context(),
+            )
+            .await;
         assert!(loaded.is_err());
+
+        // Enabling it in the same config makes it visible again, no restart.
+        std::fs::write(
+            hermes.path().join("config.yaml"),
+            "skills:\n  disabled: []\n",
+        )
+        .unwrap();
+        let listed = tool
+            .execute(json!({"action": "list"}), create_test_context())
+            .await
+            .unwrap();
+        unsafe { std::env::remove_var("HERMES_HOME") };
+        assert!(listed.output.contains("## /optimization"));
     }
 
     #[tokio::test]
