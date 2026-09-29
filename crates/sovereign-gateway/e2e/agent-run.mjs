@@ -78,7 +78,7 @@ try {
 
   // 3. A prompt that tries a risky shell command (a recursive delete, which
   // jcode's own risk classifier always sends to approval) is denied outright:
-  // no approval prompt reaches the connected desktop client, and the file
+  // no blocking approval prompt reaches the connected desktop client, and the file
   // this would have destroyed survives.
   const marker = path.join(home, 'agent-run-marker.txt')
   fs.writeFileSync(marker, 'do not delete me')
@@ -93,7 +93,8 @@ try {
   })
   check(denied.status === 200, `denied run still responds 200 (${denied.status})`)
   check(fs.existsSync(marker), 'the shell command was denied: the file was not deleted')
-  check(approvals.length === before, `no approval frame reached the desktop client (${approvals.length - before} arrived)`)
+  // A denied unattended command is parked for a late answer: the desktop may be shown it, but nothing waits on it.
+  check(approvals.slice(before).every(a => a.params?.unattended === true), `no blocking approval frame reached the desktop client (${approvals.length - before} parked frame(s))`)
 } catch (err) {
   failures++
   console.error('FAIL', err.message)
