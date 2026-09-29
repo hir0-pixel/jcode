@@ -25,6 +25,8 @@ struct Driver {
     wake: Notify,
     /// Sessions found active when this process started, until their resume prompt is accepted.
     resume: std::sync::Mutex<Option<std::collections::HashSet<String>>>,
+    /// When each parked goal was first seen waiting on sub-agents.
+    waiting_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 static DRIVER: OnceLock<Arc<Driver>> = OnceLock::new();
@@ -54,14 +56,24 @@ async fn parent_left_waiting(conn: &Arc<Conn>, waiting: &[String], session_id: &
     if !waiting.iter().any(|w| w == parent) {
         return None;
     }
-    let sessions = conn.sessions.lock().await;
-    let running = list.iter().any(|s| {
-        let id = s["session_id"].as_str().unwrap_or_default();
-        s["parent_session_id"].as_str() == Some(parent)
-            && id != session_id
-            && (matches!(s["status"].as_str(), Some("running" | "processing")) || sessions.get(id).is_some_and(SessionState::turn_active))
-    });
+    let running = children_running(list, parent, Some(session_id), &*conn.sessions.lock().await);
     (!running).then(|| parent.to_string())
+}
+
+/// A parked goal gives up on its sub-agents after this long and carries on.
+const WAIT_CAP: Duration = Duration::from_secs(30 * 60);
+
+/// Waiting sessions whose sub-agents are done (per the engine's `list`) or have overrun `cap`:
+/// `(session, timed_out)`. `since` tracks when each was first seen waiting.
+fn released_waits(waiting: &[String], since: &mut HashMap<String, std::time::Instant>, list: &[Value], live: &HashMap<String, SessionState>, cap: Duration) -> Vec<(String, bool)> {
+    since.retain(|sid, _| waiting.contains(sid));
+    waiting
+        .iter()
+        .filter_map(|sid| {
+            let timed_out = since.entry(sid.clone()).or_insert_with(std::time::Instant::now).elapsed() >= cap;
+            (timed_out || !children_running(list, sid, None, live)).then(|| (sid.clone(), timed_out))
+        })
+        .collect()
 }
 
 /// Start the driver task (once, with the gateway).
@@ -74,39 +86,27 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
             to_ws: to_ws.clone(),
             sessions: Mutex::new(Default::default()),
         });
-        let conn = Arc::new(Conn {
-            config,
-            to_ws,
-            control: Mutex::new(None),
-            links: Mutex::new(HashMap::new()),
-            link_tasks: Mutex::new(Vec::new()),
-            known: Mutex::new(HashMap::new()),
-            fresh: Mutex::new(std::collections::HashSet::new()),
-            learning_now: Mutex::new(std::collections::HashSet::new()),
-            driver: true,
-            next_id: AtomicU64::new(1),
-            next_server_request: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            approvals: Mutex::new(HashMap::new()),
-            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
-            accept_waiters: Mutex::new(HashMap::new()),
-            upstream: Mutex::new(None),
-            next_forward: AtomicU64::new(1),
-            hub,
-            client,
-            observer,
-            run_kind: "invoke_agent",
-            run_title: None,
-            replay_of: None,
-        });
-        match conn.open_link().await {
-            Ok(link) => *conn.control.lock().await = Some(link),
-            Err(err) => return eprintln!("sovereign: goal driver could not reach the engine: {err:#}"),
-        }
-        let driver = Arc::new(Driver { conn, wake: Notify::new(), resume: Default::default() });
+        let conn = Conn::new(config, to_ws, hub, client, observer, true, "invoke_agent", None, None);
+        let driver = Arc::new(Driver { conn, wake: Notify::new(), resume: Default::default(), waiting_since: Default::default() });
         let _ = DRIVER.set(driver.clone());
+        let (mut failures, mut last_error) = (0u32, String::new());
         loop {
+            // The engine may be down at start or restart later: keep trying, forever, with backoff.
+            if let Err(err) = driver.conn.ensure_control().await {
+                let err = format!("{err:#}");
+                if err != last_error {
+                    eprintln!("sovereign: goal driver could not reach the engine (retrying): {err}");
+                    last_error = err;
+                }
+                let delay = retry_delay(failures);
+                failures = failures.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = driver.wake.notified() => {}
+                }
+                continue;
+            }
+            (failures, last_error) = (0, String::new());
             let active = driver.tick().await;
             if active {
                 tokio::select! {
@@ -118,6 +118,11 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
             }
         }
     });
+}
+
+/// Seconds to wait after `failures` failed engine connects: 1, 2, 4 ... capped at 30.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((1u64 << failures.min(5)).min(30))
 }
 
 /// The user approved a command this goal session was denied while unattended: tell it so it can
@@ -175,9 +180,7 @@ impl Driver {
     /// nothing is active (the task then sleeps until poked).
     async fn tick(&self) -> bool {
         let conn = &self.conn;
-        let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
-            return false;
-        };
+        let Some(store) = conn.control_store().await else { return false };
         let mut active = store.active_sessions().unwrap_or_default();
         let first = {
             let mut resume = self.resume.lock().unwrap();
@@ -189,6 +192,28 @@ impl Driver {
             // Nothing is running after a restart: whatever a goal was waiting on is over.
             for sid in store.waiting_sessions().unwrap_or_default() {
                 let _ = store.clear_wait(&sid);
+            }
+        }
+        // A parked goal's sub-agents may finish on a connection nobody watches: ask the engine.
+        let mut notes = HashMap::new();
+        let waiting = store.waiting_sessions().unwrap_or_default();
+        if !waiting.is_empty() {
+            match conn.call(json!({ "req": "list_sessions" })).await {
+                Ok(reply) => {
+                    let list = reply["sessions"].as_array().map_or(&[][..], Vec::as_slice);
+                    let live = conn.sessions.lock().await;
+                    let released = released_waits(&waiting, &mut self.waiting_since.lock().unwrap(), list, &live, WAIT_CAP);
+                    drop(live);
+                    for (sid, timed_out) in released {
+                        if store.clear_wait(&sid).unwrap_or(false) {
+                            if timed_out {
+                                notes.insert(sid.clone(), "Note: your sub-agents did not finish within 30 minutes and timed out; continue without their results.\n\n".to_string());
+                            }
+                            resume_soon(&sid);
+                        }
+                    }
+                }
+                Err(err) => eprintln!("sovereign: goal driver could not list sub-agents: {err:#}"),
             }
         }
         let mut gone = Vec::new();
@@ -221,6 +246,7 @@ impl Driver {
         };
         let work = due_work(&store, &active, self.resume.lock().unwrap().as_mut().unwrap(), |sid| busy.contains(sid));
         for (sid, text) in work {
+            let text = format!("{}{text}", notes.remove(&sid).unwrap_or_default());
             match conn.dispatch("prompt.submit", &json!({ "session_id": sid, "text": text })).await {
                 Ok(_) => {
                     self.resume.lock().unwrap().as_mut().unwrap().remove(&sid);
@@ -258,9 +284,7 @@ async fn supervise(conn: &Arc<Conn>, store: &ControlStore, sid: &str, fallback: 
 /// (or stops watching) the session.
 pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
     tokio::spawn(async move {
-        let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
-            return;
-        };
+        let Some(store) = conn.control_store().await else { return };
         // A sub-agent finishing may be the last thing its parent's goal was waiting on.
         if let Some(waiting) = store.waiting_sessions().ok().filter(|w| !w.is_empty()) {
             if let Some(parent) = parent_left_waiting(&conn, &waiting, &session_id).await {
@@ -329,6 +353,30 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
 mod tests {
     use super::*;
     use sovereign_prime::agent_loop::{Heartbeat, SessionGoal};
+
+    #[test]
+    fn engine_reconnects_back_off_from_one_to_thirty_seconds() {
+        let secs: Vec<u64> = (0..8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(retry_delay(u32::MAX).as_secs(), 30);
+    }
+
+    #[test]
+    fn a_parked_goal_is_released_by_the_engines_view_of_its_children_or_the_cap() {
+        let list = |status: &str| vec![json!({ "session_id": "child", "parent_session_id": "parent", "status": status })];
+        let waiting = ["parent".to_string()];
+        let (mut since, live) = (HashMap::new(), HashMap::new());
+        let day = Duration::from_secs(86400);
+        // A child the engine reports running (on any connection) keeps the parent parked.
+        assert!(released_waits(&waiting, &mut since, &list("running"), &live, day).is_empty());
+        // Once it is no longer running, the parent is released without a timeout.
+        assert_eq!(released_waits(&waiting, &mut since, &list("idle"), &live, day), [("parent".to_string(), false)]);
+        // A child that never finishes is given up on at the cap.
+        assert_eq!(released_waits(&waiting, &mut since, &list("running"), &live, Duration::ZERO), [("parent".to_string(), true)]);
+        // Sessions no longer waiting are forgotten.
+        released_waits(&[], &mut since, &[], &live, day);
+        assert!(since.is_empty());
+    }
 
     #[test]
     fn driver_resumes_goals_once_and_fires_due_heartbeats_only_when_idle() {

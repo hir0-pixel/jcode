@@ -362,19 +362,30 @@ fn react(dir: &Path, p: &Value) -> Reply {
     Ok(json!({ "row_id": row_id.unwrap_or(0), "reactions": reactions }))
 }
 
-/// Staged images as `(media_type, base64)`, ready for `send_message`; the list is not cleared.
-pub(super) fn staged_images(home: &str, session: &str) -> Vec<(String, String)> {
-    pending(&stage_dir(home, session))
+/// Staged image paths and the same images as `(media_type, base64)` for `send_message`; nothing
+/// is cleared (see `clear_staged`).
+pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let paths = pending(&stage_dir(home, session));
+    let images = paths
         .iter()
         .filter_map(|p| {
             let bytes = std::fs::read(p).ok()?;
             Some((media_type(Path::new(p)).to_string(), base64::engine::general_purpose::STANDARD.encode(bytes)))
         })
-        .collect()
+        .collect();
+    (paths, images)
 }
 
-pub(super) fn clear_staged(home: &str, session: &str) {
-    let _ = std::fs::remove_file(stage_dir(home, session).join("pending.json"));
+/// Drop only the `sent` paths from the queue: an image attached while the submit was in flight
+/// stays for the next turn.
+pub(super) fn clear_staged(home: &str, session: &str, sent: &[String]) {
+    let dir = stage_dir(home, session);
+    let left: Vec<String> = pending(&dir).into_iter().filter(|p| !sent.contains(p)).collect();
+    if left.is_empty() {
+        let _ = std::fs::remove_file(dir.join("pending.json"));
+    } else {
+        let _ = write_json(&dir.join("pending.json"), &left);
+    }
 }
 
 #[cfg(test)]
@@ -406,7 +417,7 @@ mod tests {
         assert!(r["text"].as_str().unwrap().starts_with("[User attached image: upload_"));
         assert!(Path::new(r["path"].as_str().unwrap()).is_file());
 
-        let images = staged_images(&home, "s1");
+        let (sent, images) = staged_images(&home, "s1");
         assert_eq!(images, vec![("image/png".to_string(), b64.clone())]);
         // The harness bridge carries them into the legacy `message` jcode turns into an image content part.
         let mut request = super::super::send_message_request("s1", "look", None, images);
@@ -417,8 +428,13 @@ mod tests {
         let Some(Outbound::Legacy(message)) = out.first() else { panic!("no legacy message") };
         assert_eq!(message["images"], json!([["image/png", b64]]));
 
-        clear_staged(&home, "s1");
-        assert!(staged_images(&home, "s1").is_empty(), "consumed by the submit");
+        // An image attached while the submit was in flight survives clearing what was sent.
+        let late = call("image.attach_bytes", &home, json!({ "content_base64": format!("data:image/png;base64,{b64}") })).unwrap();
+        clear_staged(&home, "s1", &sent);
+        let (left, _) = staged_images(&home, "s1");
+        assert_eq!(left, vec![late["path"].as_str().unwrap().to_string()]);
+        clear_staged(&home, "s1", &left);
+        assert!(staged_images(&home, "s1").0.is_empty(), "consumed by the submit");
     }
 
     #[test]

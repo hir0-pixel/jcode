@@ -243,6 +243,33 @@ impl Drop for Upstream {
 const UPSTREAM_REQUEST_PREFIX: &str = "up-";
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
 
+static STORE_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A store failed to open: say so once (log line plus an error `status.update` to every window),
+/// not on every retry. Goals and learning stay off until it opens again.
+async fn store_unavailable(hub: &Hub, what: &'static str, err: &anyhow::Error) {
+    if !STORE_WARNED.lock().unwrap_or_else(|e| e.into_inner()).insert(what) {
+        return;
+    }
+    eprintln!("sovereign: {what} store unavailable: {err:#}");
+    let text = format!("The {what} store could not be opened, so those features are off: {err:#}");
+    let event = json!({ "jsonrpc": "2.0", "method": "event", "params": { "type": "status.update", "payload": { "kind": "error", "text": text } } });
+    hub.broadcast_text(event.to_string()).await;
+}
+
+/// Whether any child of `parent` (other than `except`) is running: the engine's own status
+/// (whichever connection started the child) or a turn this connection sees running.
+fn children_running(list: &[Value], parent: &str, except: Option<&str>, live: &HashMap<String, SessionState>) -> bool {
+    list.iter().any(|s| {
+        let id = s["session_id"].as_str().unwrap_or_default();
+        s["parent_session_id"].as_str() == Some(parent)
+            && Some(id) != except
+            && (["status", "swarm_status"].iter().any(|f| matches!(s[*f].as_str(), Some("running" | "processing")))
+                || live.get(id).is_some_and(SessionState::turn_active))
+    })
+}
+
 pub(crate) struct Conn {
     config: Arc<Config>,
     to_ws: mpsc::Sender<Message>,
@@ -283,6 +310,46 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: Arc<Config>,
+        to_ws: mpsc::Sender<Message>,
+        hub: Arc<Hub>,
+        client: Arc<Client>,
+        observer: Arc<Observer>,
+        driver: bool,
+        run_kind: &'static str,
+        run_title: Option<String>,
+        replay_of: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            to_ws,
+            control: Mutex::new(None),
+            links: Mutex::new(HashMap::new()),
+            link_tasks: Mutex::new(Vec::new()),
+            known: Mutex::new(HashMap::new()),
+            fresh: Mutex::new(Default::default()),
+            learning_now: Mutex::new(Default::default()),
+            driver,
+            next_id: AtomicU64::new(1),
+            next_server_request: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+            accept_waiters: Mutex::new(HashMap::new()),
+            upstream: Mutex::new(None),
+            next_forward: AtomicU64::new(1),
+            hub,
+            client,
+            observer,
+            run_kind,
+            run_title,
+            replay_of,
+        })
+    }
+
     /// Send one harness request and await its direct reply.
     async fn call(&self, request: Value) -> Result<Value> {
         let link = self.route(&request).await?;
@@ -301,7 +368,7 @@ impl Conn {
     /// The link a request belongs on: its session's link, else the control link.
     async fn route(&self, request: &Value) -> Result<mpsc::Sender<String>> {
         if let Some(sid) = request["session_id"].as_str() {
-            if let Some(link) = self.links.lock().await.get(sid) {
+            if let Some(link) = self.links.lock().await.get(sid).filter(|l| !l.is_closed()) {
                 return Ok(link.clone());
             }
         }
@@ -309,6 +376,7 @@ impl Conn {
             .lock()
             .await
             .clone()
+            .filter(|l| !l.is_closed())
             .ok_or_else(|| anyhow!("engine connection closed"))
     }
 
@@ -365,11 +433,20 @@ impl Conn {
             }
         });
         let weak = Arc::downgrade(self);
+        let mine = tx.clone();
         let reader = tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
-                let Some(conn) = weak.upgrade() else { break };
+                let Some(conn) = weak.upgrade() else { return };
                 if let Ok(frame) = serde_json::from_str::<Value>(&line) {
                     conn.on_harness_frame(frame).await;
+                }
+            }
+            // The bridge closed: forget this link so the next attach or tick opens a fresh one.
+            if let Some(conn) = weak.upgrade() {
+                conn.links.lock().await.retain(|_, l| !l.same_channel(&mine));
+                let mut control = conn.control.lock().await;
+                if control.as_ref().is_some_and(|l| l.same_channel(&mine)) {
+                    *control = None;
                 }
             }
         });
@@ -381,9 +458,39 @@ impl Conn {
         Ok(tx)
     }
 
+    async fn control_store(&self) -> Option<Arc<sovereign_prime::agent_loop::ControlStore>> {
+        match sovereign_prime::agent_loop::ControlStore::open_cached(Path::new(&self.config.home)) {
+            Ok(store) => Some(store),
+            Err(err) => {
+                store_unavailable(&self.hub, "goal control", &err).await;
+                None
+            }
+        }
+    }
+
+    async fn entry_store(&self) -> Option<Arc<sovereign_prime::entries::EntryStore>> {
+        match sovereign_prime::entries::EntryStore::open_cached(Path::new(&self.config.home)) {
+            Ok(store) => Some(store),
+            Err(err) => {
+                store_unavailable(&self.hub, "learning", &err).await;
+                None
+            }
+        }
+    }
+
+    /// Open the control link when there is none or its bridge has closed.
+    async fn ensure_control(self: &Arc<Self>) -> Result<()> {
+        if self.control.lock().await.as_ref().is_some_and(|l| !l.is_closed()) {
+            return Ok(());
+        }
+        let link = self.open_link().await?;
+        *self.control.lock().await = Some(link);
+        Ok(())
+    }
+
     /// Attach this connection to `session_id` once.
     async fn ensure_attached(self: &Arc<Self>, session_id: &str) -> Result<Value> {
-        if self.links.lock().await.contains_key(session_id) {
+        if self.links.lock().await.get(session_id).is_some_and(|l| !l.is_closed()) {
             return Ok(Value::Null);
         }
         let link = self.open_link().await?;
@@ -649,7 +756,7 @@ impl Conn {
             // The model-callable `refine` tool / REPL `refine` schedule a
             // request that runs at the end of the turn, independent of the
             // checkpoint counter (Prime runs those immediately, too).
-            let store = sovereign_prime::entries::EntryStore::open_cached(Path::new(&conn.config.home)).ok();
+            let store = conn.entry_store().await;
             let scheduled = store.as_ref().and_then(|store| store.refine_pending(&session).ok()).unwrap_or(false);
             // Counters and the `learning.enabled` switch live in sovereign.db.
             let gate_due = store.as_ref().filter(|store| store.learning_enabled()).and_then(|store| {
@@ -696,14 +803,7 @@ impl Conn {
     /// boundary; a no-op unless this session has a due steer-mode heartbeat.
     fn maybe_steer_heartbeat(self: Arc<Self>, session_id: String) {
         tokio::spawn(async move {
-            let home = Path::new(&self.config.home);
-            let store = match sovereign_prime::agent_loop::ControlStore::open_cached(home) {
-                Ok(store) => store,
-                Err(err) => {
-                    eprintln!("sovereign: steer heartbeat store for {session_id}: {err:#}");
-                    return;
-                }
-            };
+            let Some(store) = self.control_store().await else { return };
             let due = sovereign_prime::agent_loop::due_steer_heartbeat(&store, &session_id);
             let Ok(Some(sovereign_prime::agent_loop::Continuation::Heartbeat { prompt, .. })) = due
             else {
@@ -727,14 +827,7 @@ impl Conn {
             return false;
         };
         let sessions = self.sessions.lock().await;
-        reply["sessions"].as_array().is_some_and(|list| {
-            list.iter().any(|s| {
-                s["parent_session_id"].as_str() == Some(parent_id)
-                    && s["session_id"]
-                        .as_str()
-                        .is_some_and(|id| sessions.get(id).is_some_and(SessionState::turn_active))
-            })
-        })
+        children_running(reply["sessions"].as_array().map_or(&[][..], Vec::as_slice), parent_id, None, &sessions)
     }
 
     async fn list_owned_children(self: &Arc<Self>, parent_id: &str) -> Result<Vec<Value>> {
@@ -1795,12 +1888,12 @@ impl Conn {
                     self.observer.link_replay(&run, original);
                 }
                 // Images staged by `image.attach` ride along on this turn.
-                let images = attach::staged_images(&self.config.home, &id);
+                let (staged, images) = attach::staged_images(&self.config.home, &id);
                 if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str(), images).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
                 }
-                attach::clear_staged(&self.config.home, &id);
+                attach::clear_staged(&self.config.home, &id, &staged);
                 let mut response = json!({ "status": if busy { "queued" } else { "streaming" } });
                 if self.replay_of.is_some() {
                     response["run_id"] = json!(run);
@@ -2341,32 +2434,7 @@ pub async fn replay_run(
         to_ws: to_ws.clone(),
         sessions: Mutex::new(Default::default()),
     });
-    let conn = Arc::new(Conn {
-        config: config.clone(),
-        to_ws,
-        control: Mutex::new(None),
-        links: Mutex::new(HashMap::new()),
-        link_tasks: Mutex::new(Vec::new()),
-        known: Mutex::new(HashMap::new()),
-        fresh: Mutex::new(std::collections::HashSet::new()),
-        learning_now: Mutex::new(std::collections::HashSet::new()),
-        driver: false,
-        next_id: AtomicU64::new(1),
-        next_server_request: AtomicU64::new(1),
-        pending: Mutex::new(HashMap::new()),
-        sessions: Mutex::new(HashMap::new()),
-        approvals: Mutex::new(HashMap::new()),
-        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
-        accept_waiters: Mutex::new(HashMap::new()),
-        upstream: Mutex::new(None),
-        next_forward: AtomicU64::new(1),
-        hub: hub.clone(),
-        client,
-        observer: observer.clone(),
-        run_kind: "invoke_agent",
-        run_title: Some(format!("Replay {run_id}")),
-        replay_of: Some(run_id.clone()),
-    });
+    let conn = Conn::new(config.clone(), to_ws, hub.clone(), client, observer.clone(), false, "invoke_agent", Some(format!("Replay {run_id}")), Some(run_id.clone()));
     let control = conn.open_link().await.context("engine unavailable")?;
     *conn.control.lock().await = Some(control);
 
@@ -2585,160 +2653,146 @@ pub(crate) async fn agent_run(
         to_ws: to_ws.clone(),
         sessions: Mutex::new(Default::default()),
     });
-    let conn = Arc::new(Conn {
-        config,
-        to_ws,
-        control: Mutex::new(None),
-        links: Mutex::new(HashMap::new()),
-        link_tasks: Mutex::new(Vec::new()),
-        known: Mutex::new(HashMap::new()),
-        fresh: Mutex::new(std::collections::HashSet::new()),
-        learning_now: Mutex::new(std::collections::HashSet::new()),
-        driver: false,
-        next_id: AtomicU64::new(1),
-        next_server_request: AtomicU64::new(1),
-        pending: Mutex::new(HashMap::new()),
-        sessions: Mutex::new(HashMap::new()),
-        approvals: Mutex::new(HashMap::new()),
-        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
-        accept_waiters: Mutex::new(HashMap::new()),
-        upstream: Mutex::new(None),
-        next_forward: AtomicU64::new(1),
-        hub: hub.clone(),
-        client,
-        observer,
-        run_kind: kind,
-        run_title: title.map(str::to_string),
-        replay_of: None,
-    });
+    let conn = Conn::new(config, to_ws, hub.clone(), client, observer, false, kind, title.map(str::to_string), None);
 
-    let control = conn.open_link().await.context("engine unavailable")?;
-    *conn.control.lock().await = Some(control);
+    // Every exit path, including a failed create or tool policy, ends the run's registration
+    // and its link tasks below.
+    let result: Result<Value> = async {
+        let _ = conn.entry_store().await; // report an unopenable store once, up front
+        let control = conn.open_link().await.context("engine unavailable")?;
+        *conn.control.lock().await = Some(control);
 
-    // A `session_key` (one bot chat) resumes its engine session; otherwise (or on
-    // first use) a fresh one is created and remembered under the key.
-    let resumed = session_key.and_then(|key| load_bot_session(&home, key));
-    let resumed = match resumed {
-        Some(id) => conn
-            .dispatch("session.activate", &json!({ "session_id": id, "omit_messages": true }))
-            .await
-            .ok()
-            .map(|_| id),
-        None => None,
-    };
-    let session_id = match resumed {
-        Some(id) => id,
-        None => {
-            let create_params = run_session_params(cwd, title, &opts);
-            let created = conn
-                .dispatch("session.create", &create_params)
+        // A `session_key` (one bot chat) resumes its engine session; otherwise (or on
+        // first use) a fresh one is created and remembered under the key.
+        let resumed = session_key.and_then(|key| load_bot_session(&home, key));
+        let resumed = match resumed {
+            Some(id) => conn
+                .dispatch("session.activate", &json!({ "session_id": id, "omit_messages": true }))
                 .await
-                .map_err(|e| anyhow!(e.message))?;
-            let id = created["session_id"].as_str().unwrap_or_default().to_string();
-            if id.is_empty() {
-                bail!("engine did not return a session id");
+                .ok()
+                .map(|_| id),
+            None => None,
+        };
+        let session_id = match resumed {
+            Some(id) => id,
+            None => {
+                let create_params = run_session_params(cwd, title, &opts);
+                let created = conn
+                    .dispatch("session.create", &create_params)
+                    .await
+                    .map_err(|e| anyhow!(e.message))?;
+                let id = created["session_id"].as_str().unwrap_or_default().to_string();
+                if id.is_empty() {
+                    bail!("engine did not return a session id");
+                }
+                if let Some(key) = session_key {
+                    save_bot_session(&home, key, &id);
+                }
+                id
             }
-            if let Some(key) = session_key {
-                save_bot_session(&home, key, &id);
-            }
-            id
-        }
-    };
+        };
 
-    if let Some(key) = session_key {
-        ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), (conn.clone(), session_id.clone()));
-    }
-    // A cron job's toolset policy holds for the whole run (fails closed: no policy, no run).
-    if let Some(request) = toolsets::request(&session_id, opts.enabled_toolsets.as_deref(), &opts.disabled_toolsets) {
-        conn.call(request).await.context("could not apply the job's tool policy")?;
-    }
-    // Nobody waits on an approval here: both gates (`Out::Approval`, `decide`) apply
-    // the unattended policy (Hermes config, else deny and park for the desktop).
-    hub.mark_headless(&session_id, opts.surface).await;
-
-    let outcome = tokio::time::timeout(timeout, async {
-        conn.dispatch(
-            "prompt.submit",
-            &json!({ "session_id": session_id, "text": prompt, "system_reminder": opts.instructions }),
-        )
-        .await
-        .map_err(|e| anyhow!(e.message))?;
-        while let Some(msg) = ws_out.recv().await {
-            let Message::Text(text) = msg else { continue };
-            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if frame["method"] != "event" || frame["params"]["session_id"] != session_id.as_str() {
-                continue;
-            }
-            if frame["params"]["type"] == "message.complete" {
-                let payload = frame["params"]["payload"].clone();
-                return Ok(payload);
-            }
+        if let Some(key) = session_key {
+            ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), (conn.clone(), session_id.clone()));
         }
-        bail!("engine connection closed before the turn finished")
-    })
+        // A cron job's toolset policy holds for the whole run (fails closed: no policy, no run).
+        if let Some(request) = toolsets::request(&session_id, opts.enabled_toolsets.as_deref(), &opts.disabled_toolsets) {
+            conn.call(request).await.context("could not apply the job's tool policy")?;
+        }
+        // Nobody waits on an approval here: both gates (`Out::Approval`, `decide`) apply
+        // the unattended policy (Hermes config, else deny and park for the desktop).
+        hub.mark_headless(&session_id, opts.surface).await;
+
+        let outcome = tokio::time::timeout(timeout, async {
+            conn.dispatch(
+                "prompt.submit",
+                &json!({ "session_id": session_id, "text": prompt, "system_reminder": opts.instructions }),
+            )
+            .await
+            .map_err(|e| anyhow!(e.message))?;
+            while let Some(msg) = ws_out.recv().await {
+                let Message::Text(text) = msg else { continue };
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if frame["method"] != "event" || frame["params"]["session_id"] != session_id.as_str() {
+                    continue;
+                }
+                if frame["params"]["type"] == "message.complete" {
+                    let payload = frame["params"]["payload"].clone();
+                    return Ok(payload);
+                }
+            }
+            bail!("engine connection closed before the turn finished")
+        })
+        .await;
+
+        hub.unmark_headless(&session_id).await;
+        // Only now is the session guaranteed persisted (jcode does not write a
+        // session record until its first turn), so hide it from session.list
+        // here rather than before the turn — the same mechanism a user's own
+        // archived chats use. Best-effort: a session that never got this far
+        // (e.g. jcode was unreachable) has nothing to hide.
+        let _ = conn
+            .dispatch(
+                "session.set_hidden",
+                &json!({ "session_id": session_id, "hidden": true }),
+            )
+            .await;
+        // Tag it so the sidebar lists the transcript, and let old one-shot cron ones expire.
+        if matches!(opts.surface, "cron" | "bot") {
+            crate::surface_sessions::tag(&home, &session_id, opts.surface, crate::observability::now());
+        }
+        if opts.surface == "cron" {
+            crate::surface_sessions::prune_cron(&conn.config, crate::observability::now()).await;
+        }
+        let usage = |payload: &Value| -> Value {
+            let u = &payload["usage"];
+            if u.is_null() {
+                Value::Null
+            } else {
+                json!({ "input_tokens": u["input"], "output_tokens": u["output"], "cached_tokens": u["cache_read"] })
+            }
+        };
+        Ok(match outcome {
+            Ok(Ok(payload)) => {
+                let ok = payload["status"] == "complete";
+                let text = payload["text"].as_str().unwrap_or_default().to_string();
+                json!({
+                    "ok": ok,
+                    "text": text,
+                    "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({})", payload["status"].as_str().unwrap_or("unknown"))) },
+                    "session_id": session_id,
+                    "usage": usage(&payload),
+                })
+            }
+            Ok(Err(err)) => {
+                json!({ "ok": false, "text": "", "error": err.to_string(), "session_id": session_id })
+            }
+            Err(_) => {
+                let _ = conn
+                    .dispatch("session.interrupt", &json!({ "session_id": session_id }))
+                    .await;
+                json!({ "ok": false, "text": "", "error": "timed out waiting for the turn to finish", "session_id": session_id })
+            }
+        })
+    }
     .await;
+    end_run(&conn, session_key).await;
+    result
+}
 
-    hub.unmark_headless(&session_id).await;
+/// End a headless run's registration and link tasks, whatever way it ended.
+async fn end_run(conn: &Arc<Conn>, session_key: Option<&str>) {
     if let Some(key) = session_key {
         let mut runs = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        if runs.get(key).is_some_and(|(_, id)| *id == session_id) {
+        if runs.get(key).is_some_and(|(c, _)| Arc::ptr_eq(c, conn)) {
             runs.remove(key);
         }
-    }
-    // Only now is the session guaranteed persisted (jcode does not write a
-    // session record until its first turn), so hide it from session.list
-    // here rather than before the turn — the same mechanism a user's own
-    // archived chats use. Best-effort: a session that never got this far
-    // (e.g. jcode was unreachable) has nothing to hide.
-    let _ = conn
-        .dispatch(
-            "session.set_hidden",
-            &json!({ "session_id": session_id, "hidden": true }),
-        )
-        .await;
-    // Tag it so the sidebar lists the transcript, and let old one-shot cron ones expire.
-    if matches!(opts.surface, "cron" | "bot") {
-        crate::surface_sessions::tag(&home, &session_id, opts.surface, crate::observability::now());
-    }
-    if opts.surface == "cron" {
-        crate::surface_sessions::prune_cron(&conn.config, crate::observability::now()).await;
     }
     for task in conn.link_tasks.lock().await.drain(..) {
         task.abort();
     }
-
-    let usage = |payload: &Value| -> Value {
-        let u = &payload["usage"];
-        if u.is_null() {
-            Value::Null
-        } else {
-            json!({ "input_tokens": u["input"], "output_tokens": u["output"], "cached_tokens": u["cache_read"] })
-        }
-    };
-    Ok(match outcome {
-        Ok(Ok(payload)) => {
-            let ok = payload["status"] == "complete";
-            let text = payload["text"].as_str().unwrap_or_default().to_string();
-            json!({
-                "ok": ok,
-                "text": text,
-                "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({})", payload["status"].as_str().unwrap_or("unknown"))) },
-                "session_id": session_id,
-                "usage": usage(&payload),
-            })
-        }
-        Ok(Err(err)) => {
-            json!({ "ok": false, "text": "", "error": err.to_string(), "session_id": session_id })
-        }
-        Err(_) => {
-            let _ = conn
-                .dispatch("session.interrupt", &json!({ "session_id": session_id }))
-                .await;
-            json!({ "ok": false, "text": "", "error": "timed out waiting for the turn to finish", "session_id": session_id })
-        }
-    })
 }
 
 pub async fn run(
@@ -2755,32 +2809,7 @@ pub async fn run(
         sessions: Mutex::new(Default::default()),
     });
     hub.add(client.clone()).await;
-    let conn = Arc::new(Conn {
-        config,
-        to_ws,
-        control: Mutex::new(None),
-        links: Mutex::new(HashMap::new()),
-        link_tasks: Mutex::new(Vec::new()),
-        known: Mutex::new(HashMap::new()),
-        fresh: Mutex::new(std::collections::HashSet::new()),
-        learning_now: Mutex::new(std::collections::HashSet::new()),
-        driver: false,
-        next_id: AtomicU64::new(1),
-        next_server_request: AtomicU64::new(1),
-        pending: Mutex::new(HashMap::new()),
-        sessions: Mutex::new(HashMap::new()),
-        approvals: Mutex::new(HashMap::new()),
-        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
-        accept_waiters: Mutex::new(HashMap::new()),
-        upstream: Mutex::new(None),
-        next_forward: AtomicU64::new(1),
-        hub: hub.clone(),
-        client: client.clone(),
-        observer,
-        run_kind: "invoke_agent",
-        run_title: None,
-        replay_of: None,
-    });
+    let conn = Conn::new(config, to_ws, hub.clone(), client.clone(), observer, false, "invoke_agent", None, None);
 
     // Control link first: if the engine is unreachable, refuse the client.
     match conn.open_link().await {
@@ -2887,6 +2916,90 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_conn(name: &str) -> Arc<Conn> {
+        let home = std::env::temp_dir().join(format!("c{name}{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // A stand-in daemon: accepts the bridge's dials and holds them open.
+        let socket = home.join("d.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let config = Arc::new(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: "t".repeat(32),
+            version: "test".into(),
+            legacy_socket: socket,
+            default_cwd: "/".into(),
+            allow_non_loopback: false,
+            provider: "p".into(),
+            model: "m".into(),
+            home: home.to_string_lossy().into(),
+            complete: None,
+            approval_secret: String::new(),
+            features: None,
+            learning: None,
+        });
+        let observer = Observer::open(&home, "p", "m", None).unwrap();
+        let hub = Arc::new(Hub::default());
+        let (to_ws, _rx) = mpsc::channel::<Message>(8);
+        let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
+        Conn::new(config, to_ws, hub, client, observer, false, "invoke_agent", None, None)
+    }
+
+    #[tokio::test]
+    async fn a_link_whose_bridge_closed_is_dropped_and_reopened() {
+        let conn = test_conn("dead-link");
+        conn.ensure_control().await.unwrap();
+        let first = conn.control.lock().await.clone().unwrap();
+        conn.link_tasks.lock().await[0].abort(); // the bridge dies
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.control.lock().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reader forgets the closed control link");
+        assert!(conn.route(&json!({ "req": "list_sessions" })).await.is_err(), "not trusted while closed");
+        conn.ensure_control().await.unwrap();
+        let second = conn.control.lock().await.clone().unwrap();
+        assert!(!second.same_channel(&first) && !second.is_closed());
+        conn.route(&json!({ "req": "list_sessions" })).await.unwrap();
+        // A session link whose writer is gone is likewise not trusted.
+        conn.link_tasks.lock().await[1].abort();
+        tokio::time::timeout(Duration::from_secs(5), first.closed()).await.expect("writer gone");
+        conn.links.lock().await.insert("s".into(), first);
+        assert!(conn.route(&json!({ "session_id": "s" })).await.unwrap().same_channel(&second), "falls back to the control link");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_still_ends_its_registration_and_link_tasks() {
+        let conn = test_conn("end-run");
+        conn.ensure_control().await.unwrap();
+        ACTIVE_RUNS.lock().unwrap().insert("telegram:end-run".into(), (conn.clone(), "s".into()));
+        end_run(&conn, Some("telegram:end-run")).await;
+        assert!(!ACTIVE_RUNS.lock().unwrap().contains_key("telegram:end-run"));
+        assert!(conn.link_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unopenable_store_is_reported_once() {
+        let conn = test_conn("store-warn");
+        let (to_ws, mut rx) = mpsc::channel::<Message>(8);
+        conn.hub.add(Arc::new(Client { id: 99, to_ws, sessions: Mutex::new(Default::default()) })).await;
+        let err = anyhow!("database is locked");
+        store_unavailable(&conn.hub, "test store", &err).await;
+        store_unavailable(&conn.hub, "test store", &err).await;
+        let Message::Text(text) = rx.try_recv().unwrap() else { panic!("text frame") };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((event["params"]["type"].as_str(), event["params"]["payload"]["kind"].as_str()), (Some("status.update"), Some("error")));
+        assert!(rx.try_recv().is_err(), "the second failure is silent");
+    }
 
     #[test]
     fn a_cron_jobs_model_and_provider_reach_the_run_session() {
