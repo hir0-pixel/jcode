@@ -233,6 +233,7 @@ impl Observer {
                                     eprintln!("sovereign-observability: prune failed: {err}");
                                 }
                                 last_prune = at;
+                                jcode_base::migrate::daily_backup_due(&writer_home.join("sovereign.db"));
                             }
                             if at - last_alert >= 60_000 {
                                 if let Err(err) = evaluate_alerts(

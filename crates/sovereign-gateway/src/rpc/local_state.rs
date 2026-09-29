@@ -62,8 +62,30 @@ pub(super) async fn process_stop(mgr: &BackgroundTaskManager) -> Value {
 }
 
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git").current_dir(cwd).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    git_capped(cwd, args, usize::MAX)
+}
+
+/// Run git with the repo's own config unable to execute anything, reading at most `max` bytes of
+/// output (a huge diff is cut off, not read whole).
+fn git_capped(cwd: &str, args: &[&str], max: usize) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(sovereign_prime::goal_ratchet::SAFE_GIT)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut buf = Vec::new();
+    child.stdout.take()?.take(max.min(u64::MAX as usize) as u64).read_to_end(&mut buf).ok()?;
+    let cut = buf.len() >= max;
+    if cut {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    (cut || status.success()).then(|| String::from_utf8_lossy(&buf).trim_end().to_string())
 }
 
 /// This session's goal-ratchet checkpoints, newest first: `(hash, iso time, message)`.
@@ -105,8 +127,8 @@ pub(super) fn rollback(method: &str, cwd: &str, session: &str, p: &Value) -> Res
         return if method == "rollback.diff" { Err(err(5022, "unknown checkpoint")) } else { Ok(json!({ "success": false, "error": "unknown checkpoint" })) };
     };
     if method == "rollback.diff" {
-        let stat = git(cwd, &["diff", "--stat", &hash]).unwrap_or_default();
-        let diff: String = git(cwd, &["diff", &hash]).unwrap_or_default().chars().take(4000).collect();
+        let stat = git_capped(cwd, &["diff", "--no-ext-diff", "--no-textconv", "--stat", &hash], 16_000).unwrap_or_default();
+        let diff: String = git_capped(cwd, &["diff", "--no-ext-diff", "--no-textconv", &hash], 16_000).unwrap_or_default().chars().take(4000).collect();
         return Ok(json!({ "stat": stat, "diff": diff }));
     }
     let file = p["file_path"].as_str().filter(|f| !f.is_empty());
@@ -213,5 +235,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(repo.join("f.txt")).unwrap(), "one");
         let _ = std::fs::remove_dir_all(repo);
         let _ = std::fs::remove_dir_all(plain);
+    }
+
+    #[test]
+    fn repo_config_cannot_run_code_through_snapshot_diff_or_restore() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("rollback-fsmon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (marker, script) = (root.join("ran"), root.join("fsmon.sh"));
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let raw = |args: &[&str]| std::process::Command::new("git").current_dir(&repo).args(args).output().unwrap();
+        raw(&["init", "-q"]);
+        raw(&["config", "core.fsmonitor", script.to_str().unwrap()]);
+        std::fs::write(repo.join("f.txt"), "one").unwrap();
+        raw(&["status"]);
+        assert!(marker.exists(), "sanity: unprotected git runs the configured script");
+        std::fs::remove_file(&marker).unwrap();
+
+        let cwd = repo.to_str().unwrap();
+        sovereign_prime::goal_ratchet::snapshot(&repo, "s1", 1).unwrap();
+        std::fs::write(repo.join("f.txt"), "two").unwrap();
+        rollback("rollback.list", cwd, "s1", &json!({})).unwrap();
+        assert!(rollback("rollback.diff", cwd, "s1", &json!({ "hash": "1" })).unwrap()["diff"].as_str().unwrap().contains("-one"));
+        rollback("rollback.restore", cwd, "s1", &json!({ "hash": "1" })).unwrap();
+        assert!(!marker.exists(), "repo-controlled fsmonitor must not run");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

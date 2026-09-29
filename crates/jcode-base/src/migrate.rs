@@ -179,6 +179,12 @@ fn spawn_daily_backup(path: &Path) {
         return;
     }
     started.push(path.to_path_buf());
+    drop(started);
+    daily_backup_due(path);
+}
+
+/// Long-lived processes call this from a daily tick: refresh the backup off-thread if it is over a day old.
+pub fn daily_backup_due(path: &Path) {
     let path = path.to_path_buf();
     std::thread::spawn(move || {
         let result = daily_backup(&path, DAILY);
@@ -289,6 +295,15 @@ mod tests {
         let bak = dir.join("sovereign.db.daily.bak");
         assert!(daily_backup(&path, DAILY).unwrap());
         assert!(!daily_backup(&path, DAILY).unwrap(), "fresh backup is not redone");
+        // A stale backup is refreshed by the tick even though open() already started one this process.
+        let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        std::fs::File::options().write(true).open(&bak).unwrap().set_modified(old).unwrap();
+        daily_backup_due(&path);
+        for _ in 0..100 {
+            if std::fs::metadata(&bak).unwrap().modified().unwrap() > old { break; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(std::fs::metadata(&bak).unwrap().modified().unwrap() > old, "the daily tick refreshed the stale backup");
         assert_eq!(Connection::open(&bak).unwrap().query_row("SELECT a FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         std::fs::write(&path, vec![0x5a; 8192]).unwrap();
         assert!(daily_backup(&path, Duration::ZERO).is_err());

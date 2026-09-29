@@ -8,15 +8,19 @@ use std::collections::HashMap;
 
 const PREFIX: &str = "session_surface:";
 
-/// Mark `session_id` as made by `surface` ("cron" | "bot") at `at_ms`.
-pub(crate) fn tag(home: &str, session_id: &str, surface: &str, at_ms: i64) {
+/// Newest cron sessions kept per job, on top of the age limit.
+const KEEP_PER_JOB: usize = 20;
+
+/// Mark `session_id` as made by `surface` ("cron" | "bot") at `at_ms`; `job` is the cron job's title.
+pub(crate) fn tag(home: &str, session_id: &str, surface: &str, at_ms: i64, job: Option<&str>) {
     if let Some(store) = crate::rpc::entries_or_log(home) {
-        let _ = store.set_setting(&format!("{PREFIX}{session_id}"), &format!("{surface}@{at_ms}"));
+        let job = job.map(|j| format!("|{j}")).unwrap_or_default();
+        let _ = store.set_setting(&format!("{PREFIX}{session_id}"), &format!("{surface}@{at_ms}{job}"));
     }
 }
 
-/// session id -> (surface, last tagged ms).
-pub(crate) fn tags(home: &str) -> HashMap<String, (String, i64)> {
+/// session id -> (surface, last tagged ms, job title).
+fn tagged(home: &str) -> HashMap<String, (String, i64, Option<String>)> {
     let Some(store) = crate::rpc::entries_or_log(home) else {
         return HashMap::new();
     };
@@ -24,25 +28,42 @@ pub(crate) fn tags(home: &str) -> HashMap<String, (String, i64)> {
         .settings_with_prefix(PREFIX)
         .into_iter()
         .filter_map(|(id, value)| {
-            let (surface, at) = value.split_once('@')?;
-            Some((id, (surface.to_string(), at.parse().ok()?)))
+            let (surface, rest) = value.split_once('@')?;
+            let (at, job) = match rest.split_once('|') {
+                Some((at, job)) => (at, Some(job.to_string())),
+                None => (rest, None),
+            };
+            Some((id, (surface.to_string(), at.parse().ok()?, job)))
         })
         .collect()
 }
 
-/// Cron sessions tagged before `now_ms - retention_days`. Bot sessions are reused per chat
-/// and never expire here.
-fn expired_cron(tags: &HashMap<String, (String, i64)>, now_ms: i64, retention_days: i64) -> Vec<String> {
+/// session id -> (surface, last tagged ms).
+pub(crate) fn tags(home: &str) -> HashMap<String, (String, i64)> {
+    tagged(home).into_iter().map(|(id, (surface, at, _))| (id, (surface, at))).collect()
+}
+
+/// Cron sessions tagged before `now_ms - retention_days`, plus each job's runs beyond its newest
+/// [`KEEP_PER_JOB`]. Bot sessions are reused per chat and never expire here.
+fn expired_cron(tags: &HashMap<String, (String, i64, Option<String>)>, now_ms: i64, retention_days: i64) -> Vec<String> {
     let cutoff = now_ms - retention_days * 86_400_000;
-    tags.iter()
-        .filter(|(_, (surface, at))| surface == "cron" && *at < cutoff)
-        .map(|(id, _)| id.clone())
-        .collect()
+    let mut out: Vec<String> = tags.iter().filter(|(_, (s, at, _))| s == "cron" && *at < cutoff).map(|(id, _)| id.clone()).collect();
+    let mut by_job: HashMap<&str, Vec<(i64, &String)>> = HashMap::new();
+    for (id, (s, at, job)) in tags {
+        if let (true, Some(job)) = (s == "cron" && *at >= cutoff, job) {
+            by_job.entry(job).or_default().push((*at, id));
+        }
+    }
+    for mut runs in by_job.into_values() {
+        runs.sort_by(|a, b| b.cmp(a));
+        out.extend(runs.into_iter().skip(KEEP_PER_JOB).map(|(_, id)| id.clone()));
+    }
+    out
 }
 
 /// Delete expired one-shot cron sessions (and their tags).
 pub(crate) async fn prune_cron(config: &Config, now_ms: i64) {
-    let expired = expired_cron(&tags(&config.home), now_ms, crate::observability::retention_days());
+    let expired = expired_cron(&tagged(&config.home), now_ms, crate::observability::retention_days());
     let Some(store) = crate::rpc::entries_or_log(&config.home) else {
         return;
     };
@@ -94,16 +115,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_newest_runs_of_each_cron_job_are_kept() {
+        let day = 86_400_000;
+        let tags: HashMap<_, _> = (0..30)
+            .map(|i| (format!("a{i}"), ("cron".to_string(), 90 * day + i, Some("every-5".to_string()))))
+            .chain([("b0".to_string(), ("cron".to_string(), 90 * day, Some("nightly".to_string())))])
+            .chain([("bot".to_string(), ("bot".to_string(), 90 * day, None))])
+            .collect();
+        let mut gone = expired_cron(&tags, 100 * day, 30);
+        gone.sort();
+        let mut want: Vec<String> = (0..10).map(|i| format!("a{i}")).collect();
+        want.sort();
+        assert_eq!(gone, want, "the 10 oldest runs of the busy job go; other jobs and bots are untouched");
+    }
+
+    #[test]
     fn bot_and_cron_transcripts_reach_the_sidebar_and_old_cron_ones_expire() {
         let day = 86_400_000;
         let home = std::env::temp_dir().join(format!("surface-{}", std::process::id()));
         let home_str = home.to_string_lossy().to_string();
-        tag(&home_str, "chat", "bot", 100 * day);
-        tag(&home_str, "old-cron", "cron", 10 * day);
-        tag(&home_str, "new-cron", "cron", 99 * day);
+        tag(&home_str, "chat", "bot", 100 * day, None);
+        tag(&home_str, "old-cron", "cron", 10 * day, None);
+        tag(&home_str, "new-cron", "cron", 99 * day, None);
+        let all = tagged(&home_str);
+        assert_eq!(expired_cron(&all, 100 * day, 30), vec!["old-cron".to_string()]);
         let tags = tags(&home_str);
         assert_eq!(tags["chat"], ("bot".to_string(), 100 * day));
-        assert_eq!(expired_cron(&tags, 100 * day, 30), vec!["old-cron".to_string()]);
 
         let list = vec![
             json!({"session_id": "desk"}),

@@ -143,7 +143,8 @@ pub(crate) async fn pass(
 ) -> anyhow::Result<Option<String>> {
     let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
     let history = conn.history(session).await?;
-    let turns = compact_tools(history["messages"].as_array().map(Vec::as_slice).unwrap_or_default());
+    let raw = history["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let turns = compact_tools(raw);
     // The model-callable `refine` tool (and the REPL's `refine` host
     // function) never apply mid-turn: they only schedule a request, run here
     // once the turn has actually ended. At most one pending request survives
@@ -183,8 +184,10 @@ pub(crate) async fn pass(
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     };
     // An undo or rewind can leave fewer messages than the watermark.
-    let seen = store.watermark(session).min(turns.len());
-    let fresh = &turns[seen..];
+    // The watermark counts raw messages: compaction drops old tool rows, so it can't index `turns`.
+    let seen = store.watermark(session).min(raw.len());
+    let fresh_owned = compact_tools(&raw[seen..]);
+    let fresh = &fresh_owned[..];
     if fresh.is_empty() {
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
@@ -199,7 +202,7 @@ pub(crate) async fn pass(
         session, "learning", Some("Auto-refine gate"), None, None, gate_started,
         greply.as_ref().ok().and_then(|d| d.usage), greply.as_ref().err().map(|e| e.to_string()).as_deref(),
     );
-    store.set_watermark(session, turns.len())?;
+    store.set_watermark(session, raw.len())?;
     let _ = store.learn_reviewed(session, crate::observability::now());
     let review = match greply {
         Ok(done) => parse_gate_review(&done.text),
@@ -265,6 +268,20 @@ mod tests {
             json!({ "role": "tool", "content": "exit 2", "tool_name": "grep", "is_error": true }),
         ]);
         assert_eq!((named[0].text.as_str(), named[1].text.as_str()), ("ok: bash Error: not really", "fail: grep exit 2"));
+    }
+
+    #[test]
+    fn watermark_counts_raw_messages_so_compaction_never_skips_unseen_turns() {
+        use serde_json::json;
+        let mut rows = vec![json!({ "role": "user", "content": "one" })];
+        for i in 0..MAX_TOOL_LINES + 10 {
+            rows.push(json!({ "role": "tool", "content": format!("done {i}") }));
+        }
+        let seen = rows.len(); // pass 1 stores the raw count
+        rows.push(json!({ "role": "user", "content": "second" }));
+        let fresh = compact_tools(&rows[seen..]);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].text, "second");
     }
 
     #[test]

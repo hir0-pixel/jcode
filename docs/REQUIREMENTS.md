@@ -17,7 +17,7 @@ it is measured and what the last measurement was, so a change that moves one has
 
 | Budget | Limit | How measured | Last measured |
 | --- | --- | --- | --- |
-| Idle engine memory | physical footprint <= 50 MB | Engine running, no window, 30 s idle: `footprint -p <pid>` (macOS). `ps` RSS counts shared library pages and reads about 4x higher, so it is not the budget | 12 MB footprint (peak 12 MB), 29 MB `ps` RSS, 0 child processes, release build 9922ad971, 2026-09-29; method: start `sovereign serve` on a release build with temp homes and a fake provider key, wait 30 s with no client, `footprint -p <pid>`. Audit round 3: 12 MB idle, 22 MB after `session.create`. Benchmark median with a chat session: 34 idle, 43 after a session, 45 peak (`BENCHMARK.md`, RAM table) |
+| Idle engine memory | physical footprint <= 50 MB | Engine running, no window, 30 s idle: `footprint -p <pid>` (macOS). `ps` RSS counts shared library pages and reads about 4x higher, so it is not the budget | 12 MB footprint (peak 12 MB), 29 MB `ps` RSS, 0 child processes, release build 9922ad971, 2026-09-29; method: start `sovereign serve` on a release build with temp homes and a fake provider key, wait 30 s with no client, `footprint -p <pid>`. Audit round 5: 12 MB idle, 28 MB after `session.create` (measured), 86 MB peak footprint. Peak budget (proposed): <= 150 MB footprint over a session.create plus one chat turn. Benchmark median with a chat session: 34 idle, 43 after a session, 45 peak (`BENCHMARK.md`, RAM table) |
 | Python backend | off by default | Starts only for a forwarded feature, a due cron job, or an enabled messaging platform (`features.rs`: `port()`, `ensure_bots`); stops after 10 min idle unless bots are enabled or a request is in flight (lease). Check: no child process of the engine after boot with no bots | 0 MB Python in every benchmark run; unit tests `starts_on_demand_reuses_and_stops_when_idle`, `bots_start_the_backend_and_a_leased_one_is_never_idle_stopped` |
 | Tool-schema tokens per call | see `BENCHMARK.md` section "Tool schema budget (2026-09-29)" | Counting proxy (`scripts/sovereign-counting-proxy.mjs`) on the first model call; guard test `agent_tests/tool_schema_budget.rs` | Value and history live in that section, which the lazy-tool-loading work owns; this row follows it. Before it: 7,896 tokens with 26 tools |
 | Prompt cache hit | >= 80% of prompt tokens on a new session's first call | Proxy `calls.jsonl` cached vs prompt tokens (`BENCHMARK.md`, "What explains the gap") | 88% on the first call of a new session, 66 main calls (Ollama KV cache; hosted providers differ in TTL and minimum prefix) |
@@ -60,8 +60,8 @@ select name, sum(pgsize) from dbstat group by 1 order by 2 desc limit 5;
 
 jcode stores each chat as JSON under `~/.jcode/sessions`, and an image part (`ContentBlock::Image`) is kept
 inline as base64 in that file (about 1.33x the image bytes, and once more as the staged copy in
-`<home>/attachments/<session>/`). One attached image is capped at 25 MB (`BYTES_MAX` in `rpc/attach.rs`), so
-a single chat message can add up to about 33 MB to its session file; plain text turns add a few KiB. Moving
+`<home>/attachments/<session>/`). One attached image is capped at 7 MB (`IMAGE_MAX` in `rpc/attach.rs`), so
+a single chat message can add up to about 9.3 MB to its session file; plain text turns add a few KiB. Moving
 the bytes out of the session JSON would touch every provider's message conversion, so it is not done; the
 lever is a lower per-image cap or downscaling at attach time. Chats are the user's data: there is no
 automatic retention. The user removes them per chat (delete everywhere also removes the chat's
@@ -80,6 +80,6 @@ automatic retention. The user removes them per chat (delete everywhere also remo
   late answer survive the restart (`parked_approvals`).
 - Bots: with a messaging platform enabled the engine starts the Python backend at boot and restarts it if
   it dies (checked on the idle-stop tick, at most every 60 s).
-- Schema: one `PRAGMA user_version` owned by `sovereign-prime/src/migrate.rs`, covering the memory
+- Schema: one `PRAGMA user_version` owned by `jcode-base/src/migrate.rs`, covering the memory
   tables too; a backup `sovereign.db.pre-v<N>.bak` is written before migrating a file with data; a file
   from a newer engine is refused. Rollback: `docs/RELEASING.md`.

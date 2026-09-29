@@ -35,3 +35,10 @@ pub(super) fn cache_graph(key: String, version: i64, graph: &MemoryGraph) {
         cache.insert(key, GraphCacheEntry { graph: graph.clone(), version });
     }
 }
+
+/// Forget a cached graph after a write that bypassed it (another row-level writer).
+pub(super) fn forget_graph(key: &str) {
+    if let Ok(mut cache) = graph_cache().lock() {
+        cache.remove(key);
+    }
+}

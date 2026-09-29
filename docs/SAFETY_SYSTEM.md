@@ -584,8 +584,8 @@ process, so the approval config, the allowlist, the `.env` key override and the 
 Switching profile restarts the engine.
 
 Not mapped: Hermes's dangerous-pattern keys in `command_allowlist` (the engine classifies with
-`jcode-command-risk`, not Hermes's pattern table). An attended `always` answer still means "allow everything
-until the engine restarts" (a blanket flag), unlike the late unattended `always`.
+`jcode-command-risk`, not Hermes's pattern table). An attended `always` answer is per command, like the late unattended one: it adds that exact
+command to Hermes's `command_allowlist` (an in-memory grant only when the config is unwritable), never a blanket allow.
 
 ## Threat model: the model's shell versus the approval gate
 

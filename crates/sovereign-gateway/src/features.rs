@@ -28,6 +28,44 @@ pub fn idle_stop_after() -> Duration {
         .unwrap_or(IDLE_STOP_AFTER)
 }
 
+const LOG_CAP: u64 = 2 * 1024 * 1024;
+const TAIL_LINES: usize = 20;
+
+/// Copy the backend's stderr to `path` (rotated to `path.1` past [`LOG_CAP`], keeping one old file),
+/// returning the last few lines for the "exited before ready" error. Finishes when the child closes stderr.
+fn capture_stderr(stderr: tokio::process::ChildStderr, path: Option<std::path::PathBuf>) -> tokio::task::JoinHandle<Vec<String>> {
+    use std::io::Write;
+    tokio::spawn(async move {
+        let open = |p: &std::path::Path| std::fs::OpenOptions::new().create(true).append(true).open(p).ok();
+        let mut file = path.as_deref().and_then(|p| {
+            std::fs::create_dir_all(p.parent()?).ok()?;
+            open(p)
+        });
+        let mut size = file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+        let mut tail = std::collections::VecDeque::new();
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let (Some(f), Some(p)) = (file.as_mut(), path.as_deref()) {
+                if size >= LOG_CAP {
+                    let _ = std::fs::rename(p, p.with_extension("log.1"));
+                    if let Some(fresh) = open(p) {
+                        *f = fresh;
+                        size = 0;
+                    }
+                }
+                if writeln!(f, "{line}").is_ok() {
+                    size += line.len() as u64 + 1;
+                }
+            }
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        tail.into()
+    })
+}
+
 struct Running {
     child: Child,
     port: u16,
@@ -150,7 +188,7 @@ impl Features {
             .env_remove("HERMES_PARENT_NONCE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("starting the Hermes feature backend ({program})"))?;
@@ -158,6 +196,8 @@ impl Features {
             // A child that already died is reported by the readiness wait below.
             let _ = stdin.write_all(format!("{secrets}\n").as_bytes()).await;
         }
+        let log = jcode_base::storage::jcode_dir().ok().map(|d| d.join("logs").join("hermes-backend.log"));
+        let stderr = capture_stderr(child.stderr.take().context("backend stderr")?, log);
         let mut lines = BufReader::new(child.stdout.take().context("backend stdout")?).lines();
         let port = tokio::time::timeout(START_TIMEOUT, async {
             while let Some(line) = lines.next_line().await? {
@@ -166,7 +206,8 @@ impl Features {
                     return Ok::<u16, anyhow::Error>(digits.parse()?);
                 }
             }
-            bail!("the Hermes feature backend exited before it was ready")
+            let tail = tokio::time::timeout(Duration::from_secs(2), stderr).await.ok().and_then(Result::ok).unwrap_or_default();
+            bail!("the Hermes feature backend exited before it was ready:\n{}", tail.join("\n"))
         })
         .await
         .context("the Hermes feature backend did not become ready in time")??;
@@ -267,6 +308,23 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         vec![script.to_string_lossy().into_owned()]
+    }
+
+    #[tokio::test]
+    async fn backend_stderr_is_logged_rotated_and_tailed() {
+        let dir = std::env::temp_dir().join(format!("features-stderr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("logs/hermes-backend.log");
+        let mut child = Command::new("sh")
+            .args(["-c", "echo 'ModuleNotFoundError: no yaml' >&2; head -c 3000000 /dev/zero | tr '\\0' x | fold -w 100 >&2; echo >&2; echo last >&2"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tail = capture_stderr(child.stderr.take().unwrap(), Some(log.clone())).await.unwrap();
+        assert_eq!(tail.last().map(String::as_str), Some("last"));
+        assert!(std::fs::metadata(&log).unwrap().len() <= LOG_CAP + 200, "the live log stays under the cap");
+        assert!(dir.join("logs/hermes-backend.log.1").exists(), "the old log is kept once");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The backend reads its tokens from stdin; neither is in its environment or argv.

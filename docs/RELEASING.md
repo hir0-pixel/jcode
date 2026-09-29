@@ -34,7 +34,7 @@ There is no auto-updater (`electron-updater` is not configured: no signing ident
 configures one). The procedure is a swap with a health check, `apps/desktop/scripts/sovereign-update.sh`:
 
 ```sh
-# 1. build: cargo build --release (engine), npm run stage:sovereign-python, npm run dist:mac
+# 1. build: npm run build:engine (cargo build --release with JCODE_RELEASE_BUILD=1), npm run stage:sovereign-python, npm run dist:mac
 # 2. quit Hermes, then:
 apps/desktop/scripts/sovereign-update.sh apps/desktop/release/mac-arm64/Hermes.app /Applications/Hermes.app
 ```
@@ -66,7 +66,7 @@ and run `sovereign-update.sh`.
 ## User data is never touched
 
 `~/.hermes`, `~/.jcode` and `sovereign.db` are outside the bundle and the script never opens them.
-`sovereign.db` carries a schema version (`PRAGMA user_version`, `sovereign-prime/src/migrate.rs`):
+`sovereign.db` carries a schema version (`PRAGMA user_version`, `jcode-base/src/migrate.rs`):
 
 - every opener (harness entries, session control) applies its idempotent schema, then the ordered migrations
   up to the current version, forward only (append a migration; never edit or reorder);
@@ -76,7 +76,12 @@ and run `sovereign-update.sh`.
   run on a newer schema). To go back: quit, copy the matching `sovereign.db.pre-v*.bak` over `sovereign.db`
   (delete `sovereign.db-wal` / `-shm`), start the old bundle. Anything written since the update is lost;
   the observability and memory tables opened by other components are additive and carry no separate version.
-- routine backup: at most once per 24 h, in a background thread on the first open, the engine runs
+- the update script deletes stale `sovereign.db.pre-v*.bak` files before swapping, so the new engine writes a fresh
+  pre-migration backup that a rollback can find;
+- `JCODE_RELEASE_BUILD=1` must be set for the engine build (`npm run build:engine` does): without it the embedded git
+  hash can lag the checkout (the build script deliberately does not watch `.git`);
+- after a migration the daily backup (`sovereign.db.daily.bak`) is at the NEWER schema; only `pre-v<N>.bak` restores the old one;
+- routine backup: at most once per 24 h, in a background thread on the first open and then from the observability daily tick, the engine runs
   `PRAGMA quick_check` and, if it passes, writes `sovereign.db.daily.bak` (`VACUUM INTO` a temp file, then rename,
   0600; one copy). A db that fails the check never replaces the backup; `jcode_base::migrate::backup_error()` holds
   the reason for the gateway to report. Restore: quit the app, copy `sovereign.db.daily.bak` over `sovereign.db`,

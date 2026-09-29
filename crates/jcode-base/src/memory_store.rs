@@ -242,6 +242,76 @@ pub(crate) fn save_graph(path: &Path, scope: &str, graph: &MemoryGraph, previous
     })
 }
 
+/// Add `entry` to `scope` (or reinforce an identical active one) by writing only that row and the
+/// small graph-shape row, in one immediate transaction, so a concurrent writer's rows are never
+/// rewritten or deleted. Returns the memory's id.
+pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<String> {
+    with_db(path, |db| {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let wanted = entry.content.trim().to_string();
+        let mut dup = None;
+        {
+            let mut stmt = tx.prepare_cached(
+                "SELECT m.rid, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid
+                 WHERE m.scope=?1 AND m.active=1 AND trim(m.content)=?2",
+            )?;
+            for row in stmt.query_map(params![scope, wanted], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))? {
+                let (rid, json, embedding) = row?;
+                let existing = join_embedding(&json, embedding)?;
+                if existing.category == entry.category {
+                    dup = Some((rid, existing));
+                    break;
+                }
+            }
+        }
+        let id = if let Some((rid, mut existing)) = dup {
+            existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
+            let (json, embedding) = split_embedding(&existing)?;
+            tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+            existing.id
+        } else {
+            // add_memory owns the tag nodes and edges; run it on the stored shape without the memories.
+            let shape: Option<String> = tx.query_row("SELECT graph FROM memory_graphs WHERE scope=?1", [scope], |r| r.get(0)).optional()?;
+            let mut graph = MemoryGraph::new();
+            if let Some(shape) = shape {
+                let shape: OwnedGraphShape = serde_json::from_str(&shape)?;
+                graph.graph_version = shape.graph_version;
+                graph.tags = shape.tags;
+                graph.clusters = shape.clusters;
+                graph.edges = shape.edges;
+                graph.reverse_edges = shape.reverse_edges;
+                graph.metadata = shape.metadata;
+            }
+            let id = graph.add_memory(entry);
+            let entry = &graph.memories[&id];
+            let rid: i64 = tx.query_row(
+                "INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope, id) DO UPDATE SET active=excluded.active, content=excluded.content, tags=excluded.tags
+                 RETURNING rid",
+                params![id, scope, entry.active, entry.content, entry.tags.join(" ")],
+                |r| r.get(0),
+            )?;
+            let (json, embedding) = split_embedding(entry)?;
+            tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+            let shape = GraphShape {
+                graph_version: graph.graph_version,
+                tags: &graph.tags,
+                clusters: &graph.clusters,
+                edges: &graph.edges,
+                reverse_edges: &graph.reverse_edges,
+                metadata: &graph.metadata,
+            };
+            tx.execute(
+                "INSERT INTO memory_graphs(scope, graph) VALUES (?1, ?2) ON CONFLICT(scope) DO UPDATE SET graph=excluded.graph",
+                params![scope, serde_json::to_string(&shape)?],
+            )?;
+            id
+        };
+        tx.commit()?;
+        Ok(id)
+    })
+}
+
 /// Active memories in `scopes` matching any of `terms` (already lowercased
 /// word tokens), best BM25 first. Terms are quoted so no query syntax leaks in.
 pub(crate) fn search(path: &Path, scopes: &[String], terms: &[String], limit: usize) -> Result<Vec<MemoryEntry>> {
@@ -352,6 +422,26 @@ mod tests {
             .filter(|e| meets_term_floor(&terms, e))
             .take(limit)
             .collect()
+    }
+
+    #[test]
+    fn remember_writes_one_row_and_keeps_a_concurrent_writers_rows() {
+        let (_d, path) = db();
+        save_graph(&path, "global", &graph(&["first fact"]), None).unwrap();
+        // Another handle (the memory agent, a second process) adds a row after we loaded.
+        let stale = load_graph(&path, "global").unwrap().unwrap();
+        let mut theirs = stale.clone();
+        theirs.add_memory(MemoryEntry::new(MemoryCategory::Fact, "theirs"));
+        save_graph(&path, "global", &theirs, None).unwrap();
+        // Our write, made from the stale view, must not delete theirs.
+        let id = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap();
+        let again = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap();
+        assert_eq!(id, again);
+        let all = load_graph(&path, "global").unwrap().unwrap();
+        let mut texts: Vec<_> = all.memories.values().map(|m| m.content.as_str()).collect();
+        texts.sort();
+        assert_eq!(texts, ["first fact", "ours", "theirs"]);
+        assert_eq!(all.memories[&id].strength, 2);
     }
 
     #[test]

@@ -184,9 +184,13 @@ pub fn fmt_score(s: &Score) -> String {
     out.join("; ")
 }
 
+/// Options for every git call in a user's repo: its config must not run anything (fsmonitor, hooks)
+/// outside the approval gate.
+pub const SAFE_GIT: [&str; 4] = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+
 fn git(cwd: &Path, envs: &[(&str, &Path)], args: &[&str]) -> Option<String> {
     let mut c = Command::new("git");
-    c.current_dir(cwd).args(args).stdin(Stdio::null()).stderr(Stdio::null());
+    c.current_dir(cwd).args(SAFE_GIT).args(args).stdin(Stdio::null()).stderr(Stdio::null());
     for (k, v) in envs {
         c.env(k, v);
     }

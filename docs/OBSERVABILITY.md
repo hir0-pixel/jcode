@@ -88,7 +88,7 @@ events, which the gateway consumes.
 
 SQLite has no schemas, so the tables carry EveStack's names without the
 `evestack.` prefix (databases from before this used `obs_*` names and are
-renamed by schema migration 3, `sovereign-prime/src/migrate.rs`). Timestamps are epoch milliseconds (`*_ms`) instead of `timestamptz`;
+renamed by schema migration 3, `jcode-base/src/migrate.rs`). Timestamps are epoch milliseconds (`*_ms`) instead of `timestamptz`;
 JSON is `TEXT`. The DDL beyond the shared tables lives in
 `crates/sovereign-gateway/src/observability/schema.rs` and is idempotent.
 

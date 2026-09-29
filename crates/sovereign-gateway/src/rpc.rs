@@ -2804,7 +2804,7 @@ pub(crate) async fn agent_run(
             .await;
         // Tag it so the sidebar lists the transcript, and let old one-shot cron ones expire.
         if matches!(opts.surface, "cron" | "bot") {
-            crate::surface_sessions::tag(&home, &session_id, opts.surface, crate::observability::now());
+            crate::surface_sessions::tag(&home, &session_id, opts.surface, crate::observability::now(), title);
         }
         if opts.surface == "cron" {
             crate::surface_sessions::prune_cron(&conn.config, crate::observability::now()).await;

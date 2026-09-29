@@ -41,7 +41,7 @@ pub use activity::{
     activity_snapshot, add_event, apply_remote_activity_snapshot, check_staleness, clear_activity,
     get_activity, pipeline_start, pipeline_update, record_injected_prompt, set_state,
 };
-use cache::{cache_graph, cached_graph, with_cached};
+use cache::{cache_graph, cached_graph, forget_graph, with_cached};
 pub(crate) use pending::set_pending_memory_for_project_with_selection;
 pub use pending::{
     PendingMemory, clear_all_injected_memories, clear_all_pending_memory, clear_injected_memories,
@@ -325,10 +325,14 @@ impl MemoryManager {
         Ok(id)
     }
 
+    /// Writes just this memory's row: rewriting the whole graph lost a concurrent writer's rows.
     pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
-        let mut graph = self.load_global_graph()?;
-        let id = Self::remember_in_graph(&mut graph, entry);
-        self.save_global_graph(&graph)?;
+        let db = self.db_path()?;
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        let id = crate::memory_store::remember(&db, "global", entry)?;
+        forget_graph(&format!("{}#global", db.display()));
         Ok(id)
     }
 
