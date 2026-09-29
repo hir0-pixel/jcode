@@ -79,23 +79,17 @@ fn allowlisted(home: &Path, command: &str) -> bool {
         })
 }
 
-/// Add `command` to Hermes's `command_allowlist` in `$home/config.yaml`, the format Hermes itself
-/// writes for an `always` answer (a block list of command text). A plain text edit so the rest of
-/// the file is untouched; a shape it does not recognise is left alone (false: grant stays in memory).
-fn allow_permanently(home: &Path, command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty() || command.contains('\n') || has_shell_operator(command) {
-        return false;
-    }
-    let path = home.join("config.yaml");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+/// `text` with `command` added to `command_allowlist` (the format Hermes itself writes for an `always`
+/// answer: a block list of command text). A plain text edit so the rest of the file is untouched.
+/// `Ok(None)`: already there. `Err`: a shape it does not recognise, left alone.
+fn add_to_allowlist(text: &str, command: &str) -> Result<Option<String>, ()> {
     let valid = |t: &str| serde_yaml::from_str::<serde_yaml::Value>(t).ok().filter(|v| v.is_mapping() || v.is_null());
-    let Some(cfg) = valid(&text) else { return false };
-    if config_allowlist(home).iter().any(|p| p == command) {
-        return true;
+    let cfg = valid(text).ok_or(())?;
+    if cfg["command_allowlist"].as_sequence().is_some_and(|l| l.iter().any(|v| v.as_str().map(str::trim) == Some(command))) {
+        return Ok(None);
     }
     if !cfg["command_allowlist"].is_null() && !cfg["command_allowlist"].is_sequence() {
-        return false;
+        return Err(());
     }
     let item = |indent: &str| format!("{indent}- {}", serde_json::to_string(command).unwrap_or_default());
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -115,22 +109,55 @@ fn allow_permanently(home: &Path, command: &str) -> bool {
                 let indent: String = lines.get(at + 1).filter(|l| is_item(l)).map(|l| l.chars().take_while(|c| *c == ' ').collect()).unwrap_or_default();
                 lines.insert(last + 1, item(&indent));
             } else {
-                return false;
+                return Err(());
             }
         }
     }
     let edited = lines.join("\n") + "\n";
     if !valid(&edited).is_some_and(|v| v["command_allowlist"].as_sequence().is_some_and(|l| l.iter().any(|x| x.as_str() == Some(command)))) {
+        return Err(());
+    }
+    Ok(Some(edited))
+}
+
+/// Add `command` to Hermes's `command_allowlist` in `$home/config.yaml`. Hermes has no cross-process
+/// lock on this file (its `_CONFIG_LOCK` is in-process, its writer an atomic rename), so this is
+/// edit, write a temp file, re-read and rename only if the file is still what the edit was made
+/// from, else redo the edit on the new content: a concurrent Python save is merged, not overwritten.
+fn allow_permanently(home: &Path, command: &str) -> bool {
+    allow_permanently_with(home, command, || {})
+}
+
+/// `between` runs after the edit is staged and before the re-read (a test seam for the race).
+fn allow_permanently_with(home: &Path, command: &str, mut between: impl FnMut()) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command.contains('\n') || has_shell_operator(command) {
         return false;
     }
-    let tmp = path.with_extension("yaml.tmp");
-    let done = std::fs::write(&tmp, edited).is_ok()
-        && std::fs::metadata(&path).map_or(true, |m| std::fs::set_permissions(&tmp, m.permissions()).is_ok())
-        && std::fs::rename(&tmp, &path).is_ok();
-    if !done {
-        let _ = std::fs::remove_file(&tmp);
+    let path = home.join("config.yaml");
+    let tmp = path.with_extension(format!("yaml.{}.tmp", std::process::id()));
+    for _ in 0..5 {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let edited = match add_to_allowlist(&text, command) {
+            Ok(Some(edited)) => edited,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        let staged = std::fs::write(&tmp, edited).is_ok()
+            && std::fs::metadata(&path).map_or(true, |m| std::fs::set_permissions(&tmp, m.permissions()).is_ok());
+        if !staged {
+            break;
+        }
+        between();
+        if std::fs::read_to_string(&path).unwrap_or_default() == text {
+            if std::fs::rename(&tmp, &path).is_ok() {
+                return true;
+            }
+            break;
+        }
     }
-    done
+    let _ = std::fs::remove_file(&tmp);
+    false
 }
 
 /// A desktop connection able to show prompts.
@@ -638,6 +665,16 @@ mod tests {
         assert!(!allow_permanently(&home, "make a && make b") && !allow_permanently(&home, "a\nb"));
         std::fs::write(&cfg, "command_allowlist: [a, b]\n").unwrap();
         assert!(!allow_permanently(&home, "make clean"), "inline lists are left alone");
+        // A Hermes save landing between our read and our rename is merged, not overwritten.
+        std::fs::write(&cfg, "model: x\n").unwrap();
+        let mut raced = false;
+        assert!(allow_permanently_with(&home, "make all", || {
+            if !std::mem::replace(&mut raced, true) {
+                std::fs::write(&cfg, "model: x\nagent:\n  max_turns: 9\n").unwrap();
+            }
+        }));
+        let saved = std::fs::read_to_string(&cfg).unwrap();
+        assert!(saved.contains("max_turns: 9") && allowlisted(&home, "make all"), "{saved}");
         let _ = std::fs::remove_dir_all(home);
     }
 
