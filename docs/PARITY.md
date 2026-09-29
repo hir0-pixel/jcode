@@ -2,7 +2,7 @@
 
 Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; every other Hermes method and route is forwarded to Hermes's own Python backend, which starts only when one of them is first used and stops after 10 idle minutes.
 
-**JSON-RPC methods (235):** 64 working, 0 placeholder, 171 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
+**JSON-RPC methods (235):** 67 working, 0 placeholder, 168 forwarded to Hermes (Python). Events emitted: message.start/delta/complete, reasoning.delta, tool.start/complete, session.usage, session.title, status.update, error, gateway.ready. Server requests: approval.
 
 | Namespace | Rust (working) | Rust (placeholder) | Forwarded to Hermes (Python) |
 |---|---|---|---|
@@ -12,7 +12,7 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | bot_relay | – | – | `bot_relay.deliver`, `bot_relay.outbox.drain`, `bot_relay.reply`, `bot_relay.roster.sync` |
 | browser | – | – | `browser.controller.detach`, `browser.controller.heartbeat`, `browser.controller.register`, `browser.controller.result`, `browser.manage` |
 | clarify | – | – | `clarify.lock` |
-| cli | – | – | `cli.exec` |
+| cli | `cli.exec` | – | – |
 | client | `client.capabilities` | – | – |
 | clipboard | – | – | `clipboard.paste` |
 | command | – | – | `command.dispatch`, `command.resolve` |
@@ -34,7 +34,7 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | input | – | – | `input.detect_drop` |
 | insights | `insights.get` | – | – |
 | learning | `learning.delete`, `learning.detail`, `learning.edit`, `learning.frames` | – | – |
-| llm | – | – | `llm.oneshot` |
+| llm | `llm.oneshot` | – | – |
 | mcp | – | – | `mcp.catalog`, `mcp.servers.add`, `mcp.servers.list`, `mcp.servers.oauth.callback`, `mcp.servers.oauth.cancel`, `mcp.servers.oauth.poll`, `mcp.servers.oauth.start`, `mcp.servers.remove`, `mcp.servers.set_api_key`, `mcp.servers.status`, `mcp.servers.test` |
 | message | – | – | `message.react` |
 | model | `model.options` | – | `model.disconnect`, `model.save_key` |
@@ -55,7 +55,7 @@ Nothing in Hermes is removed. The Rust (jcode) harness serves the hot path; ever
 | rollback | – | – | `rollback.diff`, `rollback.list`, `rollback.restore` |
 | session | `session.activate`, `session.active_list`, `session.branch`, `session.close`, `session.compress`, `session.context_breakdown`, `session.control`, `session.control.read`, `session.create`, `session.cwd.set`, `session.delete`, `session.events.since`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.redirect`, `session.resume`, `session.save`, `session.set_hidden`, `session.status`, `session.steer`, `session.title`, `session.undo`, `session.usage`, `session.workspace.move` | – | – |
 | setup | `setup.runtime_check`, `setup.status` | – | – |
-| shell | – | – | `shell.exec` |
+| shell | `shell.exec` | – | – |
 | skills | – | – | `skills.manage`, `skills.reload` |
 | slash | `slash.exec` | – | – |
 | spawn_tree | `spawn_tree.list`, `spawn_tree.load`, `spawn_tree.save` | – | – |
