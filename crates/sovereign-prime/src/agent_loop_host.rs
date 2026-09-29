@@ -41,22 +41,32 @@ pub fn goal_host(store: &ControlStore, session_id: &str, op_json: &str) -> Resul
             let mut goal = store
                 .get_goal(session_id)?
                 .ok_or_else(|| anyhow::anyhow!("No goal to complete."))?;
-            // Prime's `goal.complete()` takes no arguments; accept that when the
-            // engine itself already recorded a passing verification for this goal.
-            let verification = match op["verification"].as_str().map(str::trim) {
-                Some(v) if !v.is_empty() => v.to_string(),
-                _ => goal
-                    .attempt_log
-                    .iter()
-                    .rev()
-                    .find(|line| line.contains("ver=pass"))
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "goal complete requires verification: run a test/build/check first, or describe what you ran and its result"
-                        )
-                    })?,
-            };
+            // A goal that ever ran a verification command (best score non-empty) can only be
+            // completed on the engine's own record: a passing `auto` turn and no open regression.
+            // Free text is accepted only for goals with nothing to execute. Prime's bare
+            // `goal.complete()` takes no arguments, so it rides on the same recorded line.
+            let engine_pass = goal
+                .attempt_log
+                .iter()
+                .rev()
+                .find(|line| line.starts_with("auto ") && line.split(" | ").any(|f| f == "ver=pass"))
+                .cloned();
+            let cited = op["verification"].as_str().map(str::trim).filter(|v| !v.is_empty());
+            let verification = if goal.best.is_empty() {
+                cited.map(str::to_string).or(engine_pass)
+            } else {
+                if let Some(why) = &goal.regressed {
+                    anyhow::bail!("goal complete refused: an active regression is open ({why}); fix it and re-run the checks");
+                }
+                Some(engine_pass.ok_or_else(|| {
+                    anyhow::anyhow!("goal complete refused: this goal runs verification commands, so it needs a passing verification recorded by the engine (run the tests until a turn passes)")
+                })?)
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "goal complete requires verification: run a test/build/check first, or describe what you ran and its result"
+                )
+            })?;
             // AVO: completion cites the best committed score.
             let verification = if goal.best.is_empty() {
                 verification
@@ -512,10 +522,34 @@ mod tests {
         let store = ControlStore::memory().unwrap();
         let mut goal = SessionGoal::new("g");
         goal.best.insert("cargo test".into(), (7, 0));
+        goal.record_attempt("auto t2 f0 | files=yes | ver=pass | err=");
         goal.lineage.push(crate::goal_ratchet::Checkpoint { n: 1, git_ref: "refs/akira/goals/s/1".into(), score: "cargo test: 7p/0f".into(), line: "l".into() });
         store.set_goal("s", Some(&goal)).unwrap();
         let out: Value = serde_json::from_str(&goal_host(&store, "s", r#"{"op":"complete","verification":"ran tests"}"#).unwrap()).unwrap();
         assert!(out["goal"]["completion_verification"].as_str().unwrap().contains("best score: cargo test: 7p/0f"));
+        assert!(out["goal"]["completion_verification"].as_str().unwrap().contains("ver=pass"), "the engine's line, not the cited text");
         assert_eq!(out["completion_budget_report"]["lineage"][0]["ref"], "refs/akira/goals/s/1");
+    }
+
+    #[test]
+    fn a_goal_that_ran_verification_cannot_complete_on_free_text_or_with_a_regression() {
+        let store = ControlStore::memory().unwrap();
+        let mut goal = SessionGoal::new("g");
+        goal.best.insert("cargo test".into(), (7, 0));
+        store.set_goal("s", Some(&goal)).unwrap();
+        let complete = r#"{"op":"complete","verification":"I ran the tests, trust me"}"#;
+        assert!(goal_host(&store, "s", complete).is_err(), "no engine-recorded pass yet");
+        // The model's own progress note never counts as the engine's record.
+        goal_host(&store, "s", r#"{"op":"progress","note":"x | ver=pass | y","verification":"pass"}"#).unwrap();
+        assert!(goal_host(&store, "s", complete).is_err());
+        let mut goal = store.get_goal("s").unwrap().unwrap();
+        goal.record_attempt("auto t2 f0 | files=yes | ver=pass | err=");
+        goal.regressed = Some("cargo test fell from 7 to 5".into());
+        store.set_goal("s", Some(&goal)).unwrap();
+        assert!(goal_host(&store, "s", complete).unwrap_err().to_string().contains("regression"));
+        goal.regressed = None;
+        store.set_goal("s", Some(&goal)).unwrap();
+        let done: Value = serde_json::from_str(&goal_host(&store, "s", complete).unwrap()).unwrap();
+        assert_eq!(done["goal"]["status"], "done");
     }
 }
