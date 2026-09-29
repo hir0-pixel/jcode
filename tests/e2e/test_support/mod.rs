@@ -103,12 +103,29 @@ impl TestEnvGuard {
     }
 }
 
+/// Where writes that outlive their test's guard land: a temp dir kept for the
+/// life of the test process, never the user's real jcode home.
+fn late_write_sink() -> &'static std::path::Path {
+    static SINK: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("jcode-e2e-late-writes-")
+            .tempdir()
+            .expect("create e2e late-write sink")
+    })
+    .path()
+}
+
 impl Drop for TestEnvGuard {
     fn drop(&mut self) {
+        // A test's server tasks can still be saving sessions for a moment after
+        // this guard drops. Unsetting JCODE_HOME would send those writes to the
+        // real ~/.jcode (they showed up in the user's session list), so a run
+        // that started without one falls back to a process-wide sink instead.
         if let Some(prev_home) = &self.prev_home {
             jcode::env::set_var("JCODE_HOME", prev_home);
         } else {
-            jcode::env::remove_var("JCODE_HOME");
+            jcode::env::set_var("JCODE_HOME", late_write_sink());
         }
 
         if let Some(prev_runtime_dir) = &self.prev_runtime_dir {
