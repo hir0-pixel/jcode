@@ -234,7 +234,9 @@ impl Driver {
             if let Err(err) = conn.ensure_attached(sid).await {
                 // A chat deleted behind our back (its file is gone) has no work left.
                 if !jcode_base::session::session_exists(sid) {
-                    crate::sessions_rest::forget_rows(&conn.config.home, sid);
+                    if let Err(err) = crate::sessions_rest::forget_rows(&conn.config.home, sid) {
+                        eprintln!("sovereign: {err:#}");
+                    }
                     gone.push(sid.clone());
                 } else if first {
                     eprintln!("sovereign: goal driver cannot attach {sid}: {err:#}");

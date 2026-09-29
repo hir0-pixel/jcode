@@ -15,17 +15,26 @@ pub(crate) async fn delete_everywhere(config: &Config, id: &str) -> Result<()> {
     if let Err(err) = harness_request(&config.legacy_socket, json!({"req": "delete_session", "session_id": id})).await {
         if !err.to_string().contains("not found") { return Err(err); }
     }
-    forget_rows(&config.home, id);
-    Ok(())
+    forget_rows(&config.home, id)
 }
 
-/// Just the rows keyed to a session (the engine's session is already gone).
-pub(crate) fn forget_rows(home: &str, id: &str) {
-    let home = std::path::Path::new(home);
-    if let Some(store) = crate::rpc::control_or_log(&home.to_string_lossy()) { let _ = store.forget_session(id); }
-    if let Some(store) = crate::rpc::entries_or_log(&home.to_string_lossy()) { let _ = store.forget_session(id); }
-    let _ = crate::observability::forget_session(home, id);
-    let _ = std::fs::remove_dir_all(crate::rpc::attach::stage_dir(&home.to_string_lossy(), id));
+/// Just the rows keyed to a session (the engine's session is already gone). Every store is still
+/// tried when one fails; the failures come back as one error.
+pub(crate) fn forget_rows(home: &str, id: &str) -> Result<()> {
+    let mut failed = Vec::new();
+    match crate::rpc::control_or_log(home) {
+        Some(store) => { if let Err(e) = store.forget_session(id) { failed.push(format!("goal control: {e:#}")); } }
+        None => failed.push("goal control store unavailable".into()),
+    }
+    match crate::rpc::entries_or_log(home) {
+        Some(store) => { if let Err(e) = store.forget_session(id) { failed.push(format!("learning: {e:#}")); } }
+        None => failed.push("learning store unavailable".into()),
+    }
+    if let Err(e) = crate::observability::forget_session(std::path::Path::new(home), id) { failed.push(format!("observability: {e:#}")); }
+    if let Some(dir) = crate::rpc::attach::stage_dir(home, id) {
+        if let Err(e) = std::fs::remove_dir_all(&dir) { if e.kind() != std::io::ErrorKind::NotFound { failed.push(format!("attachments: {e}")); } }
+    }
+    if failed.is_empty() { Ok(()) } else { anyhow::bail!("could not clear all of {id}'s data: {}", failed.join("; ")) }
 }
 
 /// Returns `None` when the path is not under `/api/sessions`.
@@ -261,7 +270,7 @@ mod tests {
             db.execute("INSERT INTO span_content(id,input) VALUES(?1,'x'),(?2,'y')", [format!("span-{sid}"), format!("run-{sid}")]).unwrap();
             db.execute("INSERT INTO approvals(session_id,tool,command_preview,decision,actor,at_ms) VALUES(?1,'bash','rm','allow','u',1)", [sid]).unwrap();
         }
-        super::forget_rows(home.to_str().unwrap(), "gone");
+        super::forget_rows(home.to_str().unwrap(), "gone").unwrap();
         assert_eq!(control.active_sessions().unwrap(), ["kept"]);
         let count = |sql: &str| db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
         // Only "kept" is left: one row each, two for the tables holding two rows per session.
@@ -270,6 +279,24 @@ mod tests {
         }
         drop((observer, db));
         std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn forgetting_a_blank_id_spares_every_attachment_and_store_errors_are_reported() {
+        let home = std::env::temp_dir().join(format!("forget-blank-{}", std::process::id()));
+        let kept = home.join("attachments/keep");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("x.png"), b"x").unwrap();
+        for id in ["", "///", "a/b"] {
+            super::forget_rows(home.to_str().unwrap(), id).unwrap();
+        }
+        assert!(kept.join("x.png").is_file(), "no id can reach the attachments root");
+        let file = std::env::temp_dir().join(format!("forget-not-a-dir-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let err = super::forget_rows(file.to_str().unwrap(), "s").unwrap_err().to_string();
+        assert!(err.contains("could not clear all of s"), "{err}");
+        std::fs::remove_dir_all(home).ok();
+        std::fs::remove_file(file).ok();
     }
 
     #[test]

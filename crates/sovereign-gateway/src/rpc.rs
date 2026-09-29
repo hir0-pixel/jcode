@@ -1007,6 +1007,12 @@ impl Conn {
             "ping" | "gateway.ping" => Ok(json!({})),
             m if local_state::handles(m) => self.local_state(m, p).await,
             m if attach::handles(m) => {
+                // Only a session this connection has open or the engine has stored may stage files.
+                if let Some(id) = p["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    if !self.client.sessions.lock().await.contains(id) && !self.known.lock().await.contains_key(id) && !jcode_base::session::session_exists(id) {
+                        return Err(RpcError::params("unknown session_id"));
+                    }
+                }
                 let cwd = match p["session_id"].as_str() {
                     Some(id) => self.session_cwd(id).await,
                     None => None,
@@ -1951,13 +1957,19 @@ impl Conn {
                     self.observer.link_replay(&run, original);
                 }
                 // Images staged by `image.attach` ride along on this turn.
-                let (staged, images) = attach::staged_images(&self.config.home, &id);
+                let (staged, images, unreadable) = {
+                    let (home, id) = (self.config.home.clone(), id.clone());
+                    tokio::task::spawn_blocking(move || attach::staged_images(&home, &id)).await.map_err(|e| RpcError::internal(e.into()))?
+                };
                 if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str(), images).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
                 }
                 attach::clear_staged(&self.config.home, &id, &staged);
                 let mut response = json!({ "status": if busy { "queued" } else { "streaming" } });
+                if !unreadable.is_empty() {
+                    response["dropped_images"] = json!(unreadable);
+                }
                 if self.replay_of.is_some() {
                     response["run_id"] = json!(run);
                 }
@@ -2790,6 +2802,10 @@ pub(crate) async fn agent_run(
         })
         .await;
 
+        // Stop a timed-out turn first: while it can still ask, it must stay unattended.
+        if outcome.is_err() {
+            let _ = conn.dispatch("session.interrupt", &json!({ "session_id": session_id })).await;
+        }
         hub.unmark_headless(&session_id).await;
         // Only now is the session guaranteed persisted (jcode does not write a
         // session record until its first turn), so hide it from session.list
@@ -2833,9 +2849,6 @@ pub(crate) async fn agent_run(
                 json!({ "ok": false, "text": "", "error": err.to_string(), "session_id": session_id })
             }
             Err(_) => {
-                let _ = conn
-                    .dispatch("session.interrupt", &json!({ "session_id": session_id }))
-                    .await;
                 json!({ "ok": false, "text": "", "error": "timed out waiting for the turn to finish", "session_id": session_id })
             }
         })
@@ -2906,7 +2919,15 @@ pub async fn run(
     while let Some(msg) = ws_rx.next().await {
         let text = match msg {
             Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Close(_)) => break,
+            Err(tokio_tungstenite::tungstenite::Error::Capacity(_)) => {
+                // Tell the client why (close 1009) instead of dropping the socket unexplained.
+                conn.emit("status.update", None, json!({ "kind": "error", "text": "That message is larger than the gateway accepts and was refused." })).await;
+                let _ = conn.to_ws.send(Message::Close(Some(CloseFrame { code: CloseCode::Size, reason: "message too big".into() }))).await;
+                tokio::time::sleep(Duration::from_millis(200)).await; // let the writer flush it
+                break;
+            }
+            Err(_) => break,
             Ok(_) => continue,
         };
         if std::env::var_os("SOVEREIGN_GATEWAY_TRACE").is_some() {
@@ -2985,6 +3006,15 @@ mod tests {
     }
 
     pub(super) fn test_conn_as(name: &str, driver: bool) -> Arc<Conn> {
+        let (config, home) = test_config(name);
+        let observer = Observer::open(&home, "p", "m", None).unwrap();
+        let hub = Arc::new(Hub::default());
+        let (to_ws, _rx) = mpsc::channel::<Message>(8);
+        let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
+        Conn::new(config, to_ws, hub, client, observer, driver, "invoke_agent", None, None)
+    }
+
+    fn test_config(name: &str) -> (Arc<Config>, std::path::PathBuf) {
         let home = std::env::temp_dir().join(format!("c{name}{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         // A stand-in daemon: accepts the bridge's dials and holds them open.
@@ -3012,11 +3042,64 @@ mod tests {
             features: None,
             learning: None,
         });
+        (config, home)
+    }
+
+    /// A real socket pair: the gateway's `run` on one end, a raw client on the other.
+    async fn gateway_socket(name: &str) -> WebSocketStream<TcpStream> {
+        let (config, home) = test_config(name);
         let observer = Observer::open(&home, "p", "m", None).unwrap();
-        let hub = Arc::new(Hub::default());
-        let (to_ws, _rx) = mpsc::channel::<Message>(8);
-        let client = Arc::new(Client { id: hub.next_client_id(), to_ws: to_ws.clone(), sessions: Mutex::new(Default::default()) });
-        Conn::new(config, to_ws, hub, client, observer, driver, "invoke_agent", None, None)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = WebSocketStream::from_raw_socket(stream, tokio_tungstenite::tungstenite::protocol::Role::Server, Some(crate::ws_config())).await;
+            let _ = run(ws, config, Arc::new(Hub::default()), observer).await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        WebSocketStream::from_raw_socket(stream, tokio_tungstenite::tungstenite::protocol::Role::Client, None).await
+    }
+
+    async fn reply_to(ws: &mut WebSocketStream<TcpStream>, id: u64) -> Value {
+        loop {
+            let Message::Text(text) = tokio::time::timeout(Duration::from_secs(20), ws.next()).await.expect("a reply").expect("socket open").expect("no error") else { continue };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_6_5_mb_image_attach_gets_a_reply_and_the_socket_stays_open() {
+        let mut ws = gateway_socket("big-attach").await;
+        // 6.5 MB of image is ~8.7 MB of base64: over the old 8 MiB message cap.
+        let payload = "A".repeat(6_500_000 / 3 * 4);
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "image.attach_bytes", "params": { "session_id": "nobody", "content_base64": payload } });
+        ws.send(Message::Text(request.to_string())).await.unwrap();
+        let reply = reply_to(&mut ws, 1).await;
+        assert_eq!(reply["error"]["message"], "unknown session_id", "answered, not disconnected: {reply}");
+        ws.send(Message::Text(json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }).to_string())).await.unwrap();
+        assert!(reply_to(&mut ws, 2).await["result"].is_object(), "the same connection still works");
+    }
+
+    #[tokio::test]
+    async fn a_message_past_the_cap_ends_the_connection_without_hanging() {
+        let mut ws = gateway_socket("too-big").await;
+        // The gateway refuses it from the frame header and closes (1009 when the close frame beats
+        // the TCP reset); the client's own write may fail once that happens.
+        let _ = ws.send(Message::Text("x".repeat(crate::MAX_WS_MESSAGE_BYTES + 1))).await;
+        let ended = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Close(frame) = msg {
+                    return frame.map(|f| u16::from(f.code));
+                }
+            }
+            None
+        })
+        .await
+        .expect("the gateway ended the connection");
+        assert!(matches!(ended, None | Some(1009)), "{ended:?}");
     }
 
     #[tokio::test]

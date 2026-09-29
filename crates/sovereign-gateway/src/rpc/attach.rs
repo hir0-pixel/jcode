@@ -16,6 +16,12 @@ const BYTES_MAX: usize = 25 * 1024 * 1024;
 const IMAGE_MAX: usize = 7 * 1024 * 1024;
 const PDF_MAX: u64 = 50 * 1024 * 1024;
 
+/// The biggest decoded payload any attach RPC accepts (`file.attach` allows twice `BYTES_MAX`).
+const LARGEST_PAYLOAD: usize = if BYTES_MAX * 2 > PDF_MAX as usize { BYTES_MAX * 2 } else { PDF_MAX as usize };
+/// The biggest WebSocket message an attach can be: that payload as base64, plus 1 MiB for the JSON
+/// around it. The socket's message cap must not be lower or a big attach closes the connection.
+pub(crate) const MAX_WIRE_BYTES: usize = LARGEST_PAYLOAD.div_ceil(3) * 4 + 1024 * 1024;
+
 pub(super) type Failure = (i64, String);
 type Reply = Result<Value, Failure>;
 
@@ -31,9 +37,11 @@ pub(super) fn handles(method: &str) -> bool {
     )
 }
 
-pub(crate) fn stage_dir(home: &str, session: &str) -> PathBuf {
-    let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
-    Path::new(home).join("attachments").join(safe)
+/// A session's staging directory. `None` for an id that is not a plain `[A-Za-z0-9_-]+` name (empty,
+/// or with path characters), so no id can land in another session's directory or the root.
+pub(crate) fn stage_dir(home: &str, session: &str) -> Option<PathBuf> {
+    let plain = !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    plain.then(|| Path::new(home).join("attachments").join(session))
 }
 
 fn read_list(file: &Path) -> Vec<String> {
@@ -192,11 +200,16 @@ fn text_of<'a>(p: &'a Value, keys: &[&str]) -> &'a str {
     keys.iter().find_map(|k| p[*k].as_str().filter(|s| !s.trim().is_empty())).unwrap_or("").trim()
 }
 
-fn clipboard_png(to: &Path) -> bool {
-    let out = to.to_string_lossy().into_owned();
-    let script = format!(
+/// AppleScript that writes the clipboard PNG to `to`, with `\` and `"` in the path escaped.
+fn clipboard_script(to: &Path) -> String {
+    let out = to.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
         "set f to open for access POSIX file \"{out}\" with write permission\nset eof f to 0\nwrite (the clipboard as «class PNGf») to f\nclose access f"
-    );
+    )
+}
+
+fn clipboard_png(to: &Path) -> bool {
+    let script = clipboard_script(to);
     let attempts: [(&str, Vec<&str>); 3] = [
         ("osascript", vec!["-e", &script]),
         ("wl-paste", vec!["--type", "image/png"]),
@@ -217,7 +230,7 @@ fn clipboard_png(to: &Path) -> bool {
 
 pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
     let session = p["session_id"].as_str().filter(|s| !s.is_empty()).ok_or((-32602, "session_id is required".to_string()))?;
-    let dir = stage_dir(home, session);
+    let dir = stage_dir(home, session).ok_or((-32602, "invalid session_id".to_string()))?;
     match method {
         "image.attach" => {
             let raw = text_of(p, &["path"]);
@@ -263,7 +276,12 @@ pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
             let before = pending(&dir);
             let after: Vec<String> = before.iter().filter(|x| x.as_str() != raw).cloned().collect();
             write_json(&dir.join("pending.json"), &after).or_else(|e| fail(5027, e.to_string()))?;
-            Ok(json!({ "detached": after.len() != before.len(), "count": after.len() }))
+            let detached = after.len() != before.len();
+            // The staged copy goes too (never a file outside this session's directory).
+            if detached && Path::new(raw).starts_with(&dir) {
+                let _ = std::fs::remove_file(raw);
+            }
+            Ok(json!({ "detached": detached, "count": after.len() }))
         }
         "file.attach" => {
             let (raw, data_url) = (text_of(p, &["path"]), text_of(p, &["data_url"]));
@@ -382,24 +400,25 @@ fn react(dir: &Path, p: &Value) -> Reply {
     Ok(json!({ "row_id": row_id.unwrap_or(0), "reactions": reactions }))
 }
 
-/// Staged image paths and the same images as `(media_type, base64)` for `send_message`; nothing
-/// is cleared (see `clear_staged`).
-pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(String, String)>) {
-    let paths = pending(&stage_dir(home, session));
-    let images = paths
-        .iter()
-        .filter_map(|p| {
-            let bytes = std::fs::read(p).ok()?;
-            Some((media_type(Path::new(p)).to_string(), base64::engine::general_purpose::STANDARD.encode(bytes)))
-        })
-        .collect();
-    (paths, images)
+/// Staged image paths, the same images as `(media_type, base64)` for `send_message`, and the paths
+/// that could not be read (they are dropped from the turn; the caller reports them). Nothing is
+/// cleared here (see `clear_staged`). Blocking file reads and encoding: call off the async workers.
+pub(super) fn staged_images(home: &str, session: &str) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
+    let paths = stage_dir(home, session).map(|dir| pending(&dir)).unwrap_or_default();
+    let (mut images, mut unreadable) = (Vec::new(), Vec::new());
+    for p in &paths {
+        match std::fs::read(p) {
+            Ok(bytes) => images.push((media_type(Path::new(p)).to_string(), base64::engine::general_purpose::STANDARD.encode(bytes))),
+            Err(_) => unreadable.push(p.clone()),
+        }
+    }
+    (paths, images, unreadable)
 }
 
 /// Drop only the `sent` paths from the queue: an image attached while the submit was in flight
 /// stays for the next turn.
 pub(super) fn clear_staged(home: &str, session: &str, sent: &[String]) {
-    let dir = stage_dir(home, session);
+    let Some(dir) = stage_dir(home, session) else { return };
     let lock = stage_lock(&dir);
     let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
     let left: Vec<String> = pending(&dir).into_iter().filter(|p| !sent.contains(p)).collect();
@@ -439,7 +458,7 @@ mod tests {
         assert!(r["text"].as_str().unwrap().starts_with("[User attached image: upload_"));
         assert!(Path::new(r["path"].as_str().unwrap()).is_file());
 
-        let (sent, images) = staged_images(&home, "s1");
+        let (sent, images, _) = staged_images(&home, "s1");
         assert_eq!(images, vec![("image/png".to_string(), b64.clone())]);
         // The harness bridge carries them into the legacy `message` jcode turns into an image content part.
         let mut request = super::super::send_message_request("s1", "look", None, images);
@@ -453,7 +472,7 @@ mod tests {
         // An image attached while the submit was in flight survives clearing what was sent.
         let late = call("image.attach_bytes", &home, json!({ "content_base64": format!("data:image/png;base64,{b64}") })).unwrap();
         clear_staged(&home, "s1", &sent);
-        let (left, _) = staged_images(&home, "s1");
+        let (left, _, _) = staged_images(&home, "s1");
         assert_eq!(left, vec![late["path"].as_str().unwrap().to_string()]);
         clear_staged(&home, "s1", &left);
         assert!(staged_images(&home, "s1").0.is_empty(), "consumed by the submit");
@@ -468,7 +487,7 @@ mod tests {
         std::fs::write(&file, vec![0u8; IMAGE_MAX + 1]).unwrap();
         assert_eq!(call("image.attach", &home, json!({ "path": file.to_string_lossy() })).unwrap_err().0, 4018);
 
-        let dir = stage_dir(&home, "s1");
+        let dir = stage_dir(&home, "s1").unwrap();
         std::thread::scope(|s| {
             for i in 0..16 {
                 let dir = &dir;
@@ -513,5 +532,48 @@ mod tests {
         assert_eq!(react(json!("🎉"))["row_id"], 7);
         assert!(react(Value::Null)["reactions"].as_array().unwrap().is_empty());
         assert_eq!(call("message.react", &home, json!({})).unwrap_err().0, 4023);
+    }
+
+    #[test]
+    fn session_ids_that_are_not_plain_names_never_reach_the_attachments_root() {
+        let (home, _) = setup("ids");
+        for bad in ["", "///", "a/b", "..", "a b", "../x"] {
+            assert!(stage_dir(&home, bad).is_none(), "{bad:?}");
+        }
+        assert_ne!(stage_dir(&home, "ab"), stage_dir(&home, "a-b"));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(PNG);
+        for bad in ["///", "a/b"] {
+            let p = json!({ "content_base64": b64, "session_id": bad });
+            assert_eq!(handle("image.attach_bytes", &home, &home, &p).unwrap_err().0, -32602);
+        }
+        assert!(!Path::new(&home).join("attachments").exists(), "nothing was written anywhere");
+        assert!(staged_images(&home, "///").0.is_empty());
+    }
+
+    #[test]
+    fn detach_deletes_the_staged_file_and_unreadable_staged_images_are_reported() {
+        let (home, _) = setup("detach");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(PNG);
+        let a = call("image.attach_bytes", &home, json!({ "content_base64": b64 })).unwrap();
+        let b = call("image.attach_bytes", &home, json!({ "content_base64": b64 })).unwrap();
+        let (a, b) = (a["path"].as_str().unwrap().to_string(), b["path"].as_str().unwrap().to_string());
+        std::fs::remove_file(&b).unwrap(); // vanished before the turn was sent
+        let (paths, images, unreadable) = staged_images(&home, "s1");
+        assert_eq!((paths.len(), images.len(), unreadable), (2, 1, vec![b]));
+        assert_eq!(call("image.detach", &home, json!({ "path": a })).unwrap()["detached"], true);
+        assert!(!Path::new(&a).exists(), "detach removes the staged file");
+    }
+
+    #[test]
+    fn the_clipboard_script_escapes_quotes_and_backslashes_in_the_path() {
+        let script = clipboard_script(Path::new("/tmp/a\"b\\c/x.png"));
+        assert!(script.contains(r#"POSIX file "/tmp/a\"b\\c/x.png" with"#), "{script}");
+    }
+
+    #[test]
+    fn the_socket_cap_covers_the_largest_attach() {
+        let b64_len = |n: usize| n.div_ceil(3) * 4;
+        assert!(MAX_WIRE_BYTES > b64_len(IMAGE_MAX) && MAX_WIRE_BYTES > b64_len(BYTES_MAX * 2) && MAX_WIRE_BYTES > b64_len(PDF_MAX as usize));
+        assert!(MAX_WIRE_BYTES > 6_500_000 * 4 / 3, "a 6.5 MB image fits");
     }
 }

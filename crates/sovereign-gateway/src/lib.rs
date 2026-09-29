@@ -40,6 +40,16 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// WebSocket message cap: room for the biggest attach RPC (a 50 MB file as base64), not just 8 MiB,
+/// which closed the socket on a 6.5 MB image.
+pub(crate) const MAX_WS_MESSAGE_BYTES: usize = rpc::attach::MAX_WIRE_BYTES;
+
+pub(crate) fn ws_config() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_WS_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
+    config
+}
 
 /// Method names in the vendored Hermes gateway contract (parsed once).
 pub(crate) fn contract_methods() -> &'static std::collections::HashSet<String> {
@@ -560,10 +570,7 @@ async fn handle(
             "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
         );
         stream.write_all(head.as_bytes()).await?;
-        let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(MAX_FRAME_BYTES);
-        ws_config.max_frame_size = Some(MAX_FRAME_BYTES);
-        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config)).await;
+        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(ws_config())).await;
         // Close after accepting, with Hermes's codes, so the desktop reports
         // an auth failure rather than a network error.
         if let Some(reason) = host_reason {
