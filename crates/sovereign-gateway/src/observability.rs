@@ -286,7 +286,7 @@ impl Observer {
             .expect("observability writer thread");
         // Keep model/provider defaults out of the chat path and available for
         // sessions whose model_info event arrives after the first prompt.
-        observer.sessions.lock().unwrap().insert(
+        observer.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(
             String::new(),
             Active {
                 model: writer_model,
@@ -311,7 +311,7 @@ impl Observer {
     }
 
     pub fn start_turn(&self, session: &str, prompt: &str, kind: &'static str, title: Option<&str>) -> String {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.len() > 2048 {
             sessions.retain(|key, active| {
                 key.is_empty() || active.run.is_some() || !active.queued.is_empty()
@@ -380,7 +380,7 @@ impl Observer {
     }
 
     pub fn record_aux(&self, session: &str, kind: &'static str, title: Option<&str>, provider_override: Option<&str>, model_override: Option<&str>, started: i64, usage: Option<SimpleUsage>, error: Option<&str>) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let defaults = sessions.get("").map(|s| (s.provider.clone(), s.model.clone())).unwrap_or_default();
         let active = sessions.entry(session.to_string()).or_insert_with(|| Active {
             provider: defaults.0, model: defaults.1, ..Default::default()
@@ -412,7 +412,7 @@ impl Observer {
     }
 
     pub fn event(&self, session: &str, ty: &str, payload: &Value) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let defaults = sessions
             .get("")
             .map(|s| (s.provider.clone(), s.model.clone()))
@@ -579,7 +579,7 @@ impl Observer {
         let sid = params["session_id"].as_str().unwrap_or_default().to_string();
         if sid.is_empty() { return params; }
         let size = params.to_string().len();
-        let mut replay = self.replay.lock().unwrap();
+        let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         let seq = {
             let event = replay.sessions.entry(sid.clone()).or_default();
             event.seq += 1;
@@ -619,7 +619,7 @@ impl Observer {
     }
 
     pub fn replay_since(&self, sid: &str, last_seen: u64) -> (Vec<Value>, u64, bool, String) {
-        let replay = self.replay.lock().unwrap();
+        let replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         let entry = replay.sessions.get(sid);
         let Some(entry) = entry else { return (Vec::new(), 0, false, self.replay_epoch.clone()); };
         let events = entry.events.iter().filter(|(event, _)| event["seq"].as_u64().unwrap_or(0) > last_seen).map(|(event, _)| event.clone()).collect();
@@ -627,7 +627,7 @@ impl Observer {
     }
 
     pub fn replay_stats(&self) -> Value {
-        let replay = self.replay.lock().unwrap();
+        let replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         json!({
             "sessions": replay.sessions.len(),
             "events": replay.sessions.values().map(|entry| entry.events.len()).sum::<usize>(),
@@ -641,7 +641,7 @@ impl Observer {
     pub fn replay_epoch(&self) -> &str { &self.replay_epoch }
 
     pub fn metered_usage(&self) -> rusqlite::Result<(f64, u64)> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         db.query_row("SELECT COALESCE(SUM(cost_usd), 0), COUNT(cost_usd) FROM fact_turn", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
@@ -651,7 +651,7 @@ impl Observer {
         let Some(session) = frame["session_id"].as_str() else {
             return;
         };
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let defaults = sessions
             .get("")
             .map(|s| (s.provider.clone(), s.model.clone()))
@@ -734,7 +734,7 @@ impl Observer {
     }
 
     pub fn failed_submit(&self, session: &str, run: &str, error: &str) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = sessions.get_mut(session) {
             if active.run.as_deref() == Some(run) {
                 active.run = active.queued.pop_front();
@@ -766,7 +766,7 @@ impl Observer {
         outcome: Option<&str>,
         session: Option<&str>,
     ) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         let rows = list_filtered(&db, limit, status, kind, q, outcome, session, now())?;
         let budget = budget_status(&db, &self.home, now())?;
         Ok(json!({
@@ -781,7 +781,7 @@ impl Observer {
         let Some(ms) = window_ms(window) else {
             return Err("window must be 1h, 24h, or 7d");
         };
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         let mut body = monitors(&db, now() - ms, self.dropped.load(Ordering::Relaxed)).map_err(|_| "query failed")?;
         if let Ok(alerts) = list_alerts(&db) {
             body["alerts"] = alerts["monitors"].clone();
@@ -791,7 +791,7 @@ impl Observer {
 
     /// One of evestack's dashboard views, by route name.
     pub fn view(&self, name: &str, limit: u64, days: u64) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         match name {
             "sessions" => list_sessions(&db, limit, now()),
             "facts" => facts(&db, now() - days as i64 * 86_400_000),
@@ -802,22 +802,22 @@ impl Observer {
     }
 
     pub fn budget(&self) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         budget_status(&db, &self.home, now())
     }
 
     pub fn approvals(&self, limit: u64) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         list_approvals(&db, limit)
     }
 
     pub fn promote(&self, run_id: &str) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         promote_run(&db, &self.home, run_id, now())
     }
 
     pub fn replay_turn_index(&self, run_id: &str) -> rusqlite::Result<(String, i64, Option<String>)> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         let run = detail_from_db(&db, run_id)?;
         let session = run["run"]["session_id"].as_str().unwrap_or_default().to_string();
         let started = run["run"]["started_at_ms"].as_i64().unwrap_or(0);
@@ -841,7 +841,7 @@ impl Observer {
     }
 
     pub fn active_run_id(&self, session: &str) -> Option<String> {
-        self.sessions.lock().unwrap().get(session).and_then(|a| a.run.clone())
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(session).and_then(|a| a.run.clone())
     }
 
     pub fn record_approval(
@@ -870,7 +870,7 @@ impl Observer {
     /// Hermes's `/api/analytics/usage` shape, from the ledger: runs are turns,
     /// `chat` spans are model calls, `execute_tool` spans are tool calls.
     pub fn analytics(&self, days: u64) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         let since = now() - days as i64 * 86_400_000;
         let mut daily = db.prepare(
             // Driven from runs_recent, counting each run's model calls through
@@ -931,7 +931,7 @@ impl Observer {
     /// Hermes's `insights.get`: sessions and messages over the last `days`.
     /// A top-level run is one user turn and its reply, i.e. two messages.
     pub fn insights(&self, days: u64) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         let since = now() - days as i64 * 86_400_000;
         let (sessions, turns): (i64, i64) = db.query_row(
             "SELECT COUNT(DISTINCT session_id), COUNT(*) FROM fact_turn WHERE parent_id IS NULL AND started_at_ms>=?1",
@@ -942,7 +942,7 @@ impl Observer {
     }
 
     pub fn detail(&self, id: &str) -> rusqlite::Result<Value> {
-        let db = self.read_db.lock().unwrap();
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
         detail_from_db(&db, id)
     }
 }

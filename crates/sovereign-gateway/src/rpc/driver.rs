@@ -108,7 +108,7 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
             }
             (failures, last_error) = (0, String::new());
             report_backup_error(&driver.conn.hub, jcode_base::migrate::backup_error()).await;
-            let active = driver.tick().await;
+            let active = supervised(&driver.conn.hub, { let d = driver.clone(); async move { d.tick().await } }).await;
             if active {
                 tokio::select! {
                     _ = tokio::time::sleep(TICK) => {}
@@ -119,6 +119,18 @@ pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>)
             }
         }
     });
+}
+
+/// Run one tick in its own task: a panic is logged and shown, and the loop carries on (the
+/// session stays active, so the next tick retries) instead of the driver dying silently.
+async fn supervised(hub: &Hub, tick: impl std::future::Future<Output = bool> + Send + 'static) -> bool {
+    match tokio::spawn(tick).await {
+        Ok(active) => active,
+        Err(err) => {
+            error_once(hub, "goal driver", format!("The goal driver hit an internal error and restarted; goals and heartbeats continue: {err}")).await;
+            true
+        }
+    }
 }
 
 /// Seconds to wait after `failures` failed engine connects: 1, 2, 4 ... capped at 30.
@@ -385,6 +397,13 @@ mod tests {
         let work = due_work(&store, &["s".to_string()], &mut resume, |_| busy);
         assert_eq!(work.len(), 1, "the driver resumes the goal");
         assert!(work[0].1.contains("ship the parser"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tick_does_not_stop_the_next_one() {
+        let hub = Hub::default();
+        assert!(supervised(&hub, async { panic!("tick blew up") }).await, "the panic keeps the loop going");
+        assert!(!supervised(&hub, async { false }).await, "the next tick runs normally");
     }
 
     #[test]

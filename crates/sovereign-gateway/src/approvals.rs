@@ -216,16 +216,16 @@ fn now_ms() -> i64 {
 
 impl Hub {
     pub fn set_observer(&self, observer: std::sync::Arc<crate::observability::Observer>) {
-        *self.observer.lock().unwrap() = Some(observer);
+        *self.observer.lock().unwrap_or_else(|e| e.into_inner()) = Some(observer);
     }
 
     fn store(&self) -> Option<Arc<sovereign_prime::entries::EntryStore>> {
-        self.store.lock().unwrap().clone()
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Persist parked prompts in `store` and re-arm the ones still inside their 24 h window.
     pub async fn set_store(self: &Arc<Self>, store: Arc<sovereign_prime::entries::EntryStore>) {
-        *self.store.lock().unwrap() = Some(store.clone());
+        *self.store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store.clone());
         let ttl_ms = PARK_TTL.as_millis() as i64;
         for (request_id, session, params, created) in store.park_load(now_ms() - ttl_ms) {
             let Ok(params) = serde_json::from_str::<Value>(&params) else { continue };
@@ -241,7 +241,7 @@ impl Hub {
     }
 
     fn audit(&self, session_id: &str, tool: &str, command: &str, decision: &str, actor: &str) {
-        if let Some(observer) = self.observer.lock().unwrap().as_ref() {
+        if let Some(observer) = self.observer.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             observer.record_approval(session_id, tool, command, decision, actor);
         }
     }
