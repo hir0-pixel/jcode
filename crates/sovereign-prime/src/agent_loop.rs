@@ -1176,6 +1176,37 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Active goals or loops parked until their sub-agents finish.
+    pub fn waiting_sessions(&self) -> Result<Vec<String>> {
+        let mut waiting = Vec::new();
+        for sid in self.active_sessions()? {
+            let goal = self.get_goal(&sid)?.is_some_and(|g| g.status == GoalStatus::Active && g.waiting_on_subagents);
+            let auto = self.get_autonomous(&sid)?.is_some_and(|a| a.status == AutonomousStatus::Active && a.waiting_on_subagents);
+            if goal || auto {
+                waiting.push(sid);
+            }
+        }
+        Ok(waiting)
+    }
+
+    /// The sub-agents are done (or gone): let the goal and loop continue. `true` if one was waiting.
+    pub fn clear_wait(&self, session_id: &str) -> Result<bool> {
+        let mut was = false;
+        if let Some(mut g) = self.get_goal(session_id)?.filter(|g| g.waiting_on_subagents) {
+            g.waiting_on_subagents = false;
+            g.updated_at_ms = now_ms();
+            self.set_goal(session_id, Some(&g))?;
+            was = true;
+        }
+        if let Some(mut a) = self.get_autonomous(session_id)?.filter(|a| a.waiting_on_subagents) {
+            a.waiting_on_subagents = false;
+            a.updated_at_ms = now_ms();
+            self.set_autonomous(session_id, Some(&a))?;
+            was = true;
+        }
+        Ok(was)
+    }
+
     /// Drop everything the loop keeps for a deleted session.
     pub fn forget_session(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -2109,6 +2140,18 @@ mod tests {
         let c = after_turn(&store, "s1", 0, true, false).unwrap();
         assert!(c.is_none());
         assert!(store.get_goal("s1").unwrap().unwrap().waiting_on_subagents);
+    }
+
+    #[test]
+    fn clearing_the_wait_lets_the_parked_goal_continue() {
+        let store = ControlStore::memory().unwrap();
+        store.set_goal("p", Some(&SessionGoal::new("x"))).unwrap();
+        assert!(after_turn(&store, "p", 0, true, false).unwrap().is_none());
+        assert_eq!(store.waiting_sessions().unwrap(), ["p"]);
+        assert!(store.clear_wait("p").unwrap());
+        assert!(store.waiting_sessions().unwrap().is_empty());
+        assert!(!store.clear_wait("p").unwrap());
+        assert!(matches!(resume_prompt(&store, "p").unwrap(), Some(Continuation::Goal(_))));
     }
 
     #[test]

@@ -36,6 +36,34 @@ pub(crate) fn poke() {
     }
 }
 
+/// A parked goal's sub-agents finished: send its continuation on the next scan.
+fn resume_soon(session_id: &str) {
+    if let Some(driver) = DRIVER.get() {
+        if let Some(resume) = driver.resume.lock().unwrap().as_mut() {
+            resume.insert(session_id.to_string());
+        }
+    }
+    poke();
+}
+
+/// The parent of `session_id` when it was the last of that parent's children still running.
+async fn parent_left_waiting(conn: &Arc<Conn>, waiting: &[String], session_id: &str) -> Option<String> {
+    let reply = conn.call(json!({ "req": "list_sessions" })).await.ok()?;
+    let list = reply["sessions"].as_array()?;
+    let parent = list.iter().find(|s| s["session_id"].as_str() == Some(session_id))?["parent_session_id"].as_str()?;
+    if !waiting.iter().any(|w| w == parent) {
+        return None;
+    }
+    let sessions = conn.sessions.lock().await;
+    let running = list.iter().any(|s| {
+        let id = s["session_id"].as_str().unwrap_or_default();
+        s["parent_session_id"].as_str() == Some(parent)
+            && id != session_id
+            && (matches!(s["status"].as_str(), Some("running" | "processing")) || sessions.get(id).is_some_and(SessionState::turn_active))
+    });
+    (!running).then(|| parent.to_string())
+}
+
 /// Start the driver task (once, with the gateway).
 pub(crate) fn start(config: Arc<Config>, hub: Arc<Hub>, observer: Arc<Observer>) {
     tokio::spawn(async move {
@@ -157,6 +185,12 @@ impl Driver {
             resume.get_or_insert_with(|| active.iter().cloned().collect());
             first
         };
+        if first {
+            // Nothing is running after a restart: whatever a goal was waiting on is over.
+            for sid in store.waiting_sessions().unwrap_or_default() {
+                let _ = store.clear_wait(&sid);
+            }
+        }
         let mut gone = Vec::new();
         for sid in &active {
             if let Err(err) = conn.ensure_attached(sid).await {
@@ -227,6 +261,14 @@ pub(super) fn turn_done(conn: Arc<Conn>, session_id: String, payload: Value) {
         let Ok(store) = ControlStore::open_cached(Path::new(&conn.config.home)) else {
             return;
         };
+        // A sub-agent finishing may be the last thing its parent's goal was waiting on.
+        if let Some(waiting) = store.waiting_sessions().ok().filter(|w| !w.is_empty()) {
+            if let Some(parent) = parent_left_waiting(&conn, &waiting, &session_id).await {
+                if store.clear_wait(&parent).unwrap_or(false) {
+                    resume_soon(&parent);
+                }
+            }
+        }
         let usage = &payload["usage"];
         let tokens = usage["total"]
             .as_u64()
@@ -319,6 +361,22 @@ mod tests {
         // Once submitted (caller drops it) goals are not re-sent by later ticks.
         resume.remove("goal");
         assert!(due_work(&store, &active, &mut resume, |_| false).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn a_goal_parked_for_sub_agents_is_sent_on_once_they_finish() {
+        let home = std::env::temp_dir().join(format!("driver-wait-{}", std::process::id()));
+        let store = ControlStore::open(&home).unwrap();
+        let mut goal = SessionGoal::new("ship the parser");
+        goal.waiting_on_subagents = true;
+        store.set_goal("parent", Some(&goal)).unwrap();
+        assert_eq!(store.waiting_sessions().unwrap(), ["parent"]);
+        assert!(store.clear_wait("parent").unwrap());
+        let mut resume: std::collections::HashSet<String> = ["parent".to_string()].into();
+        let work = due_work(&store, &["parent".to_string()], &mut resume, |_| false);
+        assert_eq!(work.len(), 1);
+        assert!(!store.get_goal("parent").unwrap().unwrap().waiting_on_subagents);
         std::fs::remove_dir_all(home).ok();
     }
 }
