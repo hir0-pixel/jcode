@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the fixed-seed exercise selection for scripts/bench/polyglot.mjs.
+"""Generate the exercise selection for scripts/bench/polyglot.mjs.
 
-Deterministic: same seed + same sorted exercise names -> same selection, so
-re-running this regenerates byte-identical scripts/bench/polyglot-exercises.json
-(the committed file both arms and future reruns actually use; this script is
-provenance, not something polyglot.mjs imports at run time).
-
-Usage: python3 scripts/bench/select_polyglot_exercises.py [--count 40] [--seed 42]
-
-Languages: python, rust, cpp only. java and javascript are excluded - verified
-during the BUILD (not assumed): java's test runner needs a JVM (none installed;
-`javac -version` prompts to install a runtime) and gradle (not installed, and
-gradlew would download it); javascript's `npm test` needs jest/babel, which are
-devDependencies nowhere vendored in this repo and would require `npm install`
-(a network download). go was excluded per the task brief (not installed).
+Default: ALL exercises of all six languages (225), ordered by language then name ->
+polyglot-exercises.json. `--count 40 --seed 42 --out polyglot-exercises-40.json` regenerates
+the old python/rust/cpp seeded subset (polyglot.mjs `--set 40`). Deterministic; provenance only,
+polyglot.mjs reads the committed json files.
 """
 import argparse
 import json
@@ -22,7 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 POLYGLOT = ROOT.parent / "benchmarks" / "polyglot-benchmark"
-LANGUAGES = ["python", "rust", "cpp"]
+ALL = ["cpp", "go", "java", "javascript", "python", "rust"]
+LANGUAGES = ["python", "rust", "cpp"]  # the --count subset only
 
 
 def list_exercises(lang):
@@ -46,22 +38,18 @@ def select(count, seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=40)
+    ap.add_argument("--count", type=int, default=0, help="0 = all exercises")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default=str(Path(__file__).with_name("polyglot-exercises.json")))
     args = ap.parse_args()
-    chosen = select(args.count, args.seed)
+    langs = LANGUAGES if args.count else ALL
+    chosen = select(args.count, args.seed) if args.count else {l: list_exercises(l) for l in ALL}
     total = sum(len(v) for v in chosen.values())
     out = {
         "seed": args.seed,
         "requested_count": args.count,
         "actual_count": total,
-        "languages": LANGUAGES,
-        "excluded_languages": {
-            "go": "not installed (re-verified 2026-09-29)",
-            "java": "no JVM installed and gradle/gradlew would need a download",
-            "javascript": "jest/babel devDependencies not vendored; npm test needs npm install (network)",
-        },
+        "languages": langs,
         "exercises": chosen,
     }
     Path(args.out).write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")

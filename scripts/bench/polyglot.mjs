@@ -2,15 +2,16 @@
 /**
  * Aider-polyglot-exercises driver: stock Hermes vs Akira (sovereign) vs Prime, same model.
  *
- * For each exercise in scripts/bench/polyglot-exercises.json (fixed-seed, 40
- * exercises across python/rust/cpp; see select_polyglot_exercises.py for why
- * go/java/javascript are excluded):
+ * For each exercise in scripts/bench/polyglot-exercises.json (ALL 225 Aider polyglot
+ * exercises: cpp, go, java, javascript, python, rust; `--set 40` selects the old
+ * fixed-seed 40-exercise python/rust/cpp subset in polyglot-exercises-40.json):
  *
- *   1. Copy the exercise to a throwaway sandbox.
+ *   1. Copy the exercise to a throwaway sandbox (JS gets a pre-warmed node_modules).
  *   2. Give the agent the instructions + current stub file(s), mirroring
  *      Aider's benchmark prompt ("implement the stubs, don't touch the tests").
- *   3. Run the language's OWN test command independently (never via the agent):
- *      pass@1.
+ *   3. Restore every non-solution file from the pristine exercise (tests, build files),
+ *      un-skip the tests (Aider's harness does the same), then run the language's OWN
+ *      test command independently (never via the agent): pass@1.
  *   4. On failure, ONE retry turn carrying the test output; re-run tests: pass@2.
  *
  * All arms mirror scripts/bench/abeval.py's hardened setup:
@@ -32,12 +33,15 @@
  *
  * Usage:
  *   node scripts/bench/polyglot.mjs --dry-run
- *   node scripts/bench/polyglot.mjs run --arm hermes|sovereign|prime [--only name,lang]
+ *   node scripts/bench/polyglot.mjs prewarm [--lang l]   # download toolchain deps once (untimed)
+ *   node scripts/bench/polyglot.mjs verify [--lang l] [--only name]  # stub must fail, reference must pass; no model
+ *   node scripts/bench/polyglot.mjs run --arm hermes|sovereign|prime [--lang l] [--only name,...] [--set 40|full]
  *   node scripts/bench/polyglot.mjs report
  *
  * Environment: BENCH_BASE_URL, BENCH_MODEL, BENCH_API_KEY, BENCH_CONTEXT,
  * BENCH_PROXY, BENCH_OUT, BENCH_TURN_TIMEOUT_MS, BENCH_PRICE_*, HERMES_VENV_PY,
- * HERMES_STOCK_SRC, SOVEREIGN_BIN, PRIME_CLI, PRIME_AGENT_KERNEL_VENV.
+ * HERMES_STOCK_SRC, SOVEREIGN_BIN, PRIME_CLI, PRIME_AGENT_KERNEL_VENV, JAVA_HOME (default
+ * Homebrew openjdk@21), BENCH_CACHE (shared gradle/npm/warm-marker cache).
  *
  * Never starts Ollama or any model server itself.
  */
@@ -73,6 +77,8 @@ const cfg = {
   HERMES_STOCK_SRC: process.env.HERMES_STOCK_SRC || '', // pristine upstream Hermes source (PYTHONPATH); unset = the fork
   PRIME_CLI: process.env.PRIME_CLI || '/tmp/prime-agent/packages/coding-agent/dist/bundle/cli.js',
   PRIME_KERNEL_VENV: process.env.PRIME_AGENT_KERNEL_VENV || '/tmp/prime-agent/kernel-venv',
+  JAVA_HOME: process.env.BENCH_JAVA_HOME || '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home',
+  CACHE: process.env.BENCH_CACHE || path.join(os.homedir(), '.cache', 'sovereign-bench'),
   PRICE_TABLE: process.env.SOVEREIGN_PRICE_TABLE || path.join(engineRoot, 'scripts', 'sovereign-prices.json'),
 }
 const baseUrlParsed = new URL(cfg.BASE_URL)
@@ -83,7 +89,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 const say = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a)
 
 // ---------------------------------------------------------------- selection
-const selection = JSON.parse(fs.readFileSync(path.join(__dirname, 'polyglot-exercises.json'), 'utf8'))
+const SET = flag('set', 'full')
+const selection = JSON.parse(fs.readFileSync(path.join(__dirname, SET === '40' ? 'polyglot-exercises-40.json' : 'polyglot-exercises.json'), 'utf8'))
 /** Fixed, deterministic order: languages as listed, exercises alphabetically within each. */
 const EXERCISES = selection.languages.flatMap(lang => (selection.exercises[lang] || []).map(name => ({ lang, name })))
 
@@ -125,33 +132,139 @@ function buildPrompt(dir, retry) {
   return prompt
 }
 
-// ---------------------------------------------------------------- per-language test runner
-function runTests(lang, dir) {
+// ---------------------------------------------------------------- toolchain env, sandbox setup, test runner
+/** Toolchain env shared by the harness's own test runs and every agent arm (real JDK, brew tools, shared caches). */
+const toolEnv = () => ({
+  JAVA_HOME: cfg.JAVA_HOME,
+  GRADLE_USER_HOME: path.join(cfg.CACHE, 'gradle'),
+  npm_config_cache: path.join(cfg.CACHE, 'npm'),
+  PATH: [`${cfg.JAVA_HOME}/bin`, '/opt/homebrew/bin', process.env.PATH].join(':'),
+})
+const sh = (bin, argv, opts = {}) => {
+  const r = spawnSync(bin, argv, { encoding: 'utf8', env: { ...process.env, ...toolEnv(), CI: '1' }, maxBuffer: 64 << 20, ...opts })
+  return { pass: r.status === 0, output: `${r.stdout || ''}\n${r.stderr || ''}`.trim() }
+}
+const sha = x => crypto.createHash('sha1').update(x).digest('hex').slice(0, 16)
+const SKIP_DIRS = new Set(['target', 'node_modules', 'build', '.gradle'])
+
+/** Aider's harness runs every test; the exercises ship with skips (@Disabled, xit/xtest, rust #[ignore]). */
+function unskip(lang, text) {
+  if (lang === 'java') return text.replace(/^[ \t]*@Disabled(\([^)]*\))?[ \t]*\r?\n/gm, '')
+  if (lang === 'javascript') return text.replace(/\bx(it|test|describe)\(/g, '$1(').replace(/\b(it|test|describe)\.skip\(/g, '$1(')
+  return text
+}
+
+function walk(dir, rel = '') {
+  return fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).flatMap(e => {
+    if (SKIP_DIRS.has(e.name) || e.name === 'Cargo.lock') return []
+    const r = path.join(rel, e.name)
+    return e.isDirectory() ? walk(dir, r) : [r]
+  })
+}
+
+/** Put back every non-solution file (tests, build files, wrappers) from the pristine exercise, un-skipped.
+ *  Returns the files the agent had changed (tampering). */
+function restoreTests(lang, dir, name) {
+  const orig = exDir(lang, name)
+  const { solution, test } = solutionAndTestFiles(orig)
+  const tampered = []
+  for (const rel of walk(orig)) {
+    if (solution.includes(rel)) continue
+    const o = fs.readFileSync(path.join(orig, rel))
+    const want = test.includes(rel) ? Buffer.from(unskip(lang, o.toString('utf8'))) : o
+    const dst = path.join(dir, rel)
+    const have = fs.existsSync(dst) ? fs.readFileSync(dst) : null
+    if (have && have.equals(want)) continue
+    if (have && !have.equals(o)) tampered.push(rel)
+    fs.mkdirSync(path.dirname(dst), { recursive: true })
+    fs.writeFileSync(dst, want)
+    if (fs.statSync(path.join(orig, rel)).mode & 0o111) fs.chmodSync(dst, 0o755)
+  }
+  return tampered
+}
+
+/** Untimed per-exercise setup inside the sandbox (network allowed on a cold cache). JS: node_modules from a
+ *  shared template keyed by the devDependencies hash (APFS clone), so no npm install ever lands in a timed turn. */
+function setupSandbox(lang, dir) {
+  if (lang !== 'javascript') return
+  const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+  const tpl = path.join(cfg.CACHE, 'nm', sha(JSON.stringify(pkg.devDependencies || {})), 'node_modules')
+  if (!fs.existsSync(tpl)) {
+    const r = sh('npm', ['install', '--no-audit', '--no-fund'], { cwd: dir, timeout: 600_000 })
+    if (!r.pass) throw new Error(`npm install failed in ${dir}\n${r.output.slice(-800)}`)
+    fs.mkdirSync(path.dirname(tpl), { recursive: true })
+    spawnSync('cp', ['-cR', path.join(dir, 'node_modules'), tpl])
+  } else if (!fs.existsSync(path.join(dir, 'node_modules'))) {
+    spawnSync('cp', ['-cR', tpl, path.join(dir, 'node_modules')])
+  }
+}
+
+/** Download deps once so no timed test run needs the network. Idempotent via marker files. */
+function prewarm(exercises) {
+  const marks = path.join(cfg.CACHE, 'warm')
+  fs.mkdirSync(marks, { recursive: true })
+  for (const { lang, name } of exercises) {
+    const src = exDir(lang, name)
+    let key = null, argv = null, bin = null
+    if (lang === 'java') { key = 'java-' + sha(fs.readFileSync(path.join(src, 'build.gradle')) + fs.readFileSync(path.join(src, 'gradle/wrapper/gradle-wrapper.properties'))); bin = './gradlew'; argv = ['test', '--no-daemon', '--console=plain'] }
+    else if (lang === 'rust') { key = `rust2-${name}`; bin = 'cargo'; argv = ['fetch'] }
+    else if (lang === 'javascript') key = 'js-' + sha(JSON.stringify(JSON.parse(fs.readFileSync(path.join(src, 'package.json'), 'utf8')).devDependencies || {}))
+    else continue
+    const mark = path.join(marks, key)
+    if (fs.existsSync(mark)) continue
+    say('prewarm', lang, name)
+    const box = shortDir('pw-')
+    fs.cpSync(src, box, { recursive: true, filter: s => !SKIP_DIRS.has(path.basename(s)) })
+    if (lang === 'javascript') setupSandbox(lang, box)
+    else {
+      if (lang === 'rust' && fs.existsSync(path.join(box, '.meta', 'Cargo-example.toml'))) { // also cache the reference's crates
+        const first = sh(bin, argv, { cwd: box, timeout: 900_000 })
+        if (!first.pass) throw new Error(`prewarm rust/${name} failed\n${first.output.slice(-800)}`)
+        fs.copyFileSync(path.join(box, '.meta', 'Cargo-example.toml'), path.join(box, 'Cargo.toml'))
+        fs.rmSync(path.join(box, 'Cargo.lock'), { force: true })
+      }
+      const r = sh(bin, argv, { cwd: box, timeout: 900_000 }) // java: stub tests fail, that is fine, deps are resolved
+      if (!r.pass && lang !== 'java') throw new Error(`prewarm ${lang}/${name} failed\n${r.output.slice(-800)}`)
+      if (lang === 'java' && !/BUILD (SUCCESSFUL|FAILED)|tests completed/.test(r.output)) throw new Error(`prewarm java/${name} failed\n${r.output.slice(-800)}`)
+    }
+    fs.rmSync(box, { recursive: true, force: true })
+    fs.writeFileSync(mark, new Date().toISOString())
+  }
+}
+
+/** The language's own test command, as Aider's benchmark.py runs it (all tests, deps offline). Runs in the sandbox. */
+function runTests(lang, dir, name) {
+  const tampered = restoreTests(lang, dir, name)
   const { test } = solutionAndTestFiles(dir)
-  if (lang === 'python') {
-    const modules = test.map(f => f.replace(/\.py$/, '').replace(/\//g, '.'))
-    const r = spawnSync('python3', ['-m', 'unittest', ...modules, '-v'], { cwd: dir, encoding: 'utf8', timeout: 120_000 })
-    return { pass: r.status === 0, output: `${r.stdout || ''}\n${r.stderr || ''}`.trim() }
+  let r
+  if (lang === 'python') r = sh('python3', ['-m', 'pytest', '-q', '-p', 'no:cacheprovider', ...test], { cwd: dir, timeout: 120_000 })
+  else if (lang === 'rust') r = sh('cargo', ['test', '--offline', '--', '--include-ignored'], { cwd: dir, timeout: 300_000 })
+  else if (lang === 'go') r = sh('go', ['test', './...'], { cwd: dir, timeout: 300_000 })
+  else if (lang === 'javascript') r = sh('npm', ['test'], { cwd: dir, timeout: 300_000 })
+  else if (lang === 'java') r = sh('./gradlew', ['test', '--offline', '--no-daemon', '--console=plain'], { cwd: dir, timeout: 600_000 })
+  else if (lang === 'cpp') {
+    fs.rmSync(path.join(dir, 'build'), { recursive: true, force: true })
+    r = sh('sh', ['-c', 'cmake -S . -B build -G "Unix Makefiles" -DEXERCISM_RUN_ALL_TESTS=1 && cmake --build build -j 4'], { cwd: dir, timeout: 300_000 })
+  } else throw new Error(`no test runner for language: ${lang}`)
+  return { ...r, tampered }
+}
+
+/** Copy the exercise's reference solution (files.example) over the stub (files.solution). */
+function applyReference(lang, dir, name) {
+  const { solution } = solutionAndTestFiles(dir)
+  const meta = JSON.parse(fs.readFileSync(path.join(exDir(lang, name), '.meta', 'config.json'), 'utf8'))
+  const exs = meta.files.example || []
+  const bn = f => path.basename(f)
+  const dest = new Map() // basename match wins over extension match (java: extra example classes)
+  for (const ex of exs) { const to = solution.find(f => bn(f) === bn(ex)); if (to) dest.set(ex, to) }
+  for (const ex of exs) {
+    if (dest.has(ex)) continue
+    const taken = new Set(dest.values())
+    dest.set(ex, solution.find(f => !taken.has(f) && path.extname(f) === path.extname(ex)) || path.join(path.dirname(solution[0]), bn(ex)))
   }
-  if (lang === 'rust') {
-    const r = spawnSync('cargo', ['test', '--offline'], { cwd: dir, encoding: 'utf8', timeout: 300_000 })
-    return { pass: r.status === 0, output: `${r.stdout || ''}\n${r.stderr || ''}`.trim() }
-  }
-  if (lang === 'cpp') {
-    const { solution } = solutionAndTestFiles(dir)
-    const cppSolution = solution.filter(f => f.endsWith('.cpp'))
-    const bin = path.join(os.tmpdir(), `polyglot-cpp-${crypto.randomBytes(6).toString('hex')}`)
-    const compile = spawnSync(
-      'g++',
-      ['-std=c++17', '-I', path.join(dir, 'test'), '-o', bin, ...test, ...cppSolution, path.join(dir, 'test', 'tests-main.cpp')],
-      { cwd: dir, encoding: 'utf8', timeout: 120_000 }
-    )
-    if (compile.status !== 0) return { pass: false, output: `${compile.stdout || ''}\n${compile.stderr || ''}`.trim() }
-    const run = spawnSync(bin, [], { encoding: 'utf8', timeout: 60_000 })
-    fs.rmSync(bin, { force: true })
-    return { pass: run.status === 0, output: `${run.stdout || ''}\n${run.stderr || ''}`.trim() }
-  }
-  throw new Error(`no test runner for language: ${lang}`)
+  for (const [ex, to] of dest) fs.copyFileSync(path.join(exDir(lang, name), ex), path.join(dir, to))
+  const cargoEx = path.join(exDir(lang, name), '.meta', 'Cargo-example.toml') // rust: the reference's dependencies
+  if (lang === 'rust' && fs.existsSync(cargoEx)) fs.copyFileSync(cargoEx, path.join(dir, 'Cargo.toml'))
 }
 
 // ---------------------------------------------------------------- counting proxy
@@ -264,7 +377,7 @@ function cleanEnv(home, strict = true) {
   for (const k of Object.keys(env)) {
     if (/API_KEY|TOKEN|SECRET/.test(k) || (strict && /^(HERMES_|JCODE_|SOVEREIGN_)/.test(k))) delete env[k]
   }
-  return Object.assign(env, { HOME: home })
+  return Object.assign(env, toolEnv(), { HOME: home })
 }
 const shortDir = prefix => fs.mkdtempSync(path.join('/tmp', prefix))
 const proxyUrl = () => `http://${cfg.PROXY}${cfg.PROXY_PATH}`
@@ -408,9 +521,13 @@ function sovereignToolMetrics(jcodeHome, sessionId) {
 }
 
 // ---------------------------------------------------------------- run
-function copySandbox(lang, name, dest) {
-  fs.rmSync(dest, { recursive: true, force: true })
-  fs.cpSync(exDir(lang, name), dest, { recursive: true })
+/** Sandbox lives at <parent>/<exercise-name> (cmake names the project after the directory); returns that path. */
+function copySandbox(lang, name, parent) {
+  fs.rmSync(parent, { recursive: true, force: true })
+  const dest = path.join(parent, name)
+  fs.cpSync(exDir(lang, name), dest, { recursive: true, filter: src => !SKIP_DIRS.has(path.basename(src)) && path.basename(src) !== 'Cargo.lock' })
+  setupSandbox(lang, dest)
+  return dest
 }
 
 function loadDone(metaPath) {
@@ -424,17 +541,19 @@ function loadDone(metaPath) {
   return done
 }
 
+const selected = (lang, name, only, langFilter) => (!langFilter || langFilter === lang) && (!only || only.includes(name) || only.includes(lang))
 const ARMS = ['hermes', 'sovereign', 'prime']
 const sum = xs => xs.reduce((s, x) => s + (x || 0), 0)
 const addNullable = (a, b) => (a === null || b === null || a === undefined || b === undefined ? null : a + b)
 
-async function runArm(arm, only) {
+async function runArm(arm, only, langFilter) {
   const outDir = path.join(cfg.OUT, 'results', arm)
   fs.mkdirSync(outDir, { recursive: true })
   const metaPath = path.join(outDir, 'meta.jsonl')
   const done = loadDone(metaPath)
   const homeDir = path.join(cfg.OUT, 'homes', arm) // persistent for the whole arm, across resumes too
   fs.mkdirSync(homeDir, { recursive: true })
+  prewarm(EXERCISES.filter(e => selected(e.lang, e.name, only, langFilter)))
   const proxy = startProxy(cfg.OUT)
   await sleep(800)
 
@@ -454,22 +573,22 @@ async function runArm(arm, only) {
 
   try {
     for (const { lang, name } of EXERCISES) {
-      if (only && !only.includes(name) && !only.includes(lang)) continue
+      if (!selected(lang, name, only, langFilter)) continue
       const run_id = `${lang}-${name}`
       if (done.has(run_id)) continue
-      const sandbox = path.join(cfg.OUT, 'runs', arm, run_id)
-      copySandbox(lang, name, sandbox)
+      const parent = path.join(cfg.OUT, 'runs', arm, run_id)
+      const sandbox = copySandbox(lang, name, parent)
       const tag = `${arm}|${run_id}`
       await tagProxy(tag)
       say(arm, run_id, 'turn 1...')
 
       const turns = [await turnFn(sandbox, buildPrompt(sandbox, null), run_id)]
-      const test1 = runTests(lang, sandbox)
+      const test1 = runTests(lang, sandbox, name)
       let test = test1
       if (!test1.pass) {
         say(arm, run_id, 'turn 2 (retry with test output)...')
         turns.push(await turnFn(sandbox, buildPrompt(sandbox, test1.output), `${run_id}-retry`))
-        test = runTests(lang, sandbox)
+        test = runTests(lang, sandbox, name)
       }
 
       const samples = turns.flatMap(t => t.samples)
@@ -477,7 +596,7 @@ async function runArm(arm, only) {
       const toolSum = k => turns.reduce((s, t) => addNullable(s, t[k] ?? null), 0)
       const rec = {
         run_id, lang, name, arm, retries: turns.length - 1,
-        pass1: test1.pass, pass: test.pass, agent_ok: turns.every(t => t.ok),
+        pass1: test1.pass, pass: test.pass, tests_tampered: [...new Set([...test1.tampered, ...(test.tampered || [])])], agent_ok: turns.every(t => t.ok),
         ...pm,
         tool_calls: arm === 'hermes' ? null : toolSum('tool_calls'),
         tool_errors: arm === 'hermes' ? null : toolSum('tool_errors'),
@@ -487,7 +606,7 @@ async function runArm(arm, only) {
       }
       fs.appendFileSync(metaPath, JSON.stringify(rec) + '\n')
       say(arm, run_id, `pass@1=${rec.pass1} pass@2=${rec.pass} calls=${pm.model_calls} ${rec.wall_ms}ms rss=${rec.rss_peak_mib}/${rec.rss_mean_mib}MiB`)
-      fs.rmSync(sandbox, { recursive: true, force: true })
+      fs.rmSync(parent, { recursive: true, force: true })
     }
   } finally {
     proxy.proc.kill('SIGTERM')
@@ -534,6 +653,30 @@ function report() {
   }
 }
 
+// ---------------------------------------------------------------- verify (no model): stub fails, reference passes
+function verify(only, langFilter) {
+  const list = EXERCISES.filter(e => selected(e.lang, e.name, only, langFilter))
+  prewarm(list)
+  fs.mkdirSync(cfg.OUT, { recursive: true })
+  let bad = 0
+  for (const { lang, name } of list) {
+    const parent = path.join(cfg.OUT, 'verify', `${lang}-${name}`)
+    const box = copySandbox(lang, name, parent)
+    const stub = runTests(lang, box, name)
+    applyReference(lang, box, name)
+    const ref = runTests(lang, box, name)
+    const ok = ref.pass // stub already passing = refactoring exercise (go counter/ledger/markdown, java ledger/tree-building, js ledger): kept, flagged
+    if (!ok) bad++
+    const rec = { lang, name, stub_fails: !stub.pass, reference_passes: ref.pass, ok }
+    fs.appendFileSync(path.join(cfg.OUT, 'verify.jsonl'), JSON.stringify(rec) + '\n')
+    say(ok ? (stub.pass ? 'OK*' : 'OK ') : 'BAD', `${lang}/${name}`, `stub_fails=${!stub.pass} reference_passes=${ref.pass}`)
+    if (!ok) say((ref.pass ? stub.output : ref.output).slice(-1200))
+    else fs.rmSync(parent, { recursive: true, force: true })
+  }
+  say(`verify: ${list.length - bad}/${list.length} ok`)
+  if (bad) process.exitCode = 1
+}
+
 // ---------------------------------------------------------------- main
 function resolvedConfig() {
   return {
@@ -544,7 +687,7 @@ function resolvedConfig() {
     hermes_source: cfg.HERMES_STOCK_SRC || 'fork (HERMES_STOCK_SRC unset)',
     prime_cli_present: fs.existsSync(cfg.PRIME_CLI),
     toolchains: Object.fromEntries(
-      ['python3', 'cargo', 'g++', 'clang++', 'cmake', 'go', 'java'].map(t => [t, spawnSync(t, [t === 'java' ? '-version' : t === 'go' ? 'version' : '--version'], { stdio: 'ignore' }).status === 0])
+      ['python3', 'cargo', 'g++', 'clang++', 'cmake', 'go', 'java', 'node', 'npm'].map(t => [t, spawnSync(t, [t === 'java' ? '-version' : t === 'go' ? 'version' : '--version'], { stdio: 'ignore', env: { ...process.env, ...toolEnv() } }).status === 0])
     ),
   }
 }
@@ -554,21 +697,28 @@ async function main() {
     console.log(JSON.stringify(resolvedConfig(), null, 2))
     return
   }
+  const langFilter = flag('lang', null)
+  const only = flag('only', null)?.split(',') || null
+  if (langFilter && !selection.languages.includes(langFilter)) throw new Error(`--lang must be one of ${selection.languages}`)
+  if (['run', 'verify', 'prewarm'].includes(cmd) && !EXERCISES.some(e => selected(e.lang, e.name, only, langFilter))) throw new Error('--lang/--only matched no exercise')
+  if (cmd === 'prewarm') {
+    prewarm(EXERCISES.filter(e => selected(e.lang, e.name, only, langFilter)))
+    return
+  }
+  if (cmd === 'verify') return verify(only, langFilter)
   if (cmd === 'run') {
     const arm = flag('arm', null)
-    if (!ARMS.includes(arm)) throw new Error(`usage: polyglot.mjs run --arm ${ARMS.join('|')} [--only name1,lang,...]`)
-    const only = flag('only', null)?.split(',') || null
-    if (only && !EXERCISES.some(e => only.includes(e.name) || only.includes(e.lang))) throw new Error(`--only matched no exercise: ${only}`)
+    if (!ARMS.includes(arm)) throw new Error(`usage: polyglot.mjs run --arm ${ARMS.join('|')} [--lang l] [--only name1,...]`)
     fs.mkdirSync(cfg.OUT, { recursive: true })
     fs.writeFileSync(path.join(cfg.OUT, 'config.json'), JSON.stringify({ ...resolvedConfig(), started: new Date().toISOString() }, null, 2))
-    await runArm(arm, only)
+    await runArm(arm, only, langFilter)
     return
   }
   if (cmd === 'report') {
     report()
     return
   }
-  console.log(`usage: polyglot.mjs [--dry-run] | run --arm <${ARMS.join('|')}> [--only a,b] | report`)
+  console.log(`usage: polyglot.mjs [--dry-run] | prewarm | verify | run --arm <${ARMS.join('|')}> [--lang l] [--only a,b] [--set 40|full] | report`)
   process.exitCode = 2
 }
 
