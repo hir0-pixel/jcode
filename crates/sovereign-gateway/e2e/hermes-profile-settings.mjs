@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Proves --profile settings selected by the Hermes desktop configure Rust chat.
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'

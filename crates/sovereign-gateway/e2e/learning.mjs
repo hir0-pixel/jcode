@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check of the Prime learning loop (checkpoint gate, turn interval 1): after
 // a turn the gate is asked once; when it approves, /refine CRUD stores the lesson
 // (a memory lives once in jcode's memory store), the desktop is told, and a

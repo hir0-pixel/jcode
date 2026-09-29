@@ -140,7 +140,8 @@ impl SkillTool {
         let name = normalize_skill_name(name, "load")?;
 
         let registry = self.effective_registry(working_dir).await;
-        let skill = registry.get(&name).ok_or_else(|| {
+        // A skill switched off in Settings is not offered to the model.
+        let skill = registry.get(&name).filter(|s| s.enabled).ok_or_else(|| {
             // Endorsed skills are advertised in `list` but are not bundled;
             // a bare "not found" here reads like a bug (issue #445). Point at
             // the actual install command instead.
@@ -188,6 +189,7 @@ impl SkillTool {
 
         let installed: std::collections::HashSet<&str> =
             skills.iter().map(|s| s.name.as_str()).collect();
+        skills.retain(|s| s.enabled);
 
         let mut output = if skills.is_empty() {
             "No skills loaded.\n\n\
@@ -663,6 +665,19 @@ mod tests {
 
         let result = tool.execute(input, ctx).await.unwrap();
         assert!(result.output.contains("## Skill: optimization"));
+    }
+
+    #[tokio::test]
+    async fn disabled_skill_is_not_listed_or_loadable() {
+        let (_, temp_dir) = create_test_tool_with_skill("optimization");
+        std::fs::write(temp_dir.path().join(".jcode/skills/optimization/.disabled"), "").unwrap();
+        let registry = SkillRegistry::load_for_working_dir(Some(temp_dir.path())).unwrap();
+        let tool = SkillTool::new(Arc::new(RwLock::new(registry)));
+
+        let listed = tool.execute(json!({"action": "list"}), create_test_context()).await.unwrap();
+        assert!(!listed.output.contains("## /optimization"));
+        let loaded = tool.execute(json!({"action": "load", "name": "optimization"}), create_test_context()).await;
+        assert!(loaded.is_err());
     }
 
     #[tokio::test]

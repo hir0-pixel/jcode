@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Prime-learning "trap" check: a repo whose real test convention can only be
 // discovered by failing first (`npm test` is a broken stub that names the
 // real command, `./scripts/check.sh --fast`). Session A hits the trap and

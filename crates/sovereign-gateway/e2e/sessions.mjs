@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check that every chat-bound session method is answered by the engine
 // (never forwarded to Hermes's Python backend) and really changes the
 // engine's store. Needs Ollama with the model below.

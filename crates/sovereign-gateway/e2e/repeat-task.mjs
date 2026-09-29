@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check that the Prime learning loop helps a REPEATED task: session A
 // does a small multi-step project-scaffolding task cold, waits for a learning
 // pass to run, then session B is given the same kind of task in a fresh

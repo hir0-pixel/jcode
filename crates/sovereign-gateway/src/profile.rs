@@ -64,9 +64,55 @@ pub fn parse_config(raw: &str) -> (Option<String>, Option<String>, Option<String
     (provider, model_name, effort)
 }
 
+/// The `GET /api/mcp/servers` body from `mcp_servers` in a Hermes config.yaml, the
+/// same map the engine's MCP client loads. Env values are never echoed.
+pub fn mcp_servers_body(raw: &str) -> serde_json::Value {
+    let config = serde_yaml::from_str::<Value>(raw).unwrap_or(Value::Null);
+    let mut rows: Vec<_> = config["mcp_servers"]
+        .as_mapping()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, cfg)| Some((name.as_str()?.to_owned(), cfg)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let servers: Vec<_> = rows
+        .into_iter()
+        .map(|(name, cfg)| {
+            let (url, command) = (cfg["url"].as_str(), cfg["command"].as_str());
+            let env: serde_json::Map<_, _> = cfg["env"]
+                .as_mapping()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, _)| Some((k.as_str()?.to_owned(), "***".into())))
+                .collect();
+            serde_json::json!({
+                "name": name,
+                "transport": if url.is_some() { "http" } else if command.is_some() { "stdio" } else { "unknown" },
+                "url": url, "command": command,
+                "args": cfg["args"].as_sequence().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
+                "env": env, "auth": cfg["auth"].as_str(),
+                "enabled": !matches!(cfg["enabled"].as_bool(), Some(false)),
+                "tools": cfg["tools"].as_sequence().map(|t| t.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+                "source": "config", "plugin": null,
+            })
+        })
+        .collect();
+    serde_json::json!({ "servers": servers })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_config;
+    use super::{mcp_servers_body, parse_config};
+
+    #[test]
+    fn mcp_list_mirrors_config_yaml_without_env_values() {
+        let body = mcp_servers_body("mcp_servers:\n  b:\n    url: http://x/mcp\n    enabled: false\n  a:\n    command: /bin/a\n    args: [--x]\n    env: {K: secret}\n");
+        assert_eq!(body["servers"][0]["name"], "a");
+        assert_eq!(body["servers"][0]["transport"], "stdio");
+        assert_eq!(body["servers"][0]["env"]["K"], "***");
+        assert_eq!(body["servers"][1]["enabled"], false);
+        assert_eq!(mcp_servers_body("")["servers"], serde_json::json!([]));
+    }
 
     #[test]
     fn reads_hermes_main_model_and_effort_shapes() {

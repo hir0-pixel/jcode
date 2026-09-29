@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check of the M10a Continual Harness /refine engine: /refine creates an
 // evidence-backed entry with a rationale, /refine rollback restores the prior
 // state, a local entry never leaks into another session while a --global one

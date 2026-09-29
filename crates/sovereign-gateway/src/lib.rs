@@ -1032,8 +1032,17 @@ async fn handle(
         ("GET", "/api/skills/hub/official" | "/api/skills/hub/sources") => {
             respond(&mut stream, "200 OK", &json!([])).await
         }
-        ("GET", "/api/mcp/servers" | "/api/mcp/catalog") if bundled_startup_request(&req) => {
-            respond(&mut stream, "200 OK", &json!([])).await
+        // Boot probes never wake Python: list what the engine's MCP client loads
+        // (HERMES_HOME/config.yaml); the approved-server catalog needs Python.
+        ("GET", "/api/mcp/servers") if bundled_startup_request(&req) => {
+            let raw = profile::current()
+                .home
+                .and_then(|h| std::fs::read_to_string(h.join("config.yaml")).ok())
+                .unwrap_or_default();
+            respond(&mut stream, "200 OK", &profile::mcp_servers_body(&raw)).await
+        }
+        ("GET", "/api/mcp/catalog") if bundled_startup_request(&req) => {
+            respond(&mut stream, "200 OK", &json!({"entries": [], "diagnostics": []})).await
         }
         ("GET", "/api/plugins") if bundled_startup_request(&req) => {
             respond(&mut stream, "200 OK", &json!({"plugins": []})).await

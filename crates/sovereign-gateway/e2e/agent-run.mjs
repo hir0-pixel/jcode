@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check of #M4 `/api/agent/run`: a headless prompt runs to completion and
 // returns text, its session never shows up in session.list, and a shell
 // command needing approval is denied outright — no approval frame reaches a

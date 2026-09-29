@@ -623,11 +623,14 @@ impl McpConfig {
         Self::import_from_codex_once();
 
         let mut merged = Self::default();
-        let claude_mcp_enabled = std::env::var_os("JCODE_DISABLE_CLAUDE_MCP").is_none();
+        // On the desktop Hermes owns MCP settings: HERMES_HOME/config.yaml is the
+        // only source, so every server the engine calls is one Settings can edit.
+        // Outside that integration, standalone users keep jcode/Claude Code files.
+        let hermes_owned = std::env::var_os("HERMES_HOME").is_some();
+        let claude_mcp_enabled =
+            !hermes_owned && std::env::var_os("JCODE_DISABLE_CLAUDE_MCP").is_none();
 
-        // On the desktop Hermes owns MCP settings. Outside that integration,
-        // standalone engine users keep using ~/.jcode/mcp.json.
-        if std::env::var_os("HERMES_HOME").is_none() {
+        if !hermes_owned {
             if let Ok(jcode_dir) = crate::storage::jcode_dir() {
                 let jcode_mcp = jcode_dir.join("mcp.json");
                 if jcode_mcp.exists() {
@@ -676,7 +679,7 @@ impl McpConfig {
         }
 
         // Project-local config files, resolved against the project directory.
-        if let Some(project_root) = project_dir {
+        if let Some(project_root) = project_dir.filter(|_| !hermes_owned) {
             Self::merge_servers_preferring_runnable(
                 &mut merged.servers,
                 Self::load_project_locals(project_root).servers,

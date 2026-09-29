@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live check of M10b agent loop: /goal budget stop, /autonomous quality gate,
 // one heartbeat fire, and subagent list/interrupt. Needs Ollama.
 //

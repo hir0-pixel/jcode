@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Prove Hermes hub install/removal is reflected by an already-running engine.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'

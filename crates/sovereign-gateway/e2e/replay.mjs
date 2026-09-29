@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Replay a completed local-model turn and verify its trace is complete and linked.
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'

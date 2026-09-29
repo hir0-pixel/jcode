@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Proves a server added through Hermes's local dashboard API becomes callable
 // from a new Rust-engine chat. Requires Hermes's checkout/.venv and local Ollama.
 import { spawn } from 'node:child_process'

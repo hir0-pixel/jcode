@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.JCODE_RUNTIME_DIR ||= (await import('node:fs')).mkdtempSync('/tmp/sj-') // short private dir: never collide with a running engine
 // Live, local accounting check. Each upstream model response must have one
 // ledger span with the same model and token usage. Requires local Ollama.
 import { spawn } from 'node:child_process'

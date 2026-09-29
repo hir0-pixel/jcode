@@ -40,7 +40,16 @@ fn hermes_mcp_settings_are_loaded_for_engine_chats() {
     )
     .expect("write Hermes config");
 
+    let project = tempfile::tempdir().expect("project");
+    std::fs::write(
+        project.path().join(".mcp.json"),
+        r#"{"mcpServers":{"project-only":{"command":"/tmp/project-mcp"}}}"#,
+    )
+    .expect("write project config");
+
     let result = std::panic::catch_unwind(|| {
+        // Settings cannot edit project files, so under Hermes they are not loaded.
+        assert!(!McpConfig::load_for_dir(Some(project.path())).servers.contains_key("project-only"));
         let config = McpConfig::load_for_dir(None);
         let server = config
             .servers
