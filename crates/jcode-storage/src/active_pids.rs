@@ -121,6 +121,32 @@ pub fn prune_active_pids_owned_by(pid: u32) -> (usize, usize) {
     (removed, failed)
 }
 
+/// Remove the markers of processes that are no longer running (or that hold no valid PID), with
+/// their streaming/internal companions. Markers outlive their owner (crash, kill), and nothing
+/// else removes them, so startup sweeps them. Returns how many were removed.
+pub fn sweep_dead_active_pids() -> usize {
+    let Some(dir) = active_pids_dir() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let dead: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+                .is_none_or(|pid| !process_is_running(pid))
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    for session_id in &dead {
+        unregister_active_pid(session_id);
+    }
+    dead.iter().filter(|id| !dir.join(id).exists()).count()
+}
+
 /// Mark a session as actively streaming a model response.
 pub fn mark_streaming(session_id: &str) {
     if let Some(dir) = streaming_pids_dir() {
@@ -512,6 +538,30 @@ mod tests {
 
         // Idempotent: nothing left to prune on a second pass.
         assert_eq!(prune_active_pids_owned_by(me), (0, 0));
+
+        jcode_core::env::remove_var("JCODE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_markers_of_dead_processes_and_keeps_live_ones() {
+        let _guard = lock_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        jcode_core::env::set_var("JCODE_HOME", temp.path());
+
+        // A pid that has exited: spawn and reap a child.
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let dead = child.id();
+        child.wait().expect("reap");
+        register_active_pid("session_live", std::process::id());
+        register_active_pid("session_dead", dead);
+        mark_streaming("session_dead");
+        std::fs::write(active_pids_dir().unwrap().join("session_junk"), "not a pid").unwrap();
+
+        assert_eq!(sweep_dead_active_pids(), 2);
+        assert_eq!(active_session_ids(), vec!["session_live".to_string()]);
+        assert!(!streaming_pids_dir().unwrap().join("session_dead").exists());
+        assert_eq!(sweep_dead_active_pids(), 0);
 
         jcode_core::env::remove_var("JCODE_HOME");
     }

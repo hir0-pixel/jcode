@@ -2302,6 +2302,11 @@ impl Server {
             ));
         }
 
+        let swept = crate::storage::sweep_dead_active_pids();
+        if swept > 0 {
+            crate::logging::info(&format!("Swept {swept} active-pid marker(s) of dead processes"));
+        }
+
         // Restrict socket files to owner-only so other local users cannot connect.
         let _ = crate::platform::set_permissions_owner_only(&self.socket_path);
         let _ = crate::platform::set_permissions_owner_only(&self.debug_socket_path);
