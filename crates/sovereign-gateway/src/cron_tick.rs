@@ -32,18 +32,54 @@ fn job_stores(home: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn job_is_fireable(job: &Value) -> bool {
-    // Mirrors cron.jobs "runnable": enabled (default true), not paused/terminal, has next_run_at.
-    if job.get("enabled") == Some(&Value::Bool(false)) {
-        return false;
+/// Python truthiness of a JSON value (`bool(job.get(k))`); a missing key is falsy.
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64() != Some(0.0),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
     }
-    if matches!(job.get("state").and_then(Value::as_str), Some("paused" | "completed" | "error")) {
-        return false;
+}
+
+/// `datetime.fromisoformat` as Hermes reads it: an offset, or none (then the local zone).
+fn parse_when(text: &str) -> Option<DateTime<Utc>> {
+    use chrono::TimeZone as _;
+    DateTime::parse_from_rfc3339(text).map(|d| d.with_timezone(&Utc)).ok().or_else(|| {
+        let naive = chrono::NaiveDateTime::parse_from_str(&text.replace(' ', "T"), "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+        chrono::Local.from_local_datetime(&naive).single().map(|d| d.with_timezone(&Utc))
+    })
+}
+
+/// When Hermes's due scan would next look at `job`, or None when it never fires it. The gate is
+/// `cron.jobs._get_due_jobs_locked`, checked against Hermes itself by the contract test below:
+/// finished (`completed`, or `error` on a one-shot) and disabled jobs are skipped, so is anything
+/// with a pause marker; a recurring job in `error` is still live. A job with no usable `next_run_at`
+/// is one Hermes recovers (recurring, or a one-shot inside its 120 s grace): it is due "at once",
+/// stamped with the epoch so a job Hermes cannot advance backs off like any other stuck job.
+fn job_due(job: &Value, now: DateTime<Utc>) -> Option<SystemTime> {
+    let state = match job.get("state") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => "",
+    };
+    let schedule = job.get("schedule").filter(|s| s.is_object());
+    let kind = schedule.and_then(|s| s.get("kind")).and_then(Value::as_str);
+    let recurring = matches!(kind, Some("cron" | "interval"));
+    if matches!(state, "completed" | "error") && !(state == "error" && recurring) {
+        return None;
     }
-    if job.get("paused_at").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
-        return false;
+    if !job.get("enabled").is_none_or(|e| truthy(Some(e))) || state.trim() == "paused" || truthy(job.get("paused_at")) {
+        return None;
     }
-    job.get("next_run_at").and_then(Value::as_str).is_some()
+    if let Some(due) = job.get("next_run_at").and_then(Value::as_str).and_then(parse_when) {
+        return Some(SystemTime::from(due));
+    }
+    let oneshot_in_grace = kind == Some("once")
+        && !truthy(job.get("last_run_at"))
+        && schedule.and_then(|s| s.get("run_at")).and_then(Value::as_str).and_then(parse_when).is_some_and(|at| (now - at).num_seconds() <= 120);
+    (recurring || oneshot_in_grace).then_some(SystemTime::UNIX_EPOCH)
 }
 
 struct Job {
@@ -53,6 +89,7 @@ struct Job {
 
 /// Every fireable job of the home and its profiles with its `next_run_at`.
 fn fireable(home: &Path) -> Vec<Job> {
+    let now = Utc::now();
     job_stores(home)
         .iter()
         .filter_map(|store| serde_json::from_str::<Value>(&std::fs::read_to_string(store).ok()?).ok())
@@ -61,11 +98,7 @@ fn fireable(home: &Path) -> Vec<Job> {
             Value::Object(map) => map.get("jobs").and_then(Value::as_array).cloned().unwrap_or_default(),
             _ => Vec::new(),
         })
-        .filter(job_is_fireable)
-        .filter_map(|job| {
-            let due = DateTime::parse_from_rfc3339(job["next_run_at"].as_str()?).ok()?;
-            Some(Job { id: job["id"].as_str().unwrap_or_default().to_string(), due: SystemTime::from(due.with_timezone(&Utc)) })
-        })
+        .filter_map(|job| Some(Job { id: job["id"].as_str().unwrap_or_default().to_string(), due: job_due(&job, now)? }))
         .collect()
 }
 
@@ -163,6 +196,91 @@ mod tests {
 
     fn at(iso: &str) -> SystemTime {
         SystemTime::from(DateTime::parse_from_rfc3339(iso).unwrap().with_timezone(&Utc))
+    }
+
+    /// Contract: the jobs the timer treats as live are exactly the ones Hermes's own due scan gate
+    /// lets through, run through Hermes's `cron.jobs` (its loader, per-store profile scoping,
+    /// terminal/pause predicates and next_run recovery) over one fixture with every case.
+    #[test]
+    fn the_timer_agrees_with_hermes_on_which_jobs_are_eligible() {
+        let hermes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../hermes-agent");
+        let python = hermes.join(".venv/bin/python");
+        if !python.exists() {
+            eprintln!("skipped: no Hermes venv at {}", python.display());
+            return;
+        }
+        let iso = |secs: i64| (Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339();
+        let (soon, fresh, stale) = (iso(3600), iso(-30), iso(-3600));
+        let cron = serde_json::json!({ "kind": "cron", "expr": "0 9 * * *" });
+        let every = serde_json::json!({ "kind": "interval", "minutes": 30 });
+        let jobs = |list: Vec<Value>| serde_json::json!({ "jobs": list });
+        let main = jobs(vec![
+            serde_json::json!({ "id": "plain", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "enabled-null", "enabled": null, "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "enabled-zero", "enabled": 0, "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "disabled", "enabled": false, "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "paused-state", "state": "paused", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "paused-padded", "state": " paused ", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "paused-at", "paused_at": "2026-01-01T00:00:00+00:00", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "paused-at-empty", "paused_at": "", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "completed", "state": "completed", "schedule": cron, "next_run_at": soon }),
+            serde_json::json!({ "id": "error-recurring", "state": "error", "schedule": every, "next_run_at": soon }),
+            serde_json::json!({ "id": "error-once", "state": "error", "schedule": { "kind": "once", "run_at": fresh }, "next_run_at": soon }),
+            serde_json::json!({ "id": "missing-next-cron", "schedule": cron }),
+            serde_json::json!({ "id": "missing-next-interval", "schedule": every, "next_run_at": null }),
+            serde_json::json!({ "id": "garbage-next-interval", "schedule": every, "next_run_at": "soon" }),
+            serde_json::json!({ "id": "naive-next", "schedule": every, "next_run_at": "2099-01-01T09:00:00" }),
+            serde_json::json!({ "id": "once-fresh-missing-next", "schedule": { "kind": "once", "run_at": fresh } }),
+            serde_json::json!({ "id": "once-stale-missing-next", "schedule": { "kind": "once", "run_at": stale } }),
+            serde_json::json!({ "id": "once-ran-missing-next", "last_run_at": stale, "schedule": { "kind": "once", "run_at": fresh } }),
+            serde_json::json!({ "id": "once-pending", "schedule": { "kind": "once", "run_at": soon }, "next_run_at": soon }),
+            serde_json::json!({ "id": "no-schedule-missing-next" }),
+        ]);
+        let profile = jobs(vec![
+            serde_json::json!({ "id": "work-plain", "schedule": every, "next_run_at": soon }),
+            serde_json::json!({ "id": "work-disabled", "enabled": false, "schedule": every, "next_run_at": soon }),
+            serde_json::json!({ "id": "work-completed", "state": "completed", "schedule": every, "next_run_at": soon }),
+        ]);
+        let dir = home_with(&main.to_string());
+        let work = dir.join("profiles/work/cron");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("jobs.json"), profile.to_string()).unwrap();
+
+        let script = r#"
+import json, os
+from pathlib import Path
+from cron import jobs as J
+home = Path(os.environ["HERMES_HOME"])
+stores = [home] + sorted(p for p in (home / "profiles").iterdir() if p.is_dir())
+eligible = []
+for store in stores:
+    with J.use_cron_store(store):
+        raw = J.load_jobs()
+        J._normalize_due_scan_records(raw)
+        scan = J._DueScan(raw, J._hermes_now())
+        for job in raw:
+            if J.is_terminal_job(job) and not J._is_recoverable_error_job(job):
+                continue
+            if not job.get("enabled", True) or J._has_pause_marker(job):
+                continue
+            if job.get("next_run_at") or J._recover_missing_next_run(job, scan):
+                eligible.append(job["id"])
+print(json.dumps(sorted(eligible)))
+"#;
+        let out = std::process::Command::new(&python)
+            .current_dir(&hermes)
+            .env("HERMES_HOME", &dir)
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let theirs: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+        let mut ours: Vec<String> = fireable(&dir).into_iter().map(|j| j.id).collect();
+        ours.sort();
+        assert_eq!(ours, theirs);
+        assert!(theirs.contains(&"work-plain".to_string()) && !theirs.contains(&"work-disabled".to_string()), "profiles are covered");
+        assert!(theirs.contains(&"error-recurring".to_string()) && theirs.contains(&"once-fresh-missing-next".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
