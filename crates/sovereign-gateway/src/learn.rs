@@ -171,6 +171,7 @@ pub(crate) async fn pass(
         greply.as_ref().ok().and_then(|d| d.usage), greply.as_ref().err().map(|e| e.to_string()).as_deref(),
     );
     store.set_watermark(session, turns.len())?;
+    let _ = store.learn_reviewed(session, crate::observability::now());
     let review = match greply {
         Ok(done) => parse_gate_review(&done.text),
         Err(_) => GateReview { should_refine: false, instructions: None },

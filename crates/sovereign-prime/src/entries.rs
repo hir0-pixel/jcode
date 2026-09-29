@@ -878,7 +878,7 @@ impl EntryStore {
 
     /// Count one finished assistant turn for `session` and say whether the
     /// auto-refine gate is due (`interval` turns and `cooldown_ms` since the
-    /// last gate call). Due resets the counter and stamps `now`. Persisted, so
+    /// last gate call). Due stays due until `learn_reviewed` resets the counter and stamps the time. Persisted, so
     /// a reconnect or restart keeps counting (Prime's per-session counters).
     pub fn learn_checkpoint(&self, session: &str, interval: usize, cooldown_ms: i64, now: i64) -> Result<Option<usize>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -895,11 +895,18 @@ impl EntryStore {
         if (turns as usize) < interval || now - last < cooldown_ms {
             return Ok(None);
         }
+        // Still due until `learn_reviewed`: a review dropped for a busy turn is retried next turn.
+        Ok(Some(turns as usize))
+    }
+
+    /// The gate actually ran for `session`: restart the turn count and the cooldown.
+    pub fn learn_reviewed(&self, session: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE harness_learn_state SET turns = 0, last_review_ms = ?2 WHERE session = ?1",
             params![session, now],
         )?;
-        Ok(Some(turns as usize))
+        Ok(())
     }
 
     /// `refine.status()`: whether a refinement is scheduled for `session`.
@@ -1048,7 +1055,10 @@ mod tests {
         // A restart keeps the count: the third turn trips the gate, then cooldown holds.
         let store = EntryStore::open(&dir).unwrap();
         assert_eq!(due(&store, 5_002), Some(3));
-        assert_eq!((due(&store, 5_003), due(&store, 5_004), due(&store, 5_005)), (None, None, None));
+        // Not reviewed yet (say the turn was busy): still due, the window is not lost.
+        assert_eq!(due(&store, 5_003), Some(4));
+        store.learn_reviewed("s1", 5_003).unwrap();
+        assert_eq!((due(&store, 5_004), due(&store, 5_005), due(&store, 5_006)), (None, None, None));
         assert_eq!(due(&store, 9_000), Some(4));
         std::fs::remove_dir_all(dir).ok();
     }
