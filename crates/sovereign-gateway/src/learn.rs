@@ -100,7 +100,65 @@ fn compact_tools(rows: &[serde_json::Value]) -> Vec<Turn> {
 /// cheap call that decides whether a `/refine` pass is worth its cost.
 struct GateReview {
     should_refine: bool,
+    rationale: Option<String>,
     instructions: Option<String>,
+}
+
+/// Prime's `autoRefineInstructions`: what the approving gate saw (its rationale and
+/// instructions) is handed to the refine pass, which would otherwise start blind.
+fn approved_instructions(review: &GateReview) -> String {
+    let mut text = String::from(
+        "Automatic refine review approved this checkpoint. Only create/update/delete entries if there is clear \
+         evidence that should help this session or future ones; prefer an empty edits array over speculative or \
+         one-off memories.",
+    );
+    if let Some(r) = &review.rationale {
+        text.push_str(&format!(" Reviewer rationale: {r}"));
+    }
+    if let Some(i) = &review.instructions {
+        text.push_str(&format!("\nReviewer instructions: {i}"));
+    }
+    text
+}
+
+/// The gate already found a lesson in this exact window, so an empty or unparsable proposal is a
+/// miss to correct once, not a result (Prime records nothing either, but its reviewer is a stronger model).
+const APPROVED_RETRY: &str = "\n\nThe reviewer found a durable lesson in this conversation, so your previous reply \
+    (empty or not valid JSON) was wrong. Propose the edit the reviewer described: a `memory` entry for a stated \
+    fact, preference or correction. Reply with the JSON object only.";
+
+/// The refine pass for an approving gate: one call, plus one corrective retry when it comes back
+/// without an applicable edit. `record` sees every model call (reply and start time).
+/// The outer `Err` is a failed model call (transient: the checkpoint must be retried); the inner
+/// result is what applying the proposal came to (final: nothing more to gain from this window).
+async fn refine_approved(
+    complete: &crate::Complete,
+    store: &sovereign_prime::entries::EntryStore,
+    session: &str,
+    fresh: &[Turn],
+    review: &GateReview,
+    learning: &Learning,
+    cwd: Option<String>,
+    record: &mut (dyn FnMut(&anyhow::Result<jcode_provider_core::SimpleCompletion>, i64) + Send),
+) -> anyhow::Result<anyhow::Result<sovereign_prime::refine::RefineOutcome>> {
+    let mut instructions = approved_instructions(review);
+    let mut attempt = 0;
+    loop {
+        let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, Some(&instructions), false);
+        let started = crate::observability::now();
+        let reply = complete(system, user).await;
+        record(&reply, started);
+        let text = reply?.text;
+        match with_sink(Some(learning), cwd.clone(), |sink| {
+            sovereign_prime::refine::apply(store, session, &text, fresh, false, "auto", sink)
+        }) {
+            Err(err) if attempt == 0 && (format!("{err:#}").contains("no durable lesson") || format!("{err:#}").contains("not valid JSON")) => {
+                attempt += 1;
+                instructions.push_str(APPROVED_RETRY);
+            }
+            done => return Ok(done),
+        }
+    }
 }
 
 fn gate_request(turns_since_last_review: usize, fresh: &[Turn]) -> (String, String) {
@@ -121,10 +179,11 @@ fn gate_request(turns_since_last_review: usize, fresh: &[Turn]) -> (String, Stri
 
 fn parse_gate_review(reply: &str) -> GateReview {
     let Some(value) = parse_json_object(reply) else {
-        return GateReview { should_refine: false, instructions: None };
+        return GateReview { should_refine: false, rationale: None, instructions: None };
     };
     GateReview {
         should_refine: value["shouldRefine"].as_bool().unwrap_or(false),
+        rationale: value["rationale"].as_str().map(str::to_string),
         instructions: value["instructions"].as_str().map(str::to_string),
     }
 }
@@ -192,42 +251,57 @@ pub(crate) async fn pass(
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
 
-    // The gate: one cheap call, always asked once the turn-interval and
-    // cooldown allow it (the caller in `rpc.rs` enforces both before calling
-    // `pass` at all). No keyword pre-filter: Prime has none either.
+    let cwd = conn.session_cwd(session).await;
+    let learned = checkpoint(&complete, store, session, raw.len(), turns_since_review, fresh, learning, cwd, &mut |title, reply, started| {
+        conn.observer.record_aux(
+            session, "learning", Some(title), None, None, started,
+            reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
+        );
+    })
+    .await?;
+    Ok(match (learned, refine_summary) {
+        (Some(summary), Some(refined)) => Some(format!("Learned {summary}; refine: {refined}.")),
+        (Some(summary), None) => Some(format!("Learned {summary}.")),
+        (None, refined) => refined.map(|s| format!("Refined: {s}.")),
+    })
+}
+
+/// One auto-refine checkpoint over `fresh` (the messages after the watermark): the gate call,
+/// then, when it approves, the refine pass. The watermark and cooldown only move once the window
+/// has been judged - a failed model call (429, timeout) leaves both so the next checkpoint
+/// re-reviews the same evidence instead of skipping it for good. Returns what was learned.
+async fn checkpoint(
+    complete: &crate::Complete,
+    store: &sovereign_prime::entries::EntryStore,
+    session: &str,
+    raw_len: usize,
+    turns_since_review: usize,
+    fresh: &[Turn],
+    learning: &Learning,
+    cwd: Option<String>,
+    record: &mut (dyn FnMut(&str, &anyhow::Result<jcode_provider_core::SimpleCompletion>, i64) + Send),
+) -> anyhow::Result<Option<String>> {
+    // The gate: one cheap call, always asked once the turn-interval and cooldown allow it (the
+    // caller in `rpc.rs` enforces both). No keyword pre-filter: Prime has none either.
     let (gsystem, guser) = gate_request(turns_since_review, fresh);
-    let gate_started = crate::observability::now();
+    let started = crate::observability::now();
     let greply = complete(gsystem, guser).await;
-    conn.observer.record_aux(
-        session, "learning", Some("Auto-refine gate"), None, None, gate_started,
-        greply.as_ref().ok().and_then(|d| d.usage), greply.as_ref().err().map(|e| e.to_string()).as_deref(),
-    );
-    store.set_watermark(session, raw.len())?;
-    let _ = store.learn_reviewed(session, crate::observability::now());
-    let review = match greply {
-        Ok(done) => parse_gate_review(&done.text),
-        Err(_) => GateReview { should_refine: false, instructions: None },
+    record("Auto-refine gate", &greply, started);
+    let review = parse_gate_review(&greply?.text);
+    let judged = || -> anyhow::Result<()> {
+        store.set_watermark(session, raw_len)?;
+        store.learn_reviewed(session, crate::observability::now())
     };
     if !review.should_refine {
-        return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
+        judged()?;
+        return Ok(None);
     }
-
-    let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, review.instructions.as_deref(), false);
-    let started = crate::observability::now();
-    let reply = complete(system, user).await?;
-    conn.observer.record_aux(
-        session, "learning", Some("Auto-refine"), None, None, started, reply.usage, None,
-    );
-    let cwd = conn.session_cwd(session).await;
-    let outcome = with_sink(Some(learning), cwd, |sink| {
-        sovereign_prime::refine::apply(store, session, &reply.text, fresh, false, "auto", sink)
+    let outcome = refine_approved(complete, store, session, fresh, &review, learning, cwd, &mut |reply, started| {
+        record("Auto-refine", reply, started)
     })
-    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-    let mut parts = vec![outcome.summary];
-    if let Some(summary) = &refine_summary {
-        parts.push(format!("refine: {summary}"));
-    }
-    Ok(Some(format!("Learned {}.", parts.join("; "))))
+    .await?;
+    judged()?;
+    Ok(Some(outcome.map_err(|e| anyhow::anyhow!("{e:#}"))?.summary))
 }
 
 #[cfg(test)]
@@ -290,6 +364,87 @@ mod tests {
         assert!(yes.should_refine && yes.instructions.as_deref() == Some("save the pnpm rule"));
         assert!(!parse_gate_review("not json at all").should_refine);
         assert!(!parse_gate_review("{\"shouldRefine\": false}").should_refine);
+    }
+
+    fn scripted(replies: Vec<&str>) -> (crate::Complete, Arc<std::sync::Mutex<Vec<String>>>) {
+        let replies = Arc::new(std::sync::Mutex::new(replies.into_iter().map(String::from).collect::<std::collections::VecDeque<_>>()));
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = prompts.clone();
+        let complete: crate::Complete = Arc::new(move |_system, user| {
+            seen.lock().unwrap().push(user);
+            let text = replies.lock().unwrap().pop_front().unwrap_or_default();
+            Box::pin(async move {
+                if text == "ERR" {
+                    anyhow::bail!("429 rate limited");
+                }
+                Ok(jcode_provider_core::SimpleCompletion { text, usage: None })
+            })
+        });
+        (complete, prompts)
+    }
+
+    #[tokio::test]
+    async fn an_approved_gate_hands_its_lesson_to_refine_and_a_blank_reply_is_retried_once() {
+        let home = std::env::temp_dir().join(format!("learn-handoff-{}", std::process::id()));
+        let fresh = vec![Turn { role: "user".into(), text: "From now on write quick scripts in Nim. Remember that.".into() }];
+        let review = parse_gate_review(r#"{"shouldRefine": true, "rationale": "stated preference", "instructions": "save: quick scripts in Nim"}"#);
+        let lesson = r#"{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{"action":"create","kind":"memory","title":"Nim","category":"preference","content":"Write quick scripts in Nim"}]}"#;
+        let learning = Learning {
+            turn_interval: 1,
+            cooldown: Duration::ZERO,
+            remember: Arc::new(|_, _, _, _| Ok("mem-1".into())),
+            forget: Arc::new(|_| None),
+        };
+        // First reply: the model says nothing durable; the retry produces the edit.
+        let (complete, prompts) = scripted(vec![r#"{"summary":"none","edits":[]}"#, lesson]);
+        let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
+        let outcome = refine_approved(&complete, &store, "s1", &fresh, &review, &learning, None, &mut |_, _| {}).await.unwrap().unwrap();
+        assert_eq!(outcome.created.len(), 1);
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2, "exactly one retry");
+        assert!(prompts[0].contains("save: quick scripts in Nim") && prompts[0].contains("stated preference"), "gate handoff: {}", prompts[0]);
+        assert!(prompts[0].contains("write quick scripts in Nim") && !prompts[0].contains("previous reply"));
+        assert!(prompts[1].contains("previous reply"), "the retry says why");
+
+        // Two blanks in a row is a genuine miss, surfaced (not looped).
+        let (complete, prompts) = scripted(vec!["{\"edits\":[]}", "{\"edits\":[]}", lesson]);
+        let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
+        let err = refine_approved(&complete, &store, "s1", &fresh, &review, &learning, None, &mut |_, _| {}).await.unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("no durable lesson") && prompts.lock().unwrap().len() == 2);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_gate_call_keeps_the_window_and_cooldown_so_the_next_checkpoint_retries() {
+        let home = std::env::temp_dir().join(format!("learn-retry-{}", std::process::id()));
+        let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
+        let fresh = vec![Turn { role: "user".into(), text: "From now on write quick scripts in Nim.".into() }];
+        let learning = Learning {
+            turn_interval: 1,
+            cooldown: Duration::from_secs(3600),
+            remember: Arc::new(|_, _, _, _| Ok("mem-1".into())),
+            forget: Arc::new(|_| None),
+        };
+        let gate_yes = r#"{"shouldRefine": true, "rationale": "preference", "instructions": "save Nim"}"#;
+        let lesson = r#"{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{"action":"create","kind":"memory","title":"Nim","category":"preference","content":"Write quick scripts in Nim"}]}"#;
+        let (complete, _) = scripted(vec!["ERR", gate_yes, "ERR", lesson]);
+        let run = |complete: &crate::Complete| {
+            let (complete, store, fresh, learning) = (complete.clone(), &store, &fresh, &learning);
+            async move { checkpoint(&complete, store, "s1", 7, 1, fresh, learning, None, &mut |_, _, _| {}).await }
+        };
+        // Gate 429: nothing is judged, the checkpoint is still due (cooldown untouched).
+        assert!(run(&complete).await.is_err());
+        assert_eq!(store.watermark("s1"), 0);
+        assert!(store.learn_checkpoint("s1", 1, 3_600_000, crate::observability::now()).unwrap().is_some());
+        // Gate approves but the refine call 429s: still not judged.
+        assert!(run(&complete).await.is_err());
+        assert_eq!(store.watermark("s1"), 0);
+        // Next checkpoint succeeds end to end and only now closes the window and starts the cooldown.
+        let (complete, _) = scripted(vec![gate_yes, lesson]);
+        assert!(run(&complete).await.unwrap().is_some());
+        assert_eq!(store.watermark("s1"), 7);
+        assert!(store.learn_checkpoint("s1", 1, 3_600_000, crate::observability::now()).unwrap().is_none());
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
