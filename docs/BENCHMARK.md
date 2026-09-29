@@ -69,6 +69,88 @@ Root cause: Ollama’s OpenAI-compat `/v1/chat/completions` **ignores** per-requ
 
 Source: packaged chat journal token_usage on the first model call (`apps/desktop/release/sovereign-chat/` runs). Tool schemas are ~95% of that prefix. Lazy tool-loading (MEMORY_DESIGN M5) should cut this line item.
 
+## Tool schema budget (2026-09-29)
+
+Tool schemas were ~95% of every call's prompt (26 tools, 7,896 estimated tokens by the
+counting proxy, 9.1k first-turn prompt). Owner rule: token optimization comes from jcode plus
+Prime, so the design follows what both do.
+
+### Research
+
+- **Prime** keeps the surface at one tool. `packages/coding-agent/src/core/tools/index.ts`
+  registers only `ipython` (`code: string`, about 150 tokens). Shell is `bash()` inside the REPL,
+  skills are Python modules pre-imported into the kernel and discoverable with `help()`, and
+  sub-LLM calls are `llm_query()`. Capabilities are code, not schemas. Akira already ships the
+  same idea as the `repl` tool (122 tokens); the other 25 tools are what made the prefix large.
+- **Upstream jcode** has deferral only for MCP tools: `ToolDefinition::defer_loading`, Anthropic
+  `tool_reference` blocks, `mcp_search`/`mcp_call` in `agent/turn_execution.rs`, and a
+  `locked_tools` snapshot so the list stays cache-stable. There is no deferral for built-in
+  tools, and the native `tool_reference` path is Anthropic-only
+  (`Provider::supports_deferred_tools`). Akira had the `locked_tools` machinery already.
+- Tool descriptions were already terse (the repo caps them at 20 tokens, parameters at 25), so
+  trimming wording would not move the total; deferral does.
+
+### Measured per-tool schema (estimated tokens, name + description + schema)
+
+todo 1209, session_search 757, bg 668, agentgrep 437, replace 325, browser 317, batch 312,
+session_goal 302, bash 302, edit 298, refine 271, memory 237, delegate 220, skill_manage 214,
+websearch 195, heartbeat 176, conversation_search 172, read 156, open 150, agent_message 148,
+webfetch 138, invalid 131, ls 123, repl 122, write 120, apply_patch 118. Total 7,618 (the proxy
+meter reads 7,896 because it counts the OpenAI wrapper). The three largest tools are
+about 32% of it and are used in few coding tasks. Tool names were not persisted in earlier
+benchmark runs (only counts), so "used in most tasks" is judged by function and by the
+runs below: all of them completed using only bash, read, edit/apply_patch and agentgrep;
+`load_tools` was never needed in any of them.
+
+### Design
+
+Core tools stay inline: `read`, `write`, `edit`, `apply_patch`, `bash`, `agentgrep`, `ls`,
+`repl`, plus `load_tools`. The other 18 tools are deferred. `load_tools` takes `names: [...]`;
+its `names` parameter description lists each deferred tool with a one-line purpose
+(`tool/deferred.rs`), so the model knows what exists without paying for schemas.
+
+- **Monotonic and cache-friendly.** The loaded set is read off the session transcript
+  (`load_tools` calls plus direct calls to a deferred tool), so it only grows, survives resume
+  and compaction, and needs no new persisted state. The `locked_tools` snapshot rebuilds only
+  when that set changes, so the provider prefix breaks at most once per load.
+- **All providers.** No provider-specific code: every provider already receives the tool list
+  built per request by `Agent::tool_definitions()` (openai-compatible, anthropic and the rest
+  through `Provider::complete(..., tools, ...)`). A deferred tool that the model calls without
+  loading still executes (the registry does not gate on exposure) and is then loaded.
+- **Explicit allowlists win.** Sessions with `allowed_tools` or an SDK `enabled` list get
+  exactly their tools and no `load_tools`.
+- Why not Prime's single-tool model: it would move every capability into Python and lose native
+  approvals, diffs and observability per tool. Why not Anthropic-native `defer_loading`: it only
+  covers one provider, and this is provider-independent.
+
+### Result (local Ollama `sovereign/bench-hermes-64k:latest`, release build, proxy meter)
+
+| Metric | Before (26 tools) | After (9 tools + `load_tools`) | Change |
+| --- | ---: | ---: | ---: |
+| Tools per call | 26 | 9 | -17 |
+| Tool-schema tokens per call (proxy est.) | 7,896 | 2,167 | -72.6% |
+| First-turn prompt tokens (`plain`) | 9,083 | 2,996 | -67% |
+| `plain` task, 2 turns, prompt tokens summed | 18,199 | 6,025 | -67% |
+| `edit-code`, 8 calls, prompt tokens summed | 78,297 | 26,394 | -66% |
+| `err_python_env`: calls / prompt tokens / success | 3 / 28,955 / yes | 3 / 10,735 / yes | -63% |
+| `err_ambiguous_edit`: calls / prompt tokens / success | 5 / 48,959 / yes | 4 / 14,937 / yes | -70% |
+| `err_case_search` (3 valid runs each): mean calls / mean prompt tokens / success | 5.0 / 49,207 / 3 of 3 | 5.7 / 20,906 / 3 of 3 | -58% |
+
+`err_case_search` after: one extra first run failed (2 calls, 6,666 prompt tokens); it ran while
+another agent was killing counting proxies, so it is treated as infrastructure noise, and three
+later runs (including the final one on the HEAD build) all passed. Every model call in every
+"after" run carried the same 9 tools: no task needed `load_tools`. Both `plain` and
+`edit-code` turns succeeded (the file was renamed and the docstring added). Costs at the
+dummy price table follow the prompt tokens (for example `err_python_env` $0.00317 to $0.00072).
+Runs shared Ollama with other agents' e2e, so wall time is not comparable and is not reported.
+Raw logs are not committed; the meter is `scripts/sovereign-counting-proxy.mjs`.
+
+Regression guard: `agent_tests/tool_schema_budget.rs` asserts the inline total is at most
+2,200 estimated tokens (2,022 now), that the core tools are inline, that a deferred tool
+becomes callable after `load_tools` and stays loaded across turns, that the list is stable
+when nothing new is loaded, that the set is rebuilt from the transcript, and that explicit
+allowlists are never deferred. Adding an inline tool means raising that budget deliberately.
+
 ## Efficiency vs stock Hermes (full run, 2026-09-24)
 
 Supersedes the earlier single-prompt comparison (one `pong` prompt, once, through Hermes's

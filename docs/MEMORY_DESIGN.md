@@ -369,8 +369,9 @@ if Activity latency becomes noticeable.
 
 **M7 API cost layer** (the shipped app uses a cloud API model; local Ollama is only the free
 test stand-in, so llama.cpp bundling, KV-cache compression and warm-up are out of scope)
-- Lazy tool loading: the ~8k-token tool-schema prefix is billed on every request. Keep tool
-  names and one-line summaries in the prompt; load full schemas on demand.
+- Lazy tool loading (done, see BENCHMARK.md "Tool schema budget"): the ~8k-token tool-schema
+  prefix was billed on every request. Now 9 core tools stay inline (~2k tokens) and the rest load
+  by name through `load_tools`, whose parameter lists each deferred tool with a one-line purpose.
 - Provider prompt caching: keep the prefix byte-identical across turns (CI check) and use
   the provider's cache mechanism (explicit cache breakpoints where required, automatic
   prefix caching otherwise), so repeated prefix tokens bill at the cached rate.
