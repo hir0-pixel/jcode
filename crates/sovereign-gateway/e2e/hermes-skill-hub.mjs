@@ -18,7 +18,7 @@ const jcodeHome = path.join(root, '.jcode')
 for (const dir of [home, hermesHome, jcodeHome]) fs.mkdirSync(dir, { recursive: true })
 const token = crypto.randomBytes(24).toString('hex')
 fs.writeFileSync(path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
+  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
 const env = {
   ...process.env,
   HOME: home,
@@ -92,7 +92,7 @@ try {
   await waitAction(base, actionName('install', identifier))
   assert.ok(fs.existsSync(installedFile), 'hub install writes the shared JCODE_HOME skill')
 
-  const engine = start(engineBin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], home, env)
+  const engine = start(engineBin, ['--provider', 'openai-compatible', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], home, env)
   const enginePort = await ready(engine, 'HERMES_BACKEND_READY')
   let skills = await engineSkills(`http://127.0.0.1:${enginePort}`)
   assert.ok(skills.some(skill => skill.name === name), 'running engine sees installed hub skill')

@@ -17,14 +17,14 @@ const runtimeDir = path.join(os.tmpdir(), `sov-act-${process.pid}-${crypto.rando
 const token = crypto.randomBytes(24).toString('hex')
 fs.mkdirSync(jcodeHome)
 fs.mkdirSync(runtimeDir)
-fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
+fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
 
 let engine
 let ws
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const check = (condition, message) => { if (!condition) throw new Error(message) }
 try {
-  engine = spawn(bin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
+  engine = spawn(bin, ['--provider', 'openai-compatible', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
     cwd: home,
     env: { ...process.env, HOME: home, HERMES_HOME: path.join(home, '.hermes'), JCODE_HOME: jcodeHome, JCODE_RUNTIME_DIR: runtimeDir, HERMES_DASHBOARD_SESSION_TOKEN: token },
     stdio: ['ignore', 'pipe', 'pipe'],

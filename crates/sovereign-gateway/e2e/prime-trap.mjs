@@ -111,7 +111,7 @@ async function withEngine(fn) {
   fs.mkdirSync(jcodeHome, { recursive: true })
   fs.writeFileSync(
     path.join(jcodeHome, 'config.toml'),
-    `[providers.bench]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:18099${PROXY_PATH}"\napi_key = "${API_KEY}"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.bench.models]]\nid = "${MODEL}"\ncontext_window = ${NUM_CTX}\n`
+    `[provider]\ndefault_provider = "bench"\n\n[providers.bench]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:18099${PROXY_PATH}"\napi_key = "${API_KEY}"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.bench.models]]\nid = "${MODEL}"\ncontext_window = ${NUM_CTX}\n`
   )
   const callsFile = path.join(home, 'calls.jsonl')
   const proxy = spawn(process.execPath, [path.join(engineRoot, 'scripts/sovereign-counting-proxy.mjs')], {
@@ -126,7 +126,7 @@ async function withEngine(fn) {
   const token = crypto.randomBytes(24).toString('hex')
   const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
   delete env.SOVEREIGN_LEARNING // let the default (local-idle) switch learning on for a loopback model
-  const engine = spawn(BIN, ['--provider-profile', 'bench', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
+  const engine = spawn(BIN, ['--provider', 'openai-compatible', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
   engine.stderr.on('data', d => { stderr += d })
   try {
@@ -163,7 +163,7 @@ function wsClient(port, token) {
     ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
     return new Promise(resolve => pending.set(id, resolve))
   }
-  const turn = async (sid, text, timeoutMs = 600_000) => {
+  const turn = async (sid, text, timeoutMs = Number(process.env.PRIME_TRAP_TURN_MS || 1_800_000)) => {
     const from = events.length
     await rpc('prompt.submit', { session_id: sid, text })
     const t0 = Date.now()
@@ -198,7 +198,7 @@ async function sessionMetrics(port, token, sid) {
     totals.cached_tokens += r.cache_read_tokens || 0
     const detail = await api(`/api/sovereign/observability/run?id=${encodeURIComponent(r.id)}`)
     for (const s of detail.spans || []) {
-      if (s.kind === 'chat') totals.model_calls += 1
+      if (s.kind === 'chat' || s.kind === 'tool_followup') totals.model_calls += 1
       if (s.kind === 'execute_tool') {
         totals.tool_calls += 1
         const failed = s.status === 'error' || Boolean(s.error)

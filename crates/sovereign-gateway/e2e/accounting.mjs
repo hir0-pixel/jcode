@@ -16,7 +16,7 @@ const jcodeHome = path.join(home, '.jcode')
 const callsFile = path.join(home, 'calls.jsonl')
 const token = crypto.randomBytes(24).toString('hex')
 fs.mkdirSync(jcodeHome)
-fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:18080/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
+fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:18080/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const proxy = spawn(process.execPath, [path.join(root, 'scripts/sovereign-counting-proxy.mjs')], {
   env: { ...process.env, SOVEREIGN_PROXY_LISTEN: '127.0.0.1:18080', SOVEREIGN_PROXY_CALLS: callsFile },
@@ -33,7 +33,7 @@ try {
     await sleep(100)
   }
   if (!proxyError.includes('listening on')) throw new Error(`proxy did not start: ${proxyError}`)
-  engine = spawn(bin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
+  engine = spawn(bin, ['--provider', 'openai-compatible', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
     cwd: home,
     env: { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -94,27 +94,24 @@ try {
   // Engine titles the first turn. Trigger a separate explicit rename as well.
   const renamed = await rpc('session.title', { session_id: session, title: 'Accounting check' })
   if (renamed.error) throw new Error(`title rename failed: ${JSON.stringify(renamed.error)}`)
-  const learnLog = path.join(jcodeHome, 'harness', 'log.jsonl')
   for (let i = 0; i < 310; i++) {
-    if (fs.existsSync(learnLog) && fs.readFileSync(learnLog, 'utf8').includes('"op":"learn"')) break
+    if (fs.existsSync(callsFile) && fs.readFileSync(callsFile, 'utf8').includes('"learning pass"')) break
     await sleep(1000)
   }
+  await sleep(2000)
   const cron = await api('/api/agent/run', { method: 'POST', body: JSON.stringify({ prompt: 'What is 3 plus 4? Reply with only the number.', cwd: home, title: 'Accounting cron', timeout_s: 300 }) })
   if (!cron.ok) throw new Error(`agent.run failed: ${JSON.stringify(cron)}`)
   const calls = fs.readFileSync(callsFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(call => call.status === 200)
   let db
   for (const file of [path.join(jcodeHome, 'sovereign.db'), path.join(jcodeHome, 'observability.sqlite3')].filter(fs.existsSync)) {
     const candidate = new DatabaseSync(file, { readOnly: true })
-    if (candidate.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('obs_spans','spans')").get()) { db = candidate; break }
+    if (candidate.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='spans'").get()) { db = candidate; break }
     candidate.close()
   }
   if (!db) throw new Error('observation database missing')
-  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name))
-  const runs = tables.has('obs_runs') ? 'obs_runs' : 'runs'
-  const spans = tables.has('obs_spans') ? 'obs_spans' : 'spans'
   let rows = []
   for (let i = 0; i < 50; i++) {
-    rows = db.prepare(`SELECT s.*, r.model, r.session_id, r.kind AS run_kind, r.title AS run_title FROM ${spans} s JOIN ${runs} r ON r.id=s.run_id WHERE s.input_tokens>0 OR s.output_tokens>0`).all()
+    rows = db.prepare(`SELECT s.*, r.model, r.session_id, r.kind AS run_kind, r.title AS run_title FROM spans s JOIN fact_turn r ON r.id=s.run_id WHERE s.input_tokens>0 OR s.output_tokens>0`).all()
     if (rows.length >= calls.length) break
     await sleep(100)
   }

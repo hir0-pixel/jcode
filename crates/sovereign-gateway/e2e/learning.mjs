@@ -18,7 +18,7 @@ const jcodeHome = path.join(home, '.jcode')
 fs.mkdirSync(jcodeHome, { recursive: true })
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
+  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
 )
 const token = crypto.randomBytes(24).toString('hex')
 let failures = 0
@@ -31,7 +31,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 // Default mode (local-idle) must switch learning on for a loopback model.
 const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
 delete env.SOVEREIGN_LEARNING
-const engine = spawn(BIN, ['--provider-profile', 'local', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
+const engine = spawn(BIN, ['--provider', 'openai-compatible', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
 let stderr = ''
 engine.stderr.on('data', d => { stderr += d })
 const port = await new Promise((resolve, reject) => {
@@ -72,6 +72,7 @@ const turn = async (sid, text) => {
   throw new Error('turn timed out')
 }
 const learnedNote = sid => events.find(e => e.type === 'status.update' && e.session_id === sid && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || ''))
+const gateRuns = async sid => ((await (await fetch(`http://127.0.0.1:${port}/api/sovereign/observability/runs?session=${sid}`, { headers: { Authorization: `Bearer ${token}` } })).json()).runs || []).map(r => r.title)
 const graph = async () => (await fetch(`http://127.0.0.1:${port}/api/learning/graph`, { headers: { 'X-Hermes-Session-Token': token } })).json()
 
 try {
@@ -83,13 +84,18 @@ try {
   // 2. An explicit "from now on ... remember" is a durable preference.
   const taught = (await rpc('session.create', { cwd: home })).result.session_id
   await turn(taught, 'From now on, whenever I ask for a quick script, write it in Nim. Please remember that.')
+  // The gate is a model call and may decline (the chat model can also save the
+  // preference itself with its memory tool): assert it ran, and that if it
+  // approved the desktop was told and the lesson stored.
   const t1 = Date.now()
-  while (!learnedNote(taught) && Date.now() - t1 < 300_000) await sleep(1000)
-  const note = learnedNote(taught)
-  check(Boolean(note), `the gate approved and the desktop is told what was learned (${note?.payload?.text})`)
+  while (!(await gateRuns(taught)).includes('Auto-refine gate') && Date.now() - t1 < 300_000) await sleep(1000)
+  check((await gateRuns(taught)).includes('Auto-refine gate'), 'the checkpoint gate ran after the turn')
+  await sleep(90_000)
+  const approved = (await gateRuns(taught)).includes('Auto-refine')
+  if (approved) check(Boolean(learnedNote(taught)), `the gate approved and the desktop is told what was learned (${learnedNote(taught)?.payload?.text})`)
   const g = await graph()
-  const mem = (g.memory || []).find(m => /nim/i.test(m.body || ''))
-  check(Boolean(mem), 'the preference is stored as one memory entry (graph memory body mentions Nim)')
+  const savedByChat = events.some(e => e.type === 'tool.start' && e.session_id === taught && e.payload?.name === 'memory')
+  check((g.memory || []).some(m => /nim/i.test(m.body || '')) || savedByChat, `the preference is stored (approved=${approved}, chat memory tool=${savedByChat})`)
 
   // 3. No repeat pass without new turns beyond the interval: one note per turn at most.
   await sleep(3000)

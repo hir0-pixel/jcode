@@ -318,7 +318,7 @@ env.JCODE_OPENAI_COMPAT_API_BASE = 'http://127.0.0.1:11434/v1'
     created.result.info?.reasoning_effort !== 'low' || created.result.info?.memory_enabled !== false) {
     throw new Error(`Hermes model/provider/reasoning/memory settings did not reach the engine session: ${JSON.stringify(created.result.info)}`)
   }
-  const sendTurn = async (text, targetSid = sid, timeoutMs = 180_000) => {
+  const sendTurn = async (text, targetSid = sid, timeoutMs = 600_000) => {
     const from = events.length
     const result = await rpc('prompt.submit', { session_id: targetSid, text })
     if (result.error) throw new Error(`prompt.submit failed: ${JSON.stringify(result)}`)

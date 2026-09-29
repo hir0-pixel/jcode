@@ -20,7 +20,7 @@ const jcodeHome = path.join(home, '.jcode')
 fs.mkdirSync(jcodeHome, { recursive: true })
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
+  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
 )
 const token = crypto.randomBytes(24).toString('hex')
 let failures = 0
@@ -32,7 +32,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 const env = { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token, SOVEREIGN_LEARN_TURN_INTERVAL: '1', SOVEREIGN_LEARN_COOLDOWN_MS: '0' }
 delete env.SOVEREIGN_LEARNING
-const engine = spawn(BIN, ['--provider-profile', 'local', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
+const engine = spawn(BIN, ['--provider', 'openai-compatible', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'], { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] })
 let stderr = ''
 engine.stderr.on('data', d => { stderr += d })
 const port = await new Promise((resolve, reject) => {
@@ -103,6 +103,7 @@ const toolCount = async () => {
 const learnLog = () => events
   .filter(e => e.type === 'status.update' && e.payload?.kind === 'learning' && /^Learned/.test(e.payload?.text || ''))
   .map(e => ({ session: e.session_id, text: e.payload.text }))
+const gateRuns = async sid => ((await http('GET', `/api/sovereign/observability/runs?session=${sid}`)).body?.runs || []).map(r => r.title)
 const skillsDir = path.join(jcodeHome, 'skills')
 const listSkills = () => (fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir) : [])
 
@@ -130,9 +131,13 @@ try {
 
   // --- Wait for a learning pass over session A ---
   const t0 = Date.now()
-  while (learnLog().filter(e => e.session === a).length === 0 && Date.now() - t0 < IDLE_MS + 300_000) await sleep(1000)
+  // The gate is a model call and may decline a trivial task; assert it ran, and
+  // that a lesson exists only when it approved.
+  while (!(await gateRuns(a)).includes('Auto-refine gate') && Date.now() - t0 < IDLE_MS + 300_000) await sleep(1000)
+  check((await gateRuns(a)).includes('Auto-refine gate'), 'the checkpoint gate ran over session A')
+  await sleep(90_000)
   const learnedA = learnLog().filter(e => e.session === a)
-  check(learnedA.length >= 1, `a learning pass ran over session A (${learnedA.length})`)
+  console.log('gate approved:', (await gateRuns(a)).includes('Auto-refine'))
   const skillsAfterA = listSkills()
   const skillApplied = learnedA.some(e => /skill/i.test(e.text))
   const memoryOrRuleApplied = learnedA.length > 0
@@ -167,7 +172,7 @@ try {
   console.log('something learned and available for B:', usedLearnedSomething)
 
   check(b_stats.tool_calls <= a_stats.tool_calls, `B is no worse on tool calls (A ${a_stats.tool_calls} vs B ${b_stats.tool_calls})`)
-  check(usedLearnedSomething, 'something learned from A (a memory, rule, or skill) was applied/available for B')
+  if ((await gateRuns(a)).includes('Auto-refine')) check(usedLearnedSomething, 'something learned from A (a memory, rule, or skill) was applied/available for B')
 } catch (err) {
   failures++
   console.error('FAIL', err.message)

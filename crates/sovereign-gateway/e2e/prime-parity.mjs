@@ -14,7 +14,7 @@ fs.writeFileSync(path.join(home, 'prime-input.txt'), 'prime-parity chunk probe')
 fs.mkdirSync(path.join(jcode, 'skills', 'parity_probe', 'src', 'parity_probe'), { recursive: true })
 fs.writeFileSync(path.join(jcode, 'skills', 'parity_probe', 'SKILL.md'), '---\nname: parity-probe\ndescription: e2e test package\n---\n')
 fs.writeFileSync(path.join(jcode, 'skills', 'parity_probe', 'src', 'parity_probe', '__init__.py'), 'def marker():\n    return "prime-parity-import-ok"\n')
-fs.writeFileSync(path.join(jcode, 'config.toml'), `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
+fs.writeFileSync(path.join(jcode, 'config.toml'), `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
 const token = crypto.randomBytes(24).toString('hex')
 const env = { ...process.env, HOME: home, JCODE_HOME: jcode, HERMES_HOME: path.join(home, '.hermes'), SOVEREIGN_HERMES_PYTHON: process.env.SOVEREIGN_HERMES_PYTHON || path.resolve('../hermes-agent/.venv/bin/python'), HERMES_DASHBOARD_SESSION_TOKEN: token }
 delete env.SOVEREIGN_LEARNING
@@ -56,13 +56,14 @@ try {
   const session = (await rpc('session.create', { cwd: home })).result?.session_id
   if (!session) throw new Error('session.create returned no id')
   await rpc('slash.exec', { session_id: session, command: '/heartbeat every 1h keep the session alive' })
-  const runRepl = async code => {
+  const runRepl = async (code, attempts = 3) => {
     const from = events.length
     const submitted = await rpc('prompt.submit', { session_id: session, text: `Use the repl tool once and run this Python code exactly. Do not use any other tool.\n\n\`\`\`python\n${code}\n\`\`\`` })
     if (submitted.error) throw new Error(`prompt.submit failed: ${JSON.stringify(submitted.error)}`)
     const deadline = Date.now() + 180_000
     while (Date.now() < deadline && !events.slice(from).some(e => e.session_id === session && ['message.complete', 'error'].includes(e.type))) await new Promise(resolve => setTimeout(resolve, 200))
     const complete = events.slice(from).find(e => e.session_id === session && e.type === 'tool.complete' && e.payload.name === 'repl')
+    if (!complete && attempts > 1) return runRepl(code, attempts - 1) // a local model sometimes narrates instead of calling the tool
     if (!complete) throw new Error(`model did not complete a REPL call: ${JSON.stringify(events.slice(from).map(e => e.type + ':' + (e.payload?.text || ''))).slice(0, 1200)}`)
     return complete.payload.result_text || ''
   }
@@ -75,7 +76,7 @@ print(json.dumps({"marker":parity_probe.marker(),"value":value,"chunk":chunk,"ll
   console.log('ok CPython imports, package use, load, and llm_query')
   const goalResult = await runRepl(String.raw`import json,goal
 trial=await goal.create("exercise Python goal package",token_budget=50000)
-finished=await goal.complete()
+finished=await goal.complete("ran the probe import above and it printed ok")
 active=await goal.create("keep the long task alive until I reconnect")
 assert trial["goal"]["token_budget"]==50000 and finished["goal"]["status"]=="done"
 print(json.dumps({"goal":active["goal"]["objective"],"remaining":active["remaining_tokens"]}))`)

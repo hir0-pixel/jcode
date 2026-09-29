@@ -13,7 +13,7 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), 'sovereign-replay-e2e-'))
 const jcodeHome = path.join(home, '.jcode')
 const token = crypto.randomBytes(24).toString('hex')
 fs.mkdirSync(jcodeHome)
-fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
+fs.writeFileSync(path.join(jcodeHome, 'config.toml'), `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${model}"\n\n[[providers.local.models]]\nid = "${model}"\ncontext_window = 65536\n`)
 fs.writeFileSync(path.join(jcodeHome, 'observability.json'), JSON.stringify({ capture_content: true }))
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 let engine
@@ -25,7 +25,7 @@ const check = (ok, message) => {
 }
 
 try {
-  engine = spawn(bin, ['--provider-profile', 'local', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
+  engine = spawn(bin, ['--provider', 'openai-compatible', '--model', model, 'serve', '--host', '127.0.0.1', '--port', '0'], {
     cwd: home,
     env: { ...process.env, HOME: home, JCODE_HOME: jcodeHome, HERMES_DASHBOARD_SESSION_TOKEN: token },
     stdio: ['ignore', 'pipe', 'pipe'],

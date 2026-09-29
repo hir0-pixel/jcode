@@ -16,7 +16,7 @@ const jcodeHome = path.join(home, '.jcode')
 fs.mkdirSync(jcodeHome, { recursive: true })
 fs.writeFileSync(
   path.join(jcodeHome, 'config.toml'),
-  `[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
+  `[provider]\ndefault_provider = "local"\n\n[providers.local]\ntype = "openai-compatible"\nbase_url = "http://127.0.0.1:11434/v1"\napi_key = "ollama"\nrequires_api_key = false\ndefault_model = "${MODEL}"\n\n[[providers.local.models]]\nid = "${MODEL}"\ncontext_window = 65536\n`
 )
 const token = crypto.randomBytes(24).toString('hex')
 let failures = 0
@@ -41,7 +41,7 @@ const env = {
 delete env.SOVEREIGN_LEARNING
 const engine = spawn(
   BIN,
-  ['--provider-profile', 'local', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'],
+  ['--provider', 'openai-compatible', '--model', MODEL, 'serve', '--host', '127.0.0.1', '--port', '0'],
   { env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] }
 )
 let stderr = ''
