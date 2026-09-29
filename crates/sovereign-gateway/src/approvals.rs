@@ -574,11 +574,15 @@ pub mod hook {
         let reason = assessment
             .findings
             .first()
-            .map(|f| format!("{f:?}"))
+            .map(|f| f.reason.clone())
             .unwrap_or_else(|| "potentially destructive command".into());
         match ask(&session, &command, &reason) {
             Ok(choice) if matches!(choice.as_str(), "once" | "session" | "always") => 0,
-            Ok(_) => block("The user declined this command. Do not retry it; ask the user how to proceed."),
+            Ok(_) => block(&format!(
+                "Command not approved ({reason}): the user declined it or no one is available to approve it. \
+                 Do not retry it unchanged and do not wait for an answer. Rewrite it to avoid the flagged \
+                 operation (write only inside the working directory or $JCODE_SCRATCH_DIR), or finish without it."
+            )),
             Err(err) => block(&format!("approval unavailable ({err}); the command was not run")),
         }
     }

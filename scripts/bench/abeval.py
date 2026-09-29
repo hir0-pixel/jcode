@@ -1082,7 +1082,8 @@ def do_run(c, arm, reps, only):
                     f"errs={rec['tool_errors']} {rec['wall_s']}s rss_peak={rec['rss_peak_mib']}MiB rss_mean={rec['rss_mean_mib']}MiB",
                     flush=True,
                 )
-                __import__("shutil").rmtree(work, ignore_errors=True)
+                if not os.environ.get("BENCH_KEEP"):  # BENCH_KEEP=1 keeps each run's home/sessions for debugging
+                    __import__("shutil").rmtree(work, ignore_errors=True)
     finally:
         proxy.stop()
     return 0

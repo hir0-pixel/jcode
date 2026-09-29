@@ -688,3 +688,19 @@ fn huge_inline_one_liners_assess_quickly() {
         }
     }
 }
+
+#[test]
+fn scratch_redirect_is_safe_even_when_the_variable_is_not_exported() {
+    // The pre-tool hook process has no JCODE_SCRATCH_DIR; the fallback is <JCODE_HOME>/scratch.
+    unsafe {
+        std::env::remove_var("JCODE_SCRATCH_DIR");
+        std::env::set_var("JCODE_HOME", "/home/u/.jcode");
+    }
+    let ctx = RiskContext::from_env(Some(PathBuf::from("/home/u/proj")));
+    let command = "out=\"$JCODE_SCRATCH_DIR/noisy.out\" && python3 build.py >\"$out\" 2>&1; grep -n '^TOKEN=' \"$out\"";
+    assert!(assess(command, &ctx).level.runs_immediately(), "{:?}", assess(command, &ctx));
+    // Resolved paths are still judged; unknown or reassigned ones still escalate.
+    for bad in ["out=/etc/hosts; echo x >\"$out\"", "out=$UNKNOWN/f; echo x >\"$out\"", "out=a; out=/etc/hosts; echo x >\"$out\""] {
+        assert!(!assess(bad, &ctx).level.runs_immediately(), "{bad}");
+    }
+}

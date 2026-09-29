@@ -135,9 +135,20 @@ impl RiskContext {
         Self {
             working_dir,
             home_dir: dirs_home(),
+            // Same directory the bash tool hands to the shell: $JCODE_SCRATCH_DIR,
+            // else <jcode home>/scratch. Without the fallback a redirect into
+            // "$JCODE_SCRATCH_DIR/..." looks like an unknown path to any caller
+            // (e.g. the pre-tool hook) that doesn't have the variable exported.
             scratch_dir: std::env::var_os("JCODE_SCRATCH_DIR")
                 .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from),
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("JCODE_HOME")
+                        .filter(|value| !value.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| dirs_home().map(|h| h.join(".jcode")))
+                        .map(|dir| dir.join("scratch"))
+                }),
         }
     }
 }
@@ -214,7 +225,9 @@ pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
         });
     }
 
-    for segment in tokenize::split_segments(command) {
+    let mut segments = tokenize::split_segments(command);
+    substitute_assigned_paths(&mut segments, ctx);
+    for segment in segments {
         assess_segment(&segment, ctx, &mut findings);
     }
 
@@ -222,6 +235,39 @@ pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
         return RiskAssessment::safe();
     }
     RiskAssessment::from_findings(findings)
+}
+
+/// Resolve `out=/some/path` followed by `>"$out"`: a variable assigned exactly once in the
+/// command, at the start of a segment, to a fully known path is replaced by that path in later
+/// tokens, so the real target is classified instead of an opaque "$out". Anything not fully
+/// known, or assigned twice, stays unresolved (and so still escalates).
+fn substitute_assigned_paths(segments: &mut [Vec<Token>], ctx: &RiskContext) {
+    let mut known: std::collections::HashMap<String, Option<String>> = Default::default();
+    for token in segments.iter().filter_map(|s| s.first()) {
+        let Some((name, value)) = token.text.split_once('=') else { continue };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let expanded = paths::expand(value, ctx).display().to_string();
+        let resolved = (!expanded.contains(['$', '`', '*', '?']) && expanded.starts_with('/')).then_some(expanded);
+        known
+            .entry(name.to_string())
+            .and_modify(|v| *v = None)
+            .or_insert(resolved);
+    }
+    for token in segments.iter_mut().flatten() {
+        for (name, value) in &known {
+            let Some(value) = value else { continue };
+            for prefix in [format!("${name}"), format!("${{{name}}}")] {
+                if let Some(rest) = token.text.strip_prefix(&prefix)
+                    && (rest.is_empty() || rest.starts_with('/'))
+                {
+                    token.text = format!("{value}{rest}");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFinding>) {
