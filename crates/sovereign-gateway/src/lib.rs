@@ -27,7 +27,7 @@ mod slash_forward;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -496,6 +496,28 @@ async fn harness_requests_with(legacy_socket: &std::path::Path, requests: &[Valu
 /// Whether a forwarded Hermes RPC changes a provider credential (it wrote `$HERMES_HOME/.env`).
 pub(crate) fn changes_credentials(method: &str) -> bool {
     matches!(method, "model.save_key" | "model.disconnect" | "reload.env")
+}
+
+type CredentialStamp = Vec<Option<(std::time::SystemTime, u64)>>;
+static OAUTH_SEEN: std::sync::Mutex<Option<CredentialStamp>> = std::sync::Mutex::new(None);
+
+/// Whether Hermes's OAuth credential files (`auth.json` and the Anthropic PKCE file, for the home and
+/// each profile) differ from the last time this was asked: a device-code login lands in them on a
+/// poll or submit, a logout removes from them. The first ask only records the baseline.
+fn oauth_credentials_moved(seen: &std::sync::Mutex<Option<CredentialStamp>>, hermes_home: &Path) -> bool {
+    let mut roots = vec![hermes_home.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(hermes_home.join("profiles")) {
+        roots.extend(entries.flatten().map(|e| e.path()));
+    }
+    let now: CredentialStamp = roots
+        .iter()
+        .flat_map(|r| [r.join("auth.json"), r.join(".anthropic_oauth.json")])
+        .map(|f| std::fs::metadata(f).ok().map(|m| (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len())))
+        .collect();
+    let mut last = seen.lock().unwrap_or_else(|e| e.into_inner());
+    let moved = last.as_ref().is_some_and(|l| *l != now);
+    *last = Some(now);
+    moved
 }
 
 /// Tell the engine a credential changed, so its providers re-resolve their keys: one that had no
@@ -1203,10 +1225,18 @@ async fn handle(
             }
             let features = config.features.clone().expect("checked");
             let sets_key = matches!(req.method.as_str(), "PUT" | "DELETE") && path == "/api/env";
+            // A provider OAuth login (submit / poll to approval) or logout writes Hermes's auth store, not `.env`.
+            let oauth = path.starts_with("/api/providers/oauth");
+            let hermes_home = std::env::var_os("HERMES_HOME").map(PathBuf::from).filter(|_| oauth);
+            if let Some(home) = &hermes_home {
+                oauth_credentials_moved(&OAUTH_SEEN, home); // first sight: take the baseline
+            }
             let proxied = proxy_http(stream, &req, &features, false).await;
-            if sets_key {
+            let moved = hermes_home.is_some_and(|home| oauth_credentials_moved(&OAUTH_SEEN, &home));
+            if sets_key || moved {
                 let config = config.clone();
-                tokio::spawn(async move { notify_auth_changed(&config, None).await });
+                let provider = path.strip_prefix("/api/providers/oauth/").and_then(|r| r.split('/').next()).filter(|_| moved).map(str::to_string);
+                tokio::spawn(async move { notify_auth_changed(&config, provider.as_deref()).await });
             }
             proxied
         }
@@ -1233,6 +1263,24 @@ mod contract_gate_tests {
 #[cfg(test)]
 mod auth_notice_tests {
     use super::*;
+
+    #[test]
+    fn an_oauth_login_or_logout_moves_the_credential_stamp_and_a_plain_poll_does_not() {
+        let dir = std::env::temp_dir().join(format!("oauth-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("profiles/work")).unwrap();
+        let seen = std::sync::Mutex::new(None);
+        assert!(!oauth_credentials_moved(&seen, &dir), "the first look is only a baseline");
+        assert!(!oauth_credentials_moved(&seen, &dir), "a pending poll writes nothing");
+        std::fs::write(dir.join("auth.json"), "{}").unwrap(); // the device flow was approved
+        assert!(oauth_credentials_moved(&seen, &dir));
+        assert!(!oauth_credentials_moved(&seen, &dir), "reported once");
+        std::fs::write(dir.join("profiles/work/auth.json"), "{\"a\":1}").unwrap(); // a profile's login
+        assert!(oauth_credentials_moved(&seen, &dir));
+        std::fs::remove_file(dir.join("auth.json")).unwrap(); // logout
+        assert!(oauth_credentials_moved(&seen, &dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn only_key_writing_hermes_rpcs_signal_an_auth_change() {
