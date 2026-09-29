@@ -396,6 +396,12 @@ impl Hub {
         if self.headless.lock().await.contains_key(session_id) {
             return self.unattended(session_id, tool, command, reason).await;
         }
+        // A late `once` approval is for this session's next attempt at exactly this command: spend it
+        // here, so a stale grant can't wave through some later unattended run.
+        if self.once_grants.lock().await.remove(&(session_id.to_string(), command.to_string())) {
+            self.audit(session_id, tool, command, "once", "user-later");
+            return "once".into();
+        }
         // "always" is per command, as in Hermes: its permanent allowlist (or, when the config
         // can't take the grant, a sticky in-memory one) — never a blanket allow-everything.
         let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
@@ -409,6 +415,8 @@ impl Hub {
             self.audit(session_id, tool, command, &choice, "session-grant");
             return choice;
         }
+        // Only a window showing this chat can answer for it. Prompting unrelated windows would be
+        // denied after the timeout and never parked, so no window here means unattended (parked).
         let clients: Vec<Arc<Client>> = {
             let all = self.clients.lock().await.clone();
             let mut showing = Vec::new();
@@ -417,7 +425,7 @@ impl Hub {
                     showing.push(client.clone());
                 }
             }
-            if showing.is_empty() { all } else { showing }
+            showing
         };
         if clients.is_empty() {
             return self.unattended(session_id, tool, command, reason).await;
@@ -601,9 +609,22 @@ pub fn init_tickets(addr: String, key: String) {
     let _ = TICKET_KEY.set((addr, key));
 }
 
-fn ticket_mac(key: &str, stamp: &str) -> String {
+/// HMAC-SHA256 (RFC 2104); a bare `SHA256(key:msg)` is length-extendable.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    Sha256::digest(format!("{key}:{stamp}")).iter().map(|b| format!("{b:02x}")).collect()
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| block.map(|k| k ^ b);
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(msg).finalize();
+    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
+}
+
+fn ticket_mac(key: &str, stamp: &str) -> String {
+    hmac_sha256(key.as_bytes(), stamp.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Env for one `pre_tool` hook process: the endpoint and a fresh single-use ticket. Registered with
@@ -643,6 +664,13 @@ mod ticket_tests {
     use super::*;
 
     #[test]
+    fn the_mac_is_hmac_sha256() {
+        // RFC 4231 test case 2.
+        let mac: String = hmac_sha256(b"Jefe", b"what do ya want for nothing?").iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(mac, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    }
+
+    #[test]
     fn a_ticket_is_signed_single_use_and_expires() {
         let key = "process-memory-key";
         let stamp = format!("{}.abc", now_ms());
@@ -673,6 +701,32 @@ mod tests {
     fn request_id(msg: Message) -> String {
         let Message::Text(t) = msg else { panic!() };
         serde_json::from_str::<Value>(&t).unwrap()["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_late_once_approval_is_spent_by_the_resumed_prompt_and_no_window_for_the_chat_parks() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "elsewhere").await;
+        // A window showing a different chat is not asked: the prompt is denied at once and parked.
+        assert_eq!(hub.decide("goal", "bash", "rm -rf build", "r").await, "deny");
+        let Message::Text(frame) = rx.recv().await.unwrap() else { panic!() };
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["params"]["unattended"], true);
+        // The user's late `once` covers the resumed goal's next attempt, once, with no prompt.
+        assert!(hub.answer(frame["id"].as_str().unwrap(), "once").await);
+        for _ in 0..50 {
+            if !hub.once_grants.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_w, mut window) = client(&hub, "goal").await; // the chat is now open in a window
+        assert_eq!(hub.decide("goal", "bash", "rm -rf build", "r").await, "once");
+        assert!(hub.once_grants.lock().await.is_empty(), "consumed");
+        assert!(window.try_recv().is_err(), "no second prompt");
+        // A later unattended attempt gets no leftover grant.
+        hub.mark_headless("goal", "cron").await;
+        assert_eq!(hub.decide("goal", "bash", "rm -rf build", "r").await, "deny");
     }
 
     #[tokio::test]
