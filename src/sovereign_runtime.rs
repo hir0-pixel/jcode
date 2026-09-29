@@ -288,6 +288,19 @@ async fn server_is_running_at(path: &std::path::Path) -> bool {
     server::has_live_listener(path).await || server::is_server_ready(path).await
 }
 
+/// What rows, costs and `/api/model/info` call the provider. OpenAI-compatible profiles
+/// (groq, deepseek, a named profile) all run in the OpenRouter runtime, whose own name is
+/// "openrouter"; the label is the profile the user picked.
+fn served_provider_label(choice: ProviderChoice, runtime_name: &str) -> String {
+    if let Ok(named) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        && !named.trim().is_empty()
+    {
+        return named.trim().to_string();
+    }
+    crate::provider_catalog::resolve_openai_compatible_profile_selection(choice.as_arg_value())
+        .map_or_else(|| runtime_name.to_string(), |profile| profile.id.to_string())
+}
+
 #[allow(deprecated)]
 async fn init_provider_for_serve(
     choice: ProviderChoice,
@@ -504,7 +517,7 @@ pub async fn run_gateway(
             }
         }
     }
-    let (provider_name, provider_model) = (provider.name().to_string(), provider.model());
+    let (provider_name, provider_model) = (served_provider_label(effective_provider, provider.name()), provider.model());
     let refine_provider = provider.clone();
     let complete: sovereign_gateway::Complete =
         std::sync::Arc::new(move |system: String, user: String| {
@@ -846,5 +859,17 @@ fn sovereign_learning() -> sovereign_gateway::learn::Learning {
         cooldown: std::time::Duration::from_millis(cooldown_ms),
         remember,
         forget,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_groq_run_is_labelled_groq_not_openrouter() {
+        let _lock = crate::storage::lock_test_env();
+        assert_eq!(served_provider_label(ProviderChoice::Groq, "openrouter"), "groq");
+        assert_eq!(served_provider_label(ProviderChoice::Ollama, "ollama"), "ollama");
     }
 }
