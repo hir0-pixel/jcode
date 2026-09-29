@@ -32,9 +32,29 @@ pub fn test_env_lock() -> &'static Mutex<()> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn lock_test_env() -> MutexGuard<'static, ()> {
-    test_env_lock()
+    let guard = test_env_lock()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sandbox_test_home();
+    guard
+}
+
+/// Tests that take the env lock but never set `JCODE_HOME` wrote their
+/// sessions into the developer's real `~/.jcode`, where they showed up in the
+/// desktop's session list. The first lock of the process points `JCODE_HOME`
+/// at a process-lifetime temp dir when nothing set one; tests that set their
+/// own still win, and restoring theirs lands back here, never on `~/.jcode`.
+#[cfg(any(test, feature = "test-support"))]
+fn sandbox_test_home() {
+    static SANDBOX: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let home = SANDBOX.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("jcode-test-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    });
+    if std::env::var_os("JCODE_HOME").is_none() {
+        crate::env::set_var("JCODE_HOME", home);
+    }
 }
 
 #[cfg(test)]
