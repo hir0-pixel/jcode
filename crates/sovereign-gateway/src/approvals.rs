@@ -324,7 +324,7 @@ impl Hub {
             "allow_session": true,
             "unattended": true,
         });
-        let mut evicted: Option<(String, String)> = None;
+        let evicted: Option<(String, String)>;
         {
             let mut shown = self.shown.lock().await;
             let parked = shown.values().filter(|(_, p)| p["unattended"] == true);

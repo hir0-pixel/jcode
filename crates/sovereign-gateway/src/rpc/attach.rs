@@ -27,7 +27,7 @@ pub(super) fn handles(method: &str) -> bool {
     )
 }
 
-fn stage_dir(home: &str, session: &str) -> PathBuf {
+pub(crate) fn stage_dir(home: &str, session: &str) -> PathBuf {
     let safe: String = session.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
     Path::new(home).join("attachments").join(safe)
 }

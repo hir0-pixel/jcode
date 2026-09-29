@@ -25,6 +25,7 @@ pub(crate) fn forget_rows(home: &str, id: &str) {
     if let Ok(store) = sovereign_prime::agent_loop::ControlStore::open_cached(home) { let _ = store.forget_session(id); }
     if let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(home) { let _ = store.forget_session(id); }
     let _ = crate::observability::forget_session(home, id);
+    let _ = std::fs::remove_dir_all(crate::rpc::attach::stage_dir(&home.to_string_lossy(), id));
 }
 
 /// Returns `None` when the path is not under `/api/sessions`.

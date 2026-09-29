@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 mod driver;
 pub(crate) use driver::start as start_driver;
-mod attach;
+pub(crate) mod attach;
 mod local_state;
 mod provider_state;
 mod side_agents;

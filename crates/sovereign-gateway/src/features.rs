@@ -316,6 +316,9 @@ mod tests {
 
     #[tokio::test]
     async fn backend_gets_the_engine_jcode_dir_and_a_sigterm_first() {
+        // Other tests set JCODE_HOME under this lock; hold it so the expected dir can't move.
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let expected = jcode_base::storage::jcode_dir().unwrap();
         let dir = std::env::temp_dir().join(format!("features-term-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (env_out, term_out) = (dir.join("home"), dir.join("term"));
@@ -331,7 +334,7 @@ mod tests {
         let f = Features::new(vec![script.to_string_lossy().into_owned()]);
         f.port().await.unwrap();
         f.stop().await;
-        assert_eq!(std::fs::read_to_string(&env_out).unwrap(), jcode_base::storage::jcode_dir().unwrap().to_string_lossy());
+        assert_eq!(std::fs::read_to_string(&env_out).unwrap(), expected.to_string_lossy());
         assert!(term_out.exists(), "stopped with SIGTERM, not straight SIGKILL");
         let _ = std::fs::remove_dir_all(dir);
     }
