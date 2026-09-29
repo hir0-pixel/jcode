@@ -44,7 +44,15 @@ It refuses a bundle missing the engine, the Python runtime or the manifest; move
 write `<userData>/launch-ok.json` with the new manifest `id` (written once the engine answered and matched).
 If that doesn't happen within 120 s (`SOVEREIGN_UPDATE_WAIT`) it quits the new app, restores
 `Hermes.app.previous` and exits 1; the failed bundle is kept at `Hermes.app.failed`. Manual rollback is the
-same swap by hand. On Windows install the new NSIS build over the old one; there is no scripted rollback yet.
+same swap by hand. The rollback also restores `sovereign.db`: the new engine migrates it (and takes
+`sovereign.db.pre-v<N>.bak`) before the app can report healthy, and an older engine refuses a newer file, so the
+script copies the newest `sovereign.db.pre-v*.bak` created after the update started over `<JCODE_HOME>/sovereign.db`
+(default `~/.jcode`, override `SOVEREIGN_UPDATE_DBDIR`) and removes `-wal`/`-shm`. No backup newer than the start
+means no migration ran and the file is left alone. Data written after the update started is lost; nothing else is touched.
+
+Windows has no script. Manual rollback: quit Hermes, reinstall the previous NSIS build over the new one, then in
+`%USERPROFILE%\.jcode` (or `%JCODE_HOME%`) delete `sovereign.db-wal` and `sovereign.db-shm` and copy the newest
+`sovereign.db.pre-v*.bak` made during the failed update over `sovereign.db`. Skip the copy if there is none.
 
 The Hermes source-checkout updater (`hermes update`, `scripts/desktop-update/`) is a different path (dev
 installs that rebuild from git) and is untouched.
