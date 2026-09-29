@@ -215,10 +215,17 @@ pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
             Ok(attached_image(&path, count, json!({ "remainder": rest, "text": text })))
         }
         "image.attach_bytes" => {
-            let bytes = decode(text_of(p, &["content_base64", "data"]), BYTES_MAX, "image")
-                .map_err(|e| if e.0 == 4017 && text_of(p, &["content_base64", "data"]).is_empty() { (4015, "content_base64 required".into()) } else { e })?;
-            let ext = sniff_ext(&bytes, text_of(p, &["filename"]));
-            let ext = if ext.is_empty() { text_of(p, &["ext"]).trim_start_matches('.').to_ascii_lowercase() } else { ext };
+            let b64 = text_of(p, &["content_base64", "data"]);
+            if b64.is_empty() {
+                return fail(4015, "content_base64 required");
+            }
+            let bytes = decode(b64, BYTES_MAX, "image")?;
+            let hint = match (text_of(p, &["filename"]), text_of(p, &["ext"]).trim_start_matches('.')) {
+                ("", "") => String::new(),
+                ("", ext) => format!("x.{ext}"),
+                (name, _) => name.to_string(),
+            };
+            let ext = sniff_ext(&bytes, &hint);
             if !IMAGE_EXTS.contains(&ext.as_str()) {
                 return fail(4016, format!("unsupported image extension: .{ext}"));
             }
@@ -299,8 +306,7 @@ pub(super) fn handle(method: &str, home: &str, cwd: &str, p: &Value) -> Reply {
         }
         "clipboard.paste" => {
             let path = unique(&dir, "clip", "png");
-            write_staged(&path, &[]).ok();
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&dir));
             if !clipboard_png(&path) {
                 return Ok(json!({ "attached": false, "message": "No image found in clipboard" }));
             }
@@ -369,4 +375,86 @@ pub(super) fn staged_images(home: &str, session: &str) -> Vec<(String, String)> 
 
 pub(super) fn clear_staged(home: &str, session: &str) {
     let _ = std::fs::remove_file(stage_dir(home, session).join("pending.json"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jcode_harness_api_server::translate::{BridgeState, Outbound};
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+
+    fn setup(name: &str) -> (String, String) {
+        let home = std::env::temp_dir().join(format!("attach-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        (home.to_string_lossy().into(), home.to_string_lossy().into())
+    }
+
+    fn call(method: &str, home: &str, p: Value) -> Reply {
+        let mut p = p;
+        p["session_id"] = json!("s1");
+        handle(method, home, home, &p)
+    }
+
+    #[test]
+    fn a_staged_image_reaches_the_provider_request_once() {
+        let (home, _) = setup("image");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(PNG);
+        let r = call("image.attach_bytes", &home, json!({ "content_base64": format!("data:image/png;base64,{b64}") })).unwrap();
+        assert_eq!((r["attached"].clone(), r["count"].clone(), r["bytes"].clone()), (json!(true), json!(1), json!(PNG.len())));
+        assert!(r["text"].as_str().unwrap().starts_with("[User attached image: upload_"));
+        assert!(Path::new(r["path"].as_str().unwrap()).is_file());
+
+        let images = staged_images(&home, "s1");
+        assert_eq!(images, vec![("image/png".to_string(), b64.clone())]);
+        // The harness bridge carries them into the legacy `message` jcode turns into an image content part.
+        let mut request = super::super::send_message_request("s1", "look", None, images);
+        request["id"] = json!(2);
+        let mut bridge = BridgeState::default();
+        bridge.session_id = Some("s1".into());
+        let out = bridge.api_request_to_legacy(&request);
+        let Some(Outbound::Legacy(message)) = out.first() else { panic!("no legacy message") };
+        assert_eq!(message["images"], json!([["image/png", b64]]));
+
+        clear_staged(&home, "s1");
+        assert!(staged_images(&home, "s1").is_empty(), "consumed by the submit");
+    }
+
+    #[test]
+    fn image_attach_detach_and_drop_use_hermes_shapes() {
+        let (home, _) = setup("path");
+        let img = Path::new(&home).join("my pic.png");
+        std::fs::write(&img, PNG).unwrap();
+        let r = call("image.attach", &home, json!({ "path": format!("'{}' what is this", img.display()) })).unwrap();
+        assert_eq!((r["remainder"].as_str(), r["text"].as_str(), r["count"].as_i64()), (Some("what is this"), Some("what is this"), Some(1)));
+        assert_eq!(call("image.attach", &home, json!({})).unwrap_err().0, 4015);
+        assert_eq!(call("image.attach", &home, json!({ "path": "/nope.png" })).unwrap_err().0, 4016);
+
+        let d = call("input.detect_drop", &home, json!({ "text": img.to_string_lossy().replace(' ', "\\ ") })).unwrap();
+        assert_eq!((d["matched"].clone(), d["is_image"].clone(), d["count"].clone()), (json!(true), json!(true), json!(2)));
+        assert_eq!(call("input.detect_drop", &home, json!({ "text": "hello there" })).unwrap(), json!({ "matched": false }));
+
+        let gone = call("image.detach", &home, json!({ "path": img.to_string_lossy() })).unwrap();
+        assert_eq!(gone, json!({ "detached": true, "count": 0 }));
+    }
+
+    #[test]
+    fn file_and_pdf_attach_return_refs_and_react_toggles() {
+        let (home, _) = setup("file");
+        let data = format!("data:text/plain;base64,{}", base64::engine::general_purpose::STANDARD.encode("hi"));
+        let r = call("file.attach", &home, json!({ "name": "../notes.txt", "data_url": data })).unwrap();
+        assert_eq!((r["attached"].clone(), r["uploaded"].clone(), r["name"].clone()), (json!(true), json!(true), json!("notes.txt")));
+        assert!(r["ref_text"].as_str().unwrap().starts_with("@file:"));
+        assert_eq!(std::fs::read_to_string(r["path"].as_str().unwrap()).unwrap(), "hi");
+        assert_eq!(call("file.attach", &home, json!({})).unwrap_err().0, 4015);
+        assert_eq!(call("pdf.attach", &home, json!({ "content_base64": base64::engine::general_purpose::STANDARD.encode("nope") })).unwrap_err().0, 4017);
+
+        let react = |emoji: Value| call("message.react", &home, json!({ "row_id": 7, "emoji": emoji })).unwrap();
+        assert_eq!(react(json!("👍"))["reactions"].as_array().unwrap().len(), 1);
+        assert!(react(json!("👍"))["reactions"].as_array().unwrap().is_empty(), "same emoji retracts");
+        assert_eq!(react(json!("🎉"))["row_id"], 7);
+        assert!(react(Value::Null)["reactions"].as_array().unwrap().is_empty());
+        assert_eq!(call("message.react", &home, json!({})).unwrap_err().0, 4023);
+    }
 }

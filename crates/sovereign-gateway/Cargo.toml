@@ -14,6 +14,8 @@ jcode-base = { path = "../jcode-base" }
 jcode-build-meta = { path = "../jcode-build-meta" }
 jcode-app-core = { path = "../jcode-app-core" }
 jcode-command-risk = { path = "../jcode-command-risk" }
+jcode-pdf = { path = "../jcode-pdf" }
+base64 = "0.22"
 jcode-harness-api-server = { path = "../jcode-harness-api-server" }
 sovereign-prime = { path = "../sovereign-prime" }
 rand = "0.8"

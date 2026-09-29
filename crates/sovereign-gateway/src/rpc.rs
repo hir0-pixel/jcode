@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 mod driver;
 pub(crate) use driver::start as start_driver;
+mod attach;
 mod side_agents;
 mod spawn_tree;
 
@@ -182,6 +183,10 @@ pub async fn close(mut ws: Ws, code: u16, reason: &str) -> Result<()> {
     };
     let _ = ws.close(Some(frame)).await;
     Ok(())
+}
+
+fn send_message_request(session_id: &str, text: &str, reminder: Option<&str>, images: Vec<(String, String)>) -> Value {
+    json!({ "req": "send_message", "session_id": session_id, "content": text, "system_reminder": reminder, "images": images })
 }
 
 struct RpcError {
@@ -407,7 +412,7 @@ impl Conn {
     /// Send a message and wait until jcode acknowledges it (or rejects it).
     /// Send a user message. `reminder` rides the turn's uncached system-reminder slot (not the
     /// cached static prefix, not the transcript) and lasts for this turn only.
-    async fn submit(self: &Arc<Self>, session_id: &str, text: &str, reminder: Option<&str>) -> Result<()> {
+    async fn submit(self: &Arc<Self>, session_id: &str, text: &str, reminder: Option<&str>, images: Vec<(String, String)>) -> Result<()> {
         self.ensure_attached(session_id).await?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
         self.accept_waiters
@@ -420,7 +425,7 @@ impl Conn {
         let reply = self
             .send_on(
                 &link,
-                json!({ "req": "send_message", "session_id": session_id, "content": text, "system_reminder": reminder }),
+                send_message_request(session_id, text, reminder, images),
             )
             .await?;
         tokio::select! {
@@ -840,6 +845,15 @@ impl Conn {
         let call = |req: Value| async move { self.call(req).await.map_err(RpcError::internal) };
         match method {
             "ping" | "gateway.ping" => Ok(json!({})),
+            m if attach::handles(m) => {
+                let cwd = match p["session_id"].as_str() {
+                    Some(id) => self.session_cwd(id).await,
+                    None => None,
+                }
+                .unwrap_or_else(|| self.config.default_cwd.clone());
+                attach::handle(m, &self.config.home, &cwd, p)
+                    .map_err(|(code, message)| RpcError { code, message, data: None })
+            }
             "setup.status" => Ok(json!({
                 "provider_configured": true,
                 "ready": true,
@@ -1790,10 +1804,13 @@ impl Conn {
                 if let Some(original) = &self.replay_of {
                     self.observer.link_replay(&run, original);
                 }
-                if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str()).await {
+                // Images staged by `image.attach` ride along on this turn.
+                let images = attach::staged_images(&self.config.home, &id);
+                if let Err(err) = self.submit(&id, &text, p["system_reminder"].as_str(), images).await {
                     self.observer.failed_submit(&id, &run, &err.to_string());
                     return Err(RpcError::internal(err));
                 }
+                attach::clear_staged(&self.config.home, &id);
                 let mut response = json!({ "status": if busy { "queued" } else { "streaming" } });
                 if self.replay_of.is_some() {
                     response["run_id"] = json!(run);

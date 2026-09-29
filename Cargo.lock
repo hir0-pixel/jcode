@@ -5746,6 +5746,7 @@ name = "sovereign-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "httparse",
@@ -5754,6 +5755,7 @@ dependencies = [
  "jcode-build-meta",
  "jcode-command-risk",
  "jcode-harness-api-server",
+ "jcode-pdf",
  "jcode-provider-core",
  "jsonschema",
  "libc",
