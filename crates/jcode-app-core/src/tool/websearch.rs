@@ -240,7 +240,7 @@ impl WebSearchTool {
                     .search_bing_api(query, num_results, options.market, api_key)
                     .await;
             }
-            if let Ok(api_key) = std::env::var(options.api_key_env)
+            if let Some(api_key) = crate::provider_catalog::env_secret(options.api_key_env)
                 && !api_key.trim().is_empty()
             {
                 return self
