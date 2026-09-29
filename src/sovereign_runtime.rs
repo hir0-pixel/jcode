@@ -441,7 +441,15 @@ pub async fn run_gateway(
 ) -> Result<()> {
     let profile_defaults = sovereign_gateway::profile::current();
     let mut effective_provider = *provider_choice;
-    if let Some(provider) = profile_defaults.provider.as_deref() {
+    // An explicit `--provider` (the desktop passes one when it finds local
+    // Ollama) is not overridden by a profile that only says "auto"; that
+    // profile's model belongs to its own provider, so it is not borrowed either.
+    let cli_explicit = !matches!(provider_choice, ProviderChoice::YoloAuto);
+    let profile_provider = profile_defaults
+        .provider
+        .as_deref()
+        .filter(|p| !(cli_explicit && p.eq_ignore_ascii_case("auto")));
+    if let Some(provider) = profile_provider {
         effective_provider = match ProviderChoice::from_str(provider, true) {
             Ok(choice) => choice,
             Err(_) if crate::config::config().providers.contains_key(provider) => {
@@ -465,7 +473,11 @@ pub async fn run_gateway(
         // details and credentials for the selected OpenAI-compatible transport.
         crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", provider);
     }
-    let effective_model = profile_defaults.model.as_deref().or(model);
+    let effective_model = if cli_explicit && profile_provider.is_none() {
+        model
+    } else {
+        profile_defaults.model.as_deref().or(model)
+    };
     let socket =
         crate::storage::runtime_dir().join(format!("sovereign-{}.sock", std::process::id()));
     server::set_socket_path(&socket.to_string_lossy());
@@ -507,7 +519,15 @@ pub async fn run_gateway(
             }
         }
     }
-    let provider = init_provider_for_serve(effective_provider, serve_model.as_deref()).await?;
+    // A provider with no key yet must not stop the gateway: the desktop needs it
+    // up to show key setup, and a saved key hot-initialises via auth-changed.
+    let provider = match init_provider_for_serve(effective_provider, serve_model.as_deref()).await {
+        Ok(provider) => provider,
+        Err(err) => {
+            eprintln!("sovereign: model provider not ready ({err:#}); serving until a key is added");
+            Arc::new(provider::MultiProvider::new_fast())
+        }
+    };
     // Catalog enrichment (GET /api/ps) only runs on fetch_models. Until then
     // Ollama's context_window() hard-falls back to 4096 and every tool-heavy
     // turn emergency-compacts. Refresh now that the model is warm.
