@@ -686,7 +686,7 @@ impl EntryStore {
     pub fn recent_changesets(&self, session: Option<&str>, limit: usize) -> Result<Vec<Changeset>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT * FROM harness_changesets WHERE (?1 IS NULL OR session = ?1) ORDER BY created_at_ms DESC LIMIT ?2",
+            "SELECT * FROM harness_changesets WHERE (?1 IS NULL OR session = ?1) ORDER BY created_at_ms DESC, rowid DESC LIMIT ?2",
         )?;
         Ok(stmt
             .query_map(params![session, limit as i64], Self::row_to_changeset)?
