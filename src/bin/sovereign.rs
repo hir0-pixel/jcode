@@ -39,6 +39,17 @@ fn profile_home(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
     })
 }
 
+/// Standalone (no desktop): cron, key ownership, the unattended policy and messaging all read
+/// `HERMES_HOME`, so export the root every Hermes tool would resolve rather than silently doing nothing.
+fn export_default_hermes_home() {
+    if std::env::var_os("HERMES_HOME").is_none()
+        && let Some(root) = hermes_root()
+    {
+        // SAFETY: called before the Tokio runtime or any child processes start.
+        unsafe { std::env::set_var("HERMES_HOME", root) };
+    }
+}
+
 fn hermes_root() -> Option<PathBuf> {
     std::env::var_os("HERMES_HOME")
         .map(PathBuf::from)
@@ -97,6 +108,7 @@ fn select_profile(args: &[String]) -> anyhow::Result<Option<String>> {
         activate_profile(&root, &name)?;
         return Ok(Some(name));
     }
+    export_default_hermes_home();
     Ok(None)
 }
 
@@ -292,7 +304,7 @@ fn install_ollama_signal_unload() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_gateway_args, profile_home, sticky_profile};
+    use super::{export_default_hermes_home, parse_gateway_args, profile_home, sticky_profile};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -328,6 +340,17 @@ mod tests {
             PathBuf::from("/tmp/hermes")
         );
         assert!(profile_home(Path::new("/tmp/hermes"), "../escape").is_err());
+    }
+
+    #[test]
+    fn standalone_exports_the_default_hermes_home() {
+        // SAFETY: the only test that touches these variables.
+        unsafe { std::env::remove_var("HERMES_HOME") };
+        export_default_hermes_home();
+        assert_eq!(std::env::var_os("HERMES_HOME").map(PathBuf::from), std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".hermes")));
+        unsafe { std::env::set_var("HERMES_HOME", "/tmp/other") };
+        export_default_hermes_home();
+        assert_eq!(std::env::var("HERMES_HOME").unwrap(), "/tmp/other", "an explicit value wins");
     }
 
     #[test]
