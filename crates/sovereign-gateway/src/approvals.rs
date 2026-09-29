@@ -160,6 +160,18 @@ fn allow_permanently_with(home: &Path, command: &str, mut between: impl FnMut())
     false
 }
 
+/// What kind of risk a command carries, by jcode's classifier: the distinct reasons it flags
+/// (they name the program, never a path), or "general". Hermes keys a session grant on its
+/// pattern category the same way, so allowing `rm -rf build` for the session does not also allow
+/// a command that pipes paths into a delete.
+fn risk_category(command: &str) -> String {
+    let assessment = jcode_command_risk::assess(command, &jcode_command_risk::RiskContext::from_env(None));
+    let mut reasons: Vec<&str> = assessment.findings.iter().map(|f| f.reason.as_str()).collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    if reasons.is_empty() { "general".into() } else { reasons.join(" | ") }
+}
+
 /// A desktop connection able to show prompts.
 pub struct Client {
     pub id: u64,
@@ -174,8 +186,9 @@ pub struct Hub {
     pending: Mutex<HashMap<String, (String, oneshot::Sender<String>)>>,
     /// Params of open prompts, for `approval.pending`.
     shown: Mutex<HashMap<String, (String, Value)>>,
-    /// Sessions where the user chose "session" (allow for the rest of it).
-    session_grants: Mutex<HashSet<String>>,
+    /// (session, risk category) pairs where the user chose "session": allowed for the rest of the
+    /// session, but only for commands of the same kind (see [`risk_category`]).
+    session_grants: Mutex<HashSet<(String, String)>>,
     next: AtomicU64,
     /// Sessions running unattended (`/api/agent/run`) -> their surface ("cron" | "bot"). No desktop
     /// prompt ever waits on them; see [`Hub::unattended`].
@@ -188,6 +201,12 @@ pub struct Hub {
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
     /// Where parked unattended prompts persist (sovereign.db), so a restart keeps them.
     store: std::sync::Mutex<Option<Arc<sovereign_prime::entries::EntryStore>>>,
+}
+
+/// The lowest-numbered (oldest) parked unattended prompt.
+fn oldest_parked(shown: &HashMap<String, (String, Value)>) -> Option<(String, String)> {
+    let number = |id: &String| id.strip_prefix("approval-").and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX);
+    shown.iter().filter(|(_, (_, p))| p["unattended"] == true).min_by_key(|(id, _)| number(id)).map(|(id, (session, _))| (id.clone(), session.clone()))
 }
 
 fn now_ms() -> i64 {
@@ -305,13 +324,28 @@ impl Hub {
             "allow_session": true,
             "unattended": true,
         });
+        let mut evicted: Option<(String, String)> = None;
         {
             let mut shown = self.shown.lock().await;
             let parked = shown.values().filter(|(_, p)| p["unattended"] == true);
-            if parked.clone().count() >= MAX_PARKED || parked.into_iter().any(|(sid, p)| sid == session_id && p["command"] == command) {
+            if parked.clone().any(|(sid, p)| sid == session_id && p["command"] == command) {
                 return;
             }
+            // At the cap the oldest parked prompt makes room (request ids only grow), and the user is told.
+            evicted = (parked.count() >= MAX_PARKED).then(|| oldest_parked(&shown)).flatten();
+            if let Some((old, _)) = &evicted {
+                shown.remove(old);
+            }
             shown.insert(request_id.clone(), (session_id.to_string(), params.clone()));
+        }
+        if let Some((old, old_session)) = evicted {
+            self.pending.lock().await.remove(&old); // its waiter times out to a plain deny
+            if let Some(store) = self.store() {
+                store.park_delete(&old);
+            }
+            let note = json!({ "jsonrpc": "2.0", "method": "event", "params": { "type": "status.update", "session_id": old_session,
+                "payload": { "kind": "approval", "text": format!("Too many blocked commands are waiting for approval; the oldest ({old}) was dropped.") } } });
+            self.broadcast_text(note.to_string()).await;
         }
         if let Some(store) = self.store() {
             let _ = store.park_save(&request_id, session_id, &params.to_string(), now_ms());
@@ -363,7 +397,8 @@ impl Hub {
             self.audit(session_id, tool, command, "always", "allowlist");
             return "always".into();
         }
-        if self.session_grants.lock().await.contains(session_id) {
+        let category = risk_category(command);
+        if self.session_grants.lock().await.contains(&(session_id.to_string(), category.clone())) {
             let choice = "session".to_string();
             self.audit(session_id, tool, command, &choice, "session-grant");
             return choice;
@@ -407,7 +442,7 @@ impl Hub {
         self.shown.lock().await.remove(&request_id);
         match choice.as_str() {
             "session" => {
-                self.session_grants.lock().await.insert(session_id.to_string());
+                self.session_grants.lock().await.insert((session_id.to_string(), category));
             }
             "always" => {
                 let saved = home.as_deref().is_some_and(|home| allow_permanently(home, command));
@@ -547,41 +582,6 @@ pub mod hook {
     }
 }
 
-/// Validate and parse an approval request body.
-pub fn parse_request(body: &[u8]) -> Option<(String, String, String, String)> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    let text = |k: &str| v[k].as_str().map(str::to_owned);
-    Some((text("session_id")?, text("tool").unwrap_or_else(|| "bash".into()), text("command")?, text("reason").unwrap_or_default()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn client(hub: &Hub, session: &str) -> (Arc<Client>, mpsc::Receiver<Message>) {
-        let (tx, rx) = mpsc::channel(8);
-        let c = Arc::new(Client { id: hub.next_client_id(), to_ws: tx, sessions: Mutex::new(HashSet::from([session.to_string()])) });
-        hub.add(c.clone()).await;
-        (c, rx)
-    }
-
-    fn request_id(msg: Message) -> String {
-        let Message::Text(t) = msg else { panic!() };
-        serde_json::from_str::<Value>(&t).unwrap()["id"].as_str().unwrap().to_string()
-    }
-
-    #[tokio::test]
-    async fn no_desktop_means_deny() {
-        assert_eq!(Arc::new(Hub::default()).decide("s", "bash", "rm -rf x", "r").await, "deny");
-    }
-
-    #[tokio::test]
-    async fn the_user_decides_and_session_grants_stick() {
-        let hub = Arc::new(Hub::default());
-        let (_c, mut rx) = client(&hub, "s").await;
-        let h = hub.clone();
-        let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf build", "r").await });
-        let id = request_id(rx.recv().await.unwrap());
 pub(crate) const ADDR_ENV: &str = "SOVEREIGN_APPROVAL_ADDR";
 pub(crate) const TICKET_ENV: &str = "SOVEREIGN_APPROVAL_TICKET";
 /// A ticket is good for one request within this window.
@@ -627,13 +627,13 @@ fn redeem_ticket_at(key: &str, ticket: Option<&str>, now: i64) -> bool {
     used.insert(stamp.to_owned(), issued).is_none()
 }
 
-        assert!(hub.answer(&id, "session").await);
-        assert_eq!(asked.await.unwrap(), "session");
-        // Granted for the session: no second prompt.
-        assert_eq!(hub.decide("s", "bash", "rm -rf dist", "r").await, "session");
-        // "always" covers that exact command in every session, never other commands.
-        let (_c3, mut rx3) = client(&hub, "u").await;
-        let h = hub.clone();
+/// Validate and parse an approval request body.
+pub fn parse_request(body: &[u8]) -> Option<(String, String, String, String)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let text = |k: &str| v[k].as_str().map(str::to_owned);
+    Some((text("session_id")?, text("tool").unwrap_or_else(|| "bash".into()), text("command")?, text("reason").unwrap_or_default()))
+}
+
 #[cfg(test)]
 mod ticket_tests {
     use super::*;
@@ -655,6 +655,41 @@ mod ticket_tests {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn client(hub: &Hub, session: &str) -> (Arc<Client>, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(8);
+        let c = Arc::new(Client { id: hub.next_client_id(), to_ws: tx, sessions: Mutex::new(HashSet::from([session.to_string()])) });
+        hub.add(c.clone()).await;
+        (c, rx)
+    }
+
+    fn request_id(msg: Message) -> String {
+        let Message::Text(t) = msg else { panic!() };
+        serde_json::from_str::<Value>(&t).unwrap()["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn no_desktop_means_deny() {
+        assert_eq!(Arc::new(Hub::default()).decide("s", "bash", "rm -rf x", "r").await, "deny");
+    }
+
+    #[tokio::test]
+    async fn the_user_decides_and_session_grants_stick() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "s").await;
+        let h = hub.clone();
+        let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf build", "r").await });
+        let id = request_id(rx.recv().await.unwrap());
+        assert!(hub.answer(&id, "session").await);
+        assert_eq!(asked.await.unwrap(), "session");
+        // Granted for the session: no second prompt.
+        assert_eq!(hub.decide("s", "bash", "rm -rf dist", "r").await, "session");
+        // "always" covers that exact command in every session, never other commands.
+        let (_c3, mut rx3) = client(&hub, "u").await;
+        let h = hub.clone();
         let asked = tokio::spawn(async move { h.decide("u", "bash", "cargo publish", "r").await });
         let id = request_id(rx3.recv().await.unwrap());
         assert!(hub.answer(&id, "always").await);
@@ -672,6 +707,50 @@ mod ticket_tests {
         let id = request_id(rx2.recv().await.unwrap());
         assert!(hub.answer(&id, "deny").await);
         assert_eq!(asked.await.unwrap(), "deny");
+    }
+
+    #[tokio::test]
+    async fn a_session_grant_covers_only_its_own_risk_category() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "s").await;
+        let h = hub.clone();
+        let asked = tokio::spawn(async move { h.decide("s", "bash", "rm -rf build", "r").await });
+        assert!(hub.answer(&request_id(rx.recv().await.unwrap()), "session").await);
+        assert_eq!(asked.await.unwrap(), "session");
+        assert_eq!(hub.decide("s", "bash", "rm -rf dist", "r").await, "session", "same kind of command");
+        // A different kind of risk (paths piped into a delete) asks again, and so does a plain command.
+        for command in ["ls | xargs rm", "cargo publish"] {
+            assert_ne!(risk_category(command), risk_category("rm -rf build"), "{command}");
+            let h = hub.clone();
+            let cmd = command.to_string();
+            let asked = tokio::spawn(async move { h.decide("s", "bash", &cmd, "r").await });
+            assert!(hub.answer(&request_id(rx.recv().await.unwrap()), "deny").await, "{command} must prompt");
+            assert_eq!(asked.await.unwrap(), "deny");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_51st_parked_approval_evicts_the_oldest_and_says_so() {
+        let hub = Arc::new(Hub::default());
+        let (_c, mut rx) = client(&hub, "other").await;
+        hub.mark_headless("cron-run", "cron").await;
+        let mut notes = 0;
+        for n in 0..=MAX_PARKED {
+            assert_eq!(hub.decide("cron-run", "bash", &format!("rm -rf dir{n}"), "r").await, "deny");
+            // The client's queue is small: read what the hub sent as it goes.
+            while let Ok(Message::Text(frame)) = rx.try_recv() {
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                if frame["method"] == "event" && frame["params"]["type"] == "status.update" {
+                    notes += 1;
+                    assert!(frame["params"]["payload"]["text"].as_str().unwrap().contains("was dropped"));
+                }
+            }
+        }
+        let parked = hub.pending_for("cron-run").await;
+        assert_eq!(parked.len(), MAX_PARKED);
+        assert!(!parked.iter().any(|p| p["command"] == "rm -rf dir0"), "the oldest made room");
+        assert!(parked.iter().any(|p| p["command"] == format!("rm -rf dir{MAX_PARKED}")), "the newest is kept");
+        assert_eq!(notes, 1);
     }
 
     #[tokio::test]

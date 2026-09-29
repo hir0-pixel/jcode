@@ -46,6 +46,11 @@ def rpc_methods_handled() -> set[str]:
     handled = set()
     for arm in re.findall(r'^\s*((?:"[a-z_.]+"\s*\|\s*)*"[a-z_.]+")\s*=>', body, re.M):
         handled.update(re.findall(r'"([a-z_.]+)"', arm))
+    # Groups of methods owned by a sub-module answer through its `handles()` list.
+    for name in ("attach", "local_state"):
+        module = (ENGINE / f"crates/sovereign-gateway/src/rpc/{name}.rs").read_text()
+        start = module.index("fn handles(")
+        handled.update(re.findall(r'"([a-z_.]+)"', module[start : module.index("\n}\n", start)]))
     return handled
 
 

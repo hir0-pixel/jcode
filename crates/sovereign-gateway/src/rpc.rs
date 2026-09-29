@@ -2519,6 +2519,16 @@ fn save_bot_session(home: &str, key: &str, session_id: &str) {
 static ACTIVE_RUNS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Arc<Conn>, String)>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// One turn at a time per bot chat: two messages sent together would otherwise run two turns on
+/// one engine session, and each would take the other's `message.complete` for its own reply.
+static CHAT_TURNS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+async fn chat_turn(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = CHAT_TURNS.lock().unwrap_or_else(|e| e.into_inner()).entry(key.to_string()).or_default().clone();
+    lock.lock_owned().await
+}
+
 /// Interrupt the turn a chat is running (Hermes `/stop`); false when it has none.
 pub(crate) async fn interrupt_run(session_key: &str) -> bool {
     let entry = ACTIVE_RUNS.lock().unwrap_or_else(|e| e.into_inner()).get(session_key).cloned();
@@ -2563,6 +2573,11 @@ pub(crate) async fn agent_run(
     opts: RunOpts<'_>,
     timeout: Duration,
 ) -> Result<Value> {
+    // Queued behind the chat's running turn (its `timeout` starts once this turn does).
+    let _turn = match session_key {
+        Some(key) => Some(chat_turn(key).await),
+        None => None,
+    };
     let home = config.home.clone();
     let (to_ws, mut ws_out) = mpsc::channel::<Message>(1024);
     let client = Arc::new(Client {
@@ -2879,6 +2894,17 @@ mod tests {
         let params = run_session_params(Some("/w"), Some("nightly"), &opts);
         assert_eq!((params["model"].as_str(), params["provider"].as_str(), params["title"].as_str()), (Some("llama-3.3-70b"), Some("groq"), Some("nightly")));
         assert!(run_session_params(None, None, &RunOpts::default()).get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_chats_turns_run_one_at_a_time_while_other_chats_are_not_held_up() {
+        let first = chat_turn("telegram:serial").await;
+        let second = tokio::spawn(async { drop(chat_turn("telegram:serial").await) });
+        drop(chat_turn("telegram:elsewhere").await); // another chat is free while the first is busy
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished(), "the second message waits for the first turn");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), second).await.expect("released").unwrap();
     }
 
     #[tokio::test]
