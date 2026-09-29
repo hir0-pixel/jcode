@@ -26,6 +26,7 @@ mod driver;
 pub(crate) use driver::start as start_driver;
 mod attach;
 mod local_state;
+mod provider_state;
 mod side_agents;
 mod spawn_tree;
 
@@ -857,32 +858,17 @@ impl Conn {
                 attach::handle(m, &self.config.home, &cwd, p)
                     .map_err(|(code, message)| RpcError { code, message, data: None })
             }
-            "setup.status" => Ok(json!({
-                "provider_configured": true,
-                "ready": true,
-                "ok": true,
-                "free_tier": false,
-                "other_providers": false,
-                "inference_provider": self.config.provider,
-            })),
-            "setup.runtime_check" => Ok(json!({
-                "ok": true,
-                "provider": self.config.provider,
-                "model": self.config.model,
-                "source": "engine",
-            })),
-            "model.options" => Ok(json!({
-                "providers": [{
-                    "slug": self.config.provider,
-                    "name": self.config.provider,
-                    "models": [self.config.model],
-                    "total_models": 1,
-                    "is_current": true,
-                    "authenticated": true,
-                }],
-                "model": self.config.model,
-                "provider": self.config.provider,
-            })),
+            "setup.status" => Ok(provider_state::setup_status(&self.config.provider)),
+            "setup.runtime_check" => Ok(provider_state::runtime_check(&self.config.provider, &self.config.model, p["provider"].as_str().filter(|r| !r.is_empty()))),
+            "model.options" => {
+                // The served provider's models come from the session's catalog when one is named.
+                let listed = match p["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    Some(id) => tokio::time::timeout(Duration::from_secs(3), self.call(json!({ "req": "list_models", "session_id": id }))).await.ok().and_then(Result::ok),
+                    None => None,
+                };
+                let models = listed.as_ref().and_then(|r| r["models"].as_array()).map(|m| m.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                Ok(provider_state::model_options(&self.config.provider, &self.config.model, models, p["include_unconfigured"] == true))
+            }
             "session.active_list" => {
                 let stored = super::session_infos(&self.config, 1000, false)
                     .await
