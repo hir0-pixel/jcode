@@ -296,13 +296,22 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
 }
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// `/api/agent/run` carries whole prompts (cron context, bot history).
+const MAX_RUN_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+fn declared_len(req: &Request) -> usize {
+    req.header("content-length")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
 
 async fn read_body(stream: &mut TcpStream, req: &Request) -> Result<Vec<u8>> {
-    let len: usize = req
-        .header("content-length")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if len > MAX_BODY_BYTES {
+    read_body_max(stream, req, MAX_BODY_BYTES).await
+}
+
+async fn read_body_max(stream: &mut TcpStream, req: &Request, max: usize) -> Result<Vec<u8>> {
+    let len = declared_len(req);
+    if len > max {
         bail!("body too large");
     }
     let mut body = req.body_prefix.clone();
@@ -667,7 +676,15 @@ async fn handle(
             .await
         }
         ("POST", "/api/agent/run") => {
-            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body(&mut stream, &req)).await??;
+            if declared_len(&req) > MAX_RUN_BODY_BYTES {
+                return respond(
+                    &mut stream,
+                    "413 Payload Too Large",
+                    &json!({"detail": format!("body exceeds {MAX_RUN_BODY_BYTES} bytes")}),
+                )
+                .await;
+            }
+            let body = tokio::time::timeout(HEADER_TIMEOUT, read_body_max(&mut stream, &req, MAX_RUN_BODY_BYTES)).await??;
             let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let Some(prompt) = body["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
                 return respond(

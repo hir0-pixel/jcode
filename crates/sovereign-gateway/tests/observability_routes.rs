@@ -117,3 +117,50 @@ async fn observability_routes_require_token() {
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn agent_run_takes_bodies_over_64kb_and_answers_413_above_4mb() {
+    let home = std::env::temp_dir().join(format!("sovereign-run-body-test-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let token = long_token();
+    let config = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        token: token.clone(),
+        version: "test".into(),
+        legacy_socket: PathBuf::from("/dev/null"),
+        default_cwd: home.to_string_lossy().into(),
+        allow_non_loopback: false,
+        provider: "ollama".into(),
+        model: "local".into(),
+        home: home.to_string_lossy().into(),
+        complete: None,
+        approval_secret: "approval-secret-m10c-test-min-32".into(),
+        features: None,
+        learning: None,
+    };
+    let gateway = Gateway::bind(config).await.unwrap();
+    let port = gateway.local_addr().port();
+    let server = tokio::spawn(async move {
+        let _ = gateway.serve().await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 100 KB with no prompt: read in full and refused by the handler (400), not dropped.
+    let big = format!(r#"{{"prompt":"","pad":"{}"}}"#, "x".repeat(100_000));
+    let (status, text) = http_post(port, "/api/agent/run", &big, Some(&token)).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("prompt is required"));
+
+    // A declared 5 MB body is answered with JSON before it is read.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let head = format!(
+        "POST /api/agent/run HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 5000000\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    assert!(text.contains("\"detail\""));
+    server.abort();
+}
