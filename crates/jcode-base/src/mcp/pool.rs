@@ -433,6 +433,9 @@ mod tests {
         let _guard = crate::storage::lock_test_env();
         let original_cwd = std::env::current_dir().expect("current cwd");
         let previous_home = std::env::var_os("JCODE_HOME");
+        // Standalone behaviour: under HERMES_HOME only Hermes's config.yaml is read.
+        let previous_hermes = std::env::var_os("HERMES_HOME");
+        crate::env::remove_var("HERMES_HOME");
         let home = tempfile::tempdir().expect("home tempdir");
         let first_project = tempfile::tempdir().expect("first project tempdir");
         let second_project = tempfile::tempdir().expect("second project tempdir");
@@ -463,6 +466,9 @@ mod tests {
         let reloaded = pool.config().await;
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
+        if let Some(previous_hermes) = previous_hermes {
+            crate::env::set_var("HERMES_HOME", previous_hermes);
+        }
         if let Some(previous_home) = previous_home {
             crate::env::set_var("JCODE_HOME", previous_home);
         } else {
