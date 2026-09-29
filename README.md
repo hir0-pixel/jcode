@@ -290,7 +290,6 @@ To have memories which are retrieved, they must also be extracted and stored. Ev
 
 The harness also provides explicit memory tools to allow the agent to actively search or store the memory without relying on a passive background process. The harness also provides session search for traditional RAG on previous sessions. 
 
-Memories are automatically consolidated every so often via the ambient mode. This reorganizes, checks for staleness and conflicts, etc
 
 <div align="center">
 
@@ -801,7 +800,6 @@ Notes:
 - [jcode.sh/swarm](https://jcode.sh/swarm) — many coding agents in one repository
 - [jcode.sh/sdk](https://jcode.sh/sdk) — TypeScript SDK: drive jcode sessions from your own program
 - [jcode.sh/bench](https://jcode.sh/bench) — benchmark methodology and results
-- [Ambient Mode / OpenClaw](docs/AMBIENT_MODE.md)
 - [Browser Provider Protocol](docs/BROWSER_PROVIDER_PROTOCOL.md)
 - [Memory Architecture](docs/MEMORY_ARCHITECTURE.md)
 - [Swarm Architecture](docs/SWARM_ARCHITECTURE.md)

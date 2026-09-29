@@ -4,13 +4,13 @@
 //! Environment variables override config file settings.
 
 pub use jcode_config_types::{
-    AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
+    AgentsConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
     CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
     DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HookCommands, HooksConfig,
     KeybindingsConfig, LatexRenderingMode, LaunchHotkeyEntry, LaunchHotkeysConfig,
     MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
     NamedProviderType, NativeScrollbarConfig, NotificationsConfig, OverscrollStatusMode,
-    PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig, SessionPickerResumeAction,
+    PowerConfig, ProviderConfig, ReasoningDisplayMode, SessionPickerResumeAction,
     SwarmSpawnMode, SwarmStripLayout, TerminalConfig, UpdateChannel,
     WebSearchConfig, WebSearchEngine,
 };
@@ -33,13 +33,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_ACP_TOOL_PROFILE",
     "JCODE_ACTIVE_SESSIONS_MANAGER",
     "JCODE_EXTERNAL_SESSIONS",
-    "JCODE_AMBIENT_ENABLED",
-    "JCODE_AMBIENT_MAX_INTERVAL",
-    "JCODE_AMBIENT_MIN_INTERVAL",
-    "JCODE_AMBIENT_MODEL",
-    "JCODE_AMBIENT_PROACTIVE",
-    "JCODE_AMBIENT_PROVIDER",
-    "JCODE_AMBIENT_VISIBLE",
     "JCODE_ANIMATION_FPS",
     "JCODE_AUTO_POKE",
     "JCODE_AUTOJUDGE_ENABLED",
@@ -76,15 +69,9 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DISABLE_BASE_TOOLS",
     "JCODE_DISABLED_ANIMATIONS",
     "JCODE_DISABLED_TOOLS",
-    "JCODE_DISCORD_BOT_TOKEN",
-    "JCODE_DISCORD_BOT_USER_ID",
-    "JCODE_DISCORD_CHANNEL_ID",
-    "JCODE_DISCORD_REPLY_ENABLED",
     "JCODE_DISPLAY_CENTERED",
     "JCODE_EFFORT_DECREASE_KEY",
     "JCODE_EFFORT_INCREASE_KEY",
-    "JCODE_EMAIL_REPLY_ENABLED",
-    "JCODE_EMAIL_TO",
     "JCODE_FOCUS_HOOK",
     "JCODE_GATEWAY_BIND_ADDR",
     "JCODE_GATEWAY_ENABLED",
@@ -100,17 +87,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_HOOK_TURN_END",
     "JCODE_HOOK_TURN_START",
     "JCODE_IDLE_ANIMATION",
-    "JCODE_IMAP_HOST",
     "JCODE_INFO_WIDGET_TOGGLE_KEY",
-    "JCODE_JADE_RELAY_API_BASE",
-    "JCODE_JADE_RELAY_ENABLED",
-    "JCODE_JADE_RELAY_LAUNCH_ENABLED",
-    "JCODE_JADE_RELAY_LAUNCH_WORKING_DIR",
-    "JCODE_JADE_RELAY_REPLY_ENABLED",
-    "JCODE_JADE_RELAY_SESSION_ID",
-    "JCODE_JADE_RELAY_TOKEN",
-    "JCODE_JADE_RELAY_TOKEN_ID",
-    "JCODE_JADE_RELAY_USER_ID",
     "JCODE_KV_CACHE_MISS_NOTICES",
     "JCODE_LATEX_RENDERING",
     "JCODE_MARKDOWN_SPACING",
@@ -128,8 +105,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_MOUSE_CAPTURE",
     "JCODE_NEW_TERMINAL_KEY",
     "JCODE_NO_EMOJI",
-    "JCODE_NTFY_SERVER",
-    "JCODE_NTFY_TOPIC",
     "JCODE_OPENAI_NATIVE_COMPACTION_MODE",
     "JCODE_OPENAI_NATIVE_COMPACTION_THRESHOLD_TOKENS",
     "JCODE_OPENAI_REASONING_EFFORT",
@@ -163,7 +138,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_SHOW_THINKING",
     "JCODE_SIDE_PANEL_TOGGLE_KEY",
     "JCODE_SIDE_PANEL_NATIVE_SCROLLBAR",
-    "JCODE_SMTP_PASSWORD",
     "JCODE_SPAWN_HOOK",
     "JCODE_STREAM_IDLE_TIMEOUT_SECS",
     "JCODE_MAX_RETRIES",
@@ -178,9 +152,6 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_SWARM_MAX_CONCURRENT_AGENTS",
     "JCODE_SWARM_SPAWN_MODE",
     "JCODE_SWARM_STRIP_LAYOUT",
-    "JCODE_TELEGRAM_BOT_TOKEN",
-    "JCODE_TELEGRAM_CHAT_ID",
-    "JCODE_TELEGRAM_REPLY_ENABLED",
     "JCODE_TOOL_CALL_DETAILS",
     "JCODE_TOOL_PROFILE",
     "JCODE_TOOLS",
@@ -521,12 +492,6 @@ pub struct Config {
 
     /// Lifecycle hooks (external commands at turn/session/tool boundaries)
     pub hooks: HooksConfig,
-
-    /// Ambient mode configuration
-    pub ambient: AmbientConfig,
-
-    /// Safety / notification configuration
-    pub safety: SafetyConfig,
 
     /// Desktop notifications for interactive sessions (e.g. turn completion)
     pub notifications: NotificationsConfig,

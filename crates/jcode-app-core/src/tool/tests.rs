@@ -358,7 +358,6 @@ fn tool_definitions_auto_inject_required_intent() {
 async fn first_party_tool_definitions_require_intent_with_display_only_docs() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
-    registry.register_ambient_tools().await;
 
     let defs = registry.definitions(None).await;
     assert!(!defs.is_empty());
@@ -1112,34 +1111,15 @@ fn test_accepts_large_output_requires_an_unambiguous_yes() {
     }
 }
 
-#[tokio::test]
-async fn test_request_permission_is_ambient_only() {
-    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
-    let registry = Registry::new(provider).await;
-
-    let defs = registry.definitions(None).await;
-    assert!(
-        !defs.iter().any(|d| d.name == "request_permission"),
-        "request_permission should not be available in normal sessions"
-    );
-
-    registry.register_ambient_tools().await;
-    let defs_after = registry.definitions(None).await;
-    assert!(
-        defs_after.iter().any(|d| d.name == "request_permission"),
-        "request_permission should be available after ambient tool registration"
-    );
-}
-
 #[test]
 fn closest_tool_names_suggests_near_misses() {
-    let available = ["todo", "end_ambient_cycle", "bash", "read", "write", "edit"];
-    // Exact-ish prefix/typo cases the ambient agent hit (#104).
+    let available = ["todo", "end_session_cycle", "bash", "read", "write", "edit"];
+    // Exact-ish prefix/typo cases (#104).
     let s = Registry::closest_tool_names("todos", &available);
     assert_eq!(s.first().map(String::as_str), Some("todo"));
 
-    let s = Registry::closest_tool_names("end_ambient_cyle", &available);
-    assert!(s.iter().any(|n| n == "end_ambient_cycle"), "got {s:?}");
+    let s = Registry::closest_tool_names("end_session_cyle", &available);
+    assert!(s.iter().any(|n| n == "end_session_cycle"), "got {s:?}");
 
     // Case-insensitive containment.
     let s = Registry::closest_tool_names("Bash", &available);
@@ -1154,7 +1134,6 @@ fn closest_tool_names_suggests_near_misses() {
 async fn unknown_tool_error_lists_available_tools_and_suggestions() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
-    registry.register_ambient_tools().await;
 
     let ctx = ToolContext {
         session_id: "test-unknown-tool".to_string(),
@@ -1176,8 +1155,8 @@ async fn unknown_tool_error_lists_available_tools_and_suggestions() {
         "error must list available tools so the model can recover (#104): {msg}"
     );
     assert!(
-        msg.contains("end_ambient_cycle"),
-        "available list should include registered ambient tools: {msg}"
+        msg.contains("bash"),
+        "available list should include registered tools: {msg}"
     );
 }
 
@@ -1461,7 +1440,6 @@ async fn test_every_tool_advertises_the_large_output_escape_hatch() {
     // failure mode is a new tool nobody remembered to annotate.
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
-    registry.register_ambient_tools().await;
 
     let defs = registry.definitions(None).await;
     assert!(
@@ -1500,7 +1478,6 @@ async fn test_large_output_flag_costs_little_across_the_whole_tool_set() {
     // the total honest: ~20 tokens per tool is acceptable, a paragraph is not.
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
     let registry = Registry::new(provider).await;
-    registry.register_ambient_tools().await;
     let defs = registry.definitions(None).await;
 
     let property =

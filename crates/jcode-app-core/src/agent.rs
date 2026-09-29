@@ -934,14 +934,6 @@ impl Agent {
         &self.session.id
     }
 
-    pub(crate) fn set_working_dir_for_pending_context(&mut self, working_dir: Option<String>) {
-        if working_dir.is_some() {
-            self.session.working_dir = working_dir;
-            self.unlock_tools();
-            self.session.refresh_initial_session_context_message();
-        }
-    }
-
     /// Mark this agent session as closed and persist it.
     pub fn mark_closed(&mut self) {
         self.persist_soft_interrupt_snapshot();

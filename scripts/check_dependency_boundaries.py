@@ -33,7 +33,6 @@ FORBIDDEN_INTERNAL_DEPS = {
     "jcode-embedding",
     "jcode-mobile-core",
     "jcode-mobile-sim",
-    "jcode-notify-email",
     "jcode-pdf",
     "jcode-plan",
     "jcode-provider-core",

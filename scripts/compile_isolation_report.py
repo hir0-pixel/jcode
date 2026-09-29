@@ -153,7 +153,6 @@ def target_state_violations(stats_by_name: dict[str, CrateStats]) -> list[str]:
                 "jcode-provider-gemini",
                 "jcode-provider-openai",
                 "jcode-provider-openrouter",
-                "jcode-notify-email",
                 "jcode-build-support",
             }:
                 violations.append(f"target-state: jcode-base still depends on leaf/runtime crate {dep}")

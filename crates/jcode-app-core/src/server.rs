@@ -21,7 +21,6 @@ mod comm_plan;
 mod comm_session;
 mod comm_sync;
 mod debug;
-mod debug_ambient;
 mod debug_command_exec;
 mod debug_events;
 mod debug_help;
@@ -33,7 +32,6 @@ mod debug_swarm_write;
 mod debug_testers;
 mod durable_state;
 mod headless;
-mod jade_relay;
 mod lifecycle;
 mod live_turn;
 mod provider_control;
@@ -83,7 +81,6 @@ use self::swarm_persistence::{
 };
 use self::util::get_shared_mcp_pool;
 use crate::agent::Agent;
-use crate::ambient_runner::AmbientRunnerHandle;
 use crate::bus::{Bus, BusEvent};
 use crate::protocol::{NotificationType, ServerEvent};
 use crate::provider::Provider;
@@ -725,8 +722,6 @@ pub struct Server {
     event_counter: Arc<std::sync::atomic::AtomicU64>,
     /// Broadcast channel for swarm event subscriptions (debug socket subscribers)
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
-    /// Ambient mode runner handle (None if ambient is disabled)
-    ambient_runner: Option<AmbientRunnerHandle>,
     /// Shared MCP server pool (processes shared across sessions), initialized lazily.
     mcp_pool: Arc<OnceCell<Arc<crate::mcp::SharedMcpPool>>>,
     /// Graceful shutdown signals by session_id (stored outside agent mutex so they
@@ -775,15 +770,6 @@ impl Server {
         };
         crate::process_title::set_server_title(&identity.name);
 
-        // Initialize the background runner even when ambient mode is disabled so
-        // session-targeted scheduled tasks still have a live delivery loop.
-        let ambient_runner = {
-            let safety = Arc::new(crate::safety::SafetySystem::new());
-            let handle = AmbientRunnerHandle::new(safety);
-            crate::tool::ambient::init_schedule_runner(handle.clone());
-            Some(handle)
-        };
-
         let LoadedSwarmRuntimeState {
             plans: restored_swarm_plans,
             coordinators: restored_swarm_coordinators,
@@ -819,7 +805,6 @@ impl Server {
             event_history: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             event_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             swarm_event_tx: broadcast::channel(256).0,
-            ambient_runner,
             mcp_pool: Arc::new(OnceCell::new()),
             shutdown_signals: Arc::new(RwLock::new(HashMap::new())),
             soft_interrupt_queues: Arc::new(RwLock::new(HashMap::new())),
@@ -1415,27 +1400,6 @@ impl Server {
         // This watches the same "running" member signal Waybar surfaces as
         // "N streaming" and toggles a best-effort OS power inhibitor accordingly.
         Self::spawn_power_inhibitor(Arc::clone(&self.swarm_state.members));
-
-        // Spawn the background ambient/schedule loop.
-        if let Some(ref runner) = self.ambient_runner {
-            let ambient_handle = runner.clone();
-            let ambient_provider = Arc::clone(&self.provider);
-            crate::logging::info("Starting ambient/schedule background loop");
-            tokio::spawn(async move {
-                ambient_handle.run_loop(ambient_provider).await;
-            });
-        }
-
-        // Spawn the Jade cloud relay listener independently of ambient mode. The
-        // worker is strictly opt-in and requires an explicit API base, token,
-        // session id, and reply-enabled flag before it makes any outbound calls.
-        jade_relay::spawn_if_configured(
-            &crate::config::config().safety,
-            Arc::clone(&self.sessions),
-            Arc::clone(&self.soft_interrupt_queues),
-            Arc::clone(&self.shutdown_signals),
-            Arc::clone(&self.swarm_state.members),
-        );
 
         // Spawn embedding idle monitor so the model can be unloaded when this
         // server has been quiet for a while.

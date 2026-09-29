@@ -6,12 +6,10 @@
 mod mock_provider;
 mod test_support;
 
-mod ambient;
 mod burst_spawn;
 mod disconnect;
 mod provider_behavior;
 mod reload_multiclient;
-mod safety;
 mod session_flow;
 mod text_framing;
 mod transport;

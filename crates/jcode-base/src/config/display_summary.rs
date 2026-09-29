@@ -103,31 +103,10 @@ impl Config {
 - Review: {}
 - Judge: {}
 - Memory recall: local (indexed search)
-- Ambient: {}
 
 **Gateway:**
 - Enabled: {}
 - Bind address: {}:{}
-
-**Ambient:**
-- Enabled: {}
-- Provider: {}
-- Model: {}
-- Interval: {}-{} minutes
-- Pause on active session: {}
-- Proactive work: {}
-- Work branch prefix: `{}`
-- Visible mode: {}
-
-**Notifications:**
-- ntfy.sh: {}
-- Desktop: {}
-- Email: {}
-- Email replies: {}
-- Telegram: {}
-- Telegram replies: {}
-- Discord: {}
-- Discord replies: {}
 
 *Edit the config file or set environment variables to customize.*
 *Environment variables (e.g., `JCODE_SCROLL_UP_KEY`, `JCODE_GATEWAY_ENABLED`) override file settings.*"#,
@@ -293,77 +272,9 @@ impl Config {
                 .model
                 .as_deref()
                 .unwrap_or("(inherit current session)"),
-            self.ambient
-                .model
-                .as_deref()
-                .unwrap_or("(provider default)"),
             self.gateway.enabled,
             self.gateway.bind_addr,
             self.gateway.port,
-            self.ambient.enabled,
-            self.ambient.provider.as_deref().unwrap_or("(auto)"),
-            self.ambient
-                .model
-                .as_deref()
-                .unwrap_or("(provider default)"),
-            self.ambient.min_interval_minutes,
-            self.ambient.max_interval_minutes,
-            self.ambient.pause_on_active_session,
-            self.ambient.proactive_work,
-            self.ambient.work_branch_prefix,
-            self.ambient.visible,
-            self.safety
-                .ntfy_topic
-                .as_deref()
-                .map(|t| format!("enabled (topic: {})", t))
-                .unwrap_or_else(|| "disabled".to_string()),
-            if self.safety.desktop_notifications {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            if self.safety.email_enabled {
-                self.safety
-                    .email_to
-                    .as_deref()
-                    .unwrap_or("enabled (no recipient)")
-            } else {
-                "disabled"
-            },
-            if self.safety.email_reply_enabled {
-                self.safety
-                    .email_imap_host
-                    .as_deref()
-                    .unwrap_or("enabled (no IMAP host)")
-            } else {
-                "disabled"
-            },
-            if self.safety.telegram_enabled {
-                self.safety
-                    .telegram_chat_id
-                    .as_deref()
-                    .unwrap_or("enabled (no chat_id)")
-            } else {
-                "disabled"
-            },
-            if self.safety.telegram_reply_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            if self.safety.discord_enabled {
-                self.safety
-                    .discord_channel_id
-                    .as_deref()
-                    .unwrap_or("enabled (no channel_id)")
-            } else {
-                "disabled"
-            },
-            if self.safety.discord_reply_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
         )
     }
 }

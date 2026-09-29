@@ -513,8 +513,7 @@ swarm_max_concurrent_agents = 32
 
 [notifications]
 # Desktop notifications for interactive sessions (macOS Notification Center /
-# Linux notify-send). Separate from [safety], which covers ambient-mode
-# ntfy/email/channel notifications.
+# Linux notify-send).
 #
 # Notify when an agent turn finishes. Fires only for long turns and, by
 # default, only while the terminal window is unfocused. The notification is a
@@ -586,31 +585,6 @@ swarm_max_concurrent_agents = 32
 # JCODE_HOOK_ERROR.
 # post_tool = ""
 
-[ambient]
-# Ambient mode: background agent that maintains your codebase
-# Enable ambient mode (default: false)
-enabled = false
-# Provider override (default: auto-select based on available credentials)
-# provider = "claude"
-# Model override (default: provider's strongest)
-# model = "claude-sonnet-4-20250514"
-# Allow API key usage (default: false, only OAuth to avoid surprise costs)
-allow_api_keys = false
-# Daily token budget when using API keys (optional)
-# api_daily_budget = 100000
-# Minimum interval between cycles in minutes
-min_interval_minutes = 5
-# Maximum interval between cycles in minutes
-max_interval_minutes = 120
-# Pause ambient when user has active session
-pause_on_active_session = true
-# Enable proactive work (new features, refactoring) vs garden-only (lint, format, deps)
-proactive_work = true
-# Branch prefix for proactive work
-work_branch_prefix = "ambient/"
-# Show ambient cycle in a terminal window (default: true)
-# visible = true
-
 [gateway]
 # Enable WebSocket gateway for iOS/web clients
 enabled = false
@@ -626,54 +600,6 @@ bind_addr = "0.0.0.0"
 # The guard is held only for as long as work is in flight. (default: true)
 # Set JCODE_DISABLE_POWER_INHIBIT=1 to force-disable regardless of this setting.
 prevent_sleep_while_streaming = true
-
-[safety]
-# Notification settings for ambient mode events
-
-# ntfy.sh push notifications (free, phone app: https://ntfy.sh)
-# ntfy_topic = "jcode-ambient-your-secret-topic"
-# ntfy_server = "https://ntfy.sh"
-
-# Desktop notifications via notify-send (default: true)
-desktop_notifications = true
-
-# Email notifications via SMTP
-# email_enabled = false
-# email_to = "you@example.com"
-# email_from = "jcode@example.com"
-# email_smtp_host = "smtp.gmail.com"
-# email_smtp_port = 587
-# Password via env: JCODE_SMTP_PASSWORD (preferred) or config below
-# email_password = ""
-
-# IMAP for email replies (reply to ambient emails to send directives)
-# email_reply_enabled = false
-# email_imap_host = "imap.gmail.com"
-# email_imap_port = 993
-
-# Telegram notifications via Bot API (free, https://telegram.org)
-# telegram_enabled = false
-# telegram_bot_token = ""  # From @BotFather (prefer JCODE_TELEGRAM_BOT_TOKEN env var)
-# telegram_chat_id = ""    # Your user/chat ID
-# telegram_reply_enabled = false  # Reply to bot messages to send directives
-
-# Discord notifications via Bot API (https://discord.com/developers)
-# discord_enabled = false
-# discord_bot_token = ""     # From Discord Developer Portal (prefer JCODE_DISCORD_BOT_TOKEN env var)
-# discord_channel_id = ""    # Channel ID to post in
-# discord_bot_user_id = ""   # Bot's user ID (for filtering own messages)
-# discord_reply_enabled = false  # Messages in channel become agent directives
-
-# Jade cloud relay (outbound-only long polling, disabled by default).
-# Prefer environment variables for secrets:
-# JCODE_JADE_RELAY_API_BASE, JCODE_JADE_RELAY_TOKEN, JCODE_JADE_RELAY_TOKEN_ID,
-# JCODE_JADE_RELAY_USER_ID, JCODE_JADE_RELAY_SESSION_ID.
-# jade_relay_enabled = false
-# jade_relay_reply_enabled = false   # Deliver cloud prompts to one configured live session.
-# jade_relay_launch_enabled = false  # Allow cloud device commands to open headed local sessions.
-# jade_relay_launch_working_dir = "" # Optional default cwd for launched sessions.
-
-# endpoint = "https://api.jcode.sh/v1/discovery"
 	"##;
 
         // Substitute platform-specific defaults from the keybinding registry.

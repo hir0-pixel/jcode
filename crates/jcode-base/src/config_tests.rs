@@ -1,5 +1,5 @@
 use super::{
-    AmbientConfig, Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
+    Config, DiffDisplayMode, DisplayConfig, HookCommands, LatexRenderingMode,
     McpToolsMode, ProviderConfig, SessionPickerResumeAction, SwarmSpawnMode, ToolConfig,
     config_env_fingerprint, populate_context_limits_from_config_ref,
 };
@@ -948,11 +948,6 @@ fn cached_external_auth_trust_observes_manual_revocation() {
 
     restore_env_var("JCODE_HOME", prev_home);
     Config::invalidate_cache();
-}
-
-#[test]
-fn test_ambient_visible_defaults_to_true() {
-    assert!(AmbientConfig::default().visible);
 }
 
 #[test]

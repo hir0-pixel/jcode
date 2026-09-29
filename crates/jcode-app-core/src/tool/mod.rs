@@ -1,6 +1,5 @@
 mod agent_message;
 mod agentgrep;
-pub mod ambient;
 mod apply_patch;
 mod bash;
 mod batch;
@@ -36,7 +35,6 @@ pub(crate) fn repl_available() -> bool {
 }
 mod replace;
 pub(crate) mod sdk;
-pub(crate) mod serde_coerce;
 mod session_search;
 pub(crate) mod session_search_index;
 mod skill;
@@ -1549,33 +1547,6 @@ impl Registry {
                 }
             });
         }
-    }
-
-    /// Register ambient-mode tools (only for ambient sessions)
-    pub async fn register_ambient_tools(&self) {
-        self.register(
-            "end_ambient_cycle".to_string(),
-            Arc::new(ambient::EndAmbientCycleTool::new()) as Arc<dyn Tool>,
-        )
-        .await;
-
-        self.register(
-            "schedule_ambient".to_string(),
-            Arc::new(ambient::ScheduleAmbientTool::new()) as Arc<dyn Tool>,
-        )
-        .await;
-
-        self.register(
-            "request_permission".to_string(),
-            Arc::new(ambient::RequestPermissionTool::new()) as Arc<dyn Tool>,
-        )
-        .await;
-
-        self.register(
-            "send_message".to_string(),
-            Arc::new(ambient::SendChannelMessageTool::new()) as Arc<dyn Tool>,
-        )
-        .await;
     }
 
     /// Unregister a tool

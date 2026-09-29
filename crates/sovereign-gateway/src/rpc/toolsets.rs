@@ -5,7 +5,7 @@
 fn tools_of(toolset: &str) -> Vec<&str> {
     match toolset {
         // Loop prevention: anything that re-arms unattended work for later.
-        "cronjob" => vec!["heartbeat", "schedule_ambient", "session_goal"],
+        "cronjob" => vec!["heartbeat", "session_goal"],
         "messaging" => vec!["send_message"],
         "terminal" => vec!["bash", "bg"],
         "file" => vec!["read", "write", "edit", "patch", "apply_patch", "replace", "ls", "agentgrep"],
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn the_cron_denylist_blocks_the_engines_self_scheduling_tools() {
         let req = request("s1", None, &names(&["cronjob", "messaging", "clarify"])).unwrap();
-        assert_eq!(req["tools"]["disabled"], serde_json::json!(["heartbeat", "schedule_ambient", "send_message", "session_goal"]));
+        assert_eq!(req["tools"]["disabled"], serde_json::json!(["heartbeat", "send_message", "session_goal"]));
         assert!(req["tools"].get("enabled").is_none(), "no allowlist unless the job set one");
         assert!(request("s1", None, &[]).is_none());
     }

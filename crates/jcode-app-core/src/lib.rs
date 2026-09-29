@@ -25,13 +25,8 @@ pub use jcode_base::*;
 
 // Upper layer (server / tool / agent and supporting leaves).
 pub mod agent;
-pub mod ambient;
-pub mod ambient_runner;
-pub mod ambient_scheduler;
 pub mod build;
-pub mod channel;
 pub use jcode_base::external_auth;
-pub mod notifications;
 pub mod server;
 pub mod session_effort;
 pub mod session_launch;

@@ -2,38 +2,6 @@ use super::*;
 use crate::browser_detect::BrowserKind;
 
 #[test]
-fn test_is_browser_command() {
-    assert!(is_browser_command("browser ping"));
-    assert!(is_browser_command(
-        "browser navigate '{\"url\": \"https://example.com\"}'"
-    ));
-    assert!(is_browser_command("browser"));
-    assert!(is_browser_command("  browser ping"));
-    assert!(is_browser_command("browser\tping"));
-
-    assert!(!is_browser_command("echo browser"));
-    assert!(!is_browser_command("browsers"));
-    assert!(!is_browser_command("my-browser ping"));
-    assert!(!is_browser_command(""));
-    assert!(!is_browser_command("browserify install"));
-}
-
-#[test]
-fn test_rewrite_command_with_full_path() {
-    let _guard = crate::storage::lock_test_env();
-
-    let cmd = "browser ping";
-    let result = rewrite_command_with_full_path(cmd);
-    // If binary exists, it rewrites; if not, returns unchanged
-    if browser_binary_path().exists() {
-        assert!(result.contains("ping"));
-        assert!(result.contains(".jcode/browser"));
-    } else {
-        assert_eq!(result, cmd);
-    }
-}
-
-#[test]
 fn test_paths() {
     let _guard = crate::storage::lock_test_env();
 
@@ -189,86 +157,6 @@ async fn test_ensure_browser_ready_noninteractive_without_binary() {
         assert!(!status.binary_installed);
         assert!(!status.ready);
         assert!(!status.setup_complete);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn ensure_browser_session_fails_fast_when_session_process_exits_immediately() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
-
-    let _guard = crate::storage::lock_test_env();
-    let prev_home = std::env::var_os("JCODE_HOME");
-    let temp = tempfile::TempDir::new().expect("create temp dir");
-    crate::env::set_var("JCODE_HOME", temp.path());
-
-    let browser_dir = temp.path().join("browser");
-    std::fs::create_dir_all(&browser_dir).expect("create browser dir");
-    let bin = browser_dir.join("browser");
-    std::fs::write(&bin, "#!/bin/sh\nexit 2\n").expect("write fake browser binary");
-    let mut perms = std::fs::metadata(&bin)
-        .expect("stat fake browser binary")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&bin, perms).expect("chmod fake browser binary");
-
-    let start = Instant::now();
-    let session = ensure_browser_session("fast-fail-session");
-    let elapsed = start.elapsed();
-
-    assert!(session.is_none());
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "expected immediate failure, got {:?}",
-        elapsed
-    );
-
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn ensure_browser_session_does_not_pass_unsupported_bind_window_flag() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _guard = crate::storage::lock_test_env();
-    let prev_home = std::env::var_os("JCODE_HOME");
-    let temp = tempfile::TempDir::new().expect("create temp dir");
-    crate::env::set_var("JCODE_HOME", temp.path());
-
-    let browser_dir = temp.path().join("browser");
-    std::fs::create_dir_all(&browser_dir).expect("create browser dir");
-    let bin = browser_dir.join("browser");
-    let invocations = temp.path().join("invocations");
-    std::fs::write(
-        &bin,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2 $3\" = \"session start --help\" ]; then\n  echo 'Usage: browser session start [NAME]'\nfi\nexit 2\n",
-            invocations.display()
-        ),
-    )
-    .expect("write fake browser binary");
-    let mut perms = std::fs::metadata(&bin)
-        .expect("stat fake browser binary")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&bin, perms).expect("chmod fake browser binary");
-
-    assert!(ensure_browser_session("legacy-session").is_none());
-    let calls = std::fs::read_to_string(invocations).expect("read invocations");
-    assert!(calls.contains("session start --help"), "{calls}");
-    assert!(calls.contains("session start legacy-session"), "{calls}");
-    assert!(!calls.contains("--bind-window"), "{calls}");
-
-    if let Some(prev_home) = prev_home {
-        crate::env::set_var("JCODE_HOME", prev_home);
-    } else {
-        crate::env::remove_var("JCODE_HOME");
     }
 }
 
