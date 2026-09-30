@@ -139,11 +139,15 @@ impl OpenRouterStream {
     }
 
     fn push_completed_tool_call(&mut self, index: u64, mut tc: ToolCallAccumulator) {
+        if tc.id.trim().is_empty() && !tc.name.trim().is_empty() {
+            // Hermes synthesizes ids for providers that omit them; the
+            // positional id is swapped for a unique one in queue_tool_progress.
+            tc.id = format!("{}:{index}", tc.name);
+        }
         if tc.id.trim().is_empty() {
             jcode_logging::warn(&format!(
-                "OpenRouter SSE dropped incomplete tool call for model {}: missing id (name={} args_len={})",
+                "OpenRouter SSE dropped incomplete tool call for model {}: missing id and name (args_len={})",
                 self.model,
-                tc.name,
                 tc.arguments.len()
             ));
             return;
@@ -580,6 +584,31 @@ mod tests {
             "test-model".to_string(),
             Arc::new(std::sync::Mutex::new(None)),
         )
+    }
+
+    #[test]
+    fn tool_call_with_name_but_empty_id_gets_a_synthesized_id() {
+        let mut stream = test_stream();
+        stream.buffer = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"p\\\":1}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let mut started = None;
+        let mut deltas = String::new();
+        while let Some(event) = stream.parse_next_event() {
+            match event {
+                StreamEvent::ToolUseStart { id, name } => started = Some((id, name)),
+                StreamEvent::ToolInputDeltaFor { delta, .. } => deltas.push_str(&delta),
+                StreamEvent::MessageEnd { .. } => break,
+                _ => {}
+            }
+        }
+        let (id, name) = started.expect("tool call must not be dropped");
+        assert_eq!(name, "read");
+        assert!(!id.is_empty() && id != "read:0");
+        assert_eq!(deltas, "{\"p\":1}");
     }
 
     #[test]
