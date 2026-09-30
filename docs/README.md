@@ -1,27 +1,9 @@
-# jcode Docs
+# Factr-I engine docs
 
-Reference documentation for the jcode codebase.
+Start here: `SOVEREIGN.md`, `SOVEREIGN_PLAN.md`, `design/factr-i-harness.md` (current harness and memory design), `OBSERVABILITY.md`.
 
-## Layout
-
-- `docs/*.md` — architecture, feature, and behavior docs (current state of the system).
-- `docs/plans/` — forward-looking plans, roadmaps, and TODO trackers. May be partially implemented or stale.
-- `docs/audits/` — point-in-time audits and reviews. Historical snapshots, not kept up to date.
-- `docs/proposals/` — design proposals not yet committed to.
-- `docs/dev/` — developer-facing process and testing notes.
-
-## Key entry points
-
-- Architecture: `SERVER_ARCHITECTURE.md`, `MODULAR_ARCHITECTURE_RFC.md`, `CRATE_OWNERSHIP_BOUNDARIES.md`
-- Swarm: `SWARM_ARCHITECTURE.md`, `SWARM_TASK_GRAPH.md`
-- Memory: `MEMORY_ARCHITECTURE.md`, `MEMORY_INCIDENT_RUNBOOK.md`; budgets: `REQUIREMENTS.md`
-- Refactoring and quality: `REFACTORING.md`, `plans/CODE_QUALITY_10_10_PLAN.md`
-- Desktop app: `DESKTOP_APP_ARCHITECTURE.md`, `DESKTOP_CODEBASE_ARCHITECTURE.md`
-- Providers: `PROVIDER_DOCTOR.md`, `AWS_BEDROCK_PROVIDER.md`
-- Platform: `WINDOWS.md`, `TERMINAL_CAPABILITIES.md`
-
-## Conventions
-
-- Docs describing current behavior live at the top level; anything speculative goes in `plans/` or `proposals/`.
-- Prefer updating an existing doc over adding a near-duplicate.
-- Root of the repo should only hold README, CONTRIBUTING, AGENTS, LICENSE, and similar meta files. Put everything else here.
+- Architecture: `SERVER_ARCHITECTURE.md`, `CRATE_OWNERSHIP_BOUNDARIES.md`, `SWARM_ARCHITECTURE.md`, `SWARM_TASK_GRAPH.md`, `MULTI_SESSION_CLIENT_ARCHITECTURE.md`
+- Memory: `MEMORY_ARCHITECTURE.md`, `MEMORY_DESIGN.md` (history), `MEMORY_INCIDENT_RUNBOOK.md`; budgets in `REQUIREMENTS.md`
+- Providers: `PROVIDER_DOCTOR.md`, `AWS_BEDROCK_PROVIDER.md`, `AUTH_CREDENTIAL_SOURCES.md`
+- Benchmarks: `BENCHMARK.md`, `TERMINAL_BENCH.md`, `benchmark-runs/`
+- Other: `RELEASING.md`, `WINDOWS.md`, `PARITY.md`, `PRIME_PARITY.md`, `eval-case-format.md`, `dev/`

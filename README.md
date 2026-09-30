@@ -307,7 +307,7 @@ The harness also provides explicit memory tools to allow the agent to actively s
 
 ## UI: Side panels, Diagrams, Info Widgets, rendering, scrolling, alignment
 
-The `panel` tool opens a new desktop panel from Markdown content or a linked Markdown/PDF file, and supports update, focus, close, and list actions. See [Desktop panels](docs/PANELS.md) for the API, PDF limits, and compatibility details.
+The `panel` tool opens a new desktop panel from Markdown content or a linked Markdown/PDF file, and supports update, focus, close, and list actions.
 
 The side panel is a place for auxiliary information. Tell your jcode agent to load a file into the side panel and see it update in real time, or tell your agent to write directly to the side panel, or use it as a diff viewer. The side panel (and chat) is able to render mermaid diagrams inline. 
 <img width="2877" height="1762" alt="image" src="https://github.com/user-attachments/assets/6c7bec81-ef3f-434d-8a7b-d55f8a54e5cf" />
@@ -807,7 +807,6 @@ Notes:
 - [Safety System](docs/SAFETY_SYSTEM.md)
 - [Windows Notes](docs/WINDOWS.md)
 - [Wrappers and Shell Integration](docs/WRAPPERS.md)
-- [Refactoring Notes](docs/REFACTORING.md)
 
 ---
 
