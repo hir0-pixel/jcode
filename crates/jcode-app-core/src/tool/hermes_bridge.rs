@@ -26,6 +26,12 @@ const NATIVE_TOOLSETS: &[&str] = &[
     "desktop_ui", "project", "setup", "connections",
 ];
 
+/// A Hermes tool the engine already has: its toolset is native, except the browser vault (logins,
+/// codes, form fill), which native `browser` lacks, so it is reached through `hermes`.
+fn native(name: &str, toolset: &str) -> bool {
+    NATIVE_TOOLSETS.contains(&toolset) && !name.starts_with("browser_vault_")
+}
+
 /// The answer to a `clarify` question.
 pub enum ClarifyReply {
     Answer(String),
@@ -87,7 +93,7 @@ impl HermesTool {
         let mut lines = Vec::new();
         for tool in reply["tools"].as_array().into_iter().flatten() {
             let (name, toolset) = (tool["name"].as_str().unwrap_or(""), tool["toolset"].as_str().unwrap_or(""));
-            if name.is_empty() || NATIVE_TOOLSETS.contains(&toolset) || !super::session_tool_allows(session_id, name, toolset) {
+            if name.is_empty() || native(name, toolset) || !super::session_tool_allows(session_id, name, toolset) {
                 continue;
             }
             lines.push(format!("{name}: {}", tool["description"].as_str().unwrap_or("")));
@@ -104,7 +110,7 @@ impl HermesTool {
         anyhow::ensure!(!name.is_empty(), "`tool` is required");
         let reply = host.call("GET", &format!("/api/agent-tools/{}", urlencoding::encode(name)), None).await?;
         let toolset = reply["toolset"].as_str().unwrap_or("");
-        anyhow::ensure!(!NATIVE_TOOLSETS.contains(&toolset), "'{name}' is a native tool; call it directly");
+        anyhow::ensure!(!native(name, toolset), "'{name}' is a native tool; call it directly");
         anyhow::ensure!(super::session_tool_allows(session_id, name, toolset), "Tool '{name}' is disabled in this run");
         Ok(reply)
     }
@@ -117,7 +123,7 @@ impl Tool for HermesTool {
     }
 
     fn description(&self) -> &str {
-        "Hermes-only tools (cron jobs, image/video generation, vision, text to speech, Home Assistant, kanban, x_search, computer use, CDP browser). action=list shows what is available, describe gives a tool's parameters, call runs it."
+        "Hermes-only tools (cron jobs, image/video generation, vision, text to speech, Home Assistant, kanban, x_search, computer use, browser vault and CDP). action=list shows what is available, describe gives a tool's parameters, call runs it."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -253,6 +259,8 @@ mod tests {
                     { "name": "cronjob_manage", "toolset": "cronjob", "description": "Manage cron jobs" },
                     { "name": "send_message", "toolset": "messaging", "description": "Send a message" },
                     { "name": "read_file", "toolset": "file", "description": "Native duplicate" },
+                    { "name": "browser_click", "toolset": "browser", "description": "Native browser duplicate" },
+                    { "name": "browser_vault_fill", "toolset": "browser", "description": "Fill a saved login" },
                 ]}),
                 "/api/agent-tools/invoke" => json!({ "result": "{\"ok\":true}" }),
                 other => {
@@ -293,7 +301,16 @@ mod tests {
         let out = run(&HermesTool::with_host(fake.clone()), "hb-list", json!({"action": "list"})).await.unwrap();
         assert!(out.contains("image_generate: Make an image") && out.contains("cronjob_manage"));
         assert!(!out.contains("read_file"), "native tools are not offered twice");
+        assert!(!out.contains("browser_click") && out.contains("browser_vault_fill"), "only the vault escapes the browser toolset");
         assert_eq!(fake.calls.lock().unwrap()[0].1, "/api/agent-tools");
+    }
+
+    #[test]
+    fn nothing_is_offered_twice_when_a_native_equivalent_exists() {
+        for toolset in NATIVE_TOOLSETS {
+            assert!(native("any_tool", toolset), "{toolset}");
+        }
+        assert!(!native("browser_vault_fill", "browser") && !native("browser_cdp", "browser-cdp"));
     }
 
     #[tokio::test]

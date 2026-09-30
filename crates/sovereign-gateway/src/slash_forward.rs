@@ -8,9 +8,12 @@
 
 use serde_json::{Value, json};
 
-/// Hermes built-ins that mutate the live chat (history, model, queue, checkpoints).
+/// Hermes built-ins that are never forwarded: they mutate the live chat (history, model, queue,
+/// checkpoints), or the engine owns the job (/refine learns, engine memory has no Python write
+/// path; skill hub and curator stay reachable through Hermes's REST routes and settings).
 pub(crate) const SESSION_BOUND: &[&str] = &[
     "moa", "focus", "retry", "steer", "undo", "snapshot", "snap", "compress", "compact",
+    "learn", "curator", "skills", "memory",
 ];
 
 /// Commands the engine's own `harness_command` serves (first word of each pair).
@@ -60,8 +63,6 @@ pub(crate) fn merge_catalog(engine: Value, python: &Value) -> Value {
     out["sub"] = pick(&python["sub"]);
     out["canon"] = pick(&python["canon"]);
     out["commands"] = pick(&python["commands"]);
-    out["skills"] = python["skills"].clone();
-    out["skill_count"] = python["skill_count"].clone();
     out["warning"] = python["warning"].clone();
     out
 }
@@ -75,14 +76,15 @@ mod tests {
         let engine = json!({
             "pairs": [["/goal", "engine goal"], ["/refine status", "x"]],
             "categories": [{ "name": "Harness", "pairs": [["/goal", "engine goal"]] }],
+            "skills": {}, "skill_count": 3,
         });
         let python = json!({
-            "pairs": [["/goal", "hermes goal"], ["/undo", "u"], ["/tools", "t"], ["/my-skill", "s"]],
+            "pairs": [["/goal", "hermes goal"], ["/undo", "u"], ["/learn", "l"], ["/tools", "t"], ["/my-skill", "s"]],
             "categories": [{ "name": "Tools", "pairs": [["/tools", "t"], ["/undo", "u"]] }, { "name": "Empty", "pairs": [["/goal", "g"]] }],
             "sub": { "/tools": ["list"], "/undo": [] },
             "canon": { "/t": "/tools", "/goal": "/goal", "/undo": "/undo" },
             "commands": { "/tools": {"argument_mode": null} },
-            "skills": { "/my-skill": {"usage": 1} }, "skill_count": 1, "warning": "w",
+            "skills": { "/my-skill": {"usage": 1} }, "skill_count": 9, "warning": "w",
         });
         let out = merge_catalog(engine, &python);
         let keys: Vec<&str> = out["pairs"].as_array().unwrap().iter().map(|p| p[0].as_str().unwrap()).collect();
@@ -92,6 +94,7 @@ mod tests {
         assert_eq!(cats, ["Harness", "Tools"]);
         assert_eq!(out["canon"], json!({ "/t": "/tools" }));
         assert_eq!(out["sub"], json!({ "/tools": ["list"] }));
-        assert_eq!(out["skill_count"], 1);
+        assert_eq!(out["skills"], json!({}), "the slash list matches the engine's skills");
+        assert_eq!(out["skill_count"], 3);
     }
 }

@@ -1175,6 +1175,7 @@ impl Conn {
                     ],
                     ["/harness", "Show the learned instructions"],
                     ["/goal", "Set or manage the unattended session goal"],
+                    ["/subgoal", "Add, remove or clear extra criteria on the active goal"],
                     [
                         "/autonomous",
                         "Run self-paced work with optional quality gates"
@@ -2297,6 +2298,22 @@ impl Conn {
                     std::path::Path::new(&self.config.home),
                 )?;
                 sovereign_prime::agent_loop::handle_goal_command(&store, sid, &rest.join(" "))
+            })(),
+            ["subgoal", rest @ ..] => (|| -> anyhow::Result<String> {
+                let sid = session_id
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow!("/subgoal needs an open session"))?;
+                let store = sovereign_prime::agent_loop::ControlStore::open_cached(
+                    std::path::Path::new(&self.config.home),
+                )?;
+                let (action, args) = match rest {
+                    [] => return sovereign_prime::agent_loop::handle_goal_command(&store, sid, "status"),
+                    ["clear"] => ("subgoal.clear", json!({})),
+                    ["remove" | "rm", n] => ("subgoal.remove", json!({ "index": n.parse::<u64>().unwrap_or(0) })),
+                    _ => ("subgoal.add", json!({ "text": rest.join(" ") })),
+                };
+                let (_, done) = sovereign_prime::agent_loop::control_action(&store, sid, action, &args)?;
+                Ok(done["output"].as_str().unwrap_or_default().to_string())
             })(),
             ["autonomous" | "loop", rest @ ..] => (|| -> anyhow::Result<String> {
                 let sid = session_id
