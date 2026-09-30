@@ -49,10 +49,9 @@ pub fn fuzzy_replace(content: &str, old: &str, new: &str) -> Option<(std::ops::R
         let want: Vec<String> = old_lines.iter().map(|l| norm(l)).collect();
         let hits: Vec<usize> = (0..=lines.len() - old_lines.len())
             .filter(|&i| {
-                lines[i..i + old_lines.len()]
-                    .iter()
-                    .zip(&want)
-                    .all(|((_, text, _), w)| norm(text) == *w)
+                let win = &lines[i..i + old_lines.len()];
+                win.iter().zip(&want).all(|((_, text, _), w)| norm(text) == *w)
+                    && relative_indent_ok(win, &old_lines)
             })
             .collect();
         match hits.as_slice() {
@@ -65,17 +64,41 @@ pub fn fuzzy_replace(content: &str, old: &str, new: &str) -> Option<(std::ops::R
                 let old_first = old_lines.iter().find(|l| !l.trim().is_empty())?;
                 let got_first = lines[*i..].iter().map(|l| l.1).find(|l| !l.trim().is_empty())?;
                 let (old_ind, got_ind) = (indent_of(old_first), indent_of(got_first));
-                let new_text = if old_ind == got_ind {
+                let mut new_text = if old_ind == got_ind {
                     new.to_string()
                 } else {
                     reindent(new, old_ind, got_ind)
                 };
+                // Keep the file's line endings (CRLF) and the original terminator.
+                let raw_first = &content[first.0..first.0 + first.2];
+                if raw_first.ends_with("\r\n") {
+                    if trailing_nl && !new_text.ends_with('\n') {
+                        new_text.push('\n');
+                    }
+                    new_text = new_text.replace("\r\n", "\n").replace('\n', "\r\n");
+                }
                 return Some((start..end, new_text));
             }
             _ => return None, // ambiguous: keep the existing error path
         }
     }
     None
+}
+
+/// Every non-blank line must be indented by the same offset from the file's
+/// indentation as the first one (relative nesting preserved).
+fn relative_indent_ok(win: &[(usize, &str, usize)], old_lines: &[&str]) -> bool {
+    let mut offset = None;
+    for ((_, got, _), old) in win.iter().zip(old_lines) {
+        if old.trim().is_empty() {
+            continue;
+        }
+        let d = indent_of(got).len() as isize - indent_of(old).len() as isize;
+        if *offset.get_or_insert(d) != d {
+            return false;
+        }
+    }
+    true
 }
 
 fn reindent(new: &str, from: &str, to: &str) -> String {
@@ -113,6 +136,26 @@ mod tests {
     fn ambiguous_or_missing_is_none() {
         assert!(apply("  a\n    a\n", "a", "b").is_none());
         assert!(apply("x\n", "y", "z").is_none());
+    }
+
+    #[test]
+    fn different_nesting_is_rejected() {
+        let c = "if a:\n    x = 1\n    y = 2\nz = 3\n";
+        // old has y at the same level as x; file has it nested differently
+        assert!(apply(c, "x = 1\ny = 2\nz = 3", "x = 1").is_none());
+        let c2 = "def f():\n    if a:\n        x = 1\n    y = 2\n";
+        assert!(apply(c2, "x = 1\ny = 2", "q").is_none());
+    }
+
+    #[test]
+    fn crlf_replacement_keeps_crlf() {
+        let c = "  a\r\n  b\r\n  c\r\n";
+        let out = apply(c, "a\nb\n", "x\ny\n").unwrap();
+        assert_eq!(out, "  x\r\n  y\r\n  c\r\n");
+        let out = apply(c, "a\nb\n", "x").unwrap();
+        assert_eq!(out, "  x\r\n  c\r\n");
+        let out = apply(c, "a\nb", "x\ny").unwrap();
+        assert_eq!(out, "  x\r\n  y\r\n  c\r\n");
     }
 
     #[test]

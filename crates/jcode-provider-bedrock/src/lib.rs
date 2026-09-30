@@ -470,12 +470,34 @@ impl BedrockProvider {
             .unwrap_or(0.5)
     }
 
-    /// Prompt caching is accepted by Claude and Nova on Bedrock; unknown
-    /// models get no markers (Hermes `_CACHE_POINT_PATTERNS`).
+    /// cachePoint is sent only to model families Bedrock documents as cacheable:
+    /// Claude 3.7 Sonnet, 3.5 Haiku, Claude 4.x and newer, and Nova. Other
+    /// Claude 3.x (incl. 3.5 Sonnet v2) and unknown models get no markers.
     #[cfg(any(feature = "aws-sdk", test))]
     fn supports_prompt_cache(model: &str) -> bool {
         let id = Self::normalize_model_id(model).to_ascii_lowercase();
-        id.contains("anthropic.claude") || id.contains("amazon.nova")
+        if id.contains("amazon.nova") {
+            return true;
+        }
+        let Some((_, rest)) = id.split_once("anthropic.claude-") else {
+            return false;
+        };
+        let mut nums = rest
+            .split('-')
+            .filter_map(|t| t.parse::<u32>().ok().filter(|_| t.len() <= 2));
+        match (nums.next(), nums.next()) {
+            (Some(major), _) if major >= 4 => true,
+            (Some(3), Some(7)) => true,
+            (Some(3), Some(5)) => id.contains("haiku"),
+            _ => false,
+        }
+    }
+
+    /// Any validation failure while cachePoints are on is retried once without.
+    #[cfg(any(feature = "aws-sdk", test))]
+    fn is_cache_fallback_error(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("validation") || lower.contains("cachepoint") || lower.contains("cache_point")
     }
 
     // Pure string logic; only reachable from aws-sdk request paths and tests.
@@ -1495,6 +1517,9 @@ impl Provider for BedrockProvider {
             let mut attempt = 0u32;
             let mut emitted_before = false;
             loop {
+                if tx.is_closed() {
+                    return;
+                }
                 attempt += 1;
                 let inputs = cached.clone().unwrap_or_else(|| plain.clone());
                 if emitted_before {
@@ -1509,8 +1534,7 @@ impl Provider for BedrockProvider {
                     Ok(()) => return,
                     Err(failure) => failure,
                 };
-                let lower = failure.message.to_ascii_lowercase();
-                if cached.is_some() && (lower.contains("cachepoint") || lower.contains("cache_point")) {
+                if cached.is_some() && Self::is_cache_fallback_error(&failure.message) {
                     // Model refused the marker: resend once without caching.
                     jcode_logging::warn("Bedrock rejected cachePoint; retrying without prompt caching");
                     cached = None;
@@ -1525,6 +1549,9 @@ impl Provider for BedrockProvider {
                         delay.as_secs_f64(),
                         failure.message.lines().next().unwrap_or("")
                     ));
+                    if tx.is_closed() {
+                        return;
+                    }
                     tokio::time::sleep(delay).await;
                     emitted_before = failure.emitted;
                     continue;
@@ -1753,6 +1780,29 @@ mod tests {
         );
         assert!(BedrockProvider::supports_prompt_cache(id));
         assert!(!BedrockProvider::supports_prompt_cache("meta.llama3-1-70b"));
+    }
+
+    #[test]
+    fn prompt_cache_allowlist_and_fallback_error() {
+        for yes in [
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        ] {
+            assert!(BedrockProvider::supports_prompt_cache(yes), "{yes}");
+        }
+        for no in [
+            DEFAULT_MODEL,
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-3-opus-20240229-v1:0",
+        ] {
+            assert!(!BedrockProvider::supports_prompt_cache(no), "{no}");
+        }
+        assert!(BedrockProvider::is_cache_fallback_error("ValidationException: bad request"));
+        assert!(!BedrockProvider::is_cache_fallback_error("ThrottlingException"));
     }
 
     #[cfg(feature = "aws-sdk")]

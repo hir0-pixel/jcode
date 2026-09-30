@@ -7,9 +7,15 @@
 //! turn without edits (verify) or without prior tool use (action).
 
 const EDIT_TOOLS: [&str; 4] = ["write", "edit", "apply_patch", "replace"];
-const TEST_MARKERS: [&str; 14] = [
+const TEST_MARKERS: [&str; 23] = [
+    "jest", "vitest", "bun test", "deno test", "node --test", "swift test", "dotnet test",
+    "gradle test", "tox",
     "pytest", "unittest", "cargo test", "cargo nextest", "go test", "npm test", "npm run test",
     "yarn test", "pnpm test", "make test", "gradlew test", "ctest", "mvn test", "rspec",
+];
+const CODE_EXTS: [&str; 26] = [
+    "rs", "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "swift", "c", "h",
+    "cc", "cpp", "hpp", "cs", "rb", "php", "scala", "sh", "lua", "dart", "zig", "ex",
 ];
 const ACTION_PHRASES: [&str; 6] = ["i will", "i'll", "let me", "now i'll", "i am going to", "i'm going to"];
 
@@ -35,11 +41,32 @@ fn looks_like_test_run(command: &str) -> bool {
     TEST_MARKERS.iter().any(|m| c.contains(m))
 }
 
+/// Whether an edit-tool call touched a source file. Calls with no readable
+/// path (apply_patch bodies etc.) are scanned for source-file paths.
+fn edits_code(input: &serde_json::Value) -> bool {
+    let is_code = |p: &str| {
+        let p = p.trim().trim_matches(['"', '\'']);
+        p.rsplit_once('.')
+            .is_some_and(|(_, e)| CODE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+    };
+    for k in ["file_path", "path", "filePath"] {
+        if let Some(p) = input[k].as_str() {
+            return is_code(p);
+        }
+    }
+    match input["patch_text"].as_str().or_else(|| input["patch"].as_str()).or_else(|| input["input"].as_str()) {
+        Some(t) => t.lines().filter(|l| l.starts_with("***") || l.starts_with("+++")).any(|l| {
+            l.split_whitespace().last().is_some_and(is_code)
+        }),
+        None => true,
+    }
+}
+
 impl StopNudge {
     /// Record a finished tool call.
     pub(super) fn observe(&mut self, tool: &str, input: &serde_json::Value, is_error: bool) {
         self.used_tools = true;
-        if !is_error && EDIT_TOOLS.contains(&tool) {
+        if !is_error && EDIT_TOOLS.contains(&tool) && edits_code(input) {
             self.edited = true;
         }
         if tool == "bash" && input["command"].as_str().is_some_and(looks_like_test_run) {
@@ -83,7 +110,11 @@ fn announces_action(lower: &str) -> bool {
         .rsplit(['.', '!', '?', '\n'])
         .find(|s| !s.trim().is_empty())
         .unwrap_or("");
-    ACTION_PHRASES.iter().any(|p| last.contains(p)) || lower.trim_end().ends_with(':')
+    let last = last.trim();
+    if last.starts_with("let me know") || lower.contains('?') || lower.contains("summary") {
+        return false;
+    }
+    ACTION_PHRASES.iter().any(|p| last.starts_with(p)) || lower.trim_end().ends_with(':')
 }
 
 #[cfg(test)]
@@ -121,5 +152,25 @@ mod tests {
         n.observe("read", &json!({}), false);
         assert!(n.on_text_only_stop("s", "Found the bug. Now I'll fix it."));
         assert_eq!(n.take_pending(), Some(ACTION_NUDGE));
+    }
+
+    #[test]
+    fn let_me_know_is_not_a_promise() {
+        let mut n = StopNudge::default();
+        n.observe("read", &json!({}), false);
+        assert!(!n.on_text_only_stop("s", "All fixed. Let me know if you need anything else."));
+        assert!(!n.on_text_only_stop("s", "I think it works, so I'll stop here."));
+    }
+
+    #[test]
+    fn docs_edits_do_not_need_tests_and_new_runners_count() {
+        let mut n = StopNudge::default();
+        n.observe("edit", &json!({"file_path": "README.md"}), false);
+        n.observe("write", &json!({"file_path": "a.json"}), false);
+        assert!(!n.on_text_only_stop("s", "Done."));
+        let mut n = StopNudge::default();
+        n.observe("edit", &json!({"file_path": "src/a.ts"}), false);
+        n.observe("bash", &json!({"command": "bun test"}), false);
+        assert!(!n.on_text_only_stop("s", "Done."));
     }
 }

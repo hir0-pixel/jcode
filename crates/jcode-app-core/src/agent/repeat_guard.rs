@@ -83,9 +83,15 @@ impl RepeatGuard {
         if is_poller(tool) || is_block_exempt(tool, input) {
             return None;
         }
-        let same_call =
-            self.call_count >= BLOCK_AFTER && hash_of(&[tool, &input.to_string()]) == self.last_input_sig && tool == self.last_tool;
-        let same_fail = self.fail_count >= BLOCK_AFTER && tool == self.fail_tool;
+        let sig = hash_of(&[tool, &input.to_string()]);
+        let same_input = sig == self.last_input_sig && tool == self.last_tool;
+        if !same_input && tool == self.fail_tool {
+            // A changed (corrected) call starts a fresh failure streak.
+            self.fail_count = 0;
+            self.blocked = 0;
+        }
+        let same_call = self.call_count >= BLOCK_AFTER && same_input;
+        let same_fail = self.fail_count >= BLOCK_AFTER && tool == self.fail_tool && same_input;
         if !(same_call || same_fail) {
             return None;
         }
@@ -210,6 +216,18 @@ mod tests {
         assert!(g.block("s", "bash", &args).unwrap().1.is_some());
         // A different call is never blocked.
         assert!(g.block("s", "edit", &json!({"a": 1})).is_none());
+    }
+
+    #[test]
+    fn corrected_call_after_repeated_failures_is_not_blocked() {
+        let mut g = RepeatGuard::default();
+        for _ in 0..6 {
+            g.observe("bash", &json!({"command": "make build"}), "error: no rule", true);
+        }
+        assert!(g.block("s", "bash", &json!({"command": "make build"})).is_some());
+        assert!(g.block("s", "bash", &json!({"command": "make all"})).is_none());
+        g.observe("bash", &json!({"command": "make all"}), "error: no rule", true);
+        assert!(g.block("s", "bash", &json!({"command": "make all"})).is_none());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const MAX_BYTES: usize = 1_000_000;
-const TIMEOUT: Duration = Duration::from_millis(300);
+const TIMEOUT: Duration = Duration::from_millis(1500);
 
 const PY_CHECK: &str = "import ast,sys\nsrc=sys.stdin.read()\ntry:\n ast.parse(src)\nexcept SyntaxError as e:\n print(f'{e.lineno or 1}\\t{e.msg}');sys.exit(1)\n";
 
@@ -23,9 +23,22 @@ async fn check(ext: &str, src: &str) -> Option<(usize, String)> {
             .err()
             .map(|e| (e.line(), e.to_string())),
         "py" => run("python3", &["-c", PY_CHECK], src, true).await,
-        "js" | "mjs" | "cjs" => run("node", &["--check", "-"], src, false).await,
+        "js" | "mjs" | "cjs" => {
+            let esm = ext == "mjs"
+                || (ext == "js"
+                    && src.lines().any(|l| {
+                        let l = l.trim_start();
+                        l.starts_with("import ") || l.starts_with("export ")
+                    }));
+            let args: &[&str] = if esm {
+                &["--input-type=module", "--check", "-"]
+            } else {
+                &["--check", "-"]
+            };
+            run("node", args, src, false).await
+        }
         "go" => run("gofmt", &["-e"], src, false).await,
-        "rs" => run("rustfmt", &["--check", "--emit", "stdout"], src, false).await,
+        "rs" => run("rustfmt", &["--edition", "2021", "--emit", "stdout"], src, false).await,
         _ => None,
     }
 }
@@ -52,7 +65,9 @@ async fn run(bin: &str, args: &[&str], src: &str, tabbed: bool) -> Option<(usize
         return None;
     }
     let text = String::from_utf8_lossy(if tabbed { &out.stdout } else { &out.stderr });
-    let first = text.lines().find(|l| !l.trim().is_empty())?;
+    // node prefixes "(node:PID) Warning" / "(Use ...)" noise; skip it.
+    let mut real = text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('('));
+    let first = real.clone().find(|l| l.contains("Error:")).or_else(|| real.next())?;
     if tabbed {
         let (line, msg) = first.split_once('\t')?;
         return Some((line.parse().ok()?, msg.to_string()));
@@ -61,7 +76,11 @@ async fn run(bin: &str, args: &[&str], src: &str, tabbed: bool) -> Option<(usize
     let line = text
         .lines()
         .find_map(|l| {
-            let rest = l.split("<stdin>:").nth(1).or_else(|| l.strip_prefix("[stdin]:"))?;
+            let rest = l
+                .split("<stdin>:")
+                .nth(1)
+                .or_else(|| l.split("<standard input>:").nth(1))
+                .or_else(|| l.strip_prefix("[stdin]:"))?;
             rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
         })
         .unwrap_or(1);
@@ -99,6 +118,40 @@ mod tests {
         assert!(new_syntax_note(p, Some("{"), "{\n\"a\": }").await.is_none());
         assert!(new_syntax_note(p, None, "{}").await.is_none());
         assert!(new_syntax_note(Path::new("a.txt"), None, "{").await.is_none());
+    }
+
+    fn have(b: &str) -> bool {
+        std::process::Command::new(b).arg("--version").output().is_ok()
+    }
+
+    #[tokio::test]
+    async fn rust_async_ok_and_invalid_reported() {
+        if !have("rustfmt") {
+            return;
+        }
+        let p = Path::new("a.rs");
+        assert!(new_syntax_note(p, None, "async fn f() {}\nfn main() {}\n").await.is_none());
+        let note = new_syntax_note(p, None, "fn main( {\n").await.unwrap();
+        assert!(note.contains("a.rs:1"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn node_esm_cjs_and_go() {
+        if have("node") {
+            let esm = "import a from \"b\";\nexport default a;\n";
+            assert!(new_syntax_note(Path::new("a.js"), None, esm).await.is_none());
+            assert!(new_syntax_note(Path::new("a.mjs"), None, "export const x = 1;\n").await.is_none());
+            assert!(new_syntax_note(Path::new("a.cjs"), None, "const a = require('a');\n").await.is_none());
+            assert!(new_syntax_note(Path::new("a.tsx"), None, "const a = <div/>;").await.is_none());
+            let note = new_syntax_note(Path::new("a.cjs"), None, "let = = 1;\n").await.unwrap();
+            assert!(note.contains("a.cjs:1") && !note.contains("(node:"), "{note}");
+            assert!(new_syntax_note(Path::new("a.mjs"), None, "import x from;\n").await.is_some());
+        }
+        if have("gofmt") {
+            assert!(new_syntax_note(Path::new("a.go"), None, "package main\nfunc main() {}\n").await.is_none());
+            let note = new_syntax_note(Path::new("a.go"), None, "package main\nfunc {\n").await.unwrap();
+            assert!(note.contains("a.go:2"), "{note}");
+        }
     }
 
     #[tokio::test]

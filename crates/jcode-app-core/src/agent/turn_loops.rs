@@ -56,6 +56,8 @@ impl Agent {
             self.graceful_shutdown.clone(),
         );
         let mut final_text = String::new();
+        // Text of replies that were followed by a stop nudge; kept in the result.
+        let mut nudged_text = String::new();
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
@@ -889,9 +891,15 @@ impl Agent {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
-                if matches!(stop_reason.as_deref(), None | Some("end_turn") | Some("stop"))
+                if saw_message_end
+                    && !self.is_graceful_shutdown()
+                    && matches!(stop_reason.as_deref(), None | Some("end_turn") | Some("stop"))
                     && stop_nudge.on_text_only_stop(&self.session.id, &text_content)
                 {
+                    if !text_content.trim().is_empty() {
+                        nudged_text.push_str(&text_content);
+                        nudged_text.push_str("\n\n");
+                    }
                     continue;
                 }
                 if self.maybe_reconsider_fable_guardrail(
@@ -937,7 +945,7 @@ impl Agent {
                 if print_output {
                     println!();
                 }
-                final_text = text_content;
+                final_text = format!("{nudged_text}{text_content}");
                 break;
             }
 

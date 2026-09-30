@@ -72,6 +72,7 @@ impl EditInput {
 struct AppliedEdit {
     occurrences: usize,
     start_line: usize,
+    fuzzy: bool,
 }
 
 /// Apply every edit in order to an in-memory copy. Any failure aborts the whole
@@ -114,6 +115,7 @@ fn apply_edits(
             applied.push(AppliedEdit {
                 occurrences: 1,
                 start_line,
+                fuzzy: true,
             });
             continue;
         }
@@ -140,6 +142,7 @@ fn apply_edits(
         applied.push(AppliedEdit {
             occurrences,
             start_line,
+            fuzzy: false,
         });
     }
 
@@ -291,6 +294,15 @@ impl Tool for EditTool {
             }
             body
         };
+        for (i, a) in applied.iter().enumerate() {
+            if a.fuzzy {
+                body.push_str(&format!(
+                    "\n(fuzzy match at line {}{})",
+                    a.start_line,
+                    if applied.len() > 1 { format!(", edit {}", i + 1) } else { String::new() }
+                ));
+            }
+        }
         super::config_edit_notice::append_config_edit_notice(
             &mut body,
             &path,
