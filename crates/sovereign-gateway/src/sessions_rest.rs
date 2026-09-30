@@ -12,6 +12,8 @@ use tokio::net::TcpStream;
 /// heartbeats, learning state, parked approvals, tags, traces). A session the engine no longer has
 /// still gets its leftovers cleared.
 pub(crate) async fn delete_everywhere(config: &Config, id: &str) -> Result<()> {
+    // A deleted session's commands (background or timeout-promoted) must not outlive it.
+    jcode_base::background::global().cancel_session(id).await;
     if let Err(err) = harness_request(&config.legacy_socket, json!({"req": "delete_session", "session_id": id})).await {
         // The engine's cleanup still ran; a missing file is not a failure here.
         let message = err.to_string();
