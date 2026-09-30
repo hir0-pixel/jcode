@@ -2,32 +2,91 @@ use crate::message::{ContentBlock, ToolCall};
 use crate::terminal_println as println;
 use crate::tool::ToolOutput;
 
-pub(super) const MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY: usize = 512 * 1024;
+/// History cap for ordinary tool output (about 50 KB), split head 40% / tail 60%
+/// as in Hermes' `tools/tool_output_truncate.py`. The full text is spilled to a file
+/// (Prime's `truncate.ts` does the same) and the path goes in the note.
+pub(super) const MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY: usize = 50 * 1024;
+const HEAD_RATIO: f64 = 0.4;
+
+/// Tools that page or limit their own output, and the tool the model uses to read a
+/// spilled file back. They keep the old protective ceiling and never spill, so reading
+/// a spill file cannot truncate and spill again.
+const SELF_LIMITED_TOOLS: &[&str] = &["read", "webfetch", "agentgrep", "grep", "glob", "ls"];
+const SELF_LIMITED_CEILING_CHARS: usize = 512 * 1024;
+
+fn spill_dir() -> Option<std::path::PathBuf> {
+    let dir = jcode_base::storage::jcode_dir().ok()?.join("tool-output");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn spill_full_output(tool_name: &str, text: &str) -> Option<std::path::PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let safe: String = tool_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = spill_dir()?.join(format!("{safe}-{stamp}.txt"));
+    std::fs::write(&path, text).ok()?;
+    Some(path)
+}
+
+fn char_boundary_prefix(s: &str, chars: usize) -> &str {
+    s.char_indices().nth(chars).map_or(s, |(i, _)| &s[..i])
+}
+
+fn char_boundary_suffix(s: &str, chars: usize) -> &str {
+    let total = s.chars().count();
+    if chars >= total {
+        return s;
+    }
+    s.char_indices().nth(total - chars).map_or("", |(i, _)| &s[i..])
+}
+
+/// Returns the text unchanged when it fits, else head + note + tail.
+fn cap_text_for_history(tool_name: &str, text: &str) -> Option<String> {
+    let total = text.chars().count();
+    if SELF_LIMITED_TOOLS.contains(&tool_name) {
+        if total <= SELF_LIMITED_CEILING_CHARS {
+            return None;
+        }
+        let kept = char_boundary_prefix(text, SELF_LIMITED_CEILING_CHARS);
+        return Some(format!(
+            "{kept}\n\n[Tool output truncated by jcode: tool `{tool_name}` produced {total} chars; kept first {SELF_LIMITED_CEILING_CHARS}. Use offset/limit or a narrower query.]"
+        ));
+    }
+    if total <= MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
+        return None;
+    }
+    let head = (MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY as f64 * HEAD_RATIO) as usize;
+    let tail = MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY - head;
+    let omitted = total - head - tail;
+    let where_full = match spill_full_output(tool_name, text) {
+        Some(path) => format!(
+            "full output saved to {}; read it with offset/limit or grep it",
+            path.display()
+        ),
+        None => "full output could not be saved; rerun with a narrower command".to_string(),
+    };
+    Some(format!(
+        "{}\n\n... [TOOL OUTPUT TRUNCATED - {omitted} chars omitted out of {total} total; {where_full}] ...\n\n{}",
+        char_boundary_prefix(text, head),
+        char_boundary_suffix(text, tail),
+    ))
+}
 
 pub(super) fn cap_tool_output_for_history(tool_name: &str, mut output: ToolOutput) -> ToolOutput {
-    if output.output.chars().count() <= MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
-        return output;
+    if let Some(capped) = cap_text_for_history(tool_name, &output.output) {
+        output.output = capped;
     }
-
-    let original_chars = output.output.chars().count();
-    let kept = crate::util::truncate_str(&output.output, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY);
-    output.output = format!(
-        "{}\n\n[Tool output truncated by jcode: tool `{}` produced {} chars; kept first {} chars to protect the remote protocol, session history, and prompt cache. Redirect large logs to a file and read targeted sections.]",
-        kept, tool_name, original_chars, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY,
-    );
     output
 }
 
 pub(super) fn cap_sdk_tool_content_for_history(tool_name: &str, content: String) -> String {
-    if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY {
-        return content;
-    }
-    let original_chars = content.chars().count();
-    let kept = crate::util::truncate_str(&content, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY);
-    format!(
-        "{}\n\n[Tool output truncated by jcode: tool `{}` produced {} chars; kept first {} chars to protect the remote protocol, session history, and prompt cache. Redirect large logs to a file and read targeted sections.]",
-        kept, tool_name, original_chars, MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY,
-    )
+    cap_text_for_history(tool_name, &content).unwrap_or(content)
 }
 
 /// Build rendered side-pane images from a tool output's attached images.
@@ -162,26 +221,6 @@ mod tests {
         let capped = cap_tool_output_for_history("bash", output.clone());
         assert_eq!(capped.output, output.output);
     }
-
-    #[test]
-    fn cap_tool_output_adds_visible_truncation_notice() {
-        let output = ToolOutput::new("x".repeat(MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY + 10));
-        let capped = cap_tool_output_for_history("bash", output);
-        assert!(capped.output.len() < MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY + 1_000);
-        assert!(capped.output.contains("Tool output truncated by jcode"));
-        assert!(capped.output.contains("tool `bash` produced"));
-        assert!(capped.output.contains("Redirect large logs to a file"));
-    }
-
-    #[test]
-    fn cap_sdk_tool_content_adds_same_notice() {
-        let capped = cap_sdk_tool_content_for_history(
-            "custom",
-            "y".repeat(MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY + 10),
-        );
-        assert!(capped.contains("Tool output truncated by jcode"));
-        assert!(capped.contains("tool `custom` produced"));
-    }
 }
 
 #[cfg(test)]
@@ -208,5 +247,42 @@ mod image_anchor_tests {
         assert_eq!(images[0].data, "one");
         assert_eq!(images[1].data, "two");
         assert_eq!(images[0].label.as_deref(), Some("first.png"));
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_output_keeps_head_and_tail_and_spills_full_text() {
+        let _env = jcode_base::storage::lock_test_env();
+        let text = format!("HEAD{}TAIL", "x".repeat(200_000));
+        let capped = cap_tool_output_for_history("bash", ToolOutput::new(text.clone())).output;
+        assert!(capped.starts_with("HEAD"));
+        assert!(capped.ends_with("TAIL"));
+        assert!(capped.chars().count() < MAX_TOOL_OUTPUT_CHARS_FOR_HISTORY + 400);
+        let path = capped
+            .split("saved to ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .expect("spill path in note");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+    }
+
+    #[test]
+    fn small_output_and_self_limited_tools_are_untouched() {
+        let _env = jcode_base::storage::lock_test_env();
+        let mid = "y".repeat(100_000);
+        assert_eq!(cap_tool_output_for_history("bash", ToolOutput::new("ok")).output, "ok");
+        assert_eq!(cap_tool_output_for_history("read", ToolOutput::new(mid.clone())).output, mid);
+    }
+
+    #[test]
+    fn multibyte_text_splits_on_char_boundaries() {
+        let _env = jcode_base::storage::lock_test_env();
+        let text = "é".repeat(70_000);
+        let capped = cap_sdk_tool_content_for_history("bash", text);
+        assert!(capped.contains("TRUNCATED"));
     }
 }
