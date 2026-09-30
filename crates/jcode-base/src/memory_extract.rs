@@ -4,7 +4,9 @@
 //! active provider. Triggers (all outside the gateway): every 12 fresh user turns, session end,
 //! before compaction drops messages. Each trigger extracts only the messages after the session's
 //! persisted `extracted_through` index, under a 200-char / 4-message floor, a 60 s per-session
-//! cooldown and one process-wide aux-call permit. It runs in a spawned task and never fails a
+//! cooldown (SessionEnd and Compaction are exempt), an in-flight claim taken at plan time, and one process-wide
+//! aux-call permit. The window is built oldest-first from the marker and the marker moves only to
+//! the last message actually included, so an oversized backlog is consumed across successive calls. It runs in a spawned task and never fails a
 //! turn: errors become a `memory.extract` span.
 
 use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 const PERIODIC_INTERVAL: usize = 12;
 /// Periodic runs look at no more than this many new messages.
 const PERIODIC_MAX_MESSAGES: usize = 40;
-/// Transcript cap, newest messages kept.
+/// Transcript cap per aux call (oldest messages first; the rest goes to the next window).
 const MAX_TRANSCRIPT_CHARS: usize = 24_000;
 const MIN_TRANSCRIPT_CHARS: usize = 200;
 const MIN_MESSAGES: usize = 4;
@@ -29,6 +31,12 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const EXISTING_LIMIT: usize = 80;
 const EXISTING_CHARS: usize = 150;
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a job may wait for the shared aux-call permit.
+const PERMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// An in-flight claim older than this is treated as abandoned (the task died).
+const CLAIM_TTL: Duration = Duration::from_secs(CALL_TIMEOUT.as_secs() + PERMIT_TIMEOUT.as_secs() + 30);
+/// Windows one non-periodic job may consume in a row.
+const MAX_WINDOWS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -50,7 +58,10 @@ impl Trigger {
 #[derive(Default)]
 struct SessionState {
     turns: usize,
-    last_run: Option<Instant>,
+    /// When the last job finished (cooldown clock).
+    last_done: Option<Instant>,
+    /// When a planned job claimed the session; cleared when it finishes.
+    claimed: Option<Instant>,
 }
 
 static SESSIONS: LazyLock<Mutex<HashMap<String, SessionState>>> = LazyLock::new(Default::default);
@@ -61,6 +72,11 @@ static AUX_CALLS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 pub async fn aux_call_permit() -> tokio::sync::SemaphorePermit<'static> {
     AUX_CALLS.acquire().await.expect("aux semaphore is never closed")
+}
+
+/// The permit, or `None` if it did not free up within `wait` (background work must not queue forever).
+pub async fn aux_call_permit_within(wait: Duration) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    tokio::time::timeout(wait, aux_call_permit()).await.ok()
 }
 
 /// Count a fresh user turn; true on every 12th (the caller then triggers a periodic run).
@@ -76,14 +92,29 @@ pub fn forget_session(session_id: &str) {
     SESSIONS.lock().unwrap_or_else(|p| p.into_inner()).remove(session_id);
 }
 
-fn cooldown_active(session_id: &str) -> bool {
+fn in_flight(session_id: &str) -> bool {
     let sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
-    sessions.get(session_id).and_then(|s| s.last_run).is_some_and(|at| at.elapsed() < COOLDOWN)
+    sessions.get(session_id).and_then(|s| s.claimed).is_some_and(|at| at.elapsed() < CLAIM_TTL)
 }
 
-fn stamp_run(session_id: &str) {
+fn cooldown_active(session_id: &str) -> bool {
+    let sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    sessions.get(session_id).and_then(|s| s.last_done).is_some_and(|at| at.elapsed() < COOLDOWN)
+}
+
+/// Claim the session for a planned job (at plan time, so a second trigger sees it in flight).
+fn claim(session_id: &str) {
     let mut sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
-    sessions.entry(session_id.to_string()).or_default().last_run = Some(Instant::now());
+    sessions.entry(session_id.to_string()).or_default().claimed = Some(Instant::now());
+}
+
+/// Release the claim and start the cooldown. Never recreates a session that was forgotten.
+fn release(session_id: &str) {
+    let mut sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(state) = sessions.get_mut(session_id) {
+        state.claimed = None;
+        state.last_done = Some(Instant::now());
+    }
 }
 
 fn sidecar_enabled() -> bool {
@@ -236,35 +267,64 @@ fn message_chunk(msg: &Message) -> String {
     if body.is_empty() { String::new() } else { format!("**{role}:**\n{body}\n") }
 }
 
-/// The transcript of `messages`, newest first up to `max_chars`, in chronological order.
-fn build_transcript(messages: &[Message], max_messages: usize, max_chars: usize) -> String {
-    let mut chunks: Vec<String> = Vec::new();
+/// The oldest-first window of `messages`: at most `max_messages` messages and `max_chars` chars.
+/// Returns the transcript and how many messages it consumed (a message that would overflow the
+/// cap is left for the next window, unless it is the first and gets truncated).
+fn build_window(messages: &[Message], max_messages: usize, max_chars: usize) -> (String, usize) {
+    let mut out = String::new();
     let mut total = 0usize;
-    for msg in messages.iter().rev().take(max_messages) {
+    let mut consumed = 0usize;
+    for msg in messages.iter().take(max_messages) {
         let chunk = message_chunk(msg);
-        if chunk.is_empty() {
-            continue;
-        }
-        let len = chunk.chars().count();
-        if total + len > max_chars {
-            if total == 0 {
-                chunks.push(chunk.chars().take(max_chars).collect());
+        if !chunk.is_empty() {
+            let len = chunk.chars().count();
+            if total + len > max_chars {
+                if total == 0 {
+                    out.extend(chunk.chars().take(max_chars));
+                    consumed += 1;
+                }
+                break;
             }
-            break;
+            total += len;
+            out.push_str(&chunk);
         }
-        total += len;
-        chunks.push(chunk);
+        consumed += 1;
     }
-    chunks.reverse();
-    chunks.concat()
+    (out, consumed)
 }
 
 struct Job {
     trigger: Trigger,
     session_id: String,
+    /// Absolute index of `messages[0]`.
+    from: usize,
+    /// Every message from `from` to the end of the planned range.
+    messages: Vec<Message>,
     transcript: String,
-    /// Messages covered: `extracted_through` becomes this once the run succeeds.
+    /// Last message the transcript actually includes: `extracted_through` becomes this on success.
     upto: usize,
+}
+
+impl Job {
+    fn window(&self) -> (usize, usize) {
+        let max_messages = if self.trigger == Trigger::Periodic { PERIODIC_MAX_MESSAGES } else { usize::MAX };
+        (max_messages, MAX_TRANSCRIPT_CHARS)
+    }
+
+    /// Rebuild the window so it starts at absolute index `start` (>= `from`).
+    fn rewindow(&mut self, start: usize) {
+        let skip = start.saturating_sub(self.from).min(self.messages.len());
+        self.messages.drain(..skip);
+        self.from += skip;
+        let (max_messages, max_chars) = self.window();
+        let (transcript, consumed) = build_window(&self.messages, max_messages, max_chars);
+        self.transcript = transcript;
+        self.upto = self.from + consumed;
+    }
+
+    fn drained(&self) -> bool {
+        self.upto >= self.from + self.messages.len()
+    }
 }
 
 enum Plan {
@@ -288,22 +348,32 @@ fn plan(
     if total <= through {
         return Plan::Skip("no_new_messages");
     }
-    if cooldown_active(session_id) {
-        return Plan::Skip("cooldown");
+    // SessionEnd and Compaction are exempt: the tail (or the messages about to be cut) must never be
+    // dropped. They queue behind any in-flight job on the aux permit and re-read the marker there,
+    // so they neither repeat nor skip messages.
+    if trigger == Trigger::Periodic {
+        if in_flight(session_id) {
+            return Plan::Skip("in_flight");
+        }
+        if cooldown_active(session_id) {
+            return Plan::Skip("cooldown");
+        }
     }
     let messages = fetch(through);
-    let max_messages = if trigger == Trigger::Periodic { PERIODIC_MAX_MESSAGES } else { usize::MAX };
-    let transcript = build_transcript(&messages, max_messages, MAX_TRANSCRIPT_CHARS);
-    if messages.len() < MIN_MESSAGES || transcript.chars().count() < MIN_TRANSCRIPT_CHARS {
-        return Plan::Skip("under_floor");
-    }
-    stamp_run(session_id);
-    Plan::Run(Job {
+    let mut job = Job {
         trigger,
         session_id: session_id.to_string(),
-        transcript,
-        upto: total,
-    })
+        from: through,
+        messages,
+        transcript: String::new(),
+        upto: through,
+    };
+    job.rewindow(through);
+    if job.messages.len() < MIN_MESSAGES || job.transcript.chars().count() < MIN_TRANSCRIPT_CHARS {
+        return Plan::Skip("under_floor");
+    }
+    claim(session_id);
+    Plan::Run(job)
 }
 
 struct Completion {
@@ -329,8 +399,11 @@ struct Outcome {
 async fn execute(manager: &MemoryManager, job: &Job, complete: Complete<'_>) -> (Outcome, Result<Vec<String>>) {
     let mut outcome = Outcome::default();
     let result = async {
-        let existing: Vec<String> = manager
-            .related_to(&job.transcript, EXISTING_LIMIT)?
+        // The SQLite parts run on the blocking pool, not on a tokio worker.
+        let (m, transcript) = (manager.clone(), job.transcript.clone());
+        let existing: Vec<String> = tokio::task::spawn_blocking(move || m.related_to(&transcript, EXISTING_LIMIT))
+            .await
+            .map_err(|e| anyhow!("memory lookup task failed: {e}"))??
             .into_iter()
             .map(|e| e.content)
             .collect();
@@ -343,12 +416,22 @@ async fn execute(manager: &MemoryManager, job: &Job, complete: Complete<'_>) -> 
         outcome.model = completion.model;
         let extracted = parse_extracted(&completion.text);
         outcome.extracted = extracted.len();
+        let (m, session) = (manager.clone(), job.session_id.clone());
+        let stored = tokio::task::spawn_blocking(move || -> Result<Vec<Remembered>> {
+            extracted
+                .into_iter()
+                .map(|memory| {
+                    let entry = MemoryEntry::new(MemoryCategory::from_extracted(&memory.category), memory.content)
+                        .with_source(&session)
+                        .with_trust(trust_of(&memory.trust));
+                    m.remember_extracted(entry)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| anyhow!("memory write task failed: {e}"))??;
         let mut ids = Vec::new();
-        for memory in extracted {
-            let entry = MemoryEntry::new(MemoryCategory::from_extracted(&memory.category), memory.content)
-                .with_source(&job.session_id)
-                .with_trust(trust_of(&memory.trust));
-            let remembered = manager.remember_extracted(entry)?;
+        for remembered in stored {
             match remembered {
                 Remembered::Inserted(_) => outcome.written += 1,
                 Remembered::Reinforced(_) | Remembered::Merged { .. } => outcome.merged += 1,
@@ -361,41 +444,76 @@ async fn execute(manager: &MemoryManager, job: &Job, complete: Complete<'_>) -> 
     (outcome, result)
 }
 
-/// Run one planned job to completion and record its span. Returns the ids written or merged into.
-async fn run_job(manager: &MemoryManager, job: Job, complete: Complete<'_>) -> Vec<String> {
-    let _permit = aux_call_permit().await;
-    let started = Instant::now();
-    let (outcome, result) = execute(manager, &job, complete).await;
-    let mut span = Span::new("memory.extract")
-        .session(&job.session_id)
-        .attr("trigger", job.trigger.as_str())
-        .attr("transcript_chars", job.transcript.chars().count())
-        .attr("existing_shown", outcome.existing_shown)
-        .attr("extracted", outcome.extracted)
-        .attr("written", outcome.written)
-        .attr("merged", outcome.merged)
-        .attr("tokens", outcome.input_tokens + outcome.output_tokens)
-        .attr("model", outcome.model.as_str())
-        .tokens(outcome.input_tokens, outcome.output_tokens)
-        .took_ms(started.elapsed().as_millis() as u64);
-    let ids = match result {
-        Ok(ids) => {
-            let key = through_key(&job.session_id);
-            let current = manager.meta_get(&key).ok().flatten().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-            let _ = manager.meta_set(&key, &job.upto.max(current).to_string());
-            // A closed session must not get a fresh injected-id entry (the map is pruned on close).
-            if job.trigger != Trigger::SessionEnd {
-                crate::memory::mark_memories_known(&job.session_id, &ids, "extracted from this session");
-            }
-            ids
-        }
-        Err(error) => {
-            span = span.error(error.to_string());
-            Vec::new()
-        }
+fn read_marker(manager: &MemoryManager, session_id: &str) -> usize {
+    manager.meta_get(&through_key(session_id)).ok().flatten().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Run one planned job to completion and record its spans. Returns the ids written or merged into.
+///
+/// The job waits for the aux permit (bounded), then re-reads the marker: a job that ran while it
+/// waited may have consumed part of its range. A non-periodic job keeps going window by window until
+/// its range is consumed, so an oversized backlog is never marked extracted without being read.
+async fn run_job(manager: &MemoryManager, mut job: Job, complete: Complete<'_>) -> Vec<String> {
+    let mut all_ids = Vec::new();
+    let Some(_permit) = aux_call_permit_within(PERMIT_TIMEOUT).await else {
+        obs_sink::emit(
+            Span::new("memory.extract")
+                .session(&job.session_id)
+                .attr("trigger", job.trigger.as_str())
+                .error("aux permit wait timed out"),
+        );
+        release(&job.session_id);
+        return all_ids;
     };
-    obs_sink::emit(span);
-    ids
+    let end = job.from + job.messages.len();
+    let marker = read_marker(manager, &job.session_id);
+    if marker > job.from && marker <= end {
+        job.rewindow(marker);
+    }
+    for window in 0..MAX_WINDOWS {
+        if job.messages.is_empty() || job.transcript.chars().count() < MIN_TRANSCRIPT_CHARS {
+            if window == 0 {
+                skip(job.trigger, &job.session_id, "already_extracted");
+            }
+            break;
+        }
+        let started = Instant::now();
+        let (outcome, result) = execute(manager, &job, complete).await;
+        let mut span = Span::new("memory.extract")
+            .session(&job.session_id)
+            .attr("trigger", job.trigger.as_str())
+            .attr("transcript_chars", job.transcript.chars().count())
+            .attr("existing_shown", outcome.existing_shown)
+            .attr("extracted", outcome.extracted)
+            .attr("written", outcome.written)
+            .attr("merged", outcome.merged)
+            .attr("tokens", outcome.input_tokens + outcome.output_tokens)
+            .attr("model", outcome.model.as_str())
+            .tokens(outcome.input_tokens, outcome.output_tokens)
+            .took_ms(started.elapsed().as_millis() as u64);
+        let ok = match result {
+            Ok(ids) => {
+                let _ = manager.meta_set(&through_key(&job.session_id), &job.upto.to_string());
+                // A closed session must not get a fresh injected-id entry (the map is pruned on close).
+                if job.trigger != Trigger::SessionEnd {
+                    crate::memory::mark_memories_known(&job.session_id, &ids, "extracted from this session");
+                }
+                all_ids.extend(ids);
+                true
+            }
+            Err(error) => {
+                span = span.error(error.to_string());
+                false
+            }
+        };
+        obs_sink::emit(span);
+        if !ok || job.trigger == Trigger::Periodic || job.drained() {
+            break;
+        }
+        job.rewindow(job.upto);
+    }
+    release(&job.session_id);
+    all_ids
 }
 
 async fn complete_with_active_provider(system: String, prompt: String) -> Result<Completion> {

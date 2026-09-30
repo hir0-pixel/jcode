@@ -84,16 +84,19 @@ fn parser_reads_pipe_lines_and_ignores_the_rest() {
 }
 
 #[test]
-fn transcript_strips_reminders_and_keeps_newest_within_cap() {
+fn transcript_strips_reminders_and_takes_oldest_first_within_cap() {
     let mut messages = vec![Message::user("<system-reminder>secret boilerplate</system-reminder>Hello there")];
     messages.push(Message::assistant_text("old reply that should fall off the cap"));
     messages.push(Message::user("newest question"));
-    let all = build_transcript(&messages, usize::MAX, 10_000);
+    let (all, consumed) = build_window(&messages, usize::MAX, 10_000);
     assert!(all.contains("Hello there") && !all.contains("secret boilerplate"));
-    let capped = build_transcript(&messages, usize::MAX, 40);
-    assert!(capped.contains("newest question"), "{capped}");
-    assert!(!capped.contains("old reply"), "oldest goes first: {capped}");
-    assert!(build_transcript(&messages, 1, 10_000).contains("newest question"));
+    assert_eq!(consumed, 3);
+    // Oldest first: what does not fit stays unconsumed for the next window.
+    let (capped, consumed) = build_window(&messages, usize::MAX, 60);
+    assert!(capped.contains("Hello there") && !capped.contains("newest question"), "{capped}");
+    assert_eq!(consumed, 1, "only the messages actually included are consumed");
+    let (one, consumed) = build_window(&messages, 1, 10_000);
+    assert!(one.contains("Hello there") && consumed == 1);
     assert_eq!(strip_system_reminders("a<system-reminder>x</system-reminder>b<system-reminder>open"), "ab");
 }
 
@@ -162,14 +165,18 @@ fn failure_leaves_the_marker_so_the_window_is_retried() {
 }
 
 #[test]
-fn cooldown_blocks_a_second_run_within_a_minute_and_prune_resets_it() {
+fn cooldown_spaces_periodic_runs_but_never_blocks_session_end_or_compaction() {
     with_temp_home(|| {
         let manager = MemoryManager::new_test();
         let messages = chat(3);
         assert!(matches!(plan_run(&manager, Trigger::Periodic, "cool-1", &messages, true), Plan::Run(_)));
-        assert_eq!(skipped(plan_run(&manager, Trigger::Compaction, "cool-1", &messages, true)), "cooldown");
-        forget_session("cool-1");
+        assert_eq!(skipped(plan_run(&manager, Trigger::Periodic, "cool-1", &messages, true)), "in_flight");
+        release("cool-1");
+        assert_eq!(skipped(plan_run(&manager, Trigger::Periodic, "cool-1", &messages, true)), "cooldown");
+        assert!(matches!(plan_run(&manager, Trigger::SessionEnd, "cool-1", &messages, true), Plan::Run(_)), "session end is not cooled");
         assert!(matches!(plan_run(&manager, Trigger::Compaction, "cool-1", &messages, true), Plan::Run(_)));
+        forget_session("cool-1");
+        assert!(matches!(plan_run(&manager, Trigger::Periodic, "cool-1", &messages, true), Plan::Run(_)));
     });
 }
 
@@ -190,6 +197,8 @@ fn periodic_run_takes_at_most_forty_messages_and_capped_chars() {
         let messages = chat(60);
         let job = job_of(plan_run(&manager, Trigger::Periodic, "cap-1", &messages, true));
         assert_eq!(job.transcript.matches("**User:**").count(), 20);
+        assert!(job.transcript.contains("Question 0:") && !job.transcript.contains("Question 59:"), "oldest window first");
+        assert_eq!(job.upto, 40, "only the 40 messages included are marked");
         let big = vec![Message::user(&"x".repeat(30_000)); 5];
         let job = job_of(plan_run(&manager, Trigger::SessionEnd, "cap-2", &big, true));
         assert!(job.transcript.chars().count() <= MAX_TRANSCRIPT_CHARS);
@@ -223,5 +232,53 @@ fn detailed_recall_counts_candidates_and_suppressed() {
         let again = manager.recall_local_detailed(Some("recall-1"), "where does the release tooling live", 5, crate::memory::MemoryScope::All).unwrap();
         assert!(again.suppressed >= 1);
         crate::memory::clear_injected_memories("recall-1");
+    });
+}
+
+#[test]
+fn oversized_backlog_is_consumed_across_windows_without_skipping() {
+    with_temp_home(|| {
+        let manager = MemoryManager::new_test();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let big: Vec<Message> = (0..6).map(|i| Message::user(&format!("m{i} {}", "x".repeat(10_000)))).collect();
+        let job = job_of(plan_run(&manager, Trigger::Compaction, "win-1", &big, true));
+        assert_eq!(job.upto, 2, "24k cap fits two 10k messages");
+        assert!(job.transcript.contains("m0 ") && job.transcript.contains("m1 ") && !job.transcript.contains("m2 "));
+        run(&manager, job, &fake("", seen.clone()));
+        assert_eq!(seen.lock().unwrap().len(), 3, "compaction drains the whole range window by window");
+        assert_eq!(read_marker(&manager, "win-1"), 6);
+    });
+}
+
+#[test]
+fn periodic_leaves_the_rest_for_the_next_run() {
+    with_temp_home(|| {
+        let manager = MemoryManager::new_test();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let messages = chat(60);
+        let job = job_of(plan_run(&manager, Trigger::Periodic, "per-1", &messages, true));
+        run(&manager, job, &fake("", seen.clone()));
+        assert_eq!(read_marker(&manager, "per-1"), 40);
+        forget_session("per-1");
+        let job = job_of(plan_run(&manager, Trigger::Periodic, "per-1", &messages, true));
+        assert_eq!(job.from, 40);
+        assert!(job.transcript.contains("Question 20:"));
+    });
+}
+
+#[test]
+fn session_end_after_periodic_does_not_repeat_or_drop() {
+    with_temp_home(|| {
+        let manager = MemoryManager::new_test();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let messages = chat(60);
+        let periodic = job_of(plan_run(&manager, Trigger::Periodic, "end-1", &messages, true));
+        // SessionEnd is planned while the periodic job is still in flight, from the same marker.
+        let end = job_of(plan_run(&manager, Trigger::SessionEnd, "end-1", &messages, true));
+        assert_eq!(skipped(plan_run(&manager, Trigger::Periodic, "end-1", &messages, true)), "in_flight");
+        run(&manager, periodic, &fake("", seen.clone()));
+        run(&manager, end, &fake("", seen.clone()));
+        assert_eq!(seen.lock().unwrap().len(), 2, "periodic window, then only the tail: no repeated window");
+        assert_eq!(read_marker(&manager, "end-1"), 120);
     });
 }
