@@ -285,6 +285,13 @@ impl Hub {
             let shown = self.shown.lock().await;
             self.pending.lock().await.iter().filter(|(rid, _)| shown.get(*rid).is_some_and(|(_, p)| p["unattended"] != true)).map(|(rid, (sid, _))| (rid.clone(), sid.clone())).collect()
         };
+        // A clarify only the closed window could answer is cancelled (its asker sees TimedOut).
+        let asking: Vec<(String, String)> = self.clarifying.lock().await.iter().map(|(rid, (sid, _))| (rid.clone(), sid.clone())).collect();
+        for (rid, sid) in asking {
+            if !self.has_window(&sid).await {
+                self.clarifying.lock().await.remove(&rid);
+            }
+        }
         for (rid, sid) in open {
             if !self.has_window(&sid).await {
                 if let Some((_, tx)) = self.pending.lock().await.remove(&rid) {
@@ -531,9 +538,15 @@ impl Hub {
         }
     }
 
-    /// A window answered a `clarify` request (`result.answer`; anything else is a skip).
-    pub async fn answer_clarify(&self, request_id: &str, frame: &Value) -> bool {
-        match self.clarifying.lock().await.remove(request_id) {
+    /// A window answered a `clarify` request (`result.answer`; anything else is a skip). Only a
+    /// client attached to the request's session may answer it.
+    pub async fn answer_clarify(&self, from: &Client, request_id: &str, frame: &Value) -> bool {
+        let mut clarifying = self.clarifying.lock().await;
+        let Some((session, _)) = clarifying.get(request_id) else { return false };
+        if !from.sessions.lock().await.contains(session) {
+            return false;
+        }
+        match clarifying.remove(request_id) {
             Some((_, tx)) => tx.send(frame["result"]["answer"].as_str().map(str::to_string)).is_ok(),
             None => false,
         }

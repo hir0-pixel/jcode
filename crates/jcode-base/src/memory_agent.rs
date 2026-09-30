@@ -36,7 +36,7 @@ pub fn recall_local_now(
     obs_sink::emit(
         Span::new("memory.recall")
             .session(session_id)
-            .attr("terms", recall.terms.iter().take(12).cloned().collect::<Vec<_>>())
+            .attr("terms", recall.terms.len())
             .attr("candidates", recall.candidates)
             .attr("returned", ids(&recall.entries))
             .attr("suppressed", recall.suppressed),

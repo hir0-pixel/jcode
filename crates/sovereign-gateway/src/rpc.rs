@@ -2555,7 +2555,7 @@ impl Conn {
             return;
         }
         if id.starts_with("clarify-") {
-            self.hub.answer_clarify(id, frame).await;
+            self.hub.answer_clarify(&self.client, id, frame).await;
             return;
         }
         let choice = frame["result"]["choice"].as_str().unwrap_or("deny");

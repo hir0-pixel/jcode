@@ -139,14 +139,26 @@ mod tests {
         // Nobody has the session open: answered at once.
         assert!(matches!(host.clarify("s1", "Which one?", &[]).await, ClarifyReply::NoUser));
         let (tx, mut rx) = mpsc::channel(8);
-        hub.add(Arc::new(Client { id: 1, to_ws: tx, sessions: Mutex::new(HashSet::from(["s1".to_string()])) })).await;
+        let window = Arc::new(Client { id: 1, to_ws: tx, sessions: Mutex::new(HashSet::from(["s1".to_string()])) });
+        hub.add(window.clone()).await;
         let asker = { let host = host.clone(); tokio::spawn(async move { host.clarify("s1", "Which one?", &["a".into(), "b".into()]).await }) };
         let Message::Text(frame) = rx.recv().await.unwrap() else { panic!() };
         let frame: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!((frame["method"].as_str(), frame["params"]["question"].as_str()), (Some("clarify"), Some("Which one?")));
         assert_eq!(frame["params"]["choices"], serde_json::json!(["a", "b"]));
-        assert!(hub.answer_clarify(frame["id"].as_str().unwrap(), &serde_json::json!({"result": {"answer": "b"}})).await);
+        let id = frame["id"].as_str().unwrap();
+        let answer = serde_json::json!({"result": {"answer": "b"}});
+        let (tx2, _rx2) = mpsc::channel(8);
+        let stranger = Client { id: 2, to_ws: tx2, sessions: Mutex::new(HashSet::new()) };
+        assert!(!hub.answer_clarify(&stranger, id, &answer).await, "a client not on the session cannot answer");
+        assert!(hub.answer_clarify(&window, id, &answer).await);
         assert!(matches!(asker.await.unwrap(), ClarifyReply::Answer(a) if a == "b"));
+        // A window that closes cancels its open question.
+        let asker = { let host = host.clone(); tokio::spawn(async move { host.clarify("s1", "Gone?", &[]).await }) };
+        let _ = rx.recv().await.unwrap();
+        hub.remove(1).await;
+        assert!(matches!(asker.await.unwrap(), ClarifyReply::TimedOut));
+        hub.add(window.clone()).await;
         // A cron or bot run has a window-less session marked headless: no question is sent.
         hub.mark_headless("s1", "cron").await;
         assert!(matches!(host.clarify("s1", "Still there?", &[]).await, ClarifyReply::NoUser));
