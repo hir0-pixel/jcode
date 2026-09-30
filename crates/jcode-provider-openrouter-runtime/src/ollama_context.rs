@@ -137,6 +137,33 @@ async fn fetch_server_default(client: &Client, root: &str) -> Result<Option<u64>
     parse_server_default_from_ps(&body)
 }
 
+/// Models Ollama reports as `thinking`-capable (`/api/show` `capabilities`), keyed by
+/// [`model_key`]. Filled on each catalog refresh; read by the effort ladder, which
+/// has no async context to probe from.
+static THINKING_MODELS: std::sync::LazyLock<std::sync::RwLock<HashMap<String, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `qwen3:8b` and `qwen3:8b:latest`-style ids name the same model; Ollama omits `:latest`.
+fn model_key(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.strip_suffix(":latest").map(str::to_string).unwrap_or(lower)
+}
+
+/// Whether a catalog refresh saw Ollama report `model` as able to think (switchable
+/// with `reasoning_effort`, where `none` turns it off).
+pub(crate) fn model_can_think(model: &str) -> bool {
+    THINKING_MODELS
+        .read()
+        .map(|map| map.get(&model_key(model)).copied().unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn parse_thinking_from_show(body: &str) -> Option<bool> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let caps = value.get("capabilities")?.as_array()?;
+    Some(caps.iter().any(|cap| cap.as_str() == Some("thinking")))
+}
+
 async fn fetch_trained_context(client: &Client, root: &str, model: &str) -> Result<Option<u64>> {
     let body = client
         .post(format!("{root}/api/show"))
@@ -148,6 +175,11 @@ async fn fetch_trained_context(client: &Client, root: &str, model: &str) -> Resu
         .text()
         .await
         .context("reading /api/show body failed")?;
+    if let Some(thinks) = parse_thinking_from_show(&body)
+        && let Ok(mut map) = THINKING_MODELS.write()
+    {
+        map.insert(model_key(model), thinks);
+    }
     parse_trained_context_from_show(&body)
 }
 
@@ -237,6 +269,17 @@ mod tests {
         ));
         assert!(!is_ollama_api_base("http://127.0.0.1:1234/v1", None));
         assert!(!is_ollama_api_base("https://openrouter.ai/api/v1", None));
+    }
+
+    #[test]
+    fn reads_thinking_capability_from_show() {
+        assert_eq!(
+            parse_thinking_from_show(r#"{"capabilities":["completion","tools","thinking"]}"#),
+            Some(true)
+        );
+        assert_eq!(parse_thinking_from_show(r#"{"capabilities":["completion"]}"#), Some(false));
+        assert_eq!(parse_thinking_from_show(r#"{"model_info":{}}"#), None);
+        assert_eq!(model_key("Sovereign/Qwen3.8-27b:latest"), "sovereign/qwen3.8-27b");
     }
 
     #[test]

@@ -475,7 +475,9 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if self.supports_deepseek_reasoning_effort() {
+        if self.ollama_can_think() {
+            crate::OLLAMA_SELECTABLE_EFFORTS.to_vec()
+        } else if self.supports_deepseek_reasoning_effort() {
             jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
         } else if self.supports_openai_reasoning_effort() {
             jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()

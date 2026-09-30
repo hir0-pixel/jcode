@@ -999,7 +999,15 @@ impl OpenRouterProvider {
         effort: &str,
         strict_openai_schema: bool,
     ) -> bool {
-        if self.supports_deepseek_reasoning_effort() {
+        if self.ollama_can_think() {
+            // Ollama thinks by default: `none` must be sent to turn it off. Its levels stop at `high`.
+            let effort = match effort {
+                "minimal" => "low",
+                "xhigh" | "max" => "high",
+                other => other,
+            };
+            request["reasoning_effort"] = serde_json::json!(effort);
+        } else if self.supports_deepseek_reasoning_effort() {
             let effort = match effort {
                 "minimal" => "low",
                 "xhigh" => "high",
@@ -1134,8 +1142,15 @@ impl OpenRouterProvider {
             .and_then(|effort| self.normalize_reasoning_effort_for_self(&effort))
     }
 
+    /// An Ollama model the catalog refresh saw as `thinking`-capable (`/api/show`).
+    pub(crate) fn ollama_can_think(&self) -> bool {
+        ollama_context::is_ollama_api_base(&self.api_base, self.profile_id.as_deref())
+            && ollama_context::model_can_think(&self.model_snapshot())
+    }
+
     pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
-        self.supports_deepseek_reasoning_effort()
+        self.ollama_can_think()
+            || self.supports_deepseek_reasoning_effort()
             || self.supports_openai_reasoning_effort()
             || Self::profile_supports_unified_reasoning(
                 self.profile_id.as_deref(),
@@ -1144,7 +1159,9 @@ impl OpenRouterProvider {
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
-        if self.supports_deepseek_reasoning_effort() {
+        if self.ollama_can_think() {
+            Self::normalize_openai_reasoning_effort(effort).filter(|e| OLLAMA_SELECTABLE_EFFORTS.contains(&e.as_str()))
+        } else if self.supports_deepseek_reasoning_effort() {
             Self::normalize_reasoning_effort(effort)
         } else if self.supports_openai_reasoning_effort() {
             Self::normalize_openai_reasoning_effort(effort)
@@ -2919,6 +2936,9 @@ impl OpenRouterProvider {
 
 mod models_catalog_parse;
 mod ollama_context;
+
+/// Ollama's `reasoning_effort` ladder for thinking models: `none` switches thinking off.
+const OLLAMA_SELECTABLE_EFFORTS: &[&str] = &["none", "low", "medium", "high"];
 #[path = "openrouter_provider_impl.rs"]
 mod openrouter_provider_impl;
 #[path = "openrouter_sse_stream.rs"]
