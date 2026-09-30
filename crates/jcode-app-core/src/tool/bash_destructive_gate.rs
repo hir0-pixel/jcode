@@ -66,7 +66,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in MILLISECONDS (not seconds), e.g. 600000 = 10min; kills with exit 124. Omit for no timeout."
+                "description": "Foreground timeout in MILLISECONDS (default 120000, max 600000); on expiry the command keeps running as a background task, not killed."
             },
             "run_in_background": {
                 "type": "boolean",
@@ -90,6 +90,13 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn timeout_schema_describes_background_promotion() {
+    let d = bash_parameters_schema()["properties"]["timeout"]["description"].as_str().unwrap().to_string();
+    assert!(d.contains("background") && !d.contains("124") && !d.contains("no timeout"), "{d}");
 }
 
 #[cfg(all(test, not(windows)))]
