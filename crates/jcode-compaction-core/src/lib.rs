@@ -74,15 +74,39 @@ pub const EMBEDDING_HISTORY_WINDOW: usize = 10;
 /// Per-manager semantic embedding cache capacity.
 pub const SEMANTIC_EMBED_CACHE_CAPACITY: usize = 256;
 
-pub const SUMMARY_PROMPT: &str = r#"Summarize our conversation so you can continue this work later.
+/// Structured checkpoint template, ported from Prime's `compaction.ts` SUMMARIZATION_PROMPT.
+pub const SUMMARY_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
-Write in natural language with these sections:
-- **Context:** What we're working on and why (1-2 sentences)
-- **What we did:** Key actions taken, files changed, problems solved
-- **Current state:** What works, what's broken, what's next
-- **User preferences:** Specific requirements or decisions they made
+Use this EXACT format:
 
-Be concise but preserve important details. You can search the full conversation later if you need exact error messages or code snippets."#;
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages. You can search the full conversation later if you need exact snippets."#;
 
 /// A completed summary covering turns up to a certain point
 #[derive(Debug, Clone)]
@@ -788,6 +812,22 @@ mod tests {
         assert!(prompt.contains("prior work"));
         assert!(prompt.contains("**User:**"));
         assert!(prompt.contains(SUMMARY_PROMPT));
+    }
+
+    #[test]
+    fn summary_prompt_is_the_structured_template() {
+        for section in [
+            "## Goal",
+            "## Constraints & Preferences",
+            "### Done",
+            "### In Progress",
+            "### Blocked",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+        ] {
+            assert!(SUMMARY_PROMPT.contains(section), "{section}");
+        }
     }
 
     #[test]
