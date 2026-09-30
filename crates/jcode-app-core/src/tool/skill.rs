@@ -50,6 +50,17 @@ struct SkillInput {
     package_name: Option<String>,
     #[serde(default)]
     package_code: Option<String>,
+    /// Supporting file (relative to the skill) for write_file / remove_file.
+    #[serde(default)]
+    file_path: Option<String>,
+    /// Full SKILL.md for edit, or the file body for write_file.
+    #[serde(default)]
+    file_content: Option<String>,
+    /// Exact text to replace (patch) and its replacement.
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
 }
 
 fn default_action() -> String {
@@ -73,7 +84,7 @@ impl Tool for SkillTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["load", "list", "reload", "reload_all", "read", "create"],
+                    "enum": ["load", "list", "reload", "reload_all", "read", "create", "patch", "edit", "write_file", "remove_file"],
                     "description": "Action."
                 },
                 "name": {
@@ -83,7 +94,11 @@ impl Tool for SkillTool {
                 "description": {"type":"string", "description":"Short skill summary for create."},
                 "instructions": {"type":"string", "description":"SKILL.md body for create."},
                 "package_name": {"type":"string", "description":"Optional Python module name for create."},
-                "package_code": {"type":"string", "description":"Optional Python package __init__.py for create."}
+                "package_code": {"type":"string", "description":"Optional Python package __init__.py for create."},
+                "file_path": {"type":"string", "description":"File under the skill (write_file/remove_file)."},
+                "file_content": {"type":"string", "description":"Full SKILL.md (edit) or file body (write_file)."},
+                "old_string": {"type":"string", "description":"Text to replace (patch)."},
+                "new_string": {"type":"string", "description":"Replacement (patch)."}
             }
         })
     }
@@ -107,8 +122,9 @@ impl Tool for SkillTool {
                     .await
             }
             "create" => self.create_skill(params).await,
+            "patch" | "edit" | "write_file" | "remove_file" => self.modify_skill(params).await,
             _ => Ok(ToolOutput::new(format!(
-                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', or 'create'.",
+                "Unknown action: {}. Use 'load', 'list', 'reload', 'reload_all', 'read', 'create', 'patch', 'edit', 'write_file', or 'remove_file'.",
                 params.action
             ))),
         }
@@ -130,6 +146,21 @@ impl SkillTool {
             ToolOutput::new(format!("Created skill '{}' at {}", name, path.display()))
                 .with_title(format!("Skills: Created {name}")),
         )
+    }
+
+    async fn modify_skill(&self, params: SkillInput) -> Result<ToolOutput> {
+        let name = normalize_skill_name(params.name.clone(), &params.action)?;
+        let dir = {
+            let registry = self.registry.read().await;
+            let skill = registry
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("Skill '{name}' not found"))?;
+            skill.path.parent().map(|p| p.to_path_buf())
+        }
+        .ok_or_else(|| anyhow::anyhow!("Skill '{name}' has no directory"))?;
+        let message = modify_skill_files(&dir, &params)?;
+        self.registry.write().await.reload_global()?;
+        Ok(ToolOutput::new(message).with_title(format!("Skills: {} {name}", params.action)))
     }
 
     async fn load_skill(
@@ -497,6 +528,85 @@ fn create_skill_files(
     Ok(skill_dir)
 }
 
+/// patch/edit/write_file/remove_file on one skill directory. A skill the learning loop wrote
+/// (Prime's marker) is regenerated from its memory row, so its SKILL.md is not edited here.
+fn modify_skill_files(dir: &std::path::Path, p: &SkillInput) -> Result<String> {
+    use std::path::Component;
+    let md = dir.join("SKILL.md");
+    let learned = || {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|slug| {
+                sovereign_prime::skill_files::is_learned(dir.parent().unwrap_or(dir), slug)
+            })
+    };
+    let need = |v: &Option<String>, what: &str| -> Result<String> {
+        v.clone()
+            .ok_or_else(|| anyhow::anyhow!("'{what}' is required for {} action", p.action))
+    };
+    let file = |rel: &str| -> Result<std::path::PathBuf> {
+        let rel = std::path::Path::new(rel);
+        anyhow::ensure!(
+            rel.components().all(|c| matches!(c, Component::Normal(_)))
+                && rel != std::path::Path::new("SKILL.md"),
+            "file_path must be a relative path inside the skill (not SKILL.md)"
+        );
+        Ok(dir.join(rel))
+    };
+    let guard_learned = || {
+        anyhow::ensure!(
+            !learned(),
+            "this skill was learned by the learning loop; change its memory entry instead (SKILL.md is regenerated from it)"
+        );
+        Ok::<(), anyhow::Error>(())
+    };
+    match p.action.as_str() {
+        "edit" => {
+            guard_learned()?;
+            let body = need(&p.file_content, "file_content")?;
+            anyhow::ensure!(
+                body.starts_with("---"),
+                "SKILL.md must start with YAML frontmatter"
+            );
+            std::fs::write(&md, body)?;
+            Ok("Rewrote SKILL.md".into())
+        }
+        "patch" => {
+            let target = match &p.file_path {
+                Some(rel) => file(rel)?,
+                None => {
+                    guard_learned()?;
+                    md
+                }
+            };
+            let old = need(&p.old_string, "old_string")?;
+            let new = need(&p.new_string, "new_string")?;
+            let text = std::fs::read_to_string(&target)?;
+            anyhow::ensure!(
+                !old.is_empty() && text.matches(&old).count() == 1,
+                "old_string must match exactly once"
+            );
+            std::fs::write(&target, text.replacen(&old, &new, 1))?;
+            Ok(format!("Patched {}", target.display()))
+        }
+        "write_file" => {
+            let target = file(&need(&p.file_path, "file_path")?)?;
+            let body = need(&p.file_content, "file_content")?;
+            anyhow::ensure!(body.len() <= 1_048_576, "file_content exceeds 1 MiB");
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, body)?;
+            Ok(format!("Wrote {}", target.display()))
+        }
+        _ => {
+            let target = file(&need(&p.file_path, "file_path")?)?;
+            std::fs::remove_file(&target)?;
+            Ok(format!("Removed {}", target.display()))
+        }
+    }
+}
+
 fn normalize_skill_name(name: Option<String>, action: &str) -> Result<String> {
     let name = name.ok_or_else(|| anyhow::anyhow!("'name' is required for {} action", action))?;
     let trimmed = name.trim().trim_start_matches('/').to_string();
@@ -509,6 +619,49 @@ fn normalize_skill_name(name: Option<String>, action: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input(action: &str) -> SkillInput {
+        serde_json::from_value(json!({"action": action, "name": "s"})).unwrap()
+    }
+
+    #[test]
+    fn modifies_user_skill_and_refuses_learned_or_escaping_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("s");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: s\n---\nhello world\n").unwrap();
+        let mut p = input("patch");
+        p.old_string = Some("hello".into());
+        p.new_string = Some("bye".into());
+        modify_skill_files(&dir, &p).unwrap();
+        assert!(
+            std::fs::read_to_string(dir.join("SKILL.md"))
+                .unwrap()
+                .contains("bye world")
+        );
+        let mut w = input("write_file");
+        w.file_path = Some("references/a.md".into());
+        w.file_content = Some("x".into());
+        modify_skill_files(&dir, &w).unwrap();
+        assert!(dir.join("references/a.md").is_file());
+        let mut r = input("remove_file");
+        r.file_path = Some("references/a.md".into());
+        modify_skill_files(&dir, &r).unwrap();
+        assert!(!dir.join("references/a.md").exists());
+        w.file_path = Some("../x".into());
+        assert!(modify_skill_files(&dir, &w).is_err());
+        w.file_path = Some("SKILL.md".into());
+        assert!(modify_skill_files(&dir, &w).is_err());
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: s\nakira-learned: true\n---\nbody\n",
+        )
+        .unwrap();
+        assert!(modify_skill_files(&dir, &p).is_err());
+        let mut e = input("edit");
+        e.file_content = Some("---\nx".into());
+        assert!(modify_skill_files(&dir, &e).is_err());
+    }
 
     fn create_test_tool() -> SkillTool {
         let registry = Arc::new(RwLock::new(SkillRegistry::default()));

@@ -83,6 +83,9 @@ pub struct SkillRegistry {
 /// defensively but with a bound to avoid walking arbitrarily deep trees.
 const PLUGIN_SCAN_MAX_DEPTH: usize = 5;
 
+/// Marker in `~/.jcode/skills` recording the one-time Hermes skill merge.
+const HERMES_MERGED: &str = ".hermes_merged";
+
 /// Outcome of importing one external skills directory.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SkillCopyStats {
@@ -154,8 +157,14 @@ impl SkillRegistry {
             Err(_) => return,
         };
 
-        if jcode_skills.exists() {
-            return; // Not first run
+        let first_run = !jcode_skills.exists();
+
+        if let Ok(hermes_skills) = crate::storage::user_home_path(".hermes/skills") {
+            Self::merge_hermes_skills(&hermes_skills, &jcode_skills);
+        }
+
+        if !first_run {
+            return;
         }
 
         let mut sources = Vec::new();
@@ -193,6 +202,37 @@ impl SkillRegistry {
                 copied.join(", "),
                 sources.join(" + "),
             ));
+        }
+    }
+
+    /// Once, copy Hermes' bundled skills that `dst` lacks (never overwrite, never touch `src`),
+    /// so a `~/.jcode/skills` that predates the merge still gains them. Recorded by a marker.
+    fn merge_hermes_skills(src: &Path, dst: &Path) {
+        let marker = dst.join(HERMES_MERGED);
+        if !src.is_dir() || marker.exists() {
+            return;
+        }
+        fn merge(src: &Path, dst: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let to = dst.join(entry.file_name());
+                if entry.path().is_dir() {
+                    merge(&entry.path(), &to)?;
+                } else if !to.exists() {
+                    std::fs::copy(entry.path(), &to)?;
+                }
+            }
+            Ok(())
+        }
+        match merge(src, dst) {
+            Ok(()) => {
+                let _ = std::fs::write(marker, "");
+            }
+            Err(e) => crate::logging::error(&format!("Failed to merge Hermes skills: {e}")),
         }
     }
 
@@ -1040,6 +1080,24 @@ fn normalize_skill_search_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merges_hermes_skills_once_without_overwriting() {
+        let t = tempfile::tempdir().unwrap();
+        let (src, dst) = (t.path().join("h"), t.path().join("j"));
+        std::fs::create_dir_all(src.join("apple/findmy")).unwrap();
+        std::fs::write(src.join("apple/findmy/SKILL.md"), "hermes").unwrap();
+        std::fs::create_dir_all(dst.join("apple/findmy")).unwrap();
+        std::fs::write(dst.join("apple/findmy/SKILL.md"), "mine").unwrap();
+        std::fs::create_dir_all(src.join("apple/notes")).unwrap();
+        std::fs::write(src.join("apple/notes/SKILL.md"), "n").unwrap();
+        SkillRegistry::merge_hermes_skills(&src, &dst);
+        assert_eq!(std::fs::read_to_string(dst.join("apple/findmy/SKILL.md")).unwrap(), "mine");
+        assert!(dst.join("apple/notes/SKILL.md").is_file() && src.join("apple/notes/SKILL.md").is_file());
+        std::fs::remove_file(dst.join("apple/notes/SKILL.md")).unwrap();
+        SkillRegistry::merge_hermes_skills(&src, &dst);
+        assert!(!dst.join("apple/notes/SKILL.md").exists(), "runs once");
+    }
+
     use super::*;
 
     fn test_skill(name: &str, description: &str, content: &str) -> Skill {
