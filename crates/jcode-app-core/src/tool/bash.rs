@@ -25,8 +25,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
-const MAX_OUTPUT_LEN: usize = 12000;
-const HEAD_OUTPUT_LEN: usize = 4000;
+// Stays under the 50 KB history cap (agent/tools.rs) incl. note + exit code, so output is never truncated twice.
+const MAX_OUTPUT_LEN: usize = 48_000;
+const HEAD_OUTPUT_LEN: usize = 12_000;
 const DEFAULT_TIMEOUT_MS: u64 = 120000;
 const STDIN_POLL_INTERVAL_MS: u64 = 500;
 const STDIN_INITIAL_DELAY_MS: u64 = 300;
@@ -767,7 +768,7 @@ mod utf8_truncation_tests {
             .map(|i| if i == 2000 { "UNIQUE_TOKEN=tok_mid\n".to_string() } else { format!("[build] step {i} é\n") })
             .collect();
         let output = format_command_output(input.clone(), Some(1));
-        assert!(output.len() < 13_000, "{}", output.len());
+        assert!(output.len() < 50 * 1024 && output.len() > 40_000, "{}", output.len());
         assert!(output.starts_with("[build] step 0 "));
         assert!(output.contains("step 3999") && !output.contains("UNIQUE_TOKEN"));
         assert!(output.ends_with("Exit code: 1"));
