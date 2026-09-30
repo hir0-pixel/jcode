@@ -300,7 +300,11 @@ impl StopNudge {
         }
         self.rounds += 1;
         let started = std::time::Instant::now();
-        let r = run(&cmd, &dir, std::time::Duration::from_secs(cfg.auto_verify_timeout_s.max(1)));
+        // A cold build (Cargo, Gradle, Maven, CMake) takes far longer than a script test run, so the
+        // first run would falsely time out at the base limit.
+        let slow_build = ["cargo ", "gradle ", "./gradlew ", "mvn ", "cmake "].iter().any(|b| cmd.starts_with(b));
+        let base = cfg.auto_verify_timeout_s.max(1);
+        let r = run(&cmd, &dir, std::time::Duration::from_secs(if slow_build { base.saturating_mul(3) } else { base }));
         let ms = started.elapsed().as_millis() as u64;
         let reason = match (r.passed, r.exit_code) {
             (true, _) => "auto_verify_pass",
