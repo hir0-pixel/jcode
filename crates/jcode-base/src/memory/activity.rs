@@ -60,8 +60,6 @@ pub fn set_state(state: MemoryState) {
 
 /// Add an event to the activity log
 pub fn add_event(kind: MemoryEventKind) {
-    crate::memory_log::log_event(&kind);
-
     if let Ok(mut guard) = MEMORY_ACTIVITY.lock() {
         let event = MemoryEvent {
             kind,

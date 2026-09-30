@@ -174,22 +174,6 @@ pub enum MemoryEventKind {
     ExtractionComplete { count: usize },
     /// Error occurred.
     Error { message: String },
-    /// Agent stored a memory via tool.
-    ToolRemembered {
-        content: String,
-        scope: String,
-        category: String,
-    },
-    /// Agent recalled or searched memories via tool.
-    ToolRecalled { query: String, count: usize },
-    /// Agent forgot a memory via tool.
-    ToolForgot { id: String },
-    /// Agent tagged a memory via tool.
-    ToolTagged { id: String, tags: String },
-    /// Agent linked memories via tool.
-    ToolLinked { from: String, to: String },
-    /// Agent listed memories via tool.
-    ToolListed { count: usize },
 }
 
 // Persistent memory model and pure search helpers.
@@ -657,9 +641,32 @@ fn format_entries_for_prompt_with_header(
     include_header: bool,
     include_updated_at_comments: bool,
 ) -> Option<String> {
+    let mut selected = selected_entries_for_prompt(entries, limit);
+    loop {
+        let rendered = render_entries(&selected, include_header, include_updated_at_comments);
+        match rendered {
+            Some(text) if text.chars().count() > MAX_MEMORY_BLOCK_CHARS - "# Memory\n\n".len() && selected.len() > 1 => {
+                // Over the injection budget: drop the lowest-ranked entry and render again.
+                selected.pop();
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One injected memory is at most this many characters.
+pub const MAX_MEMORY_ENTRY_CHARS: usize = 400;
+/// The whole injected memory block is at most this many characters (about 700 tokens).
+pub const MAX_MEMORY_BLOCK_CHARS: usize = 2_800;
+
+fn render_entries(
+    selected: &[&MemoryEntry],
+    include_header: bool,
+    include_updated_at_comments: bool,
+) -> Option<String> {
     let mut sections: HashMap<MemoryCategory, Vec<&MemoryEntry>> = HashMap::new();
 
-    for entry in selected_entries_for_prompt(entries, limit) {
+    for &entry in selected {
         sections
             .entry(entry.category.clone())
             .or_default()
@@ -684,7 +691,12 @@ fn format_entries_for_prompt_with_header(
         }
         output.push_str(&format!("## {title}\n"));
         for (idx, item) in items.into_iter().enumerate() {
-            output.push_str(&format!("{}. {}\n", idx + 1, item.content.trim()));
+            let content = item.content.trim();
+            let content = match content.char_indices().nth(MAX_MEMORY_ENTRY_CHARS) {
+                Some((end, _)) => &content[..end],
+                None => content,
+            };
+            output.push_str(&format!("{}. {}\n", idx + 1, content));
             if include_updated_at_comments {
                 output.push_str(&format!(
                     "<!-- updated_at: {} -->\n",
@@ -993,5 +1005,22 @@ pub mod ranking {
             assert!(top_k_by_score([("a", 1.0)], 0).is_empty());
             assert!(top_k_by_ord([("a", 1)], 0).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod injection_cap_tests {
+    use super::*;
+
+    #[test]
+    fn each_memory_is_cut_at_400_chars_and_the_block_stays_under_the_cap() {
+        let long = "a long memory ".repeat(80);
+        let entries: Vec<MemoryEntry> = (0..10).map(|i| MemoryEntry::new(MemoryCategory::Fact, format!("{i} {long}"))).collect();
+        let one = format_relevant_prompt(&entries[..1], 1).unwrap();
+        assert!(one.chars().count() < 400 + 60, "{}", one.chars().count());
+        let block = format_relevant_prompt(&entries, 10).unwrap();
+        assert!(block.chars().count() <= MAX_MEMORY_BLOCK_CHARS, "{}", block.chars().count());
+        assert!(block.contains("0 a long"), "the best-ranked entry survives");
+        assert!(!block.contains("9 a long"), "the lowest-ranked entries are dropped first");
     }
 }

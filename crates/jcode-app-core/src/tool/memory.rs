@@ -127,7 +127,7 @@ impl Tool for MemoryTool {
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         use crate::memory;
-        use crate::memory_types::{MemoryEventKind, MemoryState};
+        use crate::memory_types::MemoryState;
 
         let input: MemoryInput = serde_json::from_value(input)?;
         let action_label = input.action.clone();
@@ -168,11 +168,6 @@ impl Tool for MemoryTool {
                     std::slice::from_ref(&id),
                     "stored via memory tool in this session",
                 );
-                memory::add_event(MemoryEventKind::ToolRemembered {
-                    content: truncate_for_widget(&content, 60),
-                    scope: scope.to_string(),
-                    category: category.to_string(),
-                });
                 memory::set_state(MemoryState::Idle);
                 Ok(ToolOutput::new(format!(
                     "Remembered {} ({}): \"{}\" [id: {}]",
@@ -200,17 +195,11 @@ impl Tool for MemoryTool {
                             Some(memories) => {
                                 let count =
                                     memories.lines().filter(|l| l.starts_with("- ")).count();
-                                memory::add_event(MemoryEventKind::ToolRecalled {
-                                    query: "(recent)".into(),
-                                    count,
-                                });
+                                recalled(&session_id, "recent", count);
                                 Ok(ToolOutput::new(format!("Recent memories:\n{}", memories)))
                             }
                             None => {
-                                memory::add_event(MemoryEventKind::ToolRecalled {
-                                    query: "(recent)".into(),
-                                    count: 0,
-                                });
+                                recalled(&session_id, "recent", 0);
                                 Ok(ToolOutput::new("No memories stored yet."))
                             }
                         };
@@ -237,11 +226,7 @@ impl Tool for MemoryTool {
                         memory::set_state(MemoryState::Idle);
                         let results = results?;
 
-                        memory::add_event(MemoryEventKind::ToolRecalled {
-                            query: truncate_for_widget(&query, 40),
-                            count: results.len(),
-                        });
-                        memory::set_state(MemoryState::Idle);
+                        recalled(&session_id, "ranked", results.len());
 
                         if results.is_empty() {
                             Ok(ToolOutput::new(format!(
@@ -291,10 +276,7 @@ impl Tool for MemoryTool {
                 if let Some(limit) = input.limit {
                     results.truncate(limit);
                 }
-                memory::add_event(MemoryEventKind::ToolRecalled {
-                    query: truncate_for_widget(&query, 40),
-                    count: results.len(),
-                });
+                recalled(&session_id, "search", results.len());
                 memory::set_state(MemoryState::Idle);
                 if results.is_empty() {
                     Ok(ToolOutput::new(format!("No memories matching '{}'", query)))
@@ -319,7 +301,7 @@ impl Tool for MemoryTool {
                 if let Some(limit) = input.limit {
                     all.truncate(limit);
                 }
-                memory::add_event(MemoryEventKind::ToolListed { count: all.len() });
+                recalled(&session_id, "list", all.len());
                 memory::set_state(MemoryState::Idle);
                 if all.is_empty() {
                     Ok(ToolOutput::new("No memories stored."))
@@ -341,7 +323,13 @@ impl Tool for MemoryTool {
                     detail: truncate_for_widget(&id, 30),
                 });
                 let found = manager.forget(&id)?;
-                memory::add_event(MemoryEventKind::ToolForgot { id: id.clone() });
+                jcode_base::obs_sink::emit(
+                    jcode_base::obs_sink::Span::new("memory.write")
+                        .session(&session_id)
+                        .attr("action", "forgot")
+                        .attr("id", id.as_str())
+                        .attr("found", found),
+                );
                 memory::set_state(MemoryState::Idle);
                 if found {
                     Ok(ToolOutput::new(format!("Forgot: {}", id)))
@@ -365,10 +353,13 @@ impl Tool for MemoryTool {
                     manager.tag_memory(&id, tag)?;
                 }
                 let tags_str = tags.join(", ");
-                memory::add_event(MemoryEventKind::ToolTagged {
-                    id: id.clone(),
-                    tags: tags_str.clone(),
-                });
+                jcode_base::obs_sink::emit(
+                    jcode_base::obs_sink::Span::new("memory.write")
+                        .session(&session_id)
+                        .attr("action", "tagged")
+                        .attr("id", id.as_str())
+                        .attr("tags", tags.len()),
+                );
                 memory::set_state(MemoryState::Idle);
 
                 Ok(ToolOutput::new(format!(
@@ -394,10 +385,13 @@ impl Tool for MemoryTool {
                     ),
                 });
                 manager.link_memories(&from_id, &to_id, weight)?;
-                memory::add_event(MemoryEventKind::ToolLinked {
-                    from: from_id.clone(),
-                    to: to_id.clone(),
-                });
+                jcode_base::obs_sink::emit(
+                    jcode_base::obs_sink::Span::new("memory.write")
+                        .session(&session_id)
+                        .attr("action", "linked")
+                        .attr("id", from_id.as_str())
+                        .attr("target", to_id.as_str()),
+                );
                 memory::set_state(MemoryState::Idle);
                 Ok(ToolOutput::new(format!(
                     "Linked memories {} -> {} (weight {:.2})",
@@ -413,10 +407,7 @@ impl Tool for MemoryTool {
                     detail: truncate_for_widget(&id, 30),
                 });
                 let related = manager.get_related(&id, depth)?;
-                memory::add_event(MemoryEventKind::ToolRecalled {
-                    query: format!("related:{}", truncate_for_widget(&id, 20)),
-                    count: related.len(),
-                });
+                recalled(&session_id, "related", related.len());
                 memory::set_state(MemoryState::Idle);
 
                 if related.is_empty() {
@@ -459,6 +450,17 @@ fn truncate_for_widget(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// One `memory.recall` span per tool read: the mode and how many entries came back, never the query.
+fn recalled(session_id: &str, mode: &str, count: usize) {
+    jcode_base::obs_sink::emit(
+        jcode_base::obs_sink::Span::new("memory.recall")
+            .session(session_id)
+            .attr("source", "tool")
+            .attr("mode", mode)
+            .attr("returned", count),
+    );
 }
 
 #[cfg(test)]

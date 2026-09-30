@@ -211,11 +211,11 @@ fn take_pending_memory_inner(
             .map(|binding| binding.project_dir.as_deref())
             != Some(expected)
     {
-        crate::memory_log::log_pending_discarded(session_id, "project binding changed or missing");
+        discarded(session_id, "project binding changed or missing");
         return None;
     }
     if !queued.pending.is_fresh() {
-        crate::memory_log::log_pending_discarded(session_id, "stale (>120s)");
+        discarded(session_id, "stale (>120s)");
         return None;
     }
     if let Some(binding) = &queued.binding {
@@ -223,7 +223,7 @@ fn take_pending_memory_inner(
             snapshot_selected_memories(binding.project_dir.as_deref(), &queued.pending.memory_ids)
                 .is_ok_and(|(current, _)| current == binding.snapshots);
         if !valid {
-            crate::memory_log::log_pending_discarded(
+            discarded(
                 session_id,
                 "selected memory changed, forgotten, or unreadable",
             );
@@ -241,7 +241,7 @@ fn take_pending_memory_inner(
             .iter()
             .all(|id| is_memory_injected(session_id, id))
     {
-        crate::memory_log::log_pending_discarded(
+        discarded(
             session_id,
             "all memories already known to session",
         );
@@ -255,7 +255,7 @@ fn take_pending_memory_inner(
             && *last_sig == sig
             && last_at.elapsed().as_secs() < MEMORY_REPEAT_SUPPRESSION_SECS
         {
-            crate::memory_log::log_pending_discarded(session_id, "duplicate suppressed");
+            discarded(session_id, "duplicate suppressed");
             return None;
         }
         sig_map.insert(session_id.to_string(), (sig, Instant::now()));
@@ -270,7 +270,7 @@ fn take_pending_memory_inner(
                 if overlap >= MEMORY_SET_OVERLAP_SUPPRESSION_RATIO
                     && last_at.elapsed().as_secs() < MEMORY_SET_REPEAT_SUPPRESSION_SECS
                 {
-                    crate::memory_log::log_pending_discarded(
+                    discarded(
                         session_id,
                         "overlapping memory set suppressed",
                     );
@@ -285,12 +285,6 @@ fn take_pending_memory_inner(
         mark_memories_injected(session_id, &pending.memory_ids);
     }
 
-    crate::memory_log::log_pending_consumed(
-        session_id,
-        pending.count,
-        pending.computed_at.elapsed().as_millis() as u64,
-        pending.prompt.chars().count(),
-    );
 
     Some(pending)
 }
@@ -379,7 +373,7 @@ fn publish_scoped_memory(
     selected_entries: Option<&[super::MemoryEntry]>,
 ) {
     let Ok((snapshots, entries)) = snapshot_selected_memories(project_dir, &memory_ids) else {
-        crate::memory_log::log_pending_discarded(
+        discarded(
             session_id,
             "cannot validate selected memory at publication",
         );
@@ -398,7 +392,7 @@ fn publish_scoped_memory(
                     })
             });
         if !matches_selection {
-            crate::memory_log::log_pending_discarded(
+            discarded(
                 session_id,
                 "selected memory metadata changed during relevance evaluation",
             );
@@ -410,7 +404,7 @@ fn publish_scoped_memory(
         .map(str::trim)
         != Some(prompt.trim())
     {
-        crate::memory_log::log_pending_discarded(
+        discarded(
             session_id,
             "selected memory changed before publication",
         );
@@ -437,7 +431,6 @@ fn store_pending_memory(
     display_prompt: Option<String>,
     binding: Option<PendingBinding>,
 ) {
-    crate::memory_log::log_pending_prepared(session_id, &prompt, count, &memory_ids);
 
     if let Ok(mut guard) = PENDING_MEMORY.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
@@ -452,7 +445,7 @@ fn store_pending_memory(
             let overlap =
                 memory_overlap_ratio(&memory_set(&existing.pending.memory_ids), &new_memory_set);
             if existing_sig == new_sig || overlap >= MEMORY_SET_OVERLAP_SUPPRESSION_RATIO {
-                crate::memory_log::log_pending_discarded(
+                discarded(
                     session_id,
                     "similar pending payload already queued",
                 );
@@ -478,7 +471,6 @@ fn store_pending_memory(
 
 /// Mark memory IDs as already injected for a session (prevents re-injection on future turns).
 pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
-    crate::memory_log::log_marked_injected(session_id, ids);
     insert_injected_ids(session_id, ids);
 }
 
@@ -486,11 +478,10 @@ pub fn mark_memories_injected(session_id: &str, ids: &[String]) {
 /// injected, e.g. because they were just extracted from this session's own
 /// transcript. The conversation already contains this information, so
 /// re-injecting it would be a pure echo.
-pub fn mark_memories_known(session_id: &str, ids: &[String], reason: &str) {
+pub fn mark_memories_known(session_id: &str, ids: &[String], _reason: &str) {
     if ids.is_empty() {
         return;
     }
-    crate::memory_log::log_marked_known(session_id, ids, reason);
     insert_injected_ids(session_id, ids);
 }
 
@@ -1003,4 +994,11 @@ mod scoped_tests {
             );
         });
     }
+}
+
+/// A pending memory payload was dropped: one `memory.skip` span with the reason, no memory text.
+fn discarded(session_id: &str, reason: &str) {
+    crate::obs_sink::emit(
+        crate::obs_sink::Span::new("memory.skip").session(session_id).attr("stage", "pending").attr("reason", reason),
+    );
 }
