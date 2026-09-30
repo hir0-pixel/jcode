@@ -80,6 +80,11 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "launch" => "open",
         "shell" => "bash",
         "shell_exec" => "bash",
+        // Hermes tool names (its prompts and learned skills use them).
+        "terminal" => "bash",
+        "search_files" => "agentgrep",
+        "web_extract" => "webfetch",
+        "web_search" => "websearch",
         "read_file" => "read",
         "file_read" => "read",
         "write_file" => "write",
@@ -147,5 +152,9 @@ mod tests {
         assert_eq!(resolve_tool_name("ScheduleWakeup"), "schedule");
         assert_eq!(resolve_tool_name("Skill"), "skill_manage");
         assert_eq!(resolve_tool_name("functions.Read"), "read");
+        assert_eq!(resolve_tool_name("terminal"), "bash");
+        assert_eq!(resolve_tool_name("search_files"), "agentgrep");
+        assert_eq!(resolve_tool_name("web_extract"), "webfetch");
+        assert_eq!(resolve_tool_name("web_search"), "websearch");
     }
 }
