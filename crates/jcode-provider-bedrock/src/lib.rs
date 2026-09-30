@@ -12,7 +12,8 @@ use aws_sdk_bedrock::Client as BedrockControlClient;
 use aws_sdk_bedrockruntime::Client as BedrockRuntimeClient;
 #[cfg(feature = "aws-sdk")]
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
+    CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
+    ConversationRole, ConverseStreamOutput,
     ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
     ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
     ToolSpecification,
@@ -46,6 +47,14 @@ use tokio_stream::wrappers::ReceiverStream;
 
 const DEFAULT_MODEL: &str = "anthropic.claude-3-5-sonnet-20241022-v2:0";
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
+/// Output cap sent when JCODE_BEDROCK_MAX_TOKENS is unset. Without maxTokens
+/// Bedrock applies a small model default that truncates large file writes;
+/// 32k is within every Claude 4+ model's limit.
+const DEFAULT_REQUEST_MAX_TOKENS: usize = 32_000;
+/// Provider-level retry: total attempts, first backoff and backoff ceiling.
+const MAX_ATTEMPTS: u32 = 6;
+const BACKOFF_BASE_MS: u64 = 1_000;
+const BACKOFF_CAP_MS: u64 = 60_000;
 pub const ENV_FILE: &str = "bedrock.env";
 pub const API_KEY_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 pub const REGION_ENV: &str = "JCODE_BEDROCK_REGION";
@@ -151,7 +160,11 @@ impl BedrockProvider {
     #[cfg(feature = "aws-sdk")]
     async fn runtime_client() -> BedrockRuntimeClient {
         let sdk_config = Self::sdk_config().await;
-        let mut config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config);
+        // The provider retries throttling/5xx/network itself (see
+        // `is_retryable_error`); disable the SDK's own 3-attempt retry so the
+        // two layers do not multiply.
+        let mut config = aws_sdk_bedrockruntime::config::Builder::from(&sdk_config)
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled());
         if let Some(token) = Self::configured_bearer_token_for_runtime() {
             // Configure bearer authentication on this client only. Mutating the
             // process environment races with concurrent provider construction
@@ -301,6 +314,168 @@ impl BedrockProvider {
                 *legacy = legacy_models.into_iter().collect();
             }
         }
+    }
+
+    /// One ConverseStream request, forwarding events to `tx`.
+    #[cfg(feature = "aws-sdk")]
+    async fn converse_once(
+        client: &BedrockRuntimeClient,
+        model: &str,
+        inputs: ConverseInputs,
+        tx: &mpsc::Sender<Result<StreamEvent>>,
+    ) -> std::result::Result<(), AttemptFailure> {
+        let mut req = client
+            .converse_stream()
+            .model_id(model)
+            .set_messages(Some(inputs.messages));
+        if let Some(system) = inputs.system {
+            req = req.set_system(Some(system));
+        }
+        if let Some(tool_config) = inputs.tool_config {
+            req = req.tool_config(tool_config);
+        }
+        if let Some(inference) = inputs.inference {
+            req = req.inference_config(inference);
+        }
+        let resp = req.send().await.map_err(|err| AttemptFailure {
+            message: Self::sdk_error_message(&err),
+            emitted: false,
+        })?;
+        let mut emitted = false;
+        let mut stream = resp.stream;
+        let mut in_tool = false;
+        loop {
+            let event = match stream.recv().await {
+                Ok(Some(event)) => event,
+                Ok(None) => return Ok(()),
+                Err(err) => {
+                    return Err(AttemptFailure {
+                        message: Self::sdk_error_message(&err),
+                        emitted,
+                    });
+                }
+            };
+            let out = match event {
+                ConverseStreamOutput::ContentBlockStart(start) => {
+                    if let Some(ContentBlockStart::ToolUse(tool)) = start.start {
+                        in_tool = true;
+                        Some(StreamEvent::ToolUseStart {
+                            id: tool.tool_use_id().to_string(),
+                            name: tool.name().to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                ConverseStreamOutput::ContentBlockDelta(delta) => match delta.delta {
+                    Some(ContentBlockDelta::Text(text)) => Some(StreamEvent::TextDelta(text)),
+                    Some(ContentBlockDelta::ToolUse(tool_delta)) => {
+                        let input = tool_delta.input();
+                        (!input.is_empty()).then(|| StreamEvent::ToolInputDelta(input.to_string()))
+                    }
+                    Some(ContentBlockDelta::ReasoningContent(
+                        ReasoningContentBlockDelta::Text(text),
+                    )) => Some(StreamEvent::ThinkingDelta(text)),
+                    _ => None,
+                },
+                ConverseStreamOutput::ContentBlockStop(_) => {
+                    std::mem::take(&mut in_tool).then_some(StreamEvent::ToolUseEnd)
+                }
+                ConverseStreamOutput::MessageStop(stop) => Some(StreamEvent::MessageEnd {
+                    // snake_case ("end_turn", "tool_use", "max_tokens") like every
+                    // other provider; the turn loop matches on these strings.
+                    stop_reason: Some(stop.stop_reason().as_str().to_string()),
+                }),
+                ConverseStreamOutput::Metadata(meta) => meta.usage().map(|usage| {
+                    StreamEvent::TokenUsage {
+                        input_tokens: Some(usage.input_tokens() as u64),
+                        output_tokens: Some(usage.output_tokens() as u64),
+                        cache_read_input_tokens: usage
+                            .cache_read_input_tokens()
+                            .map(|v| v.max(0) as u64),
+                        cache_creation_input_tokens: usage
+                            .cache_write_input_tokens()
+                            .map(|v| v.max(0) as u64),
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(out) = out {
+                emitted = true;
+                if tx.send(Ok(out)).await.is_err() {
+                    return Ok(()); // consumer gone
+                }
+            }
+        }
+    }
+
+    /// Transient failures worth retrying: throttling, 5xx / unavailable /
+    /// model timeout / model not ready, and network errors. Auth, validation,
+    /// access and missing-resource errors are never retried.
+    #[cfg_attr(not(feature = "aws-sdk"), allow(dead_code))]
+    fn is_retryable_error(raw: &str) -> bool {
+        let l = raw.to_ascii_lowercase();
+        const NEVER: [&str; 9] = [
+            "accessdenied",
+            "access denied",
+            "not authorized",
+            "unauthorized",
+            "validationexception",
+            "expired",
+            "credentials",
+            "resourcenotfound",
+            "resource not found",
+        ];
+        const TRANSIENT: [&str; 20] = [
+            "throttl",
+            "too many requests",
+            "toomanyrequests",
+            "rate exceeded",
+            "serviceunavailable",
+            "service unavailable",
+            "internalserver",
+            "internal server",
+            "modeltimeout",
+            "model timeout",
+            "modelnotready",
+            "not ready",
+            "modelstreamerror",
+            "dispatch failure",
+            "timeout",
+            "timed out",
+            "connection",
+            "io error",
+            "broken pipe",
+            "try again",
+        ];
+        !NEVER.iter().any(|n| l.contains(n)) && TRANSIENT.iter().any(|t| l.contains(t))
+    }
+
+    /// Exponential backoff for 1-based `attempt`, capped, with equal jitter
+    /// (`jitter` in [0,1)): half fixed, half random, so concurrent runs spread.
+    #[cfg_attr(not(feature = "aws-sdk"), allow(dead_code))]
+    fn backoff_delay(attempt: u32, jitter: f64) -> std::time::Duration {
+        let exp = BACKOFF_BASE_MS
+            .saturating_mul(1u64 << attempt.saturating_sub(1).min(20))
+            .min(BACKOFF_CAP_MS);
+        let half = exp / 2;
+        std::time::Duration::from_millis(half + (half as f64 * jitter.clamp(0.0, 1.0)) as u64)
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    fn jitter() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| f64::from(d.subsec_nanos() % 1_000_000) / 1_000_000.0)
+            .unwrap_or(0.5)
+    }
+
+    /// Prompt caching is accepted by Claude and Nova on Bedrock; unknown
+    /// models get no markers (Hermes `_CACHE_POINT_PATTERNS`).
+    #[cfg(any(feature = "aws-sdk", test))]
+    fn supports_prompt_cache(model: &str) -> bool {
+        let id = Self::normalize_model_id(model).to_ascii_lowercase();
+        id.contains("anthropic.claude") || id.contains("amazon.nova")
     }
 
     // Pure string logic; only reachable from aws-sdk request paths and tests.
@@ -498,6 +673,41 @@ impl BedrockProvider {
 
     #[cfg(feature = "aws-sdk")]
     fn to_bedrock_messages(messages: &[JMessage], allow_images: bool) -> Result<Vec<Message>> {
+        Self::merge_consecutive_roles(Self::to_bedrock_messages_unmerged(messages, allow_images)?)
+    }
+
+    /// Converse requires user/assistant alternation, but jcode stores each tool
+    /// result (and injected system-reminder / memory text) as its own user
+    /// message. Merge runs of one role; tool results go first in a user turn.
+    #[cfg(feature = "aws-sdk")]
+    fn merge_consecutive_roles(messages: Vec<Message>) -> Result<Vec<Message>> {
+        let mut grouped: Vec<(ConversationRole, Vec<ContentBlock>)> = Vec::new();
+        for m in messages {
+            let role = m.role().clone();
+            let content = m.content().to_vec();
+            match grouped.last_mut() {
+                Some((r, c)) if *r == role => c.extend(content),
+                _ => grouped.push((role, content)),
+            }
+        }
+        grouped
+            .into_iter()
+            .map(|(role, mut content)| {
+                content.sort_by_key(|b| !matches!(b, ContentBlock::ToolResult(_)));
+                Message::builder()
+                    .role(role)
+                    .set_content(Some(content))
+                    .build()
+                    .map_err(|err| anyhow::anyhow!(err))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    fn to_bedrock_messages_unmerged(
+        messages: &[JMessage],
+        allow_images: bool,
+    ) -> Result<Vec<Message>> {
         messages
             .iter()
             .filter_map(|msg| {
@@ -509,7 +719,10 @@ impl BedrockProvider {
                 for block in &msg.content {
                     match block {
                         JContentBlock::Text { text, .. } => {
-                            content.push(ContentBlock::Text(text.clone()))
+                            // Converse rejects blank text blocks.
+                            if !text.trim().is_empty() {
+                                content.push(ContentBlock::Text(text.clone()))
+                            }
                         }
                         JContentBlock::Image { media_type, data } => {
                             if !allow_images {
@@ -538,7 +751,11 @@ impl BedrockProvider {
                                     .status(status)
                                     .content(
                                         aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(
-                                            text.clone(),
+                                            if text.trim().is_empty() {
+                                                "(no output)".to_string()
+                                            } else {
+                                                text.clone()
+                                            },
                                         ),
                                     )
                                     .build()
@@ -610,11 +827,12 @@ impl BedrockProvider {
     }
 
     #[cfg(feature = "aws-sdk")]
-    fn inference_config() -> Option<InferenceConfiguration> {
+    fn inference_config(model: &str) -> Option<InferenceConfiguration> {
         let max_tokens = std::env::var("JCODE_BEDROCK_MAX_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse::<i32>().ok())
-            .filter(|v| *v > 0);
+            .filter(|v| *v > 0)
+            .or_else(|| Self::default_max_tokens(model));
         let temperature = std::env::var("JCODE_BEDROCK_TEMPERATURE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
@@ -648,6 +866,14 @@ impl BedrockProvider {
                 .set_stop_sequences(stop_sequences)
                 .build(),
         )
+    }
+
+    #[cfg(any(feature = "aws-sdk", test))]
+    fn default_max_tokens(model: &str) -> Option<i32> {
+        let cap = Self::model_info(model)
+            .max_output_tokens
+            .min(DEFAULT_REQUEST_MAX_TOKENS);
+        i32::try_from(cap).ok()
     }
 
     fn normalize_model_id(model: &str) -> String {
@@ -838,6 +1064,19 @@ impl BedrockProvider {
                 supports_vision: true,
                 supports_reasoning: false,
                 pricing: Some((800_000, 4_000_000)),
+            }
+        } else if id.contains("anthropic.claude") || id.contains("claude-") {
+            // Newer Claude generations (Sonnet/Opus/Haiku 4.5+, 5.x): the 3.x
+            // branches above are exact, everything else Claude is tool/vision
+            // capable. Without this they fall through to the no-tools default
+            // and the agent would run tool-less.
+            BedrockModelInfo {
+                context_tokens: 200_000,
+                max_output_tokens: 64_000,
+                supports_tools: true,
+                supports_vision: true,
+                supports_reasoning: true,
+                pricing: Some((3_000_000, 15_000_000)),
             }
         } else if id.contains("amazon.nova-pro") {
             BedrockModelInfo {
@@ -1106,6 +1345,72 @@ impl Default for BedrockProvider {
     }
 }
 
+/// Owned Converse request pieces, so a retry can rebuild the request.
+#[cfg(feature = "aws-sdk")]
+#[derive(Clone)]
+struct ConverseInputs {
+    messages: Vec<Message>,
+    system: Option<Vec<SystemContentBlock>>,
+    tool_config: Option<ToolConfiguration>,
+    inference: Option<InferenceConfiguration>,
+}
+
+#[cfg(feature = "aws-sdk")]
+impl ConverseInputs {
+    /// cachePoint after the system prompt, after the tool list (Claude only,
+    /// Nova rejects it there) and on the last two messages, as Hermes'
+    /// `build_converse_kwargs` does (4 markers is the Bedrock maximum).
+    fn with_cache_points(mut self, tools_too: bool) -> Self {
+        let Some(point) = CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+            .ok()
+        else {
+            return self;
+        };
+        if let Some(system) = self.system.as_mut() {
+            system.push(SystemContentBlock::CachePoint(point.clone()));
+        }
+        if tools_too
+            && let Some(cfg) = self.tool_config.take()
+        {
+            let mut tools = cfg.tools().to_vec();
+            tools.push(Tool::CachePoint(point.clone()));
+            self.tool_config = ToolConfiguration::builder()
+                .set_tools(Some(tools))
+                .set_tool_choice(cfg.tool_choice().cloned())
+                .build()
+                .ok()
+                .or(Some(cfg));
+        }
+        let n = self.messages.len();
+        for idx in n.saturating_sub(2)..n {
+            let role = self.messages[idx].role().clone();
+            let mut content = self.messages[idx].content().to_vec();
+            if content.is_empty() {
+                continue;
+            }
+            content.push(ContentBlock::CachePoint(point.clone()));
+            if let Ok(m) = Message::builder()
+                .role(role)
+                .set_content(Some(content))
+                .build()
+            {
+                self.messages[idx] = m;
+            }
+        }
+        self
+    }
+}
+
+/// One Converse attempt failed: message plus whether any event already
+/// reached the consumer (then a RetryRollback must precede the retry).
+#[cfg(feature = "aws-sdk")]
+struct AttemptFailure {
+    message: String,
+    emitted: bool,
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     #[cfg(feature = "aws-sdk")]
@@ -1125,7 +1430,7 @@ impl Provider for BedrockProvider {
         } else {
             None
         };
-        let inference_config = Self::inference_config();
+        let inference_config = Self::inference_config(&model);
         let system_blocks = if system.trim().is_empty() {
             None
         } else {
@@ -1169,110 +1474,67 @@ impl Provider for BedrockProvider {
             ],
         );
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(64);
+        let client = Self::runtime_client().await;
+        if client.config().region().is_none() {
+            return Err(anyhow::anyhow!(
+                "AWS region is missing. Set AWS_REGION (or JCODE_BEDROCK_REGION), or a region in the AWS profile."
+            ));
+        }
+        let plain = ConverseInputs {
+            messages: request_messages,
+            system: system_blocks,
+            tool_config,
+            inference: inference_config,
+        };
+        let mut cached = Self::supports_prompt_cache(&model).then(|| {
+            plain
+                .clone()
+                .with_cache_points(Self::normalize_model_id(&model).to_ascii_lowercase().contains("claude"))
+        });
         tokio::spawn(async move {
-            let client = Self::runtime_client().await;
-            let mut req = client
-                .converse_stream()
-                .model_id(model.clone())
-                .set_messages(Some(request_messages));
-            if let Some(system_blocks) = system_blocks {
-                req = req.set_system(Some(system_blocks));
-            }
-            if let Some(tool_config) = tool_config {
-                req = req.tool_config(tool_config);
-            }
-            if let Some(inference_config) = inference_config {
-                req = req.inference_config(inference_config);
-            }
-            let resp = match req.send().await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(Self::classify_error_message(
-                            &Self::sdk_error_message(&err)
-                        ))))
-                        .await;
-                    return;
-                }
-            };
-            let mut stream = resp.stream;
-            let mut current_tool: Option<(String, String, String)> = None;
+            let mut attempt = 0u32;
+            let mut emitted_before = false;
             loop {
-                match stream.recv().await {
-                    Ok(Some(event)) => match event {
-                        ConverseStreamOutput::ContentBlockStart(start) => {
-                            if let Some(ContentBlockStart::ToolUse(tool)) = start.start {
-                                let id = tool.tool_use_id().to_string();
-                                let name = tool.name().to_string();
-                                current_tool = Some((id.clone(), name.clone(), String::new()));
-                                let _ = tx.send(Ok(StreamEvent::ToolUseStart { id, name })).await;
-                            }
-                        }
-                        ConverseStreamOutput::ContentBlockDelta(delta) => {
-                            if let Some(d) = delta.delta {
-                                match d {
-                                    ContentBlockDelta::Text(text) => {
-                                        let _ = tx.send(Ok(StreamEvent::TextDelta(text))).await;
-                                    }
-                                    ContentBlockDelta::ToolUse(tool_delta) => {
-                                        let input = tool_delta.input();
-                                        if !input.is_empty() {
-                                            if let Some((_, _, buf)) = current_tool.as_mut() {
-                                                buf.push_str(input);
-                                            }
-                                            let _ = tx
-                                                .send(Ok(StreamEvent::ToolInputDelta(
-                                                    input.to_string(),
-                                                )))
-                                                .await;
-                                        }
-                                    }
-                                    ContentBlockDelta::ReasoningContent(
-                                        ReasoningContentBlockDelta::Text(text),
-                                    ) => {
-                                        let _ = tx.send(Ok(StreamEvent::ThinkingDelta(text))).await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        ConverseStreamOutput::ContentBlockStop(_) => {
-                            if current_tool.take().is_some() {
-                                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
-                            }
-                        }
-                        ConverseStreamOutput::MessageStop(stop) => {
-                            let reason = Some(format!("{:?}", stop.stop_reason()));
-                            let _ = tx
-                                .send(Ok(StreamEvent::MessageEnd {
-                                    stop_reason: reason,
-                                }))
-                                .await;
-                        }
-                        ConverseStreamOutput::Metadata(meta) => {
-                            if let Some(usage) = meta.usage() {
-                                let _ = tx
-                                    .send(Ok(StreamEvent::TokenUsage {
-                                        input_tokens: Some(usage.input_tokens() as u64),
-                                        output_tokens: Some(usage.output_tokens() as u64),
-                                        cache_read_input_tokens: None,
-                                        cache_creation_input_tokens: None,
-                                    }))
-                                    .await;
-                            }
-                        }
-                        _ => {}
-                    },
-                    Ok(None) => break,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(Self::classify_error_message(
-                                &Self::sdk_error_message(&err)
-                            ))))
-                            .await;
-                        break;
-                    }
+                attempt += 1;
+                let inputs = cached.clone().unwrap_or_else(|| plain.clone());
+                if emitted_before {
+                    let _ = tx
+                        .send(Ok(StreamEvent::RetryRollback {
+                            attempt,
+                            max: MAX_ATTEMPTS,
+                        }))
+                        .await;
                 }
+                let failure = match Self::converse_once(&client, &model, inputs, &tx).await {
+                    Ok(()) => return,
+                    Err(failure) => failure,
+                };
+                let lower = failure.message.to_ascii_lowercase();
+                if cached.is_some() && (lower.contains("cachepoint") || lower.contains("cache_point")) {
+                    // Model refused the marker: resend once without caching.
+                    jcode_logging::warn("Bedrock rejected cachePoint; retrying without prompt caching");
+                    cached = None;
+                    attempt -= 1;
+                    emitted_before = failure.emitted;
+                    continue;
+                }
+                if attempt < MAX_ATTEMPTS && Self::is_retryable_error(&failure.message) {
+                    let delay = Self::backoff_delay(attempt, Self::jitter());
+                    jcode_logging::warn(&format!(
+                        "Bedrock transient error (attempt {attempt}/{MAX_ATTEMPTS}), retrying in {:.1}s: {}",
+                        delay.as_secs_f64(),
+                        failure.message.lines().next().unwrap_or("")
+                    ));
+                    tokio::time::sleep(delay).await;
+                    emitted_before = failure.emitted;
+                    continue;
+                }
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(Self::classify_error_message(
+                        &failure.message
+                    ))))
+                    .await;
+                return;
             }
         });
         Ok(Box::pin(ReceiverStream::new(rx))
@@ -1454,6 +1716,112 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     #[cfg(feature = "aws-sdk")]
+    #[test]
+    fn retry_classification_and_backoff() {
+        for t in [
+            "ThrottlingException: Too many requests, please wait",
+            "ServiceUnavailableException(...)",
+            "ModelTimeoutException",
+            "ModelNotReadyException",
+            "InternalServerException",
+            "dispatch failure: io error: connection reset",
+        ] {
+            assert!(BedrockProvider::is_retryable_error(t), "{t}");
+        }
+        for t in [
+            "AccessDeniedException: not authorized",
+            "ValidationException: input is too long",
+            "ExpiredTokenException: credentials expired",
+            "ResourceNotFoundException",
+        ] {
+            assert!(!BedrockProvider::is_retryable_error(t), "{t}");
+        }
+        let d = |a, j| BedrockProvider::backoff_delay(a, j).as_millis();
+        assert_eq!((d(1, 0.0), d(1, 1.0)), (500, 1000));
+        assert_eq!(d(3, 0.0), 2000);
+        assert_eq!(d(10, 1.0), 60_000, "capped at 60s");
+    }
+
+    #[test]
+    fn sonnet_5_5_is_tool_capable_with_32k_default_output() {
+        let id = "us.anthropic.claude-sonnet-5-5-v1:0";
+        assert!(BedrockProvider::model_info(id).supports_tools);
+        assert_eq!(BedrockProvider::default_max_tokens(id), Some(32_000));
+        assert_eq!(
+            BedrockProvider::default_max_tokens("anthropic.claude-3-5-haiku-20241022-v1:0"),
+            Some(8_192)
+        );
+        assert!(BedrockProvider::supports_prompt_cache(id));
+        assert!(!BedrockProvider::supports_prompt_cache("meta.llama3-1-70b"));
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    #[test]
+    fn converse_messages_merge_roles_and_round_trip_tools() {
+        use jcode_message_types::{ContentBlock as J, Message as M, Role};
+        let m = |role, content| M {
+            role,
+            content,
+            timestamp: None,
+            tool_duration_ms: None,
+        };
+        let msgs = vec![
+            m(Role::User, vec![J::Text { text: "go".into(), cache_control: None }]),
+            m(
+                Role::Assistant,
+                vec![
+                    J::ToolUse { id: "t1".into(), name: "read".into(), input: json!({"p": 1}), thought_signature: None },
+                    J::ToolUse { id: "t2".into(), name: "ls".into(), input: json!({}), thought_signature: None },
+                ],
+            ),
+            m(Role::User, vec![J::ToolResult { tool_use_id: "t1".into(), content: "a".into(), is_error: None }]),
+            m(Role::User, vec![J::Text { text: "<system-reminder>x</system-reminder>".into(), cache_control: None }]),
+            m(Role::User, vec![J::ToolResult { tool_use_id: "t2".into(), content: "".into(), is_error: Some(true) }]),
+        ];
+        let out = BedrockProvider::to_bedrock_messages(&msgs, false).unwrap();
+        assert_eq!(out.len(), 3, "alternating roles");
+        let last = out[2].content();
+        assert!(matches!(last[0], ContentBlock::ToolResult(_)));
+        assert!(matches!(last[1], ContentBlock::ToolResult(_)));
+        assert!(matches!(last[2], ContentBlock::Text(_)), "reminder after results");
+        let ContentBlock::ToolResult(r) = &last[1] else { panic!() };
+        assert_eq!(r.tool_use_id(), "t2");
+        assert!(matches!(
+            r.content()[0],
+            aws_sdk_bedrockruntime::types::ToolResultContentBlock::Text(ref t) if t == "(no output)"
+        ));
+        assert_eq!(out[1].content().len(), 2);
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    #[test]
+    fn cache_points_go_on_system_tools_and_last_two_messages() {
+        let user = |t: &str| {
+            Message::builder()
+                .role(ConversationRole::User)
+                .content(ContentBlock::Text(t.into()))
+                .build()
+                .unwrap()
+        };
+        let tool = ToolSpecification::builder()
+            .name("t")
+            .input_schema(ToolInputSchema::Json(aws_smithy_types::Document::Null))
+            .build()
+            .unwrap();
+        let inputs = ConverseInputs {
+            messages: vec![user("a"), user("b"), user("c")],
+            system: Some(vec![SystemContentBlock::Text("sys".into())]),
+            tool_config: ToolConfiguration::builder().tools(Tool::ToolSpec(tool)).build().ok(),
+            inference: None,
+        }
+        .with_cache_points(true);
+        assert!(matches!(inputs.system.as_ref().unwrap()[1], SystemContentBlock::CachePoint(_)));
+        assert!(matches!(inputs.tool_config.as_ref().unwrap().tools()[1], Tool::CachePoint(_)));
+        assert_eq!(inputs.messages[0].content().len(), 1);
+        assert!(matches!(inputs.messages[1].content()[1], ContentBlock::CachePoint(_)));
+        assert!(matches!(inputs.messages[2].content()[1], ContentBlock::CachePoint(_)));
+    }
+
     #[test]
     fn bedrock_tool_schema_removes_top_level_combinators() {
         let schema = json!({

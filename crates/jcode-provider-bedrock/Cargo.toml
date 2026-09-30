@@ -32,7 +32,7 @@ jcode-provider-env = { path = "../jcode-provider-env" }
 jcode-storage = { path = "../jcode-storage" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "process", "rt", "sync"] }
+tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 
 [dev-dependencies]
