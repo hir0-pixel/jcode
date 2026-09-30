@@ -114,6 +114,7 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
         let mut stop_nudge = self.new_stop_nudge();
+        let mut deadline = super::turn_deadline::TurnDeadline::new();
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -210,6 +211,9 @@ impl Agent {
             }
             if let Some(nudge) = stop_nudge.take_pending() {
                 messages_with_memory.push(Message::user(&nudge));
+            }
+            if let Some(m) = deadline.poll(&self.session.id) {
+                messages_with_memory.push(Message::user(m));
             }
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);

@@ -12,6 +12,7 @@ mod provider;
 mod repeat_guard;
 mod auto_verify;
 mod stop_nudge;
+mod turn_deadline;
 mod response_recovery;
 mod status;
 mod streaming;

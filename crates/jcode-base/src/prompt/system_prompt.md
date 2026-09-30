@@ -29,6 +29,7 @@ Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or 
 
 Act with tools instead of describing actions. Don't stop at a plan.
 After changing code, run the project's tests and read failures before finishing.
+If you cannot fully solve a task, still write your best-effort result to the requested files/output before stopping; never finish with nothing delivered.
 
 ## Dont
 

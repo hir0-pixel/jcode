@@ -67,6 +67,7 @@ impl Agent {
         let mut batch_nudge_pending = false;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
         let mut stop_nudge = self.new_stop_nudge();
+        let mut deadline = super::turn_deadline::TurnDeadline::new();
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -157,6 +158,9 @@ impl Agent {
             }
             if let Some(nudge) = stop_nudge.take_pending() {
                 messages_with_memory.push(Message::user(&nudge));
+            }
+            if let Some(m) = deadline.poll(&self.session.id) {
+                messages_with_memory.push(Message::user(m));
             }
 
             logging::info(&format!(
