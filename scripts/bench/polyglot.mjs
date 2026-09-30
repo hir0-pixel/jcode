@@ -644,8 +644,13 @@ function summarize(rows) {
     cost, wall_s: (sum(rows.map(r => r.wall_ms)) / 1000).toFixed(0),
     rss_peak: rss.length ? Math.max(...rss.map(r => r.rss_peak_mib)).toFixed(0) : 'n/a',
     rss_mean: rss.length ? (sum(rss.map(r => r.rss_mean_mib)) / rss.length).toFixed(0) : 'n/a',
+    // Turns that did not finish cleanly (cut at the turn limit, or the agent errored).
+    cut: rows.filter(r => r.agent_ok === false).length,
   }
 }
+
+// Report names: the Factr-I arm keeps its on-disk id `sovereign` (resume depends on it).
+const ARM_LABEL = { sovereign: 'Factr-I', prime: 'Prime', hermes: 'Hermes (stock)' }
 
 function report() {
   const rowsByArm = {}
@@ -655,17 +660,17 @@ function report() {
       ? fs.readFileSync(metaPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).map(r => ({ pass1: r.pass, ...r }))
       : []
   }
-  const head = '| arm | n | pass@1 | pass@2 | model_calls | prompt_tok | cached_tok | completion_tok | cost_usd | wall_s | rss_peak_MiB | rss_mean_MiB |\n|---|---|---|---|---|---|---|---|---|---|---|---|'
-  const line = (label, s) => `| ${label} | ${s.n} | ${s.pass1} | ${s.pass2} | ${s.calls} | ${s.prompt} | ${s.cached} | ${s.completion} | ${s.cost} | ${s.wall_s} | ${s.rss_peak} | ${s.rss_mean} |`
+  const head = '| arm | n | pass@1 | pass@2 | model_calls | prompt_tok | cached_tok | completion_tok | cost_usd | wall_s | rss_peak_MiB | rss_mean_MiB | turns_cut |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+  const line = (label, s) => `| ${label} | ${s.n} | ${s.pass1} | ${s.pass2} | ${s.calls} | ${s.prompt} | ${s.cached} | ${s.completion} | ${s.cost} | ${s.wall_s} | ${s.rss_peak} | ${s.rss_mean} | ${s.cut} |`
   console.log('Summary (totals over all exercises; rss_peak = max, rss_mean = mean of per-exercise means)\n')
   console.log(head)
-  for (const arm of ARMS) if (rowsByArm[arm].length) console.log(line(arm, summarize(rowsByArm[arm])))
+  for (const arm of ARMS) if (rowsByArm[arm].length) console.log(line(ARM_LABEL[arm] || arm, summarize(rowsByArm[arm])))
   console.log('\nPer language\n')
   console.log(head.replace('| arm |', '| lang / arm |'))
   for (const lang of selection.languages) {
     for (const arm of ARMS) {
       const rows = rowsByArm[arm].filter(r => r.lang === lang)
-      if (rows.length) console.log(line(`${lang} / ${arm}`, summarize(rows)))
+      if (rows.length) console.log(line(`${lang} / ${ARM_LABEL[arm] || arm}`, summarize(rows)))
     }
   }
 }
