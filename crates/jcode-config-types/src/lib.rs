@@ -645,6 +645,24 @@ pub struct AgentsConfig {
     /// text-only "I will ..." reply. Env: `JCODE_VERIFY_ON_STOP=0` disables.
     #[serde(default = "default_verify_on_stop")]
     pub verify_on_stop: bool,
+    /// After code edits, run the project's detected test command when a turn
+    /// ends and feed failures back (plain mode only). Env: `JCODE_AUTO_VERIFY=0`.
+    #[serde(default = "default_verify_on_stop")]
+    pub auto_verify: bool,
+    /// Per-run timeout of the auto-verify test command.
+    #[serde(default = "default_auto_verify_timeout_s")]
+    pub auto_verify_timeout_s: u64,
+    /// Maximum auto-verify gate runs per turn.
+    #[serde(default = "default_auto_verify_rounds")]
+    pub auto_verify_rounds: u32,
+}
+
+fn default_auto_verify_timeout_s() -> u64 {
+    120
+}
+
+fn default_auto_verify_rounds() -> u32 {
+    3
 }
 
 fn default_verify_on_stop() -> bool {
@@ -687,6 +705,9 @@ impl Default for AgentsConfig {
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
             verify_on_stop: default_verify_on_stop(),
+            auto_verify: default_verify_on_stop(),
+            auto_verify_timeout_s: default_auto_verify_timeout_s(),
+            auto_verify_rounds: default_auto_verify_rounds(),
         }
     }
 }

@@ -113,7 +113,7 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
-        let mut stop_nudge = super::stop_nudge::StopNudge::default();
+        let mut stop_nudge = self.new_stop_nudge();
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -209,7 +209,7 @@ impl Agent {
                 messages_with_memory.push(Message::user(&reminder));
             }
             if let Some(nudge) = stop_nudge.take_pending() {
-                messages_with_memory.push(Message::user(nudge));
+                messages_with_memory.push(Message::user(&nudge));
             }
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);
@@ -1592,7 +1592,7 @@ impl Agent {
                     match result {
                         Ok(output) => {
                             let output = cap_tool_output_for_history(&tc.name, output);
-                            stop_nudge.observe(&tc.name, &tc.input, false);
+                            stop_nudge.observe(&tc.name, &tc.input, super::auto_verify::exit_code_of(&output.output, false));
                             let verdict =
                                 repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
                             guard_stop =
@@ -1629,7 +1629,7 @@ impl Agent {
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
-                            stop_nudge.observe(&tc.name, &tc.input, true);
+                            stop_nudge.observe(&tc.name, &tc.input, 1);
                             let verdict =
                                 repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
                             guard_stop =

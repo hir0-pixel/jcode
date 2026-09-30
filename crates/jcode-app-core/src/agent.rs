@@ -10,6 +10,7 @@ mod model_usage_tests;
 mod prompting;
 mod provider;
 mod repeat_guard;
+mod auto_verify;
 mod stop_nudge;
 mod response_recovery;
 mod status;

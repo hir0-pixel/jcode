@@ -66,7 +66,7 @@ impl Agent {
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
-        let mut stop_nudge = super::stop_nudge::StopNudge::default();
+        let mut stop_nudge = self.new_stop_nudge();
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -156,7 +156,7 @@ impl Agent {
                 messages_with_memory.push(Message::user(&reminder));
             }
             if let Some(nudge) = stop_nudge.take_pending() {
-                messages_with_memory.push(Message::user(nudge));
+                messages_with_memory.push(Message::user(&nudge));
             }
 
             logging::info(&format!(
@@ -1144,7 +1144,7 @@ impl Agent {
                 match result {
                     Ok(output) => {
                         let output = cap_tool_output_for_history(&tc.name, output);
-                        stop_nudge.observe(&tc.name, &tc.input, false);
+                        stop_nudge.observe(&tc.name, &tc.input, super::auto_verify::exit_code_of(&output.output, false));
                         let verdict =
                             repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
                         guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
@@ -1193,7 +1193,7 @@ impl Agent {
                         }));
 
                         let error_msg = format!("Error: {}", e);
-                        stop_nudge.observe(&tc.name, &tc.input, true);
+                        stop_nudge.observe(&tc.name, &tc.input, 1);
                         let verdict = repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
                         guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                         if trace {
