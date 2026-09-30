@@ -400,7 +400,9 @@ impl Observer {
             provider: defaults.0, model: defaults.1, ..Default::default()
         });
         active.next += 1;
-        let run = format!("{session}:aux:{started}:{}", active.next);
+        // Learning calls share one run per session (their gate/refine spans join it too).
+        let run = if kind == "learning" { format!("{session}:aux:learning") } else { format!("{session}:aux:{started}:{}", active.next) };
+        let span_id = format!("{run}:model:{}", active.next);
         let model = model_override.unwrap_or(&active.model).to_string();
         let provider = provider_override.unwrap_or(&active.provider).to_string();
         drop(sessions);
@@ -409,7 +411,7 @@ impl Observer {
         let cost = usage.and_then(|usage| cost_usd(&provider, &model, usage.input, usage.output, usage.cache_read, usage.cache_write));
         let usage_known = usage.is_some();
         let usage = usage.unwrap_or(SimpleUsage { input: 0, output: 0, cache_read: 0, cache_write: 0 });
-        self.send(Op::Usage { run: run.clone(), span: format!("{run}:model"), root: run.clone(), kind,
+        self.send(Op::Usage { run: run.clone(), span: span_id, root: run.clone(), kind,
             model, provider, session: session.into(), input: usage.input, output: usage.output,
             cache_read: usage.cache_read, cache_write: usage.cache_write, cost, usage_known,
             error: error.map(capped), started, ended: now() }, false);
@@ -439,12 +441,15 @@ impl Observer {
                 let root = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&session).and_then(|a| a.root.clone()).unwrap_or_else(|| run.clone());
                 (run, root)
             }
+            // No session: keep the span (no fact_turn row) so it is never a session or a metric.
+            None if session.is_empty() => ("system".to_string(), "system".to_string()),
             None => {
                 let kind = if span.kind.starts_with("learning") { "learning" } else { "memory" };
                 let (provider, model) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get("").map(|s| (s.provider.clone(), s.model.clone())).unwrap_or_default();
-                let run = format!("{id}:run");
+                // One run per session and kind, shared with `record_aux` (learning).
+                let run = format!("{session}:aux:{kind}");
                 self.send(Op::RunStart { id: run.clone(), session: session.clone(), parent: None, root: run.clone(), kind, title: Some(span.kind.into()), model, provider, status: "running", at: started }, false);
-                self.send(Op::RunEnd { id: run.clone(), status: if error.is_some() { "error" } else { "complete" }.into(), error: error.clone(), at: ended, model_calls: 0 }, false);
+                self.send(Op::RunEnd { id: run.clone(), status: if error.is_some() { "error" } else { "complete" }.into(), error: error.clone(), at: ended, model_calls: (kind == "learning") as u64 }, false);
                 (run.clone(), run)
             }
         };
@@ -1494,6 +1499,32 @@ mod tests {
         let only_s2 = observer.memory(Some("s2"), 10).unwrap();
         assert_eq!(only_s2["spans"].as_array().unwrap().len(), 1);
         assert_eq!(only_s2["spans"][0]["attributes"]["approved"], false);
+        drop((observer, db));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sessionless_spans_make_no_run_and_learning_shares_one_run() {
+        use jcode_base::obs_sink::Span;
+        let dir = std::env::temp_dir().join(format!("sovereign-sessionless-spans-{}", now()));
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        observer.span(Span::new("memory.write").attr("action", "inserted").attr("id", "m1"));
+        observer.span(Span::new("learning.gate").session("s9").attr("approved", true));
+        observer.record_aux("s9", "learning", Some("Gate"), None, None, now(), None, None);
+        observer.record_aux("s9", "learning", Some("Refine"), None, None, now(), None, None);
+        observer.span(Span::new("learning.refine").session("s9"));
+        let db = Connection::open(dir.join("sovereign.db")).unwrap();
+        for _ in 0..100 {
+            let n: i64 = db.query_row("SELECT COUNT(*) FROM spans WHERE kind IN ('memory.write','learning.gate','learning.refine','learning')", [], |r| r.get(0)).unwrap();
+            if n >= 5 { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let runs: i64 = db.query_row("SELECT COUNT(*) FROM fact_turn", [], |r| r.get(0)).unwrap();
+        assert_eq!(runs, 1, "only the session's one learning run exists");
+        let empty: i64 = db.query_row("SELECT COUNT(*) FROM fact_turn WHERE session_id=''", [], |r| r.get(0)).unwrap();
+        assert_eq!(empty, 0);
+        let body = observer.memory(None, 10).unwrap();
+        assert!(body["spans"].as_array().unwrap().iter().any(|s| s["kind"] == "memory.write" && s["session_id"] == ""), "{body}");
         drop((observer, db));
         std::fs::remove_dir_all(dir).unwrap();
     }
