@@ -113,6 +113,7 @@ impl Agent {
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
+        let mut stop_nudge = super::stop_nudge::StopNudge::default();
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -206,6 +207,9 @@ impl Agent {
             let mut messages_with_memory: Vec<Message> = messages.iter().cloned().collect();
             if let Some(reminder) = repeat_guard.take_reminder() {
                 messages_with_memory.push(Message::user(&reminder));
+            }
+            if let Some(nudge) = stop_nudge.take_pending() {
+                messages_with_memory.push(Message::user(nudge));
             }
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);
@@ -1253,6 +1257,13 @@ impl Agent {
             if tool_calls.is_empty() {
                 if saw_message_end
                     && !self.is_graceful_shutdown()
+                    && matches!(stop_reason.as_deref(), None | Some("end_turn") | Some("stop"))
+                    && stop_nudge.on_text_only_stop(&self.session.id, &text_content)
+                {
+                    continue;
+                }
+                if saw_message_end
+                    && !self.is_graceful_shutdown()
                     && self.maybe_reconsider_fable_guardrail(
                         stop_reason.as_deref(),
                         &mut fable_guardrail_reconsiderations,
@@ -1581,6 +1592,7 @@ impl Agent {
                     match result {
                         Ok(output) => {
                             let output = cap_tool_output_for_history(&tc.name, output);
+                            stop_nudge.observe(&tc.name, &tc.input, false);
                             let verdict =
                                 repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
                             guard_stop =
@@ -1617,6 +1629,7 @@ impl Agent {
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
+                            stop_nudge.observe(&tc.name, &tc.input, true);
                             let verdict =
                                 repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
                             guard_stop =

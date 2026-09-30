@@ -105,6 +105,18 @@ fn apply_edits(
             continue;
         }
         let occurrences = content.matches(&edit.old_string).count();
+        if occurrences == 0
+            && let Some((range, new_text)) =
+                super::edit_fuzzy::fuzzy_replace(&content, &edit.old_string, &edit.new_string)
+        {
+            let start_line = content[..range.start].matches('\n').count() + 1;
+            content.replace_range(range, &new_text);
+            applied.push(AppliedEdit {
+                occurrences: 1,
+                start_line,
+            });
+            continue;
+        }
         if occurrences == 0 {
             let hint = flexible_match_hint(&content, &edit.old_string, file_path);
             failures.push(format!("{}{hint}", label(index)));
@@ -285,6 +297,12 @@ impl Tool for EditTool {
             &content,
             &new_content,
         );
+        if let Some(note) =
+            super::syntax_check::new_syntax_note(&path, Some(&content), &new_content).await
+        {
+            body.push_str("\n\n");
+            body.push_str(&note);
+        }
 
         Ok(super::file_diff::attach(
             ToolOutput::new(body).with_title(params.file_path.clone()),
@@ -569,6 +587,13 @@ mod tests {
         assert!(error.contains("No changes written to f.rs"), "{error}");
         assert!(error.contains("1 of 3 edits failed"), "{error}");
         assert!(error.contains("Edit 2: old_string not found"), "{error}");
+    }
+
+    #[test]
+    fn apply_edits_falls_back_to_unique_fuzzy_match() {
+        let (out, _) =
+            apply_edits("if x {\n    a();\n}\n", &[op("a();", "b();")], "f").unwrap();
+        assert_eq!(out, "if x {\n    b();\n}\n");
     }
 
     #[test]

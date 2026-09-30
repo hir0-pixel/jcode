@@ -64,6 +64,7 @@ impl Agent {
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
+        let mut stop_nudge = super::stop_nudge::StopNudge::default();
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -151,6 +152,9 @@ impl Agent {
 
             if let Some(reminder) = repeat_guard.take_reminder() {
                 messages_with_memory.push(Message::user(&reminder));
+            }
+            if let Some(nudge) = stop_nudge.take_pending() {
+                messages_with_memory.push(Message::user(nudge));
             }
 
             logging::info(&format!(
@@ -885,6 +889,11 @@ impl Agent {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
+                if matches!(stop_reason.as_deref(), None | Some("end_turn") | Some("stop"))
+                    && stop_nudge.on_text_only_stop(&self.session.id, &text_content)
+                {
+                    continue;
+                }
                 if self.maybe_reconsider_fable_guardrail(
                     stop_reason.as_deref(),
                     &mut fable_guardrail_reconsiderations,
@@ -1127,6 +1136,7 @@ impl Agent {
                 match result {
                     Ok(output) => {
                         let output = cap_tool_output_for_history(&tc.name, output);
+                        stop_nudge.observe(&tc.name, &tc.input, false);
                         let verdict =
                             repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
                         guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
@@ -1175,6 +1185,7 @@ impl Agent {
                         }));
 
                         let error_msg = format!("Error: {}", e);
+                        stop_nudge.observe(&tc.name, &tc.input, true);
                         let verdict = repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
                         guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                         if trace {

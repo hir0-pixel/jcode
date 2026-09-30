@@ -171,6 +171,7 @@ impl Agent {
 
         self.append_continual_harness_addenda(&mut split);
         self.append_repl_guidance(&mut split);
+        self.append_tool_use_enforcement(&mut split);
         self.append_current_turn_system_reminder(&mut split);
         crate::prompt::append_swarm_effort_directive(
             &mut split,
@@ -226,6 +227,17 @@ impl Agent {
         push_addenda(split, &addenda);
     }
 
+    /// Hermes `TOOL_USE_ENFORCEMENT` for the model families it lists (never
+    /// Claude). Static part, so the prompt cache prefix stays stable.
+    fn append_tool_use_enforcement(&self, split: &mut crate::prompt::SplitSystemPrompt) {
+        if !needs_tool_use_enforcement(&self.provider.model()) {
+            return;
+        }
+        split.static_part.push_str(
+            "\n\nWhen you say you will act, make the tool call in the same response. Every reply either calls a tool or gives the final result.\n",
+        );
+    }
+
     fn append_repl_guidance(&self, split: &mut crate::prompt::SplitSystemPrompt) {
         if !crate::tool::repl_available() {
             return;
@@ -249,6 +261,14 @@ impl Agent {
     }
 }
 
+fn needs_tool_use_enforcement(model: &str) -> bool {
+    const FAMILIES: [&str; 9] = [
+        "gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek", "muse",
+    ];
+    let model = model.to_ascii_lowercase();
+    FAMILIES.iter().any(|f| model.contains(f))
+}
+
 fn addenda_snapshots() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::OnceLock::new();
@@ -269,6 +289,13 @@ fn push_addenda(split: &mut crate::prompt::SplitSystemPrompt, addenda: &str) {
 #[cfg(test)]
 mod addenda_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn tool_use_enforcement_skips_claude() {
+        assert!(needs_tool_use_enforcement("gpt-5.1-codex"));
+        assert!(needs_tool_use_enforcement("Qwen3-Coder"));
+        assert!(!needs_tool_use_enforcement("claude-sonnet-4-5"));
+    }
 
     #[test]
     fn snapshot_is_reused_and_not_refreshed() {

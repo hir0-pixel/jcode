@@ -137,6 +137,16 @@ impl Tool for WriteTool {
             old_content.as_deref().unwrap_or(""),
             &params.content,
         );
+        if let Some(note) = super::syntax_check::new_syntax_note(
+            &path,
+            old_content.as_deref(),
+            &params.content,
+        )
+        .await
+        {
+            body.push_str("\n\n");
+            body.push_str(&note);
+        }
 
         let output = ToolOutput::new(body).with_title(params.file_path.clone());
         // Do not claim an authoritative diff when the old file was unreadable.

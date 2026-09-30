@@ -8,6 +8,8 @@ mod browser;
 pub use browser::set_bridge as set_browser_bridge;
 mod communicate;
 mod config_edit_notice;
+mod edit_fuzzy;
+mod syntax_check;
 mod conversation_search;
 mod edit;
 pub mod hermes_bridge;

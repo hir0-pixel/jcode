@@ -641,6 +641,14 @@ pub struct AgentsConfig {
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+    /// Nudge once when a turn ends after code edits with no test run, or with a
+    /// text-only "I will ..." reply. Env: `JCODE_VERIFY_ON_STOP=0` disables.
+    #[serde(default = "default_verify_on_stop")]
+    pub verify_on_stop: bool,
+}
+
+fn default_verify_on_stop() -> bool {
+    true
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
@@ -678,6 +686,7 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            verify_on_stop: default_verify_on_stop(),
         }
     }
 }

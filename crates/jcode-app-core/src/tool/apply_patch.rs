@@ -343,6 +343,20 @@ impl Tool for ApplyPatchTool {
                     super::file_diff::snapshot(&ctx.resolve_path(Path::new(path))).await,
                 );
             }
+            for (path, old) in &before {
+                if let (Some((_, old)), Some(Some((true, new)))) = (old, after.get(path))
+                    && old != new
+                    && let Some(note) = super::syntax_check::new_syntax_note(
+                        &ctx.resolve_path(Path::new(path)),
+                        Some(old),
+                        new,
+                    )
+                    .await
+                {
+                    body.push_str("\n");
+                    body.push_str(&note);
+                }
+            }
             let mut combined = std::collections::BTreeSet::new();
             // A simple successful move to a new path can retain the source's
             // coordinates. For overwrites or move chains, keep net per-path

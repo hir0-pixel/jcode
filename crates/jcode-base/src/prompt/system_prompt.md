@@ -25,6 +25,11 @@ Prefer swarm coordination over branches and git worktrees unless isolation is ne
 You can't interact with interactive commands. Use non-interactive instead.
 Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or Python scripts in bash.
 
+## Finishing
+
+Act with tools instead of describing actions. Don't stop at a plan.
+After changing code, run the project's tests and read failures before finishing.
+
 ## Dont
 
 Don't use em dashes. Don't use semi colons in place of em dashes.
