@@ -1,4 +1,4 @@
-//! Desktop learning REST compatibility, backed by the same M10a harness rows
+//! Desktop learning REST compatibility, backed by the same learned memories
 //! as the `learning.*` RPC methods.
 
 use super::{Config, Request, read_body, respond};
@@ -194,27 +194,11 @@ fn store(home: &Path) -> Result<std::sync::Arc<sovereign_prime::entries::EntrySt
     sovereign_prime::entries::EntryStore::open_cached(home).context("opening learning store")
 }
 
-/// A learned memory's text lives once, in jcode's memory store; its harness
-/// entry only holds `reference.memory_id` (see `refine::MemorySink`). Entries
-/// without a pointer (learning off) carry their own text.
-fn memory_body(entry: &sovereign_prime::entries::HarnessEntry) -> String {
-    entry.reference["memory_id"]
-        .as_str()
-        .and_then(|id| {
-            super::memory_rest::find(id).map(|m| m.content)
-        })
-        .unwrap_or_else(|| entry.content.clone())
-}
-
 pub(crate) fn graph(home: &Path) -> Result<Value> {
     let store = store(home)?;
     let mut body = graph_from_store(&store)?;
-    // Memories the model wrote itself (memory tool) have no harness entry; show them too.
-    let referenced = store
-        .list_all(None, None)?
-        .iter()
-        .filter_map(|e| e.reference["memory_id"].as_str().map(str::to_string))
-        .collect();
+    // Learned entries are memories too; the other memories (extraction, the memory tool) show as memory nodes.
+    let referenced = store.list_all(None, None)?.into_iter().map(|e| e.id).collect();
     for m in super::memory_rest::unreferenced(&referenced)? {
         let title: String = m.content.chars().take(60).collect();
         body["memory"].as_array_mut().unwrap().push(json!({
@@ -261,15 +245,9 @@ fn harness(store: &sovereign_prime::entries::EntryStore) -> Result<Value> {
 fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Value> {
     let entries = store.list_all(None, None)?;
     let mut nodes = Vec::new();
-    let mut memory = Vec::new();
+    let memory: Vec<Value> = Vec::new();
     let mut clusters = BTreeMap::<String, usize>::new();
-    for entry in entries.into_iter().filter(|entry| {
-        matches!(
-            entry.kind,
-            sovereign_prime::entries::EntryKind::Memory
-                | sovereign_prime::entries::EntryKind::Skill
-        )
-    }) {
+    for entry in entries.into_iter().filter(|entry| entry.kind == sovereign_prime::entries::EntryKind::Skill) {
         let kind = entry.kind.as_str();
         let category = if entry.path.is_empty() {
             kind.to_string()
@@ -278,11 +256,6 @@ fn graph_from_store(store: &sovereign_prime::entries::EntryStore) -> Result<Valu
         };
         *clusters.entry(category.clone()).or_default() += 1;
         let timestamp = entry.created_at_ms / 1000;
-        if kind == "memory" {
-            memory.push(json!({
-                "source": "memory", "timestamp": timestamp, "title": entry.title, "body": memory_body(&entry),
-            }));
-        }
         nodes.push(json!({
             "id": entry.id,
             "label": entry.title,
@@ -333,14 +306,11 @@ fn node_from_store(
     let Some(entry) = store.get(id)? else {
         return Ok(None);
     };
-    if !matches!(
-        entry.kind,
-        sovereign_prime::entries::EntryKind::Memory | sovereign_prime::entries::EntryKind::Skill
-    ) {
+    if entry.kind != sovereign_prime::entries::EntryKind::Skill {
         return Ok(None);
     }
     Ok(Some(
-        json!({"ok": true, "kind": entry.kind.as_str(), "label": entry.title, "content": memory_body(&entry)}),
+        json!({"ok": true, "kind": entry.kind.as_str(), "label": entry.title, "content": entry.content}),
     ))
 }
 
@@ -360,16 +330,10 @@ fn delete_from_store(
     let Some(entry) = store.get(id)? else {
         return Ok(None);
     };
-    if !matches!(
-        entry.kind,
-        sovereign_prime::entries::EntryKind::Memory | sovereign_prime::entries::EntryKind::Skill
-    ) {
+    if entry.kind != sovereign_prime::entries::EntryKind::Skill {
         return Ok(None);
     }
     store.delete(id)?;
-    if let Some(memory_id) = entry.reference["memory_id"].as_str() {
-        let _ = super::memory_rest::forget(memory_id);
-    }
     Ok(Some(
         json!({"ok": true, "message": format!("deleted '{}'", entry.title)}),
     ))
@@ -395,10 +359,7 @@ fn edit_in_store(
     let Some(entry) = store.get(id)? else {
         return Ok(None);
     };
-    if !matches!(
-        entry.kind,
-        sovereign_prime::entries::EntryKind::Memory | sovereign_prime::entries::EntryKind::Skill
-    ) {
+    if entry.kind != sovereign_prime::entries::EntryKind::Skill {
         return Ok(None);
     }
     if content.trim().is_empty() {
@@ -412,17 +373,14 @@ fn edit_in_store(
             "message": format!("content exceeds {} characters", sovereign_prime::entries::MAX_CONTENT_CHARS),
         })));
     }
-    if let Some(memory_id) = entry.reference["memory_id"].as_str() {
-        super::memory_rest::edit(memory_id, content)?;
-    } else {
-        store.update(
-            id,
-            sovereign_prime::entries::EntryPatch {
-                content: Some(content.to_string()),
-                ..Default::default()
-            },
-        )?;
-    }
+    sovereign_prime::refine::edit_entry(
+        store,
+        id,
+        sovereign_prime::entries::EntryPatch {
+            content: Some(content.to_string()),
+            ..Default::default()
+        },
+    )?;
     Ok(Some(
         json!({"ok": true, "message": format!("updated '{}'", entry.title)}),
     ))
@@ -459,17 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn graph_route_shapes_memory_and_skill_entries() {
+    fn graph_route_shapes_skill_entries() {
         let home = TempHome::new();
         let store = test_store(&home);
-        let memory = store
-            .create(NewEntry::new(
-                EntryKind::Memory,
-                Scope::Global,
-                "Preference",
-                "Use Rust",
-            ))
-            .unwrap();
         let skill = store
             .create(NewEntry::new(
                 EntryKind::Skill,
@@ -488,12 +438,10 @@ mod tests {
             .unwrap();
 
         let body = graph_from_store(&store).unwrap();
-        assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
-        assert_eq!(body["nodes"][0]["kind"], "memory");
-        assert_eq!(body["nodes"][0]["id"], memory.id);
-        assert_eq!(body["nodes"][1]["kind"], "skill");
-        assert_eq!(body["nodes"][1]["id"], skill.id);
-        assert_eq!(body["memory"][0]["body"], "Use Rust");
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(body["nodes"][0]["kind"], "skill");
+        assert_eq!(body["nodes"][0]["id"], skill.id);
+        assert!(body["memory"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -544,7 +492,7 @@ mod tests {
         let store = test_store(&home);
         let entry = store
             .create(NewEntry::new(
-                EntryKind::Memory,
+                EntryKind::Skill,
                 Scope::Global,
                 "Preference",
                 "Use Rust",

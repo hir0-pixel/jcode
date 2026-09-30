@@ -180,7 +180,7 @@ impl Agent {
         split
     }
 
-    /// Prime's Continual Harness `prompt`-kind entries, rendered into the
+    /// Prime's Continual Harness `prompt` notes (memories of category `prompt`), rendered into the
     /// *static* (cached) part so provider prompt caching still applies: a
     /// running session's cache stays valid because this only changes when a
     /// brand-new session builds its first prompt, matching M9's "applied to
@@ -197,9 +197,16 @@ impl Agent {
         let Ok(store) = sovereign_prime::entries::EntryStore::open_cached(&home) else {
             return;
         };
-        let Ok(addenda) = store.render_prompt(&self.session.id) else {
+        if let Some(dir) = self.session.working_dir.as_deref() {
+            let _ = store.set_session_dir(&self.session.id, dir);
+        }
+        let Ok((addenda, note_ids)) = store.render_prompt_with_ids(&self.session.id) else {
             return;
         };
+        // Behaviour rules are always here, so recall must never show them again.
+        if note_ids.iter().any(|id| !crate::memory::is_memory_injected(&self.session.id, id)) {
+            crate::memory::mark_memories_known(&self.session.id, &note_ids, "static prompt prefix");
+        }
         let addenda = addenda.trim();
         if addenda.is_empty() {
             return;

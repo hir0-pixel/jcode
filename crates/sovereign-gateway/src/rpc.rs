@@ -1204,7 +1204,7 @@ impl Conn {
                 .map_err(RpcError::internal)?;
                 let entries = store.list_all(None, None).map_err(RpcError::internal)?;
                 let categories: Vec<Value> =
-                    ["prompt", "memory", "skill", "subagent"].iter().map(|k| json!({ "name": k, "count": entries.iter().filter(|e| e.kind.as_str() == *k).count() })).collect();
+                    ["prompt", "skill", "subagent"].iter().map(|k| json!({ "name": k, "count": entries.iter().filter(|e| e.kind.as_str() == *k).count() })).collect();
                 let summary: Vec<String> = entries
                     .iter()
                     .rev()
@@ -1214,7 +1214,7 @@ impl Conn {
                 let frame = summary.iter().cloned().collect::<Vec<_>>().join("\n");
                 Ok(json!({
                     "frames": [{ "text": frame, "cols": cols, "rows": rows }],
-                    "legend": { "prompt": "P", "memory": "M", "skill": "S", "subagent": "A" },
+                    "legend": { "prompt": "P", "skill": "S", "subagent": "A" },
                     "categories": categories,
                     "buckets": categories,
                     "summary": summary,
@@ -1256,7 +1256,8 @@ impl Conn {
                 )
                 .map_err(RpcError::internal)?;
                 Ok(
-                    match store.update(
+                    match sovereign_prime::refine::edit_entry(
+                        &store,
                         id,
                         sovereign_prime::entries::EntryPatch {
                             content,
@@ -2355,7 +2356,7 @@ impl Conn {
                         global,
                     );
                     let started = crate::observability::now();
-                    let reply = complete(system, user).await;
+                    let reply = crate::learn::aux_complete(&complete, system, user).await;
                     self.observer.record_aux(
                         sid,
                         "other",

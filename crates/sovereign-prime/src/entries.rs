@@ -1,18 +1,21 @@
-//! Continual Harness entries (Prime Agent's four-kind refinement store), kept
-//! in `sovereign.db` instead of a flat file so the full CRUD + rollback model
-//! is durable and queryable.
+//! Continual Harness entries (Prime Agent's refinement store): the learned `prompt`, `skill` and
+//! `subagent` entries are rows of the one memory store (`memories`, category = the kind), written
+//! through `jcode_base::memory::learned` so they share its write path, recall and injected-id record.
+//! Only the rollback log (`harness_changesets`) and the learning bookkeeping live in tables of their own.
 //!
-//! Follows Prime Agent's `refinement.ts`: one flat table of entries, each one
-//! of `prompt | memory | skill | subagent`, each scoped `local` (a session) or
-//! `global`. A `prompt` entry is a durable addendum rendered into the cached
-//! system prompt; a `memory` entry *references* a row in the memory store
-//! rather than duplicating it; a `skill` entry describes a reusable
-//! SKILL.md-backed procedure; a `subagent` entry is a reusable delegation
-//! spec (name, instructions, allowed tools, model hint). Every write is
-//! grouped into a changeset so `/refine rollback` can restore the exact prior
-//! state, itself recorded as a new (rollback) changeset.
+//! Follows Prime Agent's `refinement.ts`. A `prompt` entry is a durable addendum rendered into the
+//! cached system prompt; a `skill` entry describes a reusable SKILL.md-backed procedure; a `subagent`
+//! entry is a reusable delegation spec (name, instructions, allowed tools, model hint). Every write is
+//! grouped into a changeset so `/refine rollback` can restore the exact prior state, itself recorded as
+//! a new (rollback) changeset.
+//!
+//! Reach: a learned entry is stored at `project:<hash>` when its session has a working directory (see
+//! [`EntryStore::set_session_dir`]) and at `global` otherwise or when asked for. Rows migrated from the
+//! old table that were local to one session keep that reach as scope `session:<id>`.
 
 use anyhow::{Context, Result, bail};
+use jcode_base::memory::learned;
+use jcode_base::memory::{LearnedMeta, MemoryCategory, MemoryEntry};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -28,24 +31,6 @@ pub const MAX_PROMPT_CHARS: usize = 6_000;
 const SCHEMA: &str = "
     PRAGMA journal_mode=WAL;
     PRAGMA busy_timeout=5000;
-    CREATE TABLE IF NOT EXISTS harness_entries(
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        path TEXT NOT NULL DEFAULT '',
-        scope TEXT NOT NULL,
-        session TEXT,
-        reference TEXT NOT NULL DEFAULT '{}',
-        arguments TEXT NOT NULL DEFAULT '{}',
-        metadata TEXT NOT NULL DEFAULT '{}',
-        source TEXT NOT NULL,
-        created_at_ms INTEGER NOT NULL,
-        updated_at_ms INTEGER NOT NULL,
-        version INTEGER NOT NULL DEFAULT 1,
-        seq INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS harness_entries_render ON harness_entries(scope, session, kind, seq);
     CREATE TABLE IF NOT EXISTS harness_changesets(
         id TEXT PRIMARY KEY,
         session TEXT,
@@ -79,7 +64,6 @@ const SCHEMA: &str = "
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Prompt,
-    Memory,
     Skill,
     Subagent,
 }
@@ -88,7 +72,6 @@ impl EntryKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             EntryKind::Prompt => "prompt",
-            EntryKind::Memory => "memory",
             EntryKind::Skill => "skill",
             EntryKind::Subagent => "subagent",
         }
@@ -96,7 +79,6 @@ impl EntryKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "prompt" => Some(EntryKind::Prompt),
-            "memory" => Some(EntryKind::Memory),
             "skill" => Some(EntryKind::Skill),
             "subagent" => Some(EntryKind::Subagent),
             _ => None,
@@ -133,9 +115,12 @@ pub struct HarnessEntry {
     pub title: String,
     pub content: String,
     pub path: String,
+    /// `Global` for the `global` memory scope, `Local` for a project or session scope.
     pub scope: Scope,
-    /// Owning session for `Scope::Local`; always `None` for `Scope::Global`.
+    /// The owning session of a `session:<id>` scope (migrated rows); `None` otherwise.
     pub session: Option<String>,
+    /// The memory scope the row lives in: `global`, `project:<hash>` or `session:<id>`.
+    pub memory_scope: String,
     pub reference: Value,
     pub arguments: Value,
     pub metadata: Value,
@@ -153,6 +138,7 @@ pub struct NewEntry {
     pub content: String,
     pub path: String,
     pub scope: Scope,
+    /// The session a `Local` entry is learned in; its working directory picks the project scope.
     pub session: Option<String>,
     pub reference: Value,
     pub arguments: Value,
@@ -256,6 +242,21 @@ pub struct Changeset {
 
 pub struct EntryStore {
     conn: Mutex<Connection>,
+    /// `sovereign.db`, where the learned entries live as memories.
+    pub(crate) db: PathBuf,
+    /// A unit test's private home, removed with the store.
+    #[cfg(test)]
+    scratch: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for EntryStore {
+    fn drop(&mut self) {
+        if let Some(home) = &self.scratch {
+            learned::close(&self.db);
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -265,27 +266,46 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// `(Scope, session)` of a memory scope string.
+fn split_scope(memory_scope: &str) -> (Scope, Option<String>) {
+    match memory_scope.strip_prefix("session:") {
+        Some(session) => (Scope::Local, Some(session.to_string())),
+        None if memory_scope == "global" => (Scope::Global, None),
+        None => (Scope::Local, None),
+    }
+}
+
 fn entry_to_json(e: &HarnessEntry) -> Value {
     json!({
         "id": e.id, "kind": e.kind.as_str(), "title": e.title, "content": e.content, "path": e.path,
-        "scope": e.scope.as_str(), "session": e.session, "reference": e.reference, "arguments": e.arguments,
+        "scope": e.memory_scope, "reference": e.reference, "arguments": e.arguments,
         "metadata": e.metadata, "source": e.source, "created_at_ms": e.created_at_ms,
         "updated_at_ms": e.updated_at_ms, "version": e.version, "seq": e.seq,
     })
 }
 
+/// A snapshot from a changeset. Older ones say `"scope": "local"` plus a `session`; that reads as
+/// the `session:<id>` scope the migration gave those rows. Snapshots of the retired `memory` kind
+/// have nothing to restore and read as `None`.
 fn entry_from_json(v: &Value) -> Option<HarnessEntry> {
     if v.is_null() {
         return None;
     }
+    let memory_scope = match (v["scope"].as_str()?, v["session"].as_str()) {
+        ("local", Some(session)) => format!("session:{session}"),
+        ("local", None) => "global".to_string(),
+        (scope, _) => scope.to_string(),
+    };
+    let (scope, session) = split_scope(&memory_scope);
     Some(HarnessEntry {
         id: v["id"].as_str()?.to_string(),
         kind: EntryKind::parse(v["kind"].as_str()?)?,
         title: v["title"].as_str().unwrap_or_default().to_string(),
         content: v["content"].as_str().unwrap_or_default().to_string(),
         path: v["path"].as_str().unwrap_or_default().to_string(),
-        scope: Scope::parse(v["scope"].as_str()?)?,
-        session: v["session"].as_str().map(str::to_string),
+        scope,
+        session,
+        memory_scope,
         reference: v["reference"].clone(),
         arguments: v["arguments"].clone(),
         metadata: v["metadata"].clone(),
@@ -314,12 +334,65 @@ fn applied_edit_from_json(v: &Value) -> Option<AppliedEdit> {
     })
 }
 
+/// The memory row of an entry: the body is the memory's content, the title is a tag (so recall
+/// matches it), everything else rides in `learned`.
+fn to_memory(e: &HarnessEntry) -> MemoryEntry {
+    let mut m = MemoryEntry::new(MemoryCategory::Custom(e.kind.as_str().to_string()), e.content.clone());
+    m.id = e.id.clone();
+    m.tags = if e.title.trim().is_empty() { Vec::new() } else { vec![e.title.clone()] };
+    m.source = Some(e.source.clone());
+    m.created_at = chrono::DateTime::from_timestamp_millis(e.created_at_ms).unwrap_or_default();
+    m.updated_at = chrono::DateTime::from_timestamp_millis(e.updated_at_ms).unwrap_or_default();
+    m.learned = Some(LearnedMeta {
+        title: e.title.clone(),
+        path: e.path.clone(),
+        reference: e.reference.clone(),
+        arguments: e.arguments.clone(),
+        metadata: e.metadata.clone(),
+        version: e.version,
+        seq: e.seq,
+        // A skill with a generated SKILL.md is offered by the skill list already.
+        listed: e.kind == EntryKind::Skill && crate::skill_files::skills_dir().is_some(),
+    });
+    m.refresh_search_text();
+    m
+}
+
+/// The entry a memory row holds; `None` for any memory that is not a learned one.
+fn from_memory(memory_scope: &str, m: &MemoryEntry) -> Option<HarnessEntry> {
+    let kind = EntryKind::parse(&m.category.to_string()).filter(|_| m.category.is_learned())?;
+    let meta = m.learned.clone().unwrap_or_default();
+    let (scope, session) = split_scope(memory_scope);
+    Some(HarnessEntry {
+        id: m.id.clone(),
+        kind,
+        title: meta.title,
+        content: m.content.clone(),
+        path: meta.path,
+        scope,
+        session,
+        memory_scope: memory_scope.to_string(),
+        reference: meta.reference,
+        arguments: meta.arguments,
+        metadata: meta.metadata,
+        source: m.source.clone().unwrap_or_default(),
+        created_at_ms: m.created_at.timestamp_millis(),
+        updated_at_ms: m.updated_at.timestamp_millis(),
+        version: meta.version.max(1),
+        seq: meta.seq,
+    })
+}
+
 impl EntryStore {
     pub fn open(home: &Path) -> Result<Self> {
         std::fs::create_dir_all(home).ok();
-        let conn = crate::migrate::open(&home.join("sovereign.db"), SCHEMA).context("opening sovereign.db")?;
+        let db = home.join("sovereign.db");
+        let conn = crate::migrate::open(&db, SCHEMA).context("opening sovereign.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db,
+            #[cfg(test)]
+            scratch: None,
         })
     }
 
@@ -340,15 +413,13 @@ impl EntryStore {
         Ok(store)
     }
 
-    /// In-memory store for unit tests.
+    /// A store on a fresh temporary home, removed when dropped (unit tests).
     #[cfg(test)]
-    pub fn memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
-        crate::migrate::run(&conn, None)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+    pub fn temp() -> Result<Self> {
+        let home = std::env::temp_dir().join(format!("entries-{}", uuid::Uuid::new_v4()));
+        let mut store = Self::open(&home)?;
+        store.scratch = Some(home);
+        Ok(store)
     }
 
     fn next_seq(conn: &Connection) -> Result<i64> {
@@ -363,58 +434,60 @@ impl EntryStore {
         )?)
     }
 
-    fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<HarnessEntry> {
-        let kind: String = row.get("kind")?;
-        let scope: String = row.get("scope")?;
-        let parse_json = |s: String| serde_json::from_str::<Value>(&s).unwrap_or(json!({}));
-        Ok(HarnessEntry {
-            id: row.get("id")?,
-            kind: EntryKind::parse(&kind).unwrap_or(EntryKind::Prompt),
-            title: row.get("title")?,
-            content: row.get("content")?,
-            path: row.get("path")?,
-            scope: Scope::parse(&scope).unwrap_or(Scope::Local),
-            session: row.get("session")?,
-            reference: parse_json(row.get("reference")?),
-            arguments: parse_json(row.get("arguments")?),
-            metadata: parse_json(row.get("metadata")?),
-            source: row.get("source")?,
-            created_at_ms: row.get("created_at_ms")?,
-            updated_at_ms: row.get("updated_at_ms")?,
-            version: row.get("version")?,
-            seq: row.get("seq")?,
-        })
+    /// Tell the store where `session` works, so what it learns lands in that project's scope.
+    /// Written only when it changes.
+    pub fn set_session_dir(&self, session: &str, dir: &str) -> Result<()> {
+        let key = format!("session_dir:{session}");
+        if self.setting(&key).as_deref() != Some(dir) {
+            self.set_setting(&key, dir)?;
+        }
+        Ok(())
+    }
+
+    fn project_scope_of(&self, session: &str) -> Option<String> {
+        self.setting(&format!("session_dir:{session}")).filter(|d| !d.trim().is_empty()).map(|d| learned::project_scope(&d))
+    }
+
+    /// Where a new entry goes: `global` when asked for, else the session's project, else `global`.
+    fn scope_for_new(&self, e: &NewEntry) -> Result<String> {
+        match e.scope {
+            Scope::Global => Ok("global".to_string()),
+            Scope::Local => {
+                let session = e.session.as_deref().context("a local entry needs a session")?;
+                Ok(self.project_scope_of(session).unwrap_or_else(|| "global".to_string()))
+            }
+        }
+    }
+
+    /// The memory scopes `session` reads learned entries from.
+    fn visible_scopes(&self, session: &str) -> Vec<String> {
+        let mut scopes = vec!["global".to_string(), format!("session:{session}")];
+        scopes.extend(self.project_scope_of(session));
+        scopes
+    }
+
+    fn entries_in(&self, kind: Option<EntryKind>, scopes: Option<&[String]>) -> Result<Vec<HarnessEntry>> {
+        let all = ["prompt", "skill", "subagent"];
+        let kinds: Vec<&str> = kind.map_or(all.to_vec(), |k| vec![k.as_str()]);
+        let mut out: Vec<HarnessEntry> =
+            learned::list(&self.db, &kinds, scopes)?.iter().filter_map(|(scope, m)| from_memory(scope, m)).collect();
+        out.sort_by_key(|e| e.seq);
+        Ok(out)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<HarnessEntry>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(conn
-            .query_row(
-                "SELECT * FROM harness_entries WHERE id = ?1",
-                [id],
-                Self::row_to_entry,
-            )
-            .optional()?)
+        Ok(learned::get(&self.db, id)?.and_then(|(scope, m)| from_memory(&scope, &m)))
     }
 
-    /// Entries visible to `session`: all globals plus that session's locals,
-    /// in deterministic (`seq`) order. On a `path` collision between a global
+    /// Entries visible to `session`: all globals plus that session's project and session-local
+    /// entries, in deterministic (`seq`) order. On a `path` collision between a global
     /// and a local entry, the local one wins (Prime's local-override rule).
     pub fn list_visible(
         &self,
         session: &str,
         kind: Option<EntryKind>,
     ) -> Result<Vec<HarnessEntry>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT * FROM harness_entries WHERE (scope = 'global' OR (scope = 'local' AND session = ?1)) \
-             AND (?2 IS NULL OR kind = ?2) ORDER BY seq ASC",
-        )?;
-        let kind_str = kind.map(|k| k.as_str());
-        let rows: Vec<HarnessEntry> = stmt
-            .query_map(params![session, kind_str], Self::row_to_entry)?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
+        let rows = self.entries_in(kind, Some(&self.visible_scopes(session)))?;
         let mut by_path: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut out: Vec<HarnessEntry> = Vec::new();
@@ -442,70 +515,60 @@ impl EntryStore {
         scope: Option<Scope>,
         session: Option<&str>,
     ) -> Result<Vec<HarnessEntry>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(
-            "SELECT * FROM harness_entries WHERE (?1 IS NULL OR scope = ?1) AND (?2 IS NULL OR session = ?2) ORDER BY seq ASC",
-        )?;
-        let scope_str = scope.map(|s| s.as_str());
-        Ok(stmt
-            .query_map(params![scope_str, session], Self::row_to_entry)?
-            .collect::<rusqlite::Result<_>>()?)
+        Ok(self
+            .entries_in(None, None)?
+            .into_iter()
+            .filter(|e| scope.is_none_or(|s| e.scope == s) && session.is_none_or(|s| e.session.as_deref() == Some(s)))
+            .collect())
     }
 
-    /// Prompt-kind entries rendered for `session`, joined with blank lines:
-    /// the stable, cacheable addendum text. Capped at `MAX_PROMPT_CHARS`
-    /// total: newest entries (highest `seq`) win the budget, then the kept
-    /// ones are emitted oldest-first so the prefix is identical turn to turn.
-    pub fn render_prompt(&self, session: &str) -> Result<String> {
+    /// The prompt notes rendered for `session` and their ids: the stable, cacheable addendum text.
+    /// Capped at `MAX_PROMPT_CHARS` total: newest entries (highest `seq`) win the budget, then the
+    /// kept ones are emitted oldest-first so the prefix is identical turn to turn.
+    pub fn render_prompt_with_ids(&self, session: &str) -> Result<(String, Vec<String>)> {
         let entries = self.list_visible(session, Some(EntryKind::Prompt))?;
         let mut used = 0;
-        let mut kept: Vec<&str> = entries
+        let mut kept: Vec<&HarnessEntry> = entries
             .iter()
             .rev()
-            .map(|e| e.content.trim())
-            .filter(|c| !c.is_empty())
-            .filter(|c| {
-                let cost = c.chars().count() + 2;
+            .filter(|e| !e.content.trim().is_empty())
+            .filter(|e| {
+                let cost = e.content.trim().chars().count() + 2;
                 (used + cost <= MAX_PROMPT_CHARS).then(|| used += cost).is_some()
             })
             .collect();
         kept.reverse();
-        Ok(kept.join("\n\n"))
+        Ok((kept.iter().map(|e| e.content.trim()).collect::<Vec<_>>().join("\n\n"), kept.iter().map(|e| e.id.clone()).collect()))
     }
 
-    fn insert_entry(
-        conn: &Connection,
-        e: &NewEntry,
-        id: &str,
-        seq: i64,
-        at: i64,
-    ) -> Result<HarnessEntry> {
-        if e.scope == Scope::Local && e.session.is_none() {
-            bail!("a local entry needs a session");
-        }
-        let title: String = e.title.chars().take(MAX_TITLE_CHARS).collect();
-        let content: String = e.content.chars().take(MAX_CONTENT_CHARS).collect();
-        let path: String = e.path.chars().take(MAX_PATH_CHARS).collect();
-        conn.execute(
-            "INSERT INTO harness_entries(id, kind, title, content, path, scope, session, reference, arguments, metadata, source, created_at_ms, updated_at_ms, version, seq) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,1,?13)",
-            params![
-                id, e.kind.as_str(), title, content, path, e.scope.as_str(), e.session, e.reference.to_string(),
-                e.arguments.to_string(), e.metadata.to_string(), e.source, at, seq
-            ],
-        )?;
-        Ok(HarnessEntry {
-            id: id.to_string(),
+    pub fn render_prompt(&self, session: &str) -> Result<String> {
+        Ok(self.render_prompt_with_ids(session)?.0)
+    }
+
+    /// Write `e` exactly as it is (a new id, or an exact snapshot restored on rollback).
+    pub(crate) fn restore(&self, e: &HarnessEntry) -> Result<HarnessEntry> {
+        learned::put(&self.db, &e.memory_scope, to_memory(e))?;
+        Ok(e.clone())
+    }
+
+    pub fn create(&self, e: NewEntry) -> Result<HarnessEntry> {
+        let memory_scope = self.scope_for_new(&e)?;
+        let seq = Self::next_seq(&self.conn.lock().unwrap_or_else(|err| err.into_inner()))?;
+        let at = now_ms();
+        let (scope, session) = split_scope(&memory_scope);
+        self.restore(&HarnessEntry {
+            id: uuid::Uuid::new_v4().to_string(),
             kind: e.kind,
-            title,
-            content,
-            path,
-            scope: e.scope,
-            session: e.session.clone(),
-            reference: e.reference.clone(),
-            arguments: e.arguments.clone(),
-            metadata: e.metadata.clone(),
-            source: e.source.clone(),
+            title: e.title.chars().take(MAX_TITLE_CHARS).collect(),
+            content: e.content.chars().take(MAX_CONTENT_CHARS).collect(),
+            path: e.path.chars().take(MAX_PATH_CHARS).collect(),
+            scope,
+            session,
+            memory_scope,
+            reference: e.reference,
+            arguments: e.arguments,
+            metadata: e.metadata,
+            source: e.source,
             created_at_ms: at,
             updated_at_ms: at,
             version: 1,
@@ -513,74 +576,25 @@ impl EntryStore {
         })
     }
 
-    pub fn create(&self, e: NewEntry) -> Result<HarnessEntry> {
-        let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
-        let id = uuid::Uuid::new_v4().to_string();
-        let seq = Self::next_seq(&conn)?;
-        Self::insert_entry(&conn, &e, &id, seq, now_ms())
-    }
-
-    /// Create with a caller-chosen id (used to restore an exact snapshot on rollback).
-    fn create_with_id(&self, e: &HarnessEntry) -> Result<HarnessEntry> {
-        let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
-        conn.execute(
-            "INSERT INTO harness_entries(id, kind, title, content, path, scope, session, reference, arguments, metadata, source, created_at_ms, updated_at_ms, version, seq) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-            params![
-                e.id, e.kind.as_str(), e.title, e.content, e.path, e.scope.as_str(), e.session,
-                e.reference.to_string(), e.arguments.to_string(), e.metadata.to_string(), e.source,
-                e.created_at_ms, e.updated_at_ms, e.version, e.seq
-            ],
-        )?;
-        Ok(e.clone())
-    }
-
     pub fn update(&self, id: &str, patch: EntryPatch) -> Result<HarnessEntry> {
         let existing = self.get(id)?.with_context(|| format!("no entry {id}"))?;
-        let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
-        let title = patch.title.unwrap_or(existing.title);
-        let content = patch.content.unwrap_or(existing.content);
-        let path = patch.path.unwrap_or(existing.path);
-        let reference = patch.reference.unwrap_or(existing.reference);
-        let arguments = patch.arguments.unwrap_or(existing.arguments);
-        let metadata = patch.metadata.unwrap_or(existing.metadata);
-        let at = now_ms();
-        let version = existing.version + 1;
-        conn.execute(
-            "UPDATE harness_entries SET title=?1, content=?2, path=?3, reference=?4, arguments=?5, metadata=?6, updated_at_ms=?7, version=?8 WHERE id=?9",
-            params![title, content, path, reference.to_string(), arguments.to_string(), metadata.to_string(), at, version, id],
-        )?;
-        Ok(HarnessEntry {
-            title,
-            content,
-            path,
-            reference,
-            arguments,
-            metadata,
-            updated_at_ms: at,
-            version,
+        self.restore(&HarnessEntry {
+            title: patch.title.unwrap_or(existing.title),
+            content: patch.content.unwrap_or(existing.content),
+            path: patch.path.unwrap_or(existing.path),
+            reference: patch.reference.unwrap_or(existing.reference),
+            arguments: patch.arguments.unwrap_or(existing.arguments),
+            metadata: patch.metadata.unwrap_or(existing.metadata),
+            updated_at_ms: now_ms(),
+            version: existing.version + 1,
             ..existing
         })
     }
 
-    /// Overwrite an entry back to an exact prior snapshot (rollback of an update).
-    fn restore(&self, snapshot: &HarnessEntry) -> Result<HarnessEntry> {
-        let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
-        conn.execute(
-            "UPDATE harness_entries SET title=?1, content=?2, path=?3, reference=?4, arguments=?5, metadata=?6, updated_at_ms=?7, version=?8 WHERE id=?9",
-            params![
-                snapshot.title, snapshot.content, snapshot.path, snapshot.reference.to_string(),
-                snapshot.arguments.to_string(), snapshot.metadata.to_string(), snapshot.updated_at_ms, snapshot.version, snapshot.id
-            ],
-        )?;
-        Ok(snapshot.clone())
-    }
-
     pub fn delete(&self, id: &str) -> Result<HarnessEntry> {
-        let existing = self.get(id)?.with_context(|| format!("no entry {id}"))?;
-        let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
-        conn.execute("DELETE FROM harness_entries WHERE id = ?1", [id])?;
-        Ok(existing)
+        learned::delete(&self.db, id)?
+            .and_then(|(scope, m)| from_memory(&scope, &m))
+            .with_context(|| format!("no entry {id}"))
     }
 
     /// Copy a local entry into the global store (Prime's promote-by-copy).
@@ -603,11 +617,14 @@ impl EntryStore {
         })
     }
 
-    /// Copy a global entry into a session's local store (demote-by-copy).
+    /// Copy a global entry into a session's project scope (demote-by-copy).
     pub fn demote(&self, id: &str, session: &str) -> Result<HarnessEntry> {
         let existing = self.get(id)?.with_context(|| format!("no entry {id}"))?;
         if existing.scope == Scope::Local {
             bail!("entry {id} is already local");
+        }
+        if self.project_scope_of(session).is_none() {
+            bail!("session {session} has no working directory to keep a local copy in");
         }
         self.create(NewEntry {
             kind: existing.kind,
@@ -734,7 +751,7 @@ impl EntryStore {
                         .before
                         .as_ref()
                         .context("delete edit missing its snapshot")?;
-                    let after = self.create_with_id(before)?;
+                    let after = self.restore(before)?;
                     inverse.push(AppliedEdit {
                         action: Action::Create,
                         id: before.id.clone(),
@@ -887,8 +904,10 @@ impl EntryStore {
             .unwrap_or_default()
     }
 
-    /// Drop the learning state, parked approvals and surface/bot tags of a deleted session.
+    /// Drop the learning state, parked approvals, surface/bot tags and session-scoped learned
+    /// entries of a deleted session.
     pub fn forget_session(&self, session: &str) -> Result<()> {
+        learned::drop_scope(&self.db, &format!("session:{session}"))?;
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         for table in ["harness_watermark", "harness_learn_state", "harness_pending_refine"] {
             conn.execute(&format!("DELETE FROM {table} WHERE session = ?1"), [session])?;
@@ -898,6 +917,7 @@ impl EntryStore {
             "DELETE FROM engine_settings WHERE key = ?1 OR (key LIKE 'bot\\_session:%' ESCAPE '\\' AND value = ?2)",
             params![format!("session_surface:{session}"), session],
         )?;
+        conn.execute("DELETE FROM engine_settings WHERE key = ?1", [format!("session_dir:{session}")])?;
         Ok(())
     }
 
@@ -984,7 +1004,7 @@ mod tests {
 
     #[test]
     fn crud_roundtrip() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let created = store
             .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
             .unwrap();
@@ -1007,7 +1027,8 @@ mod tests {
 
     #[test]
     fn scope_resolution_local_overrides_global_by_path() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
         let g = store
             .create(entry(EntryKind::Prompt, Scope::Global, None))
             .unwrap();
@@ -1043,7 +1064,7 @@ mod tests {
 
     #[test]
     fn render_prompt_is_deterministic_by_append_order() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         for (i, text) in ["first", "second", "third"].iter().enumerate() {
             let mut e = entry(EntryKind::Prompt, Scope::Local, Some("s1"));
             e.path = format!("topic/{i}");
@@ -1058,7 +1079,7 @@ mod tests {
 
     #[test]
     fn render_prompt_is_capped_newest_first_and_stable() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         for i in 0..5 {
             let mut e = entry(EntryKind::Prompt, Scope::Local, Some("s1"));
             e.path = format!("topic/{i}");
@@ -1093,7 +1114,7 @@ mod tests {
 
     #[test]
     fn learning_is_on_by_default_and_the_setting_persists() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         assert!(store.learning_enabled());
         store.set_setting("learning.enabled", "false").unwrap();
         assert!(!store.learning_enabled());
@@ -1103,7 +1124,8 @@ mod tests {
 
     #[test]
     fn promote_copies_local_entry_to_global_without_moving_it() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
         let local = store
             .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
             .unwrap();
@@ -1118,7 +1140,7 @@ mod tests {
 
     #[test]
     fn rollback_restores_create_update_delete_exactly() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let created = store
             .create(entry(EntryKind::Prompt, Scope::Local, Some("s1")))
             .unwrap();
@@ -1181,9 +1203,9 @@ mod tests {
 
     #[test]
     fn rollback_of_a_delete_recreates_the_entry_with_the_same_id() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let created = store
-            .create(entry(EntryKind::Memory, Scope::Global, None))
+            .create(entry(EntryKind::Subagent, Scope::Global, None))
             .unwrap();
         let deleted = store.delete(&created.id).unwrap();
         let cs = store
@@ -1211,7 +1233,7 @@ mod tests {
 
     #[test]
     fn schedule_refine_is_pending_until_taken_once() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         assert!(!store.refine_pending("s1").unwrap());
         store
             .schedule_refine("s1", Some("be terser"), false)
@@ -1233,7 +1255,7 @@ mod tests {
 
     #[test]
     fn resolves_a_subagent_spec_by_name_case_insensitively() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let mut e = entry(EntryKind::Subagent, Scope::Global, None);
         e.title = "Code Reviewer".into();
         e.content = "Review diffs for correctness bugs.".into();
@@ -1248,11 +1270,108 @@ mod tests {
 
     #[test]
     fn no_local_entry_leaks_into_another_session() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        store.set_session_dir("s2", "/work/b").unwrap();
         store
             .create(entry(EntryKind::Subagent, Scope::Local, Some("s1")))
             .unwrap();
         assert_eq!(store.list_visible("s1", None).unwrap().len(), 1);
         assert_eq!(store.list_visible("s2", None).unwrap().len(), 0);
+    }
+
+    fn raw(store: &EntryStore) -> Connection {
+        Connection::open(&store.db).unwrap()
+    }
+
+    #[test]
+    fn entries_are_memories_and_nothing_else_holds_their_text() {
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        let e = store.create(entry(EntryKind::Skill, Scope::Local, Some("s1"))).unwrap();
+        assert_eq!(e.memory_scope, learned::project_scope("/work/a"), "a session with a directory learns into its project");
+        let db = raw(&store);
+        let (category, scope, content): (String, String, String) = db
+            .query_row(
+                "SELECT json_extract(e.entry, '$.category.custom'), m.scope, m.content FROM memories m JOIN memory_entries e ON e.rid = m.rid WHERE m.id = ?1",
+                [&e.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((category.as_str(), scope, content.as_str()), ("skill", e.memory_scope.clone(), "Content"));
+        assert!(db.prepare("SELECT 1 FROM harness_entries").is_err(), "the old table does not exist");
+        // No directory: global.
+        let g = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s9"))).unwrap();
+        assert_eq!((g.memory_scope.as_str(), g.scope), ("global", Scope::Global));
+        // Delete removes the memory row.
+        store.delete(&e.id).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM memories WHERE id = ?1", [&e.id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn similar_prompt_notes_stay_separate_rows() {
+        let store = EntryStore::temp().unwrap();
+        let mut ids = Vec::new();
+        for (i, text) in ["Always run the linter before committing code.", "Always run the linter before committing code!", "Always run the linter before committing code."].iter().enumerate() {
+            let mut e = entry(EntryKind::Prompt, Scope::Global, None);
+            e.path = format!("p/{i}");
+            e.content = text.to_string();
+            ids.push(store.create(e).unwrap().id);
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(store.list_visible("s1", Some(EntryKind::Prompt)).unwrap().len(), 3, "no merge, no reinforcement");
+    }
+
+    #[test]
+    fn rollback_restores_every_field_of_the_entry() {
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        let before = store.create(entry(EntryKind::Subagent, Scope::Local, Some("s1"))).unwrap();
+        let after = store
+            .update(&before.id, EntryPatch { title: Some("Other".into()), content: Some("Changed".into()), path: Some("x/y".into()), reference: Some(json!({"a": 1})), ..Default::default() })
+            .unwrap();
+        let edit = |action, b, a| AppliedEdit { action, id: before.id.clone(), before: b, after: a };
+        let cs = store.record_changeset(Some("s1"), Scope::Local, "u", "r", "e", &[edit(Action::Update, Some(before.clone()), Some(after.clone()))], None, "refine").unwrap();
+        store.rollback(Some(&cs), None).unwrap();
+        assert_eq!(store.get(&before.id).unwrap().unwrap(), before, "every field, version and order included");
+        // A delete comes back the same, in the same scope, under the same id.
+        let gone = store.delete(&before.id).unwrap();
+        let cs = store.record_changeset(Some("s1"), Scope::Local, "d", "r", "e", &[edit(Action::Delete, Some(gone), None)], None, "refine").unwrap();
+        store.rollback(Some(&cs), None).unwrap();
+        assert_eq!(store.get(&before.id).unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn a_session_local_entry_dies_with_its_session() {
+        let store = EntryStore::temp().unwrap();
+        store.create(NewEntry::new(EntryKind::Prompt, Scope::Global, "G", "for everyone")).unwrap();
+        // What migration 6 makes of an old session-local row.
+        let mut legacy = store.create(NewEntry::new(EntryKind::Prompt, Scope::Global, "T", "kept only here")).unwrap();
+        store.delete(&legacy.id).unwrap();
+        legacy.memory_scope = "session:s1".into();
+        store.restore(&legacy).unwrap();
+        assert_eq!(store.list_visible("s1", None).unwrap().len(), 2);
+        assert_eq!(store.list_visible("s2", None).unwrap().len(), 1);
+        store.forget_session("s1").unwrap();
+        assert_eq!(store.list_visible("s1", None).unwrap().len(), 1, "only the global one is left");
+    }
+
+    #[test]
+    fn prompt_notes_come_with_their_ids_and_recall_leaves_them_out() {
+        let store = EntryStore::temp().unwrap();
+        let mut e = entry(EntryKind::Prompt, Scope::Global, None);
+        e.content = "Always run the linter before committing".into();
+        let note = store.create(e).unwrap();
+        let (text, ids) = store.render_prompt_with_ids("s1").unwrap();
+        assert_eq!((text.as_str(), ids), ("Always run the linter before committing", vec![note.id.clone()]));
+        let (_, m) = learned::get(&store.db, &note.id).unwrap().unwrap();
+        assert!(learned::is_kept_out_of_recall(&m), "a prompt note is in the cached prefix, so recall never shows it");
+        let mut s = entry(EntryKind::Skill, Scope::Global, None);
+        s.content = "Run the release checklist".into();
+        let skill = store.create(s).unwrap();
+        let (_, m) = learned::get(&store.db, &skill.id).unwrap().unwrap();
+        assert_eq!(learned::is_kept_out_of_recall(&m), crate::skill_files::skills_dir().is_some(), "a skill is left to the skill list only when its SKILL.md exists");
     }
 }

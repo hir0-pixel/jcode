@@ -84,6 +84,17 @@ pub(crate) fn due(
     }
 }
 
+/// One learning model call, taking the process-wide aux permit that memory extraction also takes,
+/// so the two never hit a (local) model together or in parallel with the user's own turn.
+pub(crate) async fn aux_complete(
+    complete: &crate::Complete,
+    system: String,
+    user: String,
+) -> anyhow::Result<jcode_provider_core::SimpleCompletion> {
+    let _permit = jcode_base::memory_extract::aux_call_permit().await;
+    complete(system, user).await
+}
+
 /// A `learning.*` span for one model call: its tokens, duration and error, if any.
 fn call_span(
     kind: &'static str,
@@ -201,7 +212,7 @@ async fn refine_approved(
     loop {
         let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, Some(&instructions), false);
         let started = crate::observability::now();
-        let reply = complete(system, user).await;
+        let reply = aux_complete(complete, system, user).await;
         record(&reply, started);
         emit(call_span("learning.refine", session, due.trigger, &reply, started).attr("attempt", attempt as u64));
         let text = reply?.text;
@@ -296,7 +307,7 @@ pub(crate) async fn pass(
         if let Ok(Some((instructions, global))) = store.take_pending_refine(session) {
             let (system, user) = sovereign_prime::refine::build_request(store, session, &turns, instructions.as_deref(), global);
             let started = crate::observability::now();
-            let reply = complete(system, user).await;
+            let reply = aux_complete(&complete, system, user).await;
             conn.observer.record_aux(
                 session, "learning", Some("Scheduled refine"), None, None, started,
                 reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
@@ -354,7 +365,7 @@ async fn checkpoint(
     // caller in `rpc.rs` enforces both). No keyword pre-filter: Prime has none either.
     let (gsystem, guser) = gate_request(store, session, due, fresh);
     let started = crate::observability::now();
-    let greply = complete(gsystem, guser).await;
+    let greply = aux_complete(complete, gsystem, guser).await;
     record("Auto-refine gate", &greply, started);
     let gate_span = call_span("learning.gate", session, due.trigger, &greply, started).attr("assistants", due.assistants as u64);
     let review = match &greply {

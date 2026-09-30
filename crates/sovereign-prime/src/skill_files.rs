@@ -2,7 +2,8 @@
 //! `SKILL.md` under `~/.jcode/skills/<slug>/`, so a skill created or updated
 //! through `/refine` is executable by the existing Python worker (the same
 //! bundled-skill layout `bundled_skills.rs` installs and the worker adds to
-//! `sys.path`) instead of staying inert text in `harness_entries`.
+//! `sys.path`) instead of staying inert text in its memory row. The file is generated from that row
+//! and marked with [`MARKER`]; a file without the marker is the user's and is never touched.
 //!
 //! `/refine` edits are capped and tracked by changesets (see
 //! [`crate::refine::apply`]), so this module only validates Prime's
@@ -173,4 +174,16 @@ pub fn write(dir: &Path, slug: &str, name: &str, description: &str, body: &str, 
         body.trim()
     );
     std::fs::write(skill_dir.join("SKILL.md"), content)
+}
+
+/// Rewrite the `SKILL.md` of `entry` from its memory row (after an edit made outside `/refine`).
+/// A file the user wrote under that name is left alone and reported as an error.
+pub fn regenerate(dir: &Path, entry: &crate::entries::HarnessEntry) -> Result<(), String> {
+    let slug = slugify(&entry.title);
+    if slug.is_empty() {
+        return Ok(());
+    }
+    claim(dir, &slug)?;
+    let description: String = entry.content.chars().take(200).collect();
+    write(dir, &slug, &entry.title, &description, &entry.content, &entry.reference).map_err(|e| e.to_string())
 }

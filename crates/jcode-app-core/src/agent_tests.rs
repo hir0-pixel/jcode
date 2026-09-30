@@ -2307,13 +2307,14 @@ fn learned_prompt_addenda_reach_the_prompt_without_python() {
     crate::env::set_var("JCODE_HOME", home.path());
     crate::env::set_var("SOVEREIGN_REPL_WORKER", "/bin/sovereign");
     crate::env::remove_var("SOVEREIGN_HERMES_PYTHON");
-    EntryStore::open_cached(home.path())
+    let note = EntryStore::open_cached(home.path())
         .unwrap()
         .create(NewEntry::new(EntryKind::Prompt, Scope::Global, "t", "Always run the linter first."))
         .unwrap();
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let agent = Agent::new(provider, Registry::empty());
     let prompt = agent.build_system_prompt_split(None).static_part;
+    let recorded = crate::memory::is_memory_injected(&agent.session.id, &note.id);
     for (key, value) in saved {
         match value {
             Some(value) => crate::env::set_var(key, value),
@@ -2321,4 +2322,5 @@ fn learned_prompt_addenda_reach_the_prompt_without_python() {
         }
     }
     assert!(prompt.contains("# Continual Harness") && prompt.contains("Always run the linter first."), "{prompt}");
+    assert!(recorded, "the prompt note is in the injected-id record, so recall never repeats it");
 }

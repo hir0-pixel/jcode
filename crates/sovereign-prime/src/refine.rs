@@ -242,8 +242,14 @@ fn apply_with(store: &EntryStore, session: &str, reply: &str, global: bool, sour
             // Prime's `validateEdit` has no evidence-substring gate (its `evidence` is the rationale text).
             match edit["action"].as_str().unwrap_or_default() {
                 "create" => {
-                    let kind = EntryKind::parse(edit["kind"].as_str().unwrap_or_default())
-                        .context("rejected: edit has no valid kind")?;
+                    let kind_name = edit["kind"].as_str().unwrap_or_default();
+                    let kind = EntryKind::parse(kind_name).with_context(|| {
+                        if kind_name == "memory" {
+                            "rejected: memory entries are written by memory extraction, not refine"
+                        } else {
+                            "rejected: edit has no valid kind"
+                        }
+                    })?;
                     reject_kind(kind, skills)?;
                     let title = edit["title"].as_str().unwrap_or_default();
                     let content = edit["content"].as_str().unwrap_or_default();
@@ -386,31 +392,9 @@ fn apply_with(store: &EntryStore, session: &str, reply: &str, global: bool, sour
                 Action::Create => {
                     let _ = store.delete(&op.id);
                 }
-                Action::Delete => {
+                Action::Delete | Action::Update => {
                     if let Some(before) = &op.before {
-                        let _ = store.create(
-                            NewEntry::new(
-                                before.kind,
-                                before.scope,
-                                &before.title,
-                                &before.content,
-                            )
-                            .with_path(&before.path)
-                            .with_source(&before.source),
-                        );
-                    }
-                }
-                Action::Update => {
-                    if let Some(before) = &op.before {
-                        let _ = store.update(
-                            &op.id,
-                            EntryPatch {
-                                title: Some(before.title.clone()),
-                                content: Some(before.content.clone()),
-                                path: Some(before.path.clone()),
-                                ..Default::default()
-                            },
-                        );
+                        let _ = store.restore(before);
                     }
                 }
             }
@@ -461,9 +445,9 @@ fn apply_with(store: &EntryStore, session: &str, reply: &str, global: bool, sour
 }
 
 /// Refine's kinds are `prompt`, `skill` (only where the REPL can run it) and `subagent`.
+/// (`memory` is not a kind: extraction writes those.)
 fn reject_kind(kind: EntryKind, skills: bool) -> Result<()> {
     match kind {
-        EntryKind::Memory => bail!("rejected: memory entries are written by memory extraction, not refine"),
         EntryKind::Skill if !skills => bail!("rejected: skills need the Python REPL, which is not available here"),
         _ => Ok(()),
     }
@@ -529,6 +513,34 @@ fn undo_skill_file(before: Option<&crate::entries::HarnessEntry>, after: Option<
     }
 }
 
+/// Change an entry outside a refinement (the Learning screen's edit). A skill's `SKILL.md` is
+/// regenerated from the updated row, and the edit is refused first if that file is the user's own.
+pub fn edit_entry(store: &EntryStore, id: &str, patch: EntryPatch) -> Result<crate::entries::HarnessEntry> {
+    let before = store.get(id)?.with_context(|| format!("no entry {id}"))?;
+    if before.kind != EntryKind::Skill {
+        return store.update(id, patch);
+    }
+    if let Some(dir) = crate::skill_files::skills_dir() {
+        let title = patch.title.as_deref().unwrap_or(&before.title);
+        let content = patch.content.as_deref().unwrap_or(&before.content);
+        if crate::skill_files::looks_unsafe(content) || crate::skill_files::looks_unsafe(title) {
+            bail!("rejected: skill edit appears to contain a secret or an absolute user path");
+        }
+        let updated = crate::entries::HarnessEntry {
+            title: title.to_string(),
+            content: content.to_string(),
+            reference: patch.reference.clone().unwrap_or_else(|| before.reference.clone()),
+            ..before.clone()
+        };
+        crate::skill_files::regenerate(&dir, &updated).map_err(|e| anyhow::anyhow!("rejected: {e}"))?;
+        let old = crate::skill_files::slugify(&before.title);
+        if old != crate::skill_files::slugify(&updated.title) {
+            crate::skill_files::remove_learned(&dir, &old);
+        }
+    }
+    store.update(id, patch)
+}
+
 /// `/refine rollback [id]` (and the `refine.status()`-adjacent host call):
 /// undoes the given changeset, or the most recent one for `session`.
 pub fn rollback(store: &EntryStore, session: &str, id: Option<&str>) -> Result<String> {
@@ -587,7 +599,7 @@ mod tests {
 
     #[test]
     fn applies_a_create_edit_and_records_a_changeset() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({
             "summary": "learned the crate scaffold order",
             "rationale": "the user stated a durable convention",
@@ -608,7 +620,7 @@ mod tests {
 
     #[test]
     fn a_failing_edit_leaves_no_partial_state() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({
             "summary": "x", "rationale": "x", "expectedOutcome": "x",
             "edits": [
@@ -626,7 +638,7 @@ mod tests {
 
     #[test]
     fn refine_rollback_and_status_round_trip() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({
             "summary": "learned it", "rationale": "r", "expectedOutcome": "e",
             "edits": [{"action": "create", "kind": "prompt", "title": "t", "content": "c",
@@ -641,7 +653,7 @@ mod tests {
 
     #[test]
     fn the_memory_kind_is_refused_for_create_update_and_delete() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let create = json!({
             "summary": "learned a preference", "rationale": "r", "expectedOutcome": "e",
             "edits": [{"action": "create", "kind": "memory", "title": "Nim", "category": "preference", "content": "Prefers Nim"}],
@@ -650,20 +662,23 @@ mod tests {
         let err = apply_with(&store, "s1", &create, false, "refine", true).unwrap_err();
         assert!(err.to_string().contains("memory extraction"), "{err}");
         assert!(store.list_visible("s1", None).unwrap().is_empty());
-        // An old memory-kind row is left alone too.
-        let old = store.create(NewEntry::new(EntryKind::Memory, Scope::Local, "Nim", "Nim").with_session("s1")).unwrap();
-        for edit in [json!({"action": "delete", "id": old.id}), json!({"action": "update", "id": old.id, "content": "x"})] {
+        // A plain memory of the same store is out of reach for update and delete too.
+        let fact = jcode_base::memory::MemoryEntry::new(jcode_base::memory::MemoryCategory::Fact, "Prefers Nim");
+        let id = fact.id.clone();
+        jcode_base::memory::learned::put(&store.db, "global", fact).unwrap();
+        for edit in [json!({"action": "delete", "id": id}), json!({"action": "update", "id": id, "content": "x"})] {
             let reply = json!({"summary": "s", "edits": [edit]}).to_string();
             assert!(apply_with(&store, "s1", &reply, false, "refine", true).is_err());
         }
-        assert!(store.get(&old.id).unwrap().is_some());
+        assert_eq!(jcode_base::memory::learned::list(&store.db, &["fact"], None).unwrap().len(), 0, "learned::list is for learned kinds only");
+        assert!(jcode_base::memory::learned::get(&store.db, &id).unwrap().is_none());
         let (system, _) = build_request_with(&store, "s1", &turns(), None, false, true);
         assert!(!system.contains("\"memory\""), "the memory kind is not offered: {system}");
     }
 
     #[test]
     fn skills_are_neither_offered_nor_accepted_without_the_repl() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let (with, _) = build_request_with(&store, "s1", &turns(), None, false, true);
         let (without, _) = build_request_with(&store, "s1", &turns(), None, false, false);
         assert!(with.contains("\"skill\"") && !without.contains("\"skill\"") && !without.contains("Python call"));
@@ -676,14 +691,14 @@ mod tests {
 
     #[test]
     fn the_request_carries_the_overview_and_refinement_history() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({"summary": "learned scaffold order", "rationale": "r", "expectedOutcome": "crates follow it",
             "edits": [{"action": "create", "kind": "prompt", "title": "Scaffold", "content": "Cargo.toml first", "path": "c/s"}]}).to_string();
         apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
         let (_, user) = build_request_with(&store, "s1", &turns(), None, false, true);
         assert!(user.contains("<current_harness_state>") && user.contains("prompt: 1") && user.contains("Scaffold (c/s, v1)"), "{user}");
         assert!(user.contains("learned scaffold order") && user.contains("Expected outcome: crates follow it"), "{user}");
-        assert_eq!(history(&EntryStore::memory().unwrap(), "s1"), "No prior refinement history.");
+        assert_eq!(history(&EntryStore::temp().unwrap(), "s1"), "No prior refinement history.");
     }
 
     /// Skill tests point JCODE_HOME at their own directory, one at a time.
@@ -706,12 +721,31 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_skill_regenerates_its_file_and_never_a_users() {
+        let (_lock, home) = skills_home();
+        let store = EntryStore::temp().unwrap();
+        let outcome = apply_with(&store, "s1", &skill_edit("create", "Do Thing", "old steps", None), false, "refine", true).unwrap();
+        let id = &outcome.created[0];
+        let file = home.join("skills/do-thing/SKILL.md");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("old steps"));
+        edit_entry(&store, id, EntryPatch { content: Some("new steps".into()), ..Default::default() }).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("new steps") && !text.contains("old steps") && text.contains(crate::skill_files::MARKER), "{text}");
+        assert_eq!(store.get(id).unwrap().unwrap().content, "new steps");
+        // A user who has since put their own file there keeps it, and the edit is refused.
+        std::fs::write(&file, "---\nname: do-thing\ndescription: mine\n---\nmy steps").unwrap();
+        assert!(edit_entry(&store, id, EntryPatch { content: Some("third".into()), ..Default::default() }).is_err());
+        assert_eq!(store.get(id).unwrap().unwrap().content, "new steps");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("my steps"));
+    }
+
+    #[test]
     fn a_learned_skill_never_overwrites_a_users_skill() {
         let (_lock, home) = skills_home();
         let mine = home.join("skills/do-thing");
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::write(mine.join("SKILL.md"), "---\nname: do-thing\ndescription: mine\n---\nmy steps").unwrap();
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let err = apply_with(&store, "s1", &skill_edit("create", "Do Thing", "steps", None), false, "refine", true).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert!(std::fs::read_to_string(mine.join("SKILL.md")).unwrap().contains("my steps"));
@@ -722,7 +756,7 @@ mod tests {
     #[test]
     fn undo_removes_only_the_file_the_change_created_and_a_rename_moves_the_skill() {
         let (_lock, home) = skills_home();
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let created = apply_with(&store, "s1", &skill_edit("create", "Do Thing", "v1 steps", None), false, "refine", true).unwrap();
         let dir = home.join("skills/do-thing");
         assert!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap().contains(crate::skill_files::MARKER));
@@ -744,7 +778,7 @@ mod tests {
     #[test]
     fn a_rejected_edit_writes_no_skill_file() {
         let (_lock, home) = skills_home();
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "e", "edits": [
             {"action": "create", "kind": "skill", "title": "Fine Skill", "content": "steps",
              "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}},
@@ -758,7 +792,7 @@ mod tests {
     #[test]
     fn front_matter_is_escaped() {
         let (_lock, home) = skills_home();
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let title = "Tricky: \"quoted\" #1 --- x";
         apply_with(&store, "s1", &skill_edit("create", title, "line one\nline: two\n---\nthree", None), false, "refine", true).unwrap();
         let text = std::fs::read_to_string(home.join("skills").join(crate::skill_files::slugify(title)).join("SKILL.md")).unwrap();
@@ -773,7 +807,7 @@ mod tests {
     #[test]
     fn rollback_removes_the_skill_file_apply_wrote() {
         let (_lock, home) = skills_home();
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let reply = json!({
             "summary": "s", "rationale": "r", "expectedOutcome": "e",
             "edits": [{"action": "create", "kind": "skill", "title": "Do Thing", "content": "steps",
@@ -790,7 +824,7 @@ mod tests {
 
     #[test]
     fn skill_create_requires_the_python_reference_contract() {
-        let store = EntryStore::memory().unwrap();
+        let store = EntryStore::temp().unwrap();
         let no_reference = json!({
             "summary": "s", "rationale": "r", "expectedOutcome": "e",
             "edits": [{"action": "create", "kind": "skill", "title": "Do Thing", "content": "steps",

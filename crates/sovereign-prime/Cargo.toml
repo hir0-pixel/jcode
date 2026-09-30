@@ -7,6 +7,7 @@ description = "Prime-style recursive REPL and continual harness for the sovereig
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
 jcode-base = { path = "../jcode-base" }
 jcode-storage = { path = "../jcode-storage" }
 rusqlite = { version = "0.32", features = ["bundled"] }
