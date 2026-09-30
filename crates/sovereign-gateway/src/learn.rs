@@ -86,13 +86,59 @@ pub(crate) fn due(
 
 /// One learning model call, taking the process-wide aux permit that memory extraction also takes,
 /// so the two never hit a (local) model together or in parallel with the user's own turn.
+///
+/// Both the permit wait and the call are bounded ([`AUX_TIMEOUT`]): a user's `/refine` must not sit
+/// behind background work forever, and one hung provider call must not hold the slot indefinitely.
 pub(crate) async fn aux_complete(
     complete: &crate::Complete,
     system: String,
     user: String,
 ) -> anyhow::Result<jcode_provider_core::SimpleCompletion> {
-    let _permit = jcode_base::memory_extract::aux_call_permit().await;
-    complete(system, user).await
+    aux_complete_within(complete, system, user, AUX_TIMEOUT).await
+}
+
+async fn aux_complete_within(
+    complete: &crate::Complete,
+    system: String,
+    user: String,
+    limit: Duration,
+) -> anyhow::Result<jcode_provider_core::SimpleCompletion> {
+    let _permit = jcode_base::memory_extract::aux_call_permit_within(limit)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for the model slot (background work is using it)"))?;
+    tokio::time::timeout(limit, complete(system, user))
+        .await
+        .map_err(|_| anyhow::anyhow!("the model call timed out"))?
+}
+
+/// How long an aux call may wait for the shared permit, and then run.
+pub(crate) const AUX_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run synchronous SQLite work without stalling a tokio worker. Only a multi-thread runtime can
+/// hand the worker off; on a current-thread one (tests, the fallback thread) it just runs inline.
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// A short class for a rejected proposal. The error text quotes entry titles and contents, so the
+/// span records the class only.
+fn error_class(err: &anyhow::Error) -> &'static str {
+    let text = format!("{err:#}");
+    if text.contains("no durable lesson") {
+        "no_durable_lesson"
+    } else if text.contains("not valid JSON") {
+        "invalid_json"
+    } else if text.contains("exceeds the limit") {
+        "too_many_edits"
+    } else if text.contains("rejected:") {
+        "gate_rejected"
+    } else {
+        "store_error"
+    }
 }
 
 /// A `learning.*` span for one model call: its tokens, duration and error, if any.
@@ -210,13 +256,13 @@ async fn refine_approved(
     let mut instructions = approved_instructions(due.trigger, review);
     let mut attempt = 0;
     loop {
-        let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, Some(&instructions), false);
+        let (system, user) = blocking(|| sovereign_prime::refine::build_request(store, session, fresh, Some(&instructions), false));
         let started = crate::observability::now();
         let reply = aux_complete(complete, system, user).await;
         record(&reply, started);
         emit(call_span("learning.refine", session, due.trigger, &reply, started).attr("attempt", attempt as u64));
         let text = reply?.text;
-        let applied = sovereign_prime::refine::apply(store, session, &text, false, "auto");
+        let applied = blocking(|| sovereign_prime::refine::apply(store, session, &text, false, "auto"));
         let span = Span::new("learning.apply").session(session).attr("trigger", due.trigger.as_str());
         emit(match &applied {
             Ok(done) => span
@@ -226,7 +272,7 @@ async fn refine_approved(
                 .attr("created", done.created.len() as u64)
                 .attr("updated", done.updated.len() as u64)
                 .attr("deleted", done.deleted.len() as u64),
-            Err(err) => span.attr("approved", false).attr("rejected", format!("{err:#}")),
+            Err(err) => span.attr("approved", false).attr("created", 0u64).attr("updated", 0u64).attr("deleted", 0u64).attr("error_class", error_class(err)),
         });
         match applied {
             Err(err) if attempt == 0 && (format!("{err:#}").contains("no durable lesson") || format!("{err:#}").contains("not valid JSON")) => {
@@ -305,7 +351,7 @@ pub(crate) async fn pass(
     let mut refine_summary = None;
     if let Some(store) = &store {
         if let Ok(Some((instructions, global))) = store.take_pending_refine(session) {
-            let (system, user) = sovereign_prime::refine::build_request(store, session, &turns, instructions.as_deref(), global);
+            let (system, user) = blocking(|| sovereign_prime::refine::build_request(store, session, &turns, instructions.as_deref(), global));
             let started = crate::observability::now();
             let reply = aux_complete(&complete, system, user).await;
             conn.observer.record_aux(
@@ -313,7 +359,7 @@ pub(crate) async fn pass(
                 reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
             );
             refine_summary = match reply {
-                Ok(done) => match sovereign_prime::refine::apply(store, session, &done.text, global, "refine-tool") {
+                Ok(done) => match blocking(|| sovereign_prime::refine::apply(store, session, &done.text, global, "refine-tool")) {
                     Ok(outcome) => Some(outcome.summary),
                     Err(err) => Some(format!("no change ({err:#})")),
                 },
@@ -363,7 +409,7 @@ async fn checkpoint(
 ) -> anyhow::Result<Option<String>> {
     // The gate: one cheap call, always asked once the interval and cooldown allow it (the
     // caller in `rpc.rs` enforces both). No keyword pre-filter: Prime has none either.
-    let (gsystem, guser) = gate_request(store, session, due, fresh);
+    let (gsystem, guser) = blocking(|| gate_request(store, session, due, fresh));
     let started = crate::observability::now();
     let greply = aux_complete(complete, gsystem, guser).await;
     record("Auto-refine gate", &greply, started);
@@ -375,8 +421,10 @@ async fn checkpoint(
     emit(gate_span.attr("approved", review.should_refine));
     greply?;
     let judged = || -> anyhow::Result<()> {
-        store.set_watermark(session, raw_len)?;
-        store.learn_reviewed(session, crate::observability::now())
+        blocking(|| {
+            store.set_watermark(session, raw_len)?;
+            store.learn_reviewed(session, crate::observability::now())
+        })
     };
     if !review.should_refine {
         judged()?;
@@ -393,6 +441,28 @@ async fn checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn never() -> crate::Complete {
+        std::sync::Arc::new(|_s, _u| Box::pin(async { std::future::pending().await }))
+    }
+
+    #[tokio::test]
+    async fn a_busy_slot_or_a_hung_model_fails_the_aux_call_instead_of_queueing_forever() {
+        let hung = aux_complete_within(&never(), "s".into(), "u".into(), Duration::from_millis(50)).await.err().expect("fails");
+        assert!(hung.to_string().contains("timed out"), "{hung}");
+        let held = jcode_base::memory_extract::aux_call_permit().await;
+        let busy = aux_complete_within(&never(), "s".into(), "u".into(), Duration::from_millis(50)).await.err().expect("fails");
+        assert!(busy.to_string().contains("model slot"), "{busy}");
+        drop(held);
+    }
+
+    #[test]
+    fn the_apply_span_error_is_a_class_never_the_text_with_titles() {
+        let err = anyhow::anyhow!("rejected: edit for \"Secret client plan\" appears to contain a secret");
+        assert_eq!(error_class(&err), "gate_rejected");
+        assert_eq!(error_class(&anyhow::anyhow!("no durable lesson in this session")), "no_durable_lesson");
+        assert_eq!(error_class(&anyhow::anyhow!("the refine reply was not valid JSON")), "invalid_json");
+    }
 
     #[test]
     fn learning_is_on_by_default_and_config_set_persists_it() {
@@ -591,7 +661,9 @@ mod tests {
         let spans = spans.lock().unwrap();
         let apply = spans.iter().find(|s| s.kind == "learning.apply" && s.session_id.as_deref() == Some("memory-span")).expect("apply span");
         assert_eq!(apply.attributes["approved"], false);
-        assert!(apply.attributes["rejected"].as_str().unwrap().contains("memory extraction"));
+        assert_eq!(apply.attributes["error_class"], "gate_rejected");
+        assert!(apply.attributes.get("rejected").is_none(), "the span carries a class, not the error text");
+        assert_eq!(apply.attributes["created"], 0);
         std::fs::remove_dir_all(home).ok();
     }
 

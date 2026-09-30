@@ -1648,7 +1648,10 @@ impl Conn {
             // act on a database that has never seen these sessions.
             "session.close" => {
                 let id = sid()?;
-                self.learn_before_dispose(id).await;
+                // The due review runs in the background: closing never waits on a model call.
+                let conn = self.clone();
+                let review_id = id.to_string();
+                tokio::spawn(async move { conn.learn_before_dispose(&review_id).await });
                 let closed = self.links.lock().await.remove(id).is_some();
                 self.client.sessions.lock().await.remove(id);
                 Ok(json!({ "closed": closed }))
@@ -2348,13 +2351,9 @@ impl Conn {
                         );
                     }
                     let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
-                    let (system, user) = sovereign_prime::refine::build_request(
-                        &store,
-                        sid,
-                        &turns,
-                        instructions.as_deref(),
-                        global,
-                    );
+                    let (system, user) = crate::learn::blocking(|| {
+                        sovereign_prime::refine::build_request(&store, sid, &turns, instructions.as_deref(), global)
+                    });
                     let started = crate::observability::now();
                     let reply = crate::learn::aux_complete(&complete, system, user).await;
                     self.observer.record_aux(
@@ -2368,7 +2367,7 @@ impl Conn {
                         reply.as_ref().err().map(|err| err.to_string()).as_deref(),
                     );
                     let reply = reply?.text;
-                    match sovereign_prime::refine::apply(&store, sid, &reply, global, "refine") {
+                    match crate::learn::blocking(|| sovereign_prime::refine::apply(&store, sid, &reply, global, "refine")) {
                         Ok(outcome) => {
                             let mut text = format!(
                                 "Refined ({}): {}\n",
