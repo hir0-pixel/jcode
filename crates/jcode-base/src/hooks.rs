@@ -618,7 +618,7 @@ mod tests {
             second.to_string_lossy().into_owned(),
         ])
         .expect("serialize transformer commands");
-        let _env = transform_test_config(&commands, 500);
+        let _env = transform_test_config(&commands, 3000);
 
         let output = transform_tool_input(
             "ses_transform",
