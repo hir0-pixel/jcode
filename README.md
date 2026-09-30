@@ -835,12 +835,10 @@ Set up jcode on this machine for me.
      git clone https://github.com/1jehuang/jcode.git
      cd jcode
      cargo build --release
-     scripts/install_release.sh
 
    - For local self-dev / refactor work on Linux x86_64, prefer:
      scripts/dev_cargo.sh build --release -p jcode --bin jcode
      scripts/dev_cargo.sh --print-setup
-     scripts/install_release.sh
 
 2. Verify that `jcode` is on my `PATH`.
 3. Launch `jcode` once in a new terminal window/session to confirm it starts successfully.
@@ -934,11 +932,7 @@ working local linker setup (`clang + lld`) instead of assuming every machine's
 `mold` configuration is valid, and can print the active linker/cache setup via
 `--print-setup` so slow-path builds are easier to diagnose.
 
-Then symlink to your PATH:
-
-```bash
-scripts/install_release.sh
-```
+Then symlink `target/release/jcode` onto your PATH.
 
 ### Uninstall
 

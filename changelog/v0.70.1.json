@@ -1,8 +1,0 @@
-{
-  "version": "0.70.1",
-  "date": "2026-08-06",
-  "title": "Release validation follow-up",
-  "improvements": [
-    "The inline desktop model picker release now passes repository formatting validation"
-  ]
-}
