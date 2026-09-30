@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 /// path; skill hub and curator stay reachable through Hermes's REST routes and settings).
 pub(crate) const SESSION_BOUND: &[&str] = &[
     "moa", "focus", "retry", "steer", "undo", "snapshot", "snap", "compress", "compact",
-    "learn", "curator", "skills", "memory",
+    "curator", "skills", "memory",
 ];
 
 /// Commands the engine's own `harness_command` serves (first word of each pair).
@@ -79,7 +79,7 @@ mod tests {
             "skills": {}, "skill_count": 3,
         });
         let python = json!({
-            "pairs": [["/goal", "hermes goal"], ["/undo", "u"], ["/learn", "l"], ["/tools", "t"], ["/my-skill", "s"]],
+            "pairs": [["/goal", "hermes goal"], ["/undo", "u"], ["/learn", "l"], ["/plan", "p"], ["/init", "i"], ["/tools", "t"], ["/my-skill", "s"]],
             "categories": [{ "name": "Tools", "pairs": [["/tools", "t"], ["/undo", "u"]] }, { "name": "Empty", "pairs": [["/goal", "g"]] }],
             "sub": { "/tools": ["list"], "/undo": [] },
             "canon": { "/t": "/tools", "/goal": "/goal", "/undo": "/undo" },
@@ -88,12 +88,15 @@ mod tests {
         });
         let out = merge_catalog(engine, &python);
         let keys: Vec<&str> = out["pairs"].as_array().unwrap().iter().map(|p| p[0].as_str().unwrap()).collect();
-        assert_eq!(keys, ["/goal", "/refine status", "/tools", "/my-skill"]);
+        assert_eq!(keys, ["/goal", "/refine status", "/learn", "/plan", "/init", "/tools", "/my-skill"]);
         assert_eq!(out["pairs"][0][1], "engine goal");
         let cats: Vec<&str> = out["categories"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
         assert_eq!(cats, ["Harness", "Tools"]);
         assert_eq!(out["canon"], json!({ "/t": "/tools" }));
         assert_eq!(out["sub"], json!({ "/tools": ["list"] }));
+        for k in ["learn", "plan", "init"] {
+            assert!(!bound(k), "/{k} is a session-agnostic prompt builder and must stay forwardable");
+        }
         assert_eq!(out["skills"], json!({}), "the slash list matches the engine's skills");
         assert_eq!(out["skill_count"], 3);
     }
