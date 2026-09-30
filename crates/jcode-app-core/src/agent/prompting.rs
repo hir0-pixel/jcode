@@ -191,6 +191,17 @@ impl Agent {
         if std::env::var_os("SOVEREIGN_REPL_WORKER").is_none() {
             return;
         }
+        // Snapshot once per session: a note learned elsewhere must not change a
+        // running session's static prefix (it would break its prompt cache).
+        let cached = addenda_snapshots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.session.id)
+            .cloned();
+        if let Some(addenda) = cached {
+            push_addenda(split, &addenda);
+            return;
+        }
         let Ok(home) = jcode_base::storage::jcode_dir() else {
             return;
         };
@@ -207,15 +218,12 @@ impl Agent {
         if note_ids.iter().any(|id| !crate::memory::is_memory_injected(&self.session.id, id)) {
             crate::memory::mark_memories_known(&self.session.id, &note_ids, "static prompt prefix");
         }
-        let addenda = addenda.trim();
-        if addenda.is_empty() {
-            return;
-        }
-        if !split.static_part.is_empty() {
-            split.static_part.push_str("\n\n");
-        }
-        split.static_part.push_str("# Continual Harness\n\n");
-        split.static_part.push_str(addenda);
+        let addenda = addenda.trim().to_string();
+        addenda_snapshots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.session.id.clone(), addenda.clone());
+        push_addenda(split, &addenda);
     }
 
     fn append_repl_guidance(&self, split: &mut crate::prompt::SplitSystemPrompt) {
@@ -238,5 +246,38 @@ impl Agent {
         _memory_event_tx: Option<crate::memory::MemoryEventSink>,
     ) -> Option<crate::memory::PendingMemory> {
         self.build_memory_prompt_nonblocking_shared(messages.to_vec().into(), _memory_event_tx)
+    }
+}
+
+fn addenda_snapshots() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn push_addenda(split: &mut crate::prompt::SplitSystemPrompt, addenda: &str) {
+    if addenda.is_empty() {
+        return;
+    }
+    if !split.static_part.is_empty() {
+        split.static_part.push_str("\n\n");
+    }
+    split.static_part.push_str("# Continual Harness\n\n");
+    split.static_part.push_str(addenda);
+}
+
+#[cfg(test)]
+mod addenda_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_is_reused_and_not_refreshed() {
+        addenda_snapshots().lock().unwrap().insert("s-snap".into(), "rule A".into());
+        let mut split = crate::prompt::SplitSystemPrompt::default();
+        push_addenda(&mut split, "rule A");
+        assert!(split.static_part.ends_with("rule A"));
+        // a later insert for another session leaves this one untouched
+        addenda_snapshots().lock().unwrap().insert("other".into(), "rule B".into());
+        assert_eq!(addenda_snapshots().lock().unwrap()["s-snap"], "rule A");
     }
 }
