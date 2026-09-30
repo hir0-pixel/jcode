@@ -52,6 +52,7 @@ pub mod login_qr;
 pub mod mcp;
 pub mod memory;
 pub mod memory_agent;
+pub mod memory_expire;
 pub mod memory_extract;
 pub mod memory_graph;
 pub mod memory_recall;

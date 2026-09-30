@@ -78,7 +78,7 @@ fn reset(target: &str) -> Result<Value> {
 fn row(scope: &str, entry: &MemoryEntry) -> Value {
     json!({
         "scope": scope, "id": entry.id, "content": entry.content, "category": entry.category.to_string(),
-        "source": entry.source, "updated_at": entry.updated_at.timestamp(),
+        "source": entry.source, "active": entry.active, "updated_at": entry.updated_at.timestamp(),
     })
 }
 
@@ -143,6 +143,20 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request) -> Option<Resul
             let id = id.to_string();
             blocking(move || Ok(edit(&id, &text)?.then(|| json!({ "ok": true })))).await
         }
+        ("POST", ["entries", id, "expire"]) => {
+            let id = id.to_string();
+            let reason = body["reason"].as_str().unwrap_or_default().to_string();
+            blocking(move || {
+                let found = MemoryManager::new().expire(&id, &reason)?;
+                if found {
+                    jcode_base::obs_sink::emit(
+                        jcode_base::obs_sink::Span::new("memory.write").attr("action", "expired").attr("id", id.as_str()),
+                    );
+                }
+                Ok(found.then(|| json!({ "ok": true })))
+            })
+            .await
+        }
         ("DELETE", ["entries", id]) => {
             let id = id.to_string();
             blocking(move || Ok(forget(&id)?.then(|| json!({ "ok": true })))).await
@@ -165,6 +179,22 @@ pub(super) async fn route(stream: &mut TcpStream, req: &Request) -> Option<Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiring_a_memory_deactivates_it_and_records_why() {
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("memory-rest-expire-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: JCODE_HOME is only touched under ENV_LOCK.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        let id = add("deploys need two approvals", "fact", "test").unwrap();
+        assert!(MemoryManager::new().expire(&id, "policy changed").unwrap());
+        let entry = find(&id).expect("row is kept");
+        assert!(!entry.active);
+        assert!(entry.source.unwrap().contains("policy changed"));
+        assert!(!MemoryManager::new().expire("nope", "").unwrap());
+        forget(&id).unwrap();
+    }
 
     #[test]
     fn engine_memory_is_the_single_store_behind_the_screen() {

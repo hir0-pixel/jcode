@@ -105,10 +105,10 @@ impl Tool for MemoryTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "recall", "search", "list", "forget", "tag", "link", "related"],
+                    "enum": ["remember", "recall", "search", "list", "forget", "expire", "tag", "link", "related"],
                     "description": "Action."
                 },
-                "content": { "type": "string" },
+                "content": { "type": "string", "description": "For expire: why the memory is wrong or out of date." },
                 "category": {
                     "type": "string",
                     "enum": ["fact", "preference", "entity", "correction"]
@@ -333,6 +333,28 @@ impl Tool for MemoryTool {
                 memory::set_state(MemoryState::Idle);
                 if found {
                     Ok(ToolOutput::new(format!("Forgot: {}", id)))
+                } else {
+                    Ok(ToolOutput::new(format!("Not found: {}", id)))
+                }
+            }
+            "expire" | "mark_wrong" => {
+                let id = input.id.ok_or_else(|| anyhow::anyhow!("id required"))?;
+                let reason = input.content.unwrap_or_default();
+                memory::set_state(MemoryState::ToolAction {
+                    action: "expire".into(),
+                    detail: truncate_for_widget(&id, 30),
+                });
+                let found = manager.expire(&id, &reason)?;
+                jcode_base::obs_sink::emit(
+                    jcode_base::obs_sink::Span::new("memory.write")
+                        .session(&session_id)
+                        .attr("action", "expired")
+                        .attr("id", id.as_str())
+                        .attr("found", found),
+                );
+                memory::set_state(MemoryState::Idle);
+                if found {
+                    Ok(ToolOutput::new(format!("Expired (no longer recalled): {}", id)))
                 } else {
                     Ok(ToolOutput::new(format!("Not found: {}", id)))
                 }
@@ -680,6 +702,41 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.output.matches("\n  id: ").count(), 2);
         assert!(!remaining.output.contains("global gamma"));
+    }
+
+    #[tokio::test]
+    async fn expired_memory_stops_being_recalled() {
+        let _guard = crate::storage::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _env = OfflineEnv::new(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new();
+        let ctx = || test_ctx(Some(project.path().to_path_buf()));
+        let remembered = tool
+            .execute(
+                json!({"action":"remember", "content":"the staging deploy needs two approvals", "scope":"project"}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        let id = remembered
+            .output
+            .rsplit_once("[id: ")
+            .map(|(_, tail)| tail.trim_end_matches(']').to_string())
+            .expect("remember returned an ID");
+        let recall = json!({"action":"recall", "query":"staging deploy approvals", "scope":"project"});
+        assert!(tool.execute(recall.clone(), ctx()).await.unwrap().output.contains("two approvals"));
+
+        let out = tool
+            .execute(json!({"action":"expire", "id": id, "content":"policy changed"}), ctx())
+            .await
+            .unwrap();
+        assert!(out.output.starts_with("Expired"), "{}", out.output);
+        let after = tool.execute(recall, ctx()).await.unwrap();
+        assert!(!after.output.contains("two approvals"), "{}", after.output);
+
+        let missing = tool.execute(json!({"action":"expire", "id":"nope"}), ctx()).await.unwrap();
+        assert!(missing.output.starts_with("Not found"));
     }
 
     /// Issue #491 regression: project-scoped remember followed by list must
