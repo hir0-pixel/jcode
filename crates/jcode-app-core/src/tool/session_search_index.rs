@@ -213,14 +213,9 @@ impl TokenHashIndex {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Approximate resident bytes of this index (entries + filter bits +
