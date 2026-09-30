@@ -280,6 +280,16 @@ fn unload_ollama_from_warm_file() {
     let Some(model) = meta.get("model").and_then(|v| v.as_str()) else {
         return;
     };
+    // Only the process that warmed the model releases it: any other `sovereign` run (a CLI call,
+    // a second serve, a bad argument) would otherwise evict a model someone else is serving.
+    if meta.get("pid").and_then(|v| v.as_u64()) != Some(u64::from(std::process::id())) {
+        return;
+    }
+    // A keep_alive=0 request for a model that is not resident makes Ollama load it first.
+    if !ollama_has_loaded(model) {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
     let body = serde_json::json!({ "model": model, "keep_alive": 0 }).to_string();
     let _ = std::process::Command::new("curl")
         .args([
@@ -296,6 +306,20 @@ fn unload_ollama_from_warm_file() {
     let _ = std::fs::remove_file(path);
     eprintln!("sovereign: unloaded Ollama {model}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+fn ollama_has_loaded(model: &str) -> bool {
+    let Ok(out) = std::process::Command::new("curl")
+        .args(["-s", "-m", "3", "http://127.0.0.1:11434/api/ps"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v["models"].as_array().cloned())
+        .is_some_and(|models| models.iter().any(|m| m["name"] == model || m["model"] == model))
 }
 
 fn install_ollama_signal_unload() {

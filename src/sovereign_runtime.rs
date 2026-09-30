@@ -738,7 +738,7 @@ async fn warm_ollama_serving_context(base_model: &str) -> Option<String> {
             );
             if let Ok(home) = crate::storage::jcode_dir() {
                 let meta =
-                    serde_json::json!({ "model": alias, "base": base_model, "num_ctx": num_ctx });
+                    serde_json::json!({ "model": alias, "base": base_model, "num_ctx": num_ctx, "pid": std::process::id() });
                 let _ =
                     write_private_file(&home.join("sovereign-ollama-warm.json"), &meta.to_string());
             }
