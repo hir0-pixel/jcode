@@ -185,6 +185,8 @@ impl Gateway {
             &config.model,
             Some(alert_tx),
         )?;
+        let span_observer = observer.clone();
+        jcode_base::obs_sink::install(move |span| span_observer.span(span));
         let hub = Arc::new(approvals::Hub::default());
         hub.set_observer(observer.clone());
         hub.set_store(store).await;
@@ -1101,6 +1103,15 @@ async fn handle(
             let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
             let days = query_u64(&req, "days").unwrap_or(7).clamp(1, 90);
             let result = tokio::task::spawn_blocking(move || observer.view(&view, limit, days)).await?;
+            match result {
+                Ok(body) => respond(&mut stream, "200 OK", &body).await,
+                Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,
+            }
+        }
+        ("GET", "/api/sovereign/observability/memory") => {
+            let limit = query_u64(&req, "limit").unwrap_or(50).clamp(1, 200);
+            let session = auth::query_param(req.query.as_deref().unwrap_or_default(), "session").filter(|s| !s.is_empty());
+            let result = tokio::task::spawn_blocking(move || observer.memory(session.as_deref(), limit)).await?;
             match result {
                 Ok(body) => respond(&mut stream, "200 OK", &body).await,
                 Err(err) => respond(&mut stream, "503 Service Unavailable", &json!({"detail":err.to_string()})).await,

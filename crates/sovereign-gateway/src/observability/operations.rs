@@ -355,6 +355,44 @@ pub fn list_memory_deletions(db: &Connection, limit: u64) -> rusqlite::Result<Va
     Ok(json!({ "deletions": rows }))
 }
 
+/// Recent `memory.*` / `learning.*` spans, newest first, with write counts by outcome
+/// (`inserted`, `reinforced`, `merged`, ...) over the same filter. Attributes hold ids and counts only.
+pub fn list_memory_spans(db: &Connection, session: Option<&str>, limit: u64) -> rusqlite::Result<Value> {
+    let mut stmt = db.prepare(
+        "SELECT s.id,r.session_id,s.kind,s.status,s.started_at_ms,s.ended_at_ms,s.input_tokens,s.output_tokens,s.error,s.attributes
+         FROM spans s JOIN fact_turn r ON r.id = s.run_id
+         WHERE (s.kind LIKE 'memory.%' OR s.kind LIKE 'learning.%') AND (?1 IS NULL OR r.session_id = ?1)
+         ORDER BY s.started_at_ms DESC, s.id DESC LIMIT ?2",
+    )?;
+    let spans = stmt
+        .query_map(rusqlite::params![session, limit.min(500)], |r| {
+            let attributes: String = r.get(9)?;
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "session_id": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "started_at_ms": r.get::<_, i64>(4)?,
+                "ended_at_ms": r.get::<_, Option<i64>>(5)?,
+                "input_tokens": r.get::<_, i64>(6)?,
+                "output_tokens": r.get::<_, i64>(7)?,
+                "error": r.get::<_, Option<String>>(8)?,
+                "attributes": serde_json::from_str::<Value>(&attributes).unwrap_or(Value::Null),
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stmt = db.prepare(
+        "SELECT COALESCE(json_extract(s.attributes,'$.outcome'), json_extract(s.attributes,'$.action'), 'unknown'), COUNT(*)
+         FROM spans s JOIN fact_turn r ON r.id = s.run_id WHERE s.kind = 'memory.write' AND (?1 IS NULL OR r.session_id = ?1) GROUP BY 1",
+    )?;
+    let mut counts = serde_json::Map::new();
+    for row in stmt.query_map([session], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (action, n) = row?;
+        counts.insert(action, json!(n));
+    }
+    Ok(json!({ "spans": spans, "counts": counts }))
+}
+
 /// evestack's sessions list: one row per session (its top-level turns), with
 /// the rollup evestack's listSessions computes. The LIMIT applies to the
 /// session ids first, using `fact_turn_session`, before any per-session work.

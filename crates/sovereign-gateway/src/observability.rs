@@ -5,7 +5,7 @@ mod operations;
 mod schema;
 
 use operations::{
-    apply_run_end_flags, budget_status, evaluate_alerts, list_alerts, list_approvals, list_filtered, list_memory_deletions, list_sessions, facts,
+    apply_run_end_flags, budget_status, evaluate_alerts, list_alerts, list_approvals, list_filtered, list_memory_deletions, list_memory_spans, list_sessions, facts,
     monitors, promote_run, turn_index, window_ms, write_approval,
 };
 use rusqlite::{Connection, params};
@@ -108,6 +108,19 @@ enum Op {
         status: String,
         error: Option<String>,
         at: i64,
+    },
+    /// A finished memory or learning step (`jcode_base::obs_sink`): one closed span, ids and counts only.
+    Span {
+        id: String,
+        run: String,
+        root: String,
+        kind: &'static str,
+        error: Option<String>,
+        attributes: Value,
+        input: u64,
+        output: u64,
+        started: i64,
+        ended: i64,
     },
     Usage {
         run: String,
@@ -410,6 +423,38 @@ impl Observer {
             },
             false,
         );
+    }
+
+    /// Record a memory/learning span on the session's active run, else on a fresh aux run
+    /// (`memory` or `learning`, by the span's kind prefix).
+    pub fn span(&self, span: jcode_base::obs_sink::Span) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let session = span.session_id.clone().unwrap_or_default();
+        let ended = now();
+        let started = ended - span.duration_ms as i64;
+        let id = format!("{session}:span:{ended}:{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let error = span.error.as_deref().map(capped);
+        let (run, root) = match self.active_run_id(&session) {
+            Some(run) => {
+                let root = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&session).and_then(|a| a.root.clone()).unwrap_or_else(|| run.clone());
+                (run, root)
+            }
+            None => {
+                let kind = if span.kind.starts_with("learning") { "learning" } else { "memory" };
+                let (provider, model) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).get("").map(|s| (s.provider.clone(), s.model.clone())).unwrap_or_default();
+                let run = format!("{id}:run");
+                self.send(Op::RunStart { id: run.clone(), session: session.clone(), parent: None, root: run.clone(), kind, title: Some(span.kind.into()), model, provider, status: "running", at: started }, false);
+                self.send(Op::RunEnd { id: run.clone(), status: if error.is_some() { "error" } else { "complete" }.into(), error: error.clone(), at: ended, model_calls: 0 }, false);
+                (run.clone(), run)
+            }
+        };
+        self.send(Op::Span { id, run, root, kind: span.kind, error, attributes: span.attributes, input: span.input_tokens, output: span.output_tokens, started, ended }, false);
+    }
+
+    /// Recent `memory.*` and `learning.*` spans (optionally one session) plus write counts by outcome.
+    pub fn memory(&self, session: Option<&str>, limit: u64) -> rusqlite::Result<Value> {
+        let db = self.read_db.lock().unwrap_or_else(|e| e.into_inner());
+        list_memory_spans(&db, session, limit)
     }
 
     pub fn event(&self, session: &str, ty: &str, payload: &Value) {
@@ -1099,6 +1144,10 @@ fn write_batch(db: &mut Connection, batch: Vec<Op>) -> rusqlite::Result<()> {
                     params![id, status, error, at],
                 )?;
             }
+            Op::Span { id, run, root, kind, error, attributes, input, output, started, ended } => {
+                let status = if error.is_some() { "error" } else { "complete" };
+                tx.execute("INSERT OR IGNORE INTO spans(id,run_id,parent_id,root_id,kind,name,status,started_at_ms,ended_at_ms,input_tokens,output_tokens,error,attributes) VALUES(?1,?2,?2,?3,?4,?4,?5,?6,?7,?8,?9,?10,?11)", params![id,run,root,kind,status,started,ended,input,output,error,attributes.to_string()])?;
+            }
             Op::Usage {
                 run,
                 span,
@@ -1413,6 +1462,39 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(!truncated);
         drop(observer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn memory_spans_land_on_the_active_run_or_an_aux_run_without_content() {
+        use jcode_base::obs_sink::Span;
+        let dir = std::env::temp_dir().join(format!("sovereign-memory-spans-{}", now()));
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        let run = observer.start_turn("s1", "hello", "invoke_agent", None);
+        observer.span(Span::new("memory.write").session("s1").attr("action", "merged").attr("id", "m1").took_ms(7));
+        observer.span(Span::new("memory.write").session("s1").attr("action", "inserted").attr("id", "m2"));
+        observer.span(Span::new("learning.gate").session("s2").attr("approved", false).error("boom").tokens(3, 4));
+        let mut body = Value::Null;
+        for _ in 0..100 {
+            body = observer.memory(None, 10).unwrap();
+            if body["spans"].as_array().unwrap().len() == 3 { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let spans = body["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 3, "{body}");
+        assert_eq!(body["counts"]["merged"], 1);
+        assert_eq!(body["counts"]["inserted"], 1);
+        let db = Connection::open(dir.join("sovereign.db")).unwrap();
+        let on_run: i64 = db.query_row("SELECT COUNT(*) FROM spans WHERE run_id=?1 AND kind='memory.write' AND name='memory.write'", [&run], |r| r.get(0)).unwrap();
+        assert_eq!(on_run, 2, "spans join the session's active run");
+        let (kind, status, error, input): (String, String, String, i64) = db
+            .query_row("SELECT r.kind,s.status,s.error,s.input_tokens FROM spans s JOIN fact_turn r ON r.id=s.run_id WHERE s.kind='learning.gate'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap();
+        assert_eq!((kind.as_str(), status.as_str(), error.as_str(), input), ("learning", "error", "boom", 3), "no active run: aux learning run");
+        let only_s2 = observer.memory(Some("s2"), 10).unwrap();
+        assert_eq!(only_s2["spans"].as_array().unwrap().len(), 1);
+        assert_eq!(only_s2["spans"][0]["attributes"]["approved"], false);
+        drop((observer, db));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
