@@ -42,21 +42,21 @@ pub fn recall_local_now(
             .attr("suppressed", recall.suppressed),
     );
     let relevant = recall.entries;
-    let Some(prompt) = memory::format_relevant_prompt(&relevant, 5) else {
+    let Some((prompt, kept_ids)) = crate::memory_types::format_relevant_prompt_with_ids(&relevant, 5) else {
         return;
     };
-    obs_sink::emit(
-        Span::new("memory.inject")
-            .session(session_id)
-            .attr("ids", ids(&relevant))
-            .attr("chars", prompt.chars().count()),
-    );
-    let display = memory::format_relevant_display_prompt(&relevant, 5);
+    // Only the memories that fit the injection budget are published (and later marked injected);
+    // the `memory.inject` span is emitted when the payload is actually taken.
+    let kept: Vec<memory::MemoryEntry> = kept_ids
+        .iter()
+        .filter_map(|id| relevant.iter().find(|e| &e.id == id).cloned())
+        .collect();
+    let display = memory::format_relevant_display_prompt(&kept, kept.len());
     memory::set_pending_memory_for_project_with_selection(
         session_id,
         prompt,
-        relevant.len(),
-        &relevant,
+        kept.len(),
+        &kept,
         display,
         working_dir,
     );

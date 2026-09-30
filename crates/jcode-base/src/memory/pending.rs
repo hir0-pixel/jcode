@@ -283,6 +283,12 @@ fn take_pending_memory_inner(
 
     if !pending.memory_ids.is_empty() {
         mark_memories_injected(session_id, &pending.memory_ids);
+        crate::obs_sink::emit(
+            crate::obs_sink::Span::new("memory.inject")
+                .session(session_id)
+                .attr("ids", pending.memory_ids.clone())
+                .attr("chars", pending.prompt.chars().count()),
+        );
     }
 
 
@@ -766,6 +772,23 @@ mod scoped_tests {
             publish("switch", Some("/project/b"), std::slice::from_ref(&entry));
             assert!(take_pending_memory_for_project("switch", Some("/project/b")).is_some());
             assert!(is_memory_injected("switch", &entry.id));
+        });
+    }
+
+    #[test]
+    fn memories_cut_by_the_budget_are_published_and_marked_injected_only_if_kept() {
+        fixture(|| {
+            let long = "a long memory ".repeat(80);
+            let entries: Vec<MemoryEntry> = (0..10).map(|i| fact(&format!("{i} {long}"))).collect();
+            save(Some("/project/a"), false, &entries);
+            let (prompt, kept_ids) = crate::memory_types::format_relevant_prompt_with_ids(&entries, 10).unwrap();
+            assert!(kept_ids.len() < entries.len());
+            let kept: Vec<MemoryEntry> = entries[..kept_ids.len()].to_vec();
+            set_pending_memory_for_project_with_selection("cut", prompt, kept.len(), &kept, None, Some("/project/a"));
+            let taken = take_pending_memory_for_project("cut", Some("/project/a")).expect("kept payload publishes");
+            assert_eq!(taken.memory_ids, kept_ids);
+            assert!(is_memory_injected("cut", &kept[0].id));
+            assert!(!is_memory_injected("cut", &entries[9].id), "a memory cut by the cap is not injected");
         });
     }
 

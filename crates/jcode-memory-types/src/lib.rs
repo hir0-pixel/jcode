@@ -659,15 +659,22 @@ fn selected_entries_for_prompt(entries: &[MemoryEntry], limit: usize) -> Vec<&Me
 }
 
 pub fn format_entries_for_prompt(entries: &[MemoryEntry], limit: usize) -> Option<String> {
-    format_entries_for_prompt_with_header(entries, limit, false, false)
+    format_entries_for_prompt_with_header(entries, limit, false, false).map(|(text, _)| text)
 }
 
 pub fn format_relevant_prompt(entries: &[MemoryEntry], limit: usize) -> Option<String> {
-    format_entries_for_prompt(entries, limit).map(|formatted| format!("# Memory\n\n{formatted}"))
+    format_relevant_prompt_with_ids(entries, limit).map(|(prompt, _)| prompt)
+}
+
+/// The injected prompt plus the ids of the entries that actually made it into the text (the
+/// character budget can drop the lowest-ranked ones; those must not be marked injected).
+pub fn format_relevant_prompt_with_ids(entries: &[MemoryEntry], limit: usize) -> Option<(String, Vec<String>)> {
+    format_entries_for_prompt_with_header(entries, limit, false, false)
+        .map(|(formatted, ids)| (format!("# Memory\n\n{formatted}"), ids))
 }
 
 pub fn format_relevant_display_prompt(entries: &[MemoryEntry], limit: usize) -> Option<String> {
-    format_entries_for_prompt_with_header(entries, limit, true, true)
+    format_entries_for_prompt_with_header(entries, limit, true, true).map(|(text, _)| text)
 }
 
 fn format_entries_for_prompt_with_header(
@@ -675,7 +682,7 @@ fn format_entries_for_prompt_with_header(
     limit: usize,
     include_header: bool,
     include_updated_at_comments: bool,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     let mut selected = selected_entries_for_prompt(entries, limit);
     loop {
         let rendered = render_entries(&selected, include_header, include_updated_at_comments);
@@ -684,7 +691,8 @@ fn format_entries_for_prompt_with_header(
                 // Over the injection budget: drop the lowest-ranked entry and render again.
                 selected.pop();
             }
-            other => return other,
+            Some(text) => return Some((text, selected.iter().map(|e| e.id.clone()).collect())),
+            None => return None,
         }
     }
 }
@@ -1057,5 +1065,10 @@ mod injection_cap_tests {
         assert!(block.chars().count() <= MAX_MEMORY_BLOCK_CHARS, "{}", block.chars().count());
         assert!(block.contains("0 a long"), "the best-ranked entry survives");
         assert!(!block.contains("9 a long"), "the lowest-ranked entries are dropped first");
+        let (with_ids, kept) = format_relevant_prompt_with_ids(&entries, 10).unwrap();
+        assert_eq!(with_ids, block);
+        assert!(kept.len() < entries.len() && !kept.is_empty(), "cut memories are not reported as kept");
+        assert_eq!(kept, entries[..kept.len()].iter().map(|e| e.id.clone()).collect::<Vec<_>>());
+        assert!(kept.iter().all(|id| block.contains(&entries.iter().find(|e| &e.id == id).unwrap().content[..3])));
     }
 }
