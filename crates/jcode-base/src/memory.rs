@@ -235,6 +235,11 @@ impl MemoryManager {
     }
 
     /// `project:<hash of the project dir>` (the old JSON file's name), if any.
+    ///
+    /// The hash is `DefaultHasher` (see `learned::project_scope`), whose algorithm std does not
+    /// promise to keep across Rust releases. A change would orphan every project scope, and it cannot
+    /// be migrated: only the hash is stored, never the directory. `project_scope_hash_is_pinned`
+    /// fails if a toolchain bump changes it; the fix then is to keep the old algorithm inline.
     fn project_scope(&self) -> Option<String> {
         if self.test_mode {
             return Some("project:test".to_string());
@@ -878,21 +883,75 @@ impl MemoryManager {
         Ok(all)
     }
 
+    /// The database for a single-row edit, with the old JSON graphs imported first.
+    fn store_db(&self) -> Result<PathBuf> {
+        let db = self.db_path()?;
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        Ok(db)
+    }
+
+    /// `global` plus this manager's project scope: where its own `forget` and `tag` look.
+    fn own_scopes(&self) -> Vec<String> {
+        let mut scopes: Vec<String> = self.project_scope().into_iter().collect();
+        scopes.push("global".to_string());
+        scopes
+    }
+
+    /// Edit one memory in `scopes` (every scope when `None`) with a single-row write: never a
+    /// whole-graph save, which would delete a concurrent writer's fresh rows. `Ok(false)` when the
+    /// id is unknown; an error for a learned entry (managed through learning).
+    pub(crate) fn edit_one(&self, id: &str, scopes: Option<&[String]>, edit: impl FnOnce(&mut MemoryGraph)) -> Result<bool> {
+        let db = self.store_db()?;
+        let scope = crate::memory_store::update_memory(&db, id, scopes, edit)?;
+        if let Some(scope) = &scope {
+            forget_graph(&format!("{}#{scope}", db.display()));
+        }
+        Ok(scope.is_some())
+    }
+
+    /// Forget `id` from this manager's project or global scope.
     pub fn forget(&self, id: &str) -> Result<bool> {
-        // Try graph-based removal first (new format)
-        let mut project_graph = self.load_project_graph()?;
-        if project_graph.remove_memory(id).is_some() {
-            self.save_project_graph(&project_graph)?;
-            return Ok(true);
-        }
+        self.forget_in(id, Some(&self.own_scopes()))
+    }
 
-        let mut global_graph = self.load_global_graph()?;
-        if global_graph.remove_memory(id).is_some() {
-            self.save_global_graph(&global_graph)?;
-            return Ok(true);
-        }
+    /// Forget `id` from whichever scope holds it (the maintenance screen acts on all scopes).
+    pub fn forget_anywhere(&self, id: &str) -> Result<bool> {
+        self.forget_in(id, None)
+    }
 
-        Ok(false)
+    fn forget_in(&self, id: &str, scopes: Option<&[String]>) -> Result<bool> {
+        let db = self.store_db()?;
+        let scope = crate::memory_store::delete_memory(&db, id, scopes)?;
+        if let Some(scope) = &scope {
+            forget_graph(&format!("{}#{scope}", db.display()));
+        }
+        Ok(scope.is_some())
+    }
+
+    /// Replace one memory's text in any scope; its embedding is cleared (stale for the new text,
+    /// recomputed by backfill). `Ok(false)` when the id is unknown.
+    pub fn edit_content(&self, id: &str, content: &str) -> Result<bool> {
+        self.edit_one(id, None, |graph| {
+            if let Some(memory) = graph.get_memory_mut(id) {
+                memory.content = content.to_string();
+                memory.updated_at = chrono::Utc::now();
+                memory.embedding = None;
+                memory.refresh_search_text();
+            }
+        })
+    }
+
+    /// Forget every non-learned memory in every scope: `only_preferences` `Some(true)` for
+    /// preferences, `Some(false)` for everything else, `None` for all. Returns the ids forgotten.
+    pub fn reset_all(&self, only_preferences: Option<bool>) -> Result<Vec<String>> {
+        let db = self.store_db()?;
+        let (deleted, scopes) = crate::memory_store::reset_memories(&db, only_preferences)?;
+        for scope in scopes {
+            forget_graph(&format!("{}#{scope}", db.display()));
+        }
+        Ok(deleted)
     }
 
     // === Async Memory Checking ===
@@ -1047,21 +1106,11 @@ impl MemoryManager {
 
     /// Add a tag to a memory
     pub fn tag_memory(&self, memory_id: &str, tag: &str) -> Result<()> {
-        // Try project first
-        let mut graph = self.load_project_graph()?;
-        if graph.memories.contains_key(memory_id) {
-            graph.tag_memory(memory_id, tag);
-            return self.save_project_graph(&graph);
+        if self.edit_one(memory_id, Some(&self.own_scopes()), |graph| graph.tag_memory(memory_id, tag))? {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Memory not found: {}", memory_id))
         }
-
-        // Try global
-        let mut graph = self.load_global_graph()?;
-        if graph.memories.contains_key(memory_id) {
-            graph.tag_memory(memory_id, tag);
-            return self.save_global_graph(&graph);
-        }
-
-        Err(anyhow::anyhow!("Memory not found: {}", memory_id))
     }
 
     /// Link two memories with a RelatesTo edge
@@ -1308,6 +1357,13 @@ impl Default for MemoryManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Drop `extracted_through:<session>` from the database at `db` (a forgotten session's extraction
+/// bookkeeping). Meant for the code that deletes a session's learned entries
+/// (`sovereign-prime/src/entries.rs` `forget_session`); not yet called from there.
+pub fn forget_session_meta(db: &std::path::Path, session: &str) -> Result<usize> {
+    crate::memory_store::forget_session_meta(db, session)
 }
 
 #[cfg(test)]

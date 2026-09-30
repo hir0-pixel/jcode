@@ -6,11 +6,11 @@ use crate::memory::MemoryManager;
 use anyhow::Result;
 
 impl MemoryManager {
-    /// Deactivate `id` in whichever scope holds it. `Ok(false)` when the id is unknown.
+    /// Deactivate `id` in whichever scope holds it, writing only that row. `Ok(false)` when the id is unknown.
     pub fn expire(&self, id: &str, reason: &str) -> Result<bool> {
-        for (scope, mut graph) in self.every_scope_graph()? {
+        self.edit_one(id, None, |graph| {
             let Some(memory) = graph.get_memory_mut(id) else {
-                continue;
+                return;
             };
             let previous = memory.source.take().unwrap_or_default();
             let reason = reason.trim();
@@ -23,9 +23,6 @@ impl MemoryManager {
             memory.active = false;
             memory.superseded_by = None;
             memory.updated_at = chrono::Utc::now();
-            self.save_graph_for_scope(&scope, &graph)?;
-            return Ok(true);
-        }
-        Ok(false)
+        })
     }
 }

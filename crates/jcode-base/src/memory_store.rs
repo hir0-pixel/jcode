@@ -383,18 +383,20 @@ fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remember
         }
         let outcome = if let Some((rid, mut existing)) = dup {
             existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
+            cap_reinforcements(&mut existing);
             let (json, embedding) = split_embedding(&existing)?;
             tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
             Remembered::Reinforced(existing.id)
         } else if let Some((rid, mut survivor, score)) = best_match(&tx, scope, &entry)? {
             survivor.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
+            cap_reinforcements(&mut survivor);
             if trust_rank(&entry.trust) > trust_rank(&survivor.trust) {
                 survivor.trust = entry.trust.clone();
             }
             if wanted.len() > survivor.content.trim().len() {
                 // Keep the old wording, inactive, so the merge can be reversed.
                 let mut old = survivor.clone();
-                old.id = format!("{}~was{}", survivor.id, survivor.reinforcements.len());
+                old.id = format!("{}~was{}", survivor.id, survivor.strength);
                 old.tags.clear();
                 old.reinforcements.clear();
                 old.supersede(&survivor.id);
@@ -406,6 +408,13 @@ fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remember
                 )?;
                 let (json, embedding) = split_embedding(&old)?;
                 tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![old_rid, json, embedding])?;
+                // Keep only the newest few old wordings of this survivor.
+                tx.execute(
+                    "DELETE FROM memories WHERE rid IN (
+                         SELECT rid FROM memories WHERE scope=?1 AND active=0 AND substr(id, 1, ?2) = ?3
+                         ORDER BY rid DESC LIMIT -1 OFFSET ?4)",
+                    params![scope, (survivor.id.chars().count() + 4) as i64, format!("{}~was", survivor.id), MAX_WAS_ROWS],
+                )?;
                 survivor.content = wanted.clone();
                 survivor.set_embedding(None, None);
                 survivor.refresh_search_text();
@@ -517,6 +526,139 @@ fn save_shape(tx: &Connection, scope: &str, graph: &MemoryGraph) -> Result<()> {
         params![scope, serde_json::to_string(&shape)?],
     )?;
     Ok(())
+}
+
+/// `extracted_through:<session>` bookkeeping lives in `memory_meta`; once a session is forgotten its
+/// key is dead weight. Callers that delete a session (Prime's `forget_session` in
+/// `sovereign-prime/src/entries.rs`, through `jcode_base::memory::forget_session_meta`) drop it here.
+pub(crate) fn forget_session_meta(path: &Path, session: &str) -> Result<usize> {
+    with_db(path, |db| Ok(db.execute("DELETE FROM memory_meta WHERE key=?1", [format!("extracted_through:{session}")])?))
+}
+
+/// Newest reinforcement breadcrumbs kept per memory; `strength` still counts them all.
+const MAX_REINFORCEMENTS: usize = 20;
+/// Inactive `~was` rows kept per survivor (the wordings a merge replaced, newest first).
+const MAX_WAS_ROWS: i64 = 3;
+
+fn cap_reinforcements(entry: &mut MemoryEntry) {
+    let extra = entry.reinforcements.len().saturating_sub(MAX_REINFORCEMENTS);
+    entry.reinforcements.drain(..extra);
+}
+
+/// One stored memory, found by id for a single-row edit.
+struct Found {
+    rid: i64,
+    scope: String,
+    entry: MemoryEntry,
+}
+
+/// The row with this id (optionally limited to `scopes`), for a single-row edit.
+fn find_row(tx: &Connection, id: &str, scopes: Option<&[String]>) -> Result<Option<Found>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT m.rid, m.scope, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid WHERE m.id = ?1 ORDER BY m.rid",
+    )?;
+    let rows = stmt.query_map([id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<Vec<u8>>>(3)?))
+    })?;
+    for row in rows {
+        let (rid, scope, json, embedding) = row?;
+        if scopes.is_some_and(|s| !s.contains(&scope)) {
+            continue;
+        }
+        let entry = join_embedding(&json, embedding)?;
+        return Ok(Some(Found { rid, scope, entry }));
+    }
+    Ok(None)
+}
+
+/// Delete one memory row (and its edges in the scope's graph shape) without touching any other row;
+/// returns its scope, or `None` if no such memory. The `memories` delete trigger writes the audit row.
+pub(crate) fn delete_memory(path: &Path, id: &str, scopes: Option<&[String]>) -> Result<Option<String>> {
+    with_db(path, |db| {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(Found { rid, scope, .. }) = find_row(&tx, id, scopes)? else {
+            return Ok(None);
+        };
+        let mut graph = stored_shape(&tx, &scope)?;
+        graph.remove_memory(id);
+        tx.execute("DELETE FROM memories WHERE rid=?1", [rid])?;
+        save_shape(&tx, &scope, &graph)?;
+        tx.commit()?;
+        Ok(Some(scope))
+    })
+}
+
+/// Edit one memory in place: `edit` sees it inside its scope's graph shape (so tag and edge
+/// bookkeeping stays right) and only that row and the shape are written, so a concurrent writer's
+/// rows are never rewritten or deleted. The embedding is kept unless `edit` clears it. Returns the
+/// scope, or `None` if no such memory.
+pub(crate) fn update_memory(
+    path: &Path,
+    id: &str,
+    scopes: Option<&[String]>,
+    edit: impl FnOnce(&mut MemoryGraph),
+) -> Result<Option<String>> {
+    with_db(path, |db| {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let Some(Found { rid, scope, entry }) = find_row(&tx, id, scopes)? else {
+            return Ok(None);
+        };
+        let mut graph = stored_shape(&tx, &scope)?;
+        graph.memories.insert(id.to_string(), entry);
+        edit(&mut graph);
+        let mut entry = graph.memories[id].clone();
+        cap_reinforcements(&mut entry);
+        tx.execute(
+            "UPDATE memories SET active=?1, content=?2, tags=?3 WHERE rid=?4",
+            params![entry.active, entry.content, entry.tags.join(" "), rid],
+        )?;
+        let (json, embedding) = split_embedding(&entry)?;
+        tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+        save_shape(&tx, &scope, &graph)?;
+        tx.commit()?;
+        Ok(Some(scope))
+    })
+}
+
+/// Forget every non-learned memory in every scope: only preferences (`Some(true)`), everything but
+/// preferences (`Some(false)`) or all (`None`). One scoped DELETE per scope; returns the ids and
+/// the scopes touched. Learned entries are never matched: they are reset only through Prime.
+pub(crate) fn reset_memories(path: &Path, only_preferences: Option<bool>) -> Result<(Vec<String>, Vec<String>)> {
+    let learned = crate::memory_types::MemoryCategory::LEARNED.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(",");
+    let kind = match only_preferences {
+        Some(true) => " AND json_extract(e.entry, '$.category') = 'preference'",
+        Some(false) => " AND json_extract(e.entry, '$.category') IS NOT 'preference'",
+        None => "",
+    };
+    let delete = format!(
+        "DELETE FROM memories WHERE scope=?1 AND rid IN (
+             SELECT m.rid FROM memories m JOIN memory_entries e ON e.rid = m.rid
+             WHERE m.scope=?1 AND COALESCE(json_extract(e.entry, '$.category.custom'), '') NOT IN ({learned}){kind}
+         ) RETURNING id"
+    );
+    with_db(path, |db| {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let scopes: Vec<String> = tx
+            .prepare("SELECT DISTINCT scope FROM memories")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let (mut deleted, mut touched) = (Vec::new(), Vec::new());
+        for scope in scopes {
+            let ids: Vec<String> = tx.prepare(&delete)?.query_map([&scope], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            if ids.is_empty() {
+                continue;
+            }
+            let mut graph = stored_shape(&tx, &scope)?;
+            for id in &ids {
+                graph.remove_memory(id);
+            }
+            save_shape(&tx, &scope, &graph)?;
+            deleted.extend(ids);
+            touched.push(scope);
+        }
+        tx.commit()?;
+        Ok((deleted, touched))
+    })
 }
 
 /// Make sure `scope` has a graph row (an empty one), so `every_scope_graph` lists rows written
@@ -943,6 +1085,10 @@ mod tests {
         }
     }
 
+    fn fact(text: &str) -> MemoryEntry {
+        MemoryEntry::new(MemoryCategory::Fact, text)
+    }
+
     fn pref(text: &str) -> MemoryEntry {
         MemoryEntry::new(MemoryCategory::Preference, text)
     }
@@ -1065,5 +1211,87 @@ mod tests {
         remember(&path, "global", high).unwrap();
         let graph = load_graph(&path, "global").unwrap().unwrap();
         assert_eq!(graph.memories[first.id()].trust, TrustLevel::High);
+    }
+
+    #[test]
+    fn single_row_forget_expire_and_tag_keep_a_concurrent_writers_fresh_rows() {
+        let (_d, path) = db();
+        let old = remember(&path, "global", fact("old deploy rule")).unwrap().id().to_string();
+        // A caller loaded the scope, then another writer remembered a fresh memory.
+        let fresh = remember(&path, "global", fact("freshly extracted memory")).unwrap().id().to_string();
+        let mut with_vec = fact("has an embedding");
+        with_vec.embedding = Some(vec![0.5, 0.25]);
+        let embedded = remember(&path, "global", with_vec).unwrap().id().to_string();
+
+        assert_eq!(update_memory(&path, &old, None, |g| g.get_memory_mut(&old).unwrap().active = false).unwrap().as_deref(), Some("global"));
+        assert_eq!(update_memory(&path, &embedded, None, |g| g.tag_memory(&embedded, "ops")).unwrap().as_deref(), Some("global"));
+        assert_eq!(delete_memory(&path, &old, None).unwrap().as_deref(), Some("global"));
+        assert_eq!(delete_memory(&path, &old, None).unwrap(), None);
+
+        let g = load_graph(&path, "global").unwrap().unwrap();
+        assert!(g.memories.contains_key(&fresh), "the fresh row survives every single-row edit");
+        assert!(!g.memories.contains_key(&old));
+        assert_eq!(g.memories[&embedded].embedding, Some(vec![0.5, 0.25]), "embedding untouched by a tag");
+        assert!(g.memories[&embedded].tags.contains(&"ops".to_string()));
+        assert_eq!(recall(&path, &["global"], "ops embedding", 5).len(), 1, "tag reached the index");
+    }
+
+    #[test]
+    fn reset_deletes_per_scope_and_never_touches_learned_entries() {
+        let (_d, path) = db();
+        remember(&path, "global", learned("prompt", "p1", "Always run the linter")).unwrap();
+        let note = remember(&path, "global", fact("repo uses cargo")).unwrap().id().to_string();
+        let pref = remember(&path, "project:a", pref("likes terse answers")).unwrap().id().to_string();
+        let other = remember(&path, "project:a", fact("project a uses pnpm")).unwrap().id().to_string();
+
+        let (gone, scopes) = reset_memories(&path, Some(true)).unwrap();
+        assert_eq!(gone, vec![pref]);
+        assert_eq!(scopes, vec!["project:a".to_string()]);
+        let (mut gone, _) = reset_memories(&path, None).unwrap();
+        gone.sort();
+        let mut want = vec![note, other];
+        want.sort();
+        assert_eq!(gone, want);
+        let g = load_graph(&path, "global").unwrap().unwrap();
+        assert_eq!(g.memories.keys().collect::<Vec<_>>(), vec!["p1"], "the learned prompt survives a reset of everything");
+    }
+
+    #[test]
+    fn reinforcement_breadcrumbs_are_capped_but_strength_keeps_counting() {
+        let (_d, path) = db();
+        let mut id = String::new();
+        for i in 0..30 {
+            id = remember(&path, "global", fact(&format!("same repeated fact {}", if i < 0 { 1 } else { 1 }))).unwrap().id().to_string();
+        }
+        let m = &load_graph(&path, "global").unwrap().unwrap().memories[&id];
+        assert_eq!(m.strength, 30);
+        assert_eq!(m.reinforcements.len(), MAX_REINFORCEMENTS);
+    }
+
+    #[test]
+    fn old_wordings_are_pruned_to_the_newest_three_per_survivor() {
+        let (_d, path) = db();
+        let mut text = "prefers tabs over spaces in rust code for indentation".to_string();
+        let id = remember(&path, "global", pref(&text)).unwrap().id().to_string();
+        for word in ["apple", "banana", "cherry", "damson", "elder", "grape"] {
+            text = format!("{text} {word}");
+            let r = remember(&path, "global", pref(&text)).unwrap();
+            assert!(matches!(r, Remembered::Merged { .. }), "{r:?}");
+        }
+        let g = load_graph(&path, "global").unwrap().unwrap();
+        let was: Vec<_> = g.memories.values().filter(|m| !m.active).collect();
+        assert_eq!(was.len(), 3, "{:?}", was.iter().map(|m| &m.id).collect::<Vec<_>>());
+        assert!(was.iter().all(|m| m.id.starts_with(&format!("{id}~was"))));
+        assert_eq!(g.memories[&id].content, text);
+    }
+
+    #[test]
+    fn forgetting_a_session_drops_its_extraction_bookkeeping() {
+        let (_d, path) = db();
+        meta_set(&path, "extracted_through:s1", "12").unwrap();
+        meta_set(&path, "extracted_through:s2", "3").unwrap();
+        assert_eq!(forget_session_meta(&path, "s1").unwrap(), 1);
+        assert_eq!(meta_get(&path, "extracted_through:s1").unwrap(), None);
+        assert_eq!(meta_get(&path, "extracted_through:s2").unwrap().as_deref(), Some("3"));
     }
 }
