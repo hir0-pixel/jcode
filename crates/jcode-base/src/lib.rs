@@ -56,6 +56,7 @@ pub mod memory_graph;
 pub mod memory_recall;
 pub mod migrate;
 mod memory_store;
+pub mod obs_sink;
 pub use memory_store::migrate_sovereign_db;
 pub mod memory_log;
 pub mod memory_types;

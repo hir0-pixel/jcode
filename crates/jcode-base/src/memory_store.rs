@@ -328,6 +328,30 @@ fn trust_rank(t: &TrustLevel) -> u8 {
 /// replaces the survivor's wording with a longer one, the old wording is kept as an inactive row
 /// superseded by the survivor, so a wrong merge can be undone.
 pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remembered> {
+    let (category, trust, source) = (entry.category.to_string(), format!("{:?}", entry.trust).to_lowercase(), entry.source.clone());
+    let outcome = remember_row(path, scope, entry)?;
+    let (action, similarity) = match &outcome {
+        Remembered::Inserted(_) => ("inserted", None),
+        Remembered::Reinforced(_) => ("reinforced", None),
+        Remembered::Merged { similarity, .. } => ("merged", Some(*similarity)),
+    };
+    let mut span = crate::obs_sink::Span::new("memory.write")
+        .attr("action", action)
+        .attr("id", outcome.id())
+        .attr("scope", scope)
+        .attr("category", category)
+        .attr("trust", trust);
+    if let Some(similarity) = similarity {
+        span = span.attr("similarity", similarity);
+    }
+    if let Some(source) = source {
+        span = span.attr("source", source);
+    }
+    crate::obs_sink::emit(span);
+    Ok(outcome)
+}
+
+fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remembered> {
     with_db(path, |db| {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let wanted = entry.content.trim().to_string();
