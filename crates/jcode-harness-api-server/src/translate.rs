@@ -317,6 +317,15 @@ impl BridgeState {
         NEXT_LEGACY_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// The EOF answer to a command reading stdin. The daemon acks it with `done`, so the id is
+    /// registered as a control id: a `done` with id 0 would read as a server-initiated turn's end
+    /// and finish the running turn early (its tool still running).
+    pub fn stdin_eof_response(&mut self, request_id: &str) -> Value {
+        let id = self.legacy_id();
+        self.pending_control_done_ids.insert(id);
+        json!({"type": "stdin_response", "id": id, "request_id": request_id, "input": "\u{4}"})
+    }
+
     /// Translate one API request (raw JSON) into outbound actions.
     pub fn api_request_to_legacy(&mut self, request: &Value) -> Vec<Outbound> {
         let outbound = self.translate_request(request);

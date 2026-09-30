@@ -3751,3 +3751,19 @@ fn limited_session_list_always_includes_saved_sessions() {
         .expect("saved session beyond the limit is listed");
     assert_eq!(saved.save_label.as_deref(), Some("old bookmark"));
 }
+
+#[test]
+fn a_stdin_eof_ack_does_not_end_the_running_turn() {
+    let mut state = BridgeState {
+        session_id: Some("s1".into()),
+        observed_turn_active: true,
+        ..Default::default()
+    };
+    let eof = state.stdin_eof_response("stdin-c1-1");
+    assert_eq!(eof["input"], "\u{4}");
+    let id = eof["id"].as_u64().unwrap();
+    assert_ne!(id, 0, "id 0 reads as a server-initiated turn");
+    // The daemon acks the answer with `done`: that is not the turn's end.
+    assert!(state.legacy_event_to_api(&json!({"type":"done","id":id})).is_empty());
+    assert!(state.observed_turn_active);
+}

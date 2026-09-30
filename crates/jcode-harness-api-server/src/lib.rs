@@ -451,7 +451,7 @@ where
                 // it blocked until the tool timeout.
                 if event["type"] == "stdin_request" {
                     if let Some(request_id) = event["request_id"].as_str() {
-                        let eof = serde_json::json!({"type": "stdin_response", "id": 0, "request_id": request_id, "input": "\u{4}"});
+                        let eof = state.stdin_eof_response(request_id);
                         write_json_line(&mut legacy_write, &eof).await?;
                     }
                     continue;
