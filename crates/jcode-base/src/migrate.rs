@@ -84,7 +84,66 @@ const MIGRATIONS: &[Step] = &[
     // 5: "forget" keeps no content: the memory audit records id, scope, category and length only.
     // (The old text of already-deleted memories is dropped with the columns.)
     Step::Code(memory_audit_without_content),
+    // 6: Prime's learned entries (prompt / skill / subagent) are memories: `harness_entries` moves into
+    // `memories` with the same ids (its changesets keep resolving) and the table is dropped.
+    Step::Code(learned_entries_into_memories),
 ];
+
+/// Migration 6. A session-local entry keeps its reach as scope `session:<id>`; a `memory`-kind
+/// entry that only pointed at a memory row is dropped, one that carried its own text becomes a fact.
+fn learned_entries_into_memories(conn: &Connection) -> Result<()> {
+    if !conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='harness_entries'")?.exists([])? {
+        return Ok(());
+    }
+    conn.execute_batch(crate::memory_store::TABLES)?;
+    type Row = (String, String, String, String, String, String, Option<String>, String, String, String, String, i64, i64, i64, i64);
+    let rows: Vec<Row> = conn
+        .prepare(
+            "SELECT id, kind, title, content, path, scope, session, reference, arguments, metadata, source,
+                    created_at_ms, updated_at_ms, version, seq FROM harness_entries ORDER BY seq",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?,
+                r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, kind, title, content, path, scope, session, reference, arguments, metadata, source, created, updated, version, seq) in rows {
+        let json = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| serde_json::json!({}));
+        let (reference, arguments, metadata) = (json(&reference), json(&arguments), json(&metadata));
+        let scope = match (scope.as_str(), session) {
+            ("local", Some(session)) => format!("session:{session}"),
+            _ => "global".to_string(),
+        };
+        let mut entry = if kind == "memory" {
+            if reference["memory_id"].is_string() {
+                continue;
+            }
+            crate::memory_types::MemoryEntry::new(crate::memory_types::MemoryCategory::Fact, content)
+        } else {
+            let mut entry = crate::memory_types::MemoryEntry::new(crate::memory_types::MemoryCategory::Custom(kind), content);
+            entry.tags = vec![title.clone()];
+            entry.learned = Some(crate::memory_types::LearnedMeta { title, path, reference, arguments, metadata, version, seq, listed: false });
+            entry
+        };
+        entry.id = id;
+        entry.source = Some(source);
+        let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+        (entry.created_at, entry.updated_at) = (at(created), at(updated));
+        entry.refresh_search_text();
+        let rid: i64 = conn.query_row(
+            "INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(scope, id) DO UPDATE SET content=excluded.content, tags=excluded.tags RETURNING rid",
+            params![entry.id, scope, entry.content, entry.tags.join(" ")],
+            |r| r.get(0),
+        )?;
+        conn.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, NULL)", params![rid, serde_json::to_string(&entry)?])?;
+        crate::memory_store::ensure_scope(conn, &scope)?;
+    }
+    conn.execute_batch("DROP INDEX IF EXISTS harness_entries_render; DROP TABLE harness_entries;")?;
+    Ok(())
+}
 
 fn memory_audit_without_content(conn: &Connection) -> Result<()> {
     if !conn.prepare("SELECT 1 FROM pragma_table_info('memory_deletions') WHERE name='content'")?.exists([])? {
@@ -222,12 +281,18 @@ pub fn daily_backup(path: &Path, max_age: Duration) -> Result<bool> {
     Ok(true)
 }
 
+/// An engine whose newest schema is `engine` does not touch a file of version `have` above it.
+fn refuse_newer(have: u32, engine: u32) -> Result<()> {
+    if have > engine {
+        bail!("sovereign.db is schema v{have}, newer than this engine (v{engine}); restore the sovereign.db.pre-v*.bak taken before that update or install the newer engine");
+    }
+    Ok(())
+}
+
 /// Bring `conn` to [`CURRENT`]; `backup_of` is the file to copy first (None: nothing worth keeping).
 pub fn run(conn: &Connection, backup_of: Option<&Path>) -> Result<()> {
     let have = version(conn)?;
-    if have > CURRENT {
-        bail!("sovereign.db is schema v{have}, newer than this engine (v{CURRENT}); restore the sovereign.db.pre-v*.bak taken before that update or install the newer engine");
-    }
+    refuse_newer(have, CURRENT)?;
     if have == CURRENT {
         return Ok(());
     }
@@ -358,6 +423,83 @@ mod tests {
         // A newer engine's file is refused untouched.
         conn.execute_batch(&format!("PRAGMA user_version = {}", CURRENT + 1)).unwrap();
         assert!(open(&path, schema).unwrap_err().to_string().contains("newer than this engine"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A v5 file as the previous engine left it: the old entries table beside the memory tables.
+    fn v5_file_with_entries(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(crate::memory_store::TABLES).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE harness_entries(id TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+                path TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL, session TEXT, reference TEXT NOT NULL DEFAULT '{}',
+                arguments TEXT NOT NULL DEFAULT '{}', metadata TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, version INTEGER NOT NULL DEFAULT 1, seq INTEGER NOT NULL);
+             CREATE INDEX harness_entries_render ON harness_entries(scope, session, kind, seq);
+             INSERT INTO harness_entries VALUES
+               ('p1','prompt','Lint','Run the linter first','rules/lint','global',NULL,'{}','{}','{}','auto',1000,2000,3,7),
+               ('p2','prompt','Lint too','Run the linter first!','','local','s1','{}','{}','{}','auto',1000,1000,1,8),
+               ('k1','skill','Ship','Steps to ship','','global',NULL,'{\"type\":\"python\"}','{\"x\":1}','{}','auto',1000,1000,1,9),
+               ('m1','memory','Nim','','','global',NULL,'{\"memory_id\":\"mem_1\"}','{}','{}','auto',1000,1000,1,10),
+               ('m2','memory','Nim','Prefers Nim','','global',NULL,'{}','{}','{}','auto',1000,1000,1,11);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_6_moves_learned_entries_into_memories_keeping_ids_and_drops_the_table() {
+        let dir = std::env::temp_dir().join(format!("migrate6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        v5_file_with_entries(&path);
+        let conn = open(&path, "CREATE TABLE IF NOT EXISTS engine_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        assert_eq!(version(&conn).unwrap(), 6);
+        assert!(dir.join("sovereign.db.pre-v6.bak").exists(), "the file is backed up before the first migration");
+        assert!(conn.prepare("SELECT 1 FROM harness_entries").is_err(), "the old table is gone");
+        let rows: Vec<(String, String, String, String)> = conn
+            .prepare("SELECT m.id, m.scope, m.content, json_extract(e.entry, '$.category') FROM memories m JOIN memory_entries e ON e.rid = m.rid ORDER BY m.id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let custom = |k: &str| format!("{{\"custom\":\"{k}\"}}");
+        assert_eq!(
+            rows,
+            vec![
+                ("k1".into(), "global".into(), "Steps to ship".into(), custom("skill")),
+                ("m2".into(), "global".into(), "Prefers Nim".into(), "fact".into()),
+                ("p1".into(), "global".into(), "Run the linter first".into(), custom("prompt")),
+                ("p2".into(), "session:s1".into(), "Run the linter first!".into(), custom("prompt")),
+            ],
+            "ids kept, a session-local entry keeps its reach, a pointer-only memory entry is dropped"
+        );
+        let meta: String = conn.query_row("SELECT json_extract(e.entry, '$.learned') FROM memories m JOIN memory_entries e ON e.rid = m.rid WHERE m.id = 'p1'", [], |r| r.get(0)).unwrap();
+        let meta: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!((meta["title"].as_str(), meta["path"].as_str(), meta["version"].as_i64(), meta["seq"].as_i64()), (Some("Lint"), Some("rules/lint"), Some(3), Some(7)));
+        // The rows are findable by the ordinary full-text query, and the new scope has a graph row.
+        assert_eq!(conn.query_row("SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'linter'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(conn.query_row("SELECT count(*) FROM memory_graphs WHERE scope = 'session:s1'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        // Reopening does nothing more.
+        drop(conn);
+        let conn = open(&path, "").unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        // The engine before this one (v5) refuses the migrated file.
+        let err = refuse_newer(version(&conn).unwrap(), 5).unwrap_err().to_string();
+        assert!(err.contains("schema v6, newer than this engine (v5)"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_6_on_a_fresh_file_has_nothing_to_move() {
+        let dir = std::env::temp_dir().join(format!("migrate6-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open(&dir.join("sovereign.db"), "").unwrap();
+        assert_eq!(version(&conn).unwrap(), 6);
+        assert!(conn.prepare("SELECT 1 FROM memories").is_err(), "the memory store makes its own tables");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

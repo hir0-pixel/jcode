@@ -245,6 +245,29 @@ pub struct MemoryEntry {
     /// Confidence score (0.0-1.0) - decays over time, boosted by use
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// What Prime's learning adds to a `prompt` / `skill` / `subagent` memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned: Option<LearnedMeta>,
+}
+
+/// The fields of a learned memory (category `prompt`, `skill` or `subagent`) that a plain
+/// memory has no place for. The body is the memory's own `content`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LearnedMeta {
+    pub title: String,
+    /// Short grouping label chosen by the learner.
+    pub path: String,
+    /// A skill's Python call reference.
+    pub reference: serde_json::Value,
+    /// A skill's accepted inputs.
+    pub arguments: serde_json::Value,
+    pub metadata: serde_json::Value,
+    pub version: i64,
+    /// Append order across all learned memories (prompt notes render oldest first).
+    pub seq: i64,
+    /// A generated SKILL.md offers this skill through the skill list, so recall leaves it out.
+    #[serde(default)]
+    pub listed: bool,
 }
 
 /// Model id used for memories embedded before model tagging existed. These were
@@ -302,6 +325,7 @@ impl MemoryEntry {
             embedding: None,
             embedding_model: None,
             confidence: 1.0,
+            learned: None,
         }
     }
 
@@ -442,6 +466,17 @@ pub enum MemoryCategory {
     Entity,
     Correction,
     Custom(String),
+}
+
+impl MemoryCategory {
+    /// The categories Prime's learning writes (`prompt`, `skill`, `subagent`).
+    pub const LEARNED: [&'static str; 3] = ["prompt", "skill", "subagent"];
+
+    /// Whether this is one of [`Self::LEARNED`]. Those are never merged by similarity: each keeps
+    /// its own id so a rollback restores it exactly.
+    pub fn is_learned(&self) -> bool {
+        matches!(self, MemoryCategory::Custom(name) if Self::LEARNED.contains(&name.as_str()))
+    }
 }
 
 impl std::fmt::Display for MemoryCategory {

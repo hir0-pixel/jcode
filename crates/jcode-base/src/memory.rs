@@ -24,13 +24,15 @@ use std::time::Instant;
 #[path = "memory/activity.rs"]
 mod activity;
 mod cache;
+#[path = "memory/learned.rs"]
+pub mod learned;
 #[path = "memory/pending.rs"]
 mod pending;
 #[path = "memory_prompt.rs"]
 mod prompt_support;
 
 pub use crate::memory_types::{
-    MemoryCategory, MemoryEntry, MemoryScope, MemoryStore, Reinforcement, TrustLevel,
+    LearnedMeta, MemoryCategory, MemoryEntry, MemoryScope, MemoryStore, Reinforcement, TrustLevel,
     format_relevant_display_prompt, format_relevant_prompt,
 };
 use crate::memory_types::{
@@ -238,11 +240,7 @@ impl MemoryManager {
             return Some("project:test".to_string());
         }
         let project_dir = self.get_project_dir()?;
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        project_dir.hash(&mut hasher);
-        Some(format!("project:{:016x}", hasher.finish()))
+        Some(learned::project_scope(&project_dir.to_string_lossy()))
     }
 
     fn legacy_notes_path(&self) -> Result<Option<PathBuf>> {
@@ -934,6 +932,7 @@ impl MemoryManager {
         let found = candidates.len();
         let entries: Vec<MemoryEntry> = candidates
             .into_iter()
+            .filter(|e| !learned::is_kept_out_of_recall(e))
             .filter(|e| session_id.is_none_or(|s| !is_memory_injected(s, &e.id)))
             .filter(|e| crate::memory_recall::meets_term_floor(&terms, e))
             .take(limit)

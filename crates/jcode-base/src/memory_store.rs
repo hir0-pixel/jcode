@@ -25,10 +25,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const SCHEMA: &str = "
+const PRAGMAS: &str = "
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
     PRAGMA busy_timeout=5000;
+";
+
+/// The tables, indexes and triggers; also applied by migration 6, which runs inside a transaction
+/// (where the pragmas above cannot).
+pub(crate) const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS memories(
         rid INTEGER PRIMARY KEY,
         id TEXT NOT NULL,
@@ -116,7 +121,8 @@ fn migrate(db: &mut Connection) -> Result<()> {
     let path = db.path().filter(|p| !p.is_empty()).map(PathBuf::from);
     let had_data: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table')", [], |r| r.get(0))?;
     crate::migrate::run(db, path.as_deref().filter(|_| had_data))?;
-    db.execute_batch(SCHEMA)?;
+    db.execute_batch(PRAGMAS)?;
+    db.execute_batch(TABLES)?;
     Ok(())
 }
 
@@ -354,6 +360,11 @@ pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<R
 fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remembered> {
     with_db(path, |db| {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if entry.category.is_learned() {
+            let outcome = remember_learned(&tx, scope, entry)?;
+            tx.commit()?;
+            return Ok(outcome);
+        }
         let wanted = entry.content.trim().to_string();
         let mut dup = None;
         {
@@ -443,6 +454,147 @@ fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remember
         };
         tx.commit()?;
         Ok(outcome)
+    })
+}
+
+/// A learned memory (`prompt`, `skill`, `subagent`) is written by exact id only: no content
+/// match, no similarity merge, so two alike notes stay two rows and a rollback restores exactly
+/// what was there. A new id is a new row (with its tag nodes); a known id replaces the row.
+fn remember_learned(tx: &rusqlite::Transaction, scope: &str, mut entry: MemoryEntry) -> Result<Remembered> {
+    let known: Option<i64> =
+        tx.query_row("SELECT rid FROM memories WHERE scope=?1 AND id=?2", params![scope, entry.id], |r| r.get(0)).optional()?;
+    if let Some(rid) = known {
+        entry.refresh_search_text();
+        tx.execute(
+            "UPDATE memories SET active=?1, content=?2, tags=?3 WHERE rid=?4",
+            params![entry.active, entry.content, entry.tags.join(" "), rid],
+        )?;
+        let (json, embedding) = split_embedding(&entry)?;
+        tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+        return Ok(Remembered::Reinforced(entry.id));
+    }
+    let mut graph = stored_shape(tx, scope)?;
+    let id = graph.add_memory(entry);
+    let entry = &graph.memories[&id];
+    let rid: i64 = tx.query_row(
+        "INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, ?3, ?4, ?5) RETURNING rid",
+        params![id, scope, entry.active, entry.content, entry.tags.join(" ")],
+        |r| r.get(0),
+    )?;
+    let (json, embedding) = split_embedding(entry)?;
+    tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+    save_shape(tx, scope, &graph)?;
+    Ok(Remembered::Inserted(id))
+}
+
+/// The stored graph of `scope` without its memories (an empty graph if none was saved).
+fn stored_shape(tx: &Connection, scope: &str) -> Result<MemoryGraph> {
+    let shape: Option<String> = tx.query_row("SELECT graph FROM memory_graphs WHERE scope=?1", [scope], |r| r.get(0)).optional()?;
+    let mut graph = MemoryGraph::new();
+    if let Some(shape) = shape {
+        let shape: OwnedGraphShape = serde_json::from_str(&shape)?;
+        graph.graph_version = shape.graph_version;
+        graph.tags = shape.tags;
+        graph.clusters = shape.clusters;
+        graph.edges = shape.edges;
+        graph.reverse_edges = shape.reverse_edges;
+        graph.metadata = shape.metadata;
+    }
+    Ok(graph)
+}
+
+fn save_shape(tx: &Connection, scope: &str, graph: &MemoryGraph) -> Result<()> {
+    let shape = GraphShape {
+        graph_version: graph.graph_version,
+        tags: &graph.tags,
+        clusters: &graph.clusters,
+        edges: &graph.edges,
+        reverse_edges: &graph.reverse_edges,
+        metadata: &graph.metadata,
+    };
+    tx.execute(
+        "INSERT INTO memory_graphs(scope, graph) VALUES (?1, ?2) ON CONFLICT(scope) DO UPDATE SET graph=excluded.graph",
+        params![scope, serde_json::to_string(&shape)?],
+    )?;
+    Ok(())
+}
+
+/// Make sure `scope` has a graph row (an empty one), so `every_scope_graph` lists rows written
+/// straight into `memories` by a migration.
+pub(crate) fn ensure_scope(conn: &Connection, scope: &str) -> Result<()> {
+    let empty = MemoryGraph::new();
+    let shape = GraphShape {
+        graph_version: empty.graph_version,
+        tags: &empty.tags,
+        clusters: &empty.clusters,
+        edges: &empty.edges,
+        reverse_edges: &empty.reverse_edges,
+        metadata: &empty.metadata,
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_graphs(scope, graph) VALUES (?1, ?2)",
+        params![scope, serde_json::to_string(&shape)?],
+    )?;
+    Ok(())
+}
+
+/// Active learned memories in `categories`, with their scope: all scopes when `scopes` is `None`.
+pub(crate) fn list_learned(path: &Path, categories: &[&str], scopes: Option<&[String]>) -> Result<Vec<(String, MemoryEntry)>> {
+    with_db(path, |db| {
+        let mut stmt = db.prepare_cached(
+            "SELECT m.scope, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid
+             WHERE m.active = 1 AND json_extract(e.entry, '$.category.custom') IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (scope, json, embedding) = row?;
+            if scopes.is_some_and(|s| !s.contains(&scope)) {
+                continue;
+            }
+            let entry = join_embedding(&json, embedding)?;
+            if entry.category.is_learned() && categories.contains(&entry.category.to_string().as_str()) {
+                out.push((scope, entry));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// The learned memory with this id, wherever it lives.
+pub(crate) fn get_learned(path: &Path, id: &str) -> Result<Option<(String, MemoryEntry)>> {
+    with_db(path, |db| {
+        let mut stmt = db.prepare_cached(
+            "SELECT m.scope, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid WHERE m.id = ?1 AND m.active = 1",
+        )?;
+        let rows = stmt.query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))?;
+        for row in rows {
+            let (scope, json, embedding) = row?;
+            let entry = join_embedding(&json, embedding)?;
+            if entry.category.is_learned() {
+                return Ok(Some((scope, entry)));
+            }
+        }
+        Ok(None)
+    })
+}
+
+/// Remove the learned memory with this id (its row, FTS entry and entry JSON); returns what it was.
+pub(crate) fn delete_learned(path: &Path, id: &str) -> Result<Option<(String, MemoryEntry)>> {
+    let Some((scope, entry)) = get_learned(path, id)? else { return Ok(None) };
+    with_db(path, |db| {
+        db.execute("DELETE FROM memories WHERE scope=?1 AND id=?2", params![scope, id])?;
+        Ok(())
+    })?;
+    Ok(Some((scope, entry)))
+}
+
+/// Remove every memory in `scope` (a deleted session's own rows) and its graph row.
+pub(crate) fn drop_scope(path: &Path, scope: &str) -> Result<usize> {
+    with_db(path, |db| {
+        let n = db.execute("DELETE FROM memories WHERE scope=?1", [scope])?;
+        db.execute("DELETE FROM memory_graphs WHERE scope=?1", [scope])?;
+        Ok(n)
     })
 }
 
@@ -797,6 +949,60 @@ mod tests {
 
     fn active_count(path: &Path, scope: &str) -> usize {
         load_graph(path, scope).unwrap().map(|g| g.active_memories().count()).unwrap_or(0)
+    }
+
+    fn learned(kind: &str, id: &str, text: &str) -> MemoryEntry {
+        let mut e = MemoryEntry::new(MemoryCategory::Custom(kind.to_string()), text);
+        e.id = id.to_string();
+        e
+    }
+
+    #[test]
+    fn learned_memories_are_keyed_by_id_and_never_merged() {
+        let (_d, path) = db();
+        // Identical and near-identical bodies stay separate rows, unlike any other category.
+        for (i, text) in ["Always run the linter before committing code", "Always run the linter before committing code", "Always run the linter before committing code."].iter().enumerate() {
+            let out = remember(&path, "global", learned("prompt", &format!("p{i}"), text)).unwrap();
+            assert_eq!(out, Remembered::Inserted(format!("p{i}")));
+        }
+        assert_eq!(list_learned(&path, &["prompt"], None).unwrap().len(), 3);
+        // The same id replaces the row (an update), and only that row.
+        let out = remember(&path, "global", learned("prompt", "p1", "Run tests before the linter")).unwrap();
+        assert_eq!(out, Remembered::Reinforced("p1".into()));
+        let rows = list_learned(&path, &["prompt"], None).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(_, e)| e.id == "p1" && e.content == "Run tests before the linter"));
+        // The full-text index followed the update.
+        let hits = search(&path, &["global".into()], &["tests".into()], 5).unwrap();
+        assert_eq!(hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["p1"]);
+        // Other kinds are not returned for a prompt query, a plain memory never is.
+        remember(&path, "global", pref("The user prefers tabs")).unwrap();
+        remember(&path, "project:x", learned("skill", "k1", "Ship it")).unwrap();
+        assert_eq!(list_learned(&path, &["skill"], None).unwrap().len(), 1);
+        assert_eq!(list_learned(&path, &["prompt", "skill", "subagent"], Some(&["global".to_string()])).unwrap().len(), 3);
+        assert_eq!(get_learned(&path, "k1").unwrap().unwrap().0, "project:x");
+        assert!(get_learned(&path, "nope").unwrap().is_none());
+        // Delete removes the row and its index entry.
+        assert!(delete_learned(&path, "p0").unwrap().is_some());
+        assert_eq!(list_learned(&path, &["prompt"], None).unwrap().len(), 2);
+        assert_eq!(drop_scope(&path, "project:x").unwrap(), 1);
+        assert!(get_learned(&path, "k1").unwrap().is_none());
+    }
+
+    #[test]
+    fn recall_leaves_prompt_notes_out_and_offers_the_other_learned_kinds() {
+        let (_d, path) = db();
+        remember(&path, "global", learned("prompt", "p", "Always run the release checklist before shipping")).unwrap();
+        remember(&path, "global", learned("subagent", "a", "Release checker: run the release checklist before shipping")).unwrap();
+        let hits = search(&path, &["global".into()], &["release".into(), "checklist".into()], 5).unwrap();
+        let shown: Vec<&str> = hits.iter().filter(|e| !crate::memory::learned::is_kept_out_of_recall(e)).map(|e| e.id.as_str()).collect();
+        assert_eq!(shown, ["a"], "the prompt note is in the cached prompt already; the subagent spec is recalled");
+        let listed = {
+            let mut e = learned("skill", "s", "Release checklist steps");
+            e.learned = Some(crate::memory_types::LearnedMeta { listed: true, ..Default::default() });
+            e
+        };
+        assert!(crate::memory::learned::is_kept_out_of_recall(&listed), "a skill the skill list offers is not recalled too");
     }
 
     #[test]
