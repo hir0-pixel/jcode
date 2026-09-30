@@ -66,7 +66,7 @@ pub(super) fn bash_parameters_schema() -> serde_json::Value {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Foreground timeout in MILLISECONDS (default 120000, max 600000); on expiry the command keeps running as a background task, not killed."
+                "description": "MILLISECONDS (default 120000, max 600000). On expiry it keeps running as a background task."
             },
             "run_in_background": {
                 "type": "boolean",
