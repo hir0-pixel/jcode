@@ -379,14 +379,29 @@ pub async fn run_pre_tool_gate(
         event = event.cwd(cwd);
     }
 
+    let env_hook = std::env::var("JCODE_HOOK_PRE_TOOL").ok();
+    let only = std::env::var("JCODE_HOOK_PRE_TOOL_TOOLS").ok();
     let mut decision = GateDecision::Allow;
     for command_line in command_lines {
+        if !hook_applies(&command_line, tool_name, env_hook.as_deref(), only.as_deref()) {
+            continue;
+        }
         let current = run_pre_tool_command(&command_line, &event, tool_name, tool_input_json).await;
         if matches!(current, GateDecision::Block { .. }) && decision == GateDecision::Allow {
             decision = current;
         }
     }
     decision
+}
+
+/// `JCODE_HOOK_PRE_TOOL_TOOLS` (comma-separated tool names) limits the env-configured
+/// `JCODE_HOOK_PRE_TOOL` hook to those tools, so the engine's bash-only gate is not spawned for
+/// every other tool call. Hooks from config files always run.
+fn hook_applies(command_line: &str, tool_name: &str, env_hook: Option<&str>, only: Option<&str>) -> bool {
+    match (env_hook, only) {
+        (Some(hook), Some(only)) if hook.trim() == command_line => only.split(',').any(|t| t.trim() == tool_name),
+        _ => true,
+    }
 }
 
 static PRE_TOOL_ENV: std::sync::OnceLock<fn() -> Vec<(String, String)>> = std::sync::OnceLock::new();
@@ -1016,5 +1031,18 @@ mod tests {
             String::from_utf8_lossy(&second_output.stdout),
             "client-pane-b|herdr-pane-b|client-pane-b|herdr-pane-b"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_applies_tests {
+    use super::hook_applies;
+
+    #[test]
+    fn env_hook_limited_to_named_tools_but_other_hooks_always_run() {
+        assert!(hook_applies("gate", "bash", Some("gate"), Some("bash")));
+        assert!(!hook_applies("gate", "read", Some("gate"), Some("bash")));
+        assert!(hook_applies("other", "read", Some("gate"), Some("bash")));
+        assert!(hook_applies("gate", "read", Some("gate"), None));
     }
 }

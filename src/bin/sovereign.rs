@@ -228,6 +228,8 @@ fn main() -> Result<()> {
             unsafe {
                 std::env::set_var("JCODE_HOOK_PRE_TOOL", hook);
                 std::env::set_var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS", "600000");
+                // The gate only acts on bash: don't spawn it for any other tool.
+                std::env::set_var("JCODE_HOOK_PRE_TOOL_TOOLS", "bash");
             }
         }
     }
