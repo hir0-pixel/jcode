@@ -368,6 +368,7 @@ impl Agent {
                 .checked_sub(std::time::Duration::from_secs(10))
                 .unwrap_or_else(Instant::now);
             let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut repaired_tool_ids: std::collections::HashSet<String> = Default::default();
             let mut current_tool: Option<String> = None;
             let mut streaming_tools: HashMap<String, (ToolCall, String)> = HashMap::new();
             let mut generated_image_contexts: Vec<Vec<ContentBlock>> = Vec::new();
@@ -659,6 +660,9 @@ impl Agent {
                             .as_ref()
                             .and_then(|id| streaming_tools.remove(id))
                         {
+                            if super::tool_args_repair::needed_repair(&current_tool_input) {
+                                repaired_tool_ids.insert(tool.id.clone());
+                            }
                             tool.input = super::tool_args_repair::parse_streamed_tool_input(
                                 &current_tool_input,
                             );
@@ -1228,6 +1232,7 @@ impl Agent {
                 stop_reason.as_deref(),
                 &mut tool_calls,
                 assistant_message_id.as_ref(),
+                &repaired_tool_ids,
             );
 
             if tool_calls.is_empty() && !generated_image_contexts.is_empty() {
@@ -1429,6 +1434,28 @@ impl Agent {
 
                 self.validate_tool_allowed(&tc.name)?;
 
+                if let Some((blocked_msg, stop)) =
+                    repeat_guard.block(&self.session.id, &tc.name, &tc.input)
+                {
+                    guard_stop = guard_stop.or(stop);
+                    let _ = event_tx.send(ServerEvent::ToolDone {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        output: blocked_msg.clone(),
+                        error: Some(blocked_msg.clone()),
+                    });
+                    self.add_message(
+                        Role::User,
+                        vec![ContentBlock::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: blocked_msg,
+                            is_error: Some(true),
+                        }],
+                    );
+                    tool_results_dirty = true;
+                    continue;
+                }
+
                 let is_native_tool = JCODE_NATIVE_TOOLS.contains(&tc.name.as_str());
 
                 if let Some((sdk_content, sdk_is_error)) = sdk_tool_results.remove(&tc.id) {
@@ -1497,6 +1524,8 @@ impl Agent {
                 let allow_reload_handoff = tc.name == "bash";
                 let tool_result;
                 let mut tool_handle = tool_handle;
+                // A dropped (cancelled) turn must not leave its tool running.
+                let mut tool_abort = crate::tool::inflight::AbortOnDrop::new(tool_handle.abort_handle());
                 tokio::select! {
                     biased;
                     res = &mut tool_handle => {
@@ -1530,6 +1559,7 @@ impl Agent {
                     }
                 };
 
+                tool_abort.disarm();
                 self.unlock_tools_if_needed(&tc.name);
                 let tool_elapsed = tool_start.elapsed();
                 crate::session_metrics::record_activity(&self.session.id);

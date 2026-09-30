@@ -21,6 +21,15 @@ pub(super) fn parse_streamed_tool_input(raw: &str) -> Value {
     }
 }
 
+/// True when the arguments only parse because `repair` fixed them up
+/// (closed brackets, dropped commas, ...). Such calls are untrusted when the
+/// turn was cut off by the output limit: a closed-over write/edit body is
+/// truncated content.
+pub(super) fn needed_repair(raw: &str) -> bool {
+    ToolCall::parse_streamed_input_to_object(raw) == Value::Null
+        && parse_streamed_tool_input(raw) != Value::Null
+}
+
 fn repair(raw: &str) -> Option<String> {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::with_capacity(raw.len() + 8);
@@ -118,6 +127,14 @@ mod tests {
             p(r#"{"tool": "edit", "args": {"items": [{"k": 1}, {"k": 2}}}}"#),
             json!({"tool": "edit", "args": {"items": [{"k": 1}, {"k": 2}]}})
         );
+    }
+
+    #[test]
+    fn needed_repair_only_for_repaired_input() {
+        assert!(!needed_repair(r#"{"a": 1}"#));
+        assert!(!needed_repair(""));
+        assert!(needed_repair(r#"{"content": "x", "p": [1"#));
+        assert!(!needed_repair(r#"{"truncated": "val"#));
     }
 
     #[test]

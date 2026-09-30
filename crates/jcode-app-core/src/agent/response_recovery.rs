@@ -380,15 +380,14 @@ impl Agent {
         stop_reason: Option<&str>,
         tool_calls: &mut Vec<ToolCall>,
         assistant_message_id: Option<&String>,
+        repaired_tool_ids: &std::collections::HashSet<String>,
     ) {
         let stop_reason = stop_reason.unwrap_or("");
         if !Self::should_continue_after_stop_reason(stop_reason) {
             return;
         }
 
-        let before = tool_calls.len();
-        tool_calls.retain(|tc| !tc.input.is_null());
-        let discarded = before - tool_calls.len();
+        let discarded = drop_untrusted_truncated_calls(tool_calls, repaired_tool_ids);
         if discarded > 0 && tool_calls.is_empty() {
             logging::warn(&format!(
                 "Discarded {} tool call(s) with null input (truncated by {}); requesting continuation",
@@ -404,5 +403,44 @@ impl Agent {
                 self.persist_session_best_effort("truncated tool-call repair");
             }
         }
+    }
+}
+
+/// On a length stop, keep only calls whose arguments parsed as sent: null
+/// inputs and arguments rescued from truncated JSON are untrusted.
+fn drop_untrusted_truncated_calls(
+    tool_calls: &mut Vec<ToolCall>,
+    repaired_tool_ids: &std::collections::HashSet<String>,
+) -> usize {
+    let before = tool_calls.len();
+    tool_calls.retain(|tc| !tc.input.is_null() && !repaired_tool_ids.contains(&tc.id));
+    before - tool_calls.len()
+}
+
+#[cfg(test)]
+mod truncated_call_tests {
+    use super::*;
+
+    fn call(id: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            input,
+            intent: None,
+            thought_signature: None,
+        }
+    }
+
+    #[test]
+    fn repaired_and_null_calls_are_dropped_on_length_stop() {
+        let mut calls = vec![
+            call("ok", serde_json::json!({"content": "full"})),
+            call("fixed", serde_json::json!({"content": "half"})),
+            call("null", serde_json::Value::Null),
+        ];
+        let repaired = ["fixed".to_string()].into_iter().collect();
+        assert_eq!(drop_untrusted_truncated_calls(&mut calls, &repaired), 2);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "ok");
     }
 }

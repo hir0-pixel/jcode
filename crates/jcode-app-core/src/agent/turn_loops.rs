@@ -235,6 +235,7 @@ impl Agent {
 
             let mut text_content = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut repaired_tool_ids: std::collections::HashSet<String> = Default::default();
             let mut current_tool: Option<String> = None;
             let mut streaming_tools: HashMap<String, (ToolCall, String)> = HashMap::new();
             let mut generated_image_contexts: Vec<Vec<ContentBlock>> = Vec::new();
@@ -384,6 +385,9 @@ impl Agent {
                             .and_then(|id| streaming_tools.remove(id))
                         {
                             // Parse the accumulated JSON
+                            if super::tool_args_repair::needed_repair(&current_tool_input) {
+                                repaired_tool_ids.insert(tool.id.clone());
+                            }
                             let tool_input = super::tool_args_repair::parse_streamed_tool_input(
                                 &current_tool_input,
                             );
@@ -865,6 +869,7 @@ impl Agent {
                 stop_reason.as_deref(),
                 &mut tool_calls,
                 assistant_message_id.as_ref(),
+                &repaired_tool_ids,
             );
 
             if tool_calls.is_empty() && !generated_image_contexts.is_empty() {
@@ -997,6 +1002,22 @@ impl Agent {
                 }
 
                 self.validate_tool_allowed(&tc.name)?;
+
+                if let Some((blocked_msg, stop)) =
+                    repeat_guard.block(&self.session.id, &tc.name, &tc.input)
+                {
+                    guard_stop = guard_stop.or(stop);
+                    self.add_message(
+                        Role::User,
+                        vec![ContentBlock::ToolResult {
+                            tool_use_id: tc.id,
+                            content: blocked_msg,
+                            is_error: Some(true),
+                        }],
+                    );
+                    tool_results_dirty = true;
+                    continue;
+                }
 
                 let is_native_tool = JCODE_NATIVE_TOOLS.contains(&tc.name.as_str());
 
