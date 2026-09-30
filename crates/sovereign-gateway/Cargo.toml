@@ -7,6 +7,7 @@ description = "Hermes tui_gateway-compatible HTTP/WebSocket front end for the jc
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 futures-util = "0.3"
 httparse = "1"
 libc = "0.2"

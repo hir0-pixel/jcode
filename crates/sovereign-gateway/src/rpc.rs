@@ -2538,6 +2538,10 @@ impl Conn {
             }
             return;
         }
+        if id.starts_with("clarify-") {
+            self.hub.answer_clarify(id, frame).await;
+            return;
+        }
         let choice = frame["result"]["choice"].as_str().unwrap_or("deny");
         if self.hub.answer(id, choice).await {
             return;

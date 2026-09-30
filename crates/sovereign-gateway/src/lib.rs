@@ -13,6 +13,7 @@ pub mod cron_tick;
 pub mod features;
 pub mod learn;
 mod hermes_env;
+mod hermes_host;
 mod learning_rest;
 mod memory_rest;
 mod oneshot;
@@ -224,6 +225,7 @@ impl Gateway {
 
     pub async fn serve(self) -> Result<()> {
         rpc::start_driver(self.config.clone(), self.hub.clone(), self.observer.clone());
+        hermes_host::install(self.config.features.clone(), self.hub.clone());
         if let Some(features) = self.config.features.clone() {
             let idle = features.clone();
             tokio::spawn(async move {

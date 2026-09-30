@@ -201,6 +201,8 @@ pub struct Hub {
     // (session, command); an empty session is the in-memory stand-in for an "always" Hermes can't store.
     once_grants: Mutex<HashSet<(String, String)>>,
     sticky_grants: Mutex<HashSet<(String, String)>>,
+    /// Open `clarify` questions (`clarify-N`) -> (session, answer channel; `None` = the window cancelled).
+    clarifying: Mutex<HashMap<String, (String, oneshot::Sender<Option<String>>)>>,
     observer: std::sync::Mutex<Option<std::sync::Arc<crate::observability::Observer>>>,
     /// Where parked unattended prompts persist (sovereign.db), so a restart keeps them.
     store: std::sync::Mutex<Option<Arc<sovereign_prime::entries::EntryStore>>>,
@@ -491,6 +493,50 @@ impl Hub {
         };
         self.audit(session_id, tool, command, &final_choice, "user");
         final_choice
+    }
+
+    /// Ask the person a question for the `clarify` tool and wait for the answer. A run nobody watches
+    /// (cron, bot, goal without a window) gets `NoUser` at once instead of waiting for a reply that
+    /// cannot come.
+    pub async fn clarify(&self, session_id: &str, question: &str, choices: &[String]) -> jcode_app_core::tool::hermes_bridge::ClarifyReply {
+        use jcode_app_core::tool::hermes_bridge::ClarifyReply;
+        if self.headless.lock().await.contains_key(session_id) {
+            return ClarifyReply::NoUser;
+        }
+        let mut showing = Vec::new();
+        for client in self.clients.lock().await.clone() {
+            if client.sessions.lock().await.contains(session_id) {
+                showing.push(client);
+            }
+        }
+        if showing.is_empty() {
+            return ClarifyReply::NoUser;
+        }
+        let request_id = format!("clarify-{}", self.next.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        self.clarifying.lock().await.insert(request_id.clone(), (session_id.to_string(), tx));
+        let mut params = json!({ "session_id": session_id, "question": question });
+        if !choices.is_empty() {
+            params["choices"] = json!(choices);
+        }
+        let frame = json!({ "jsonrpc": "2.0", "id": request_id, "method": "clarify", "params": params }).to_string();
+        for client in &showing {
+            let _ = client.to_ws.send(Message::Text(frame.clone())).await;
+        }
+        let reply = tokio::time::timeout(DECISION_TIMEOUT, rx).await;
+        self.clarifying.lock().await.remove(&request_id);
+        match reply {
+            Ok(Ok(answer)) => ClarifyReply::Answer(answer.unwrap_or_default()),
+            _ => ClarifyReply::TimedOut,
+        }
+    }
+
+    /// A window answered a `clarify` request (`result.answer`; anything else is a skip).
+    pub async fn answer_clarify(&self, request_id: &str, frame: &Value) -> bool {
+        match self.clarifying.lock().await.remove(request_id) {
+            Some((_, tx)) => tx.send(frame["result"]["answer"].as_str().map(str::to_string)).is_ok(),
+            None => false,
+        }
     }
 
     /// Open prompts for a session (`approval.pending`, e.g. after a reload).

@@ -10,6 +10,7 @@ mod communicate;
 mod config_edit_notice;
 mod conversation_search;
 mod edit;
+pub mod hermes_bridge;
 mod edit_stats;
 mod file_diff;
 pub(crate) mod file_lock;
@@ -252,6 +253,15 @@ fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
         }
     }
     policy
+}
+
+/// Whether this session's tool policy (the run's allow/deny lists) lets a tool run, named either by
+/// its own name or by the `group` (toolset) it belongs to. No policy: yes.
+pub(crate) fn session_tool_allows(session_id: &str, tool_name: &str, group: &str) -> bool {
+    session_tool_policy(session_id).is_none_or(|policy| {
+        let named = |set: &HashSet<String>| set.contains(tool_name) || (!group.is_empty() && set.contains(group));
+        policy.allowed_tools.as_ref().is_none_or(named) && !named(&policy.disabled_tools)
+    })
 }
 
 #[cfg(test)]
@@ -556,6 +566,8 @@ impl Registry {
                 session_heartbeat::SessionHeartbeatTool,
             );
             Self::insert_tool(&mut tools_map, "delegate", delegate::DelegateTool::new());
+            Self::insert_tool(&mut tools_map, "hermes", hermes_bridge::HermesTool::new());
+            Self::insert_tool(&mut tools_map, "clarify", hermes_bridge::ClarifyTool::new());
             Self::insert_tool(
                 &mut tools_map,
                 "agent_message",
