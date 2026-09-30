@@ -1,39 +1,108 @@
 //! Automatic learning (the Prime loop) for chats served by this gateway.
 //!
 //! Ports Prime Agent's `reviewAutoRefine` / `_maybeAutoRefine` semantics
-//! (`refinement.ts`, `agent-session.ts`): a per-session turn counter, no
-//! idle wait. Once `turn_interval` assistant turns have passed since the
-//! last review (and a cooldown has elapsed), one lightweight model call
-//! ("the gate") decides whether anything here is worth a `/refine` pass; a
-//! "no" costs exactly that one call and resets the counter, same as a "yes".
-//! There is no free keyword pre-filter: Prime has none, so this doesn't
-//! either. A "yes" runs the existing full-CRUD `/refine` (all four entry
-//! kinds, including memory and executable skills) exactly once - the same
-//! path the interactive `/refine` command and the model-callable `refine`
-//! tool use, so there is one learning pipeline, not two.
+//! (`refinement.ts`, `agent-session.ts`): a per-session counter of assistant messages (not error or
+//! abort, as Prime counts them), no idle wait. Once `turn_interval` of them have passed since the
+//! last review (or a context compaction happened) and a cooldown has elapsed, one lightweight model
+//! call ("the gate") decides whether anything here is worth a `/refine` pass; a "no" costs exactly
+//! that one call and resets the counter, same as a "yes". There is no free keyword pre-filter:
+//! Prime has none, so this doesn't either. A "yes" runs the existing `/refine` (prompt, skill and
+//! subagent entries; fact-type memories are jcode extraction's job) exactly once - the same path
+//! the interactive `/refine` command and the model-callable `refine` tool use, so there is one
+//! learning pipeline, not two. Every step emits a `learning.*` span.
 
 use crate::rpc::Conn;
-use sovereign_prime::refine::{MemorySink, Turn, parse_json_object, transcript};
+use jcode_base::obs_sink::{Span, emit};
+use serde_json::Value;
+use sovereign_prime::refine::{GATE_TRANSCRIPT_CHARS, Turn, parse_json_object, transcript};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Stores a proposed memory's text in jcode's own memory store and returns
-/// its id; `cwd` is the chat's working directory. Never runs in Python.
-pub type Remember = Arc<dyn Fn(&str, &str, bool, Option<&str>) -> anyhow::Result<String> + Send + Sync>;
-/// Removes a memory stored through [`Remember`] (rollback / refine delete),
-/// returning its `(text, category)` so a rolled-back delete can restore it.
-pub type Forget = Arc<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>;
-
 #[derive(Clone)]
 pub struct Learning {
-    /// Assistant turns since the last auto-refine review before the gate is
-    /// asked again (Prime default: 25; `settings.autoRefine.turnInterval`).
+    /// Assistant messages since the last auto-refine review before the gate is asked again
+    /// (Prime default: 25; `settings.autoRefine.turnInterval`).
     pub turn_interval: usize,
-    /// Minimum time between two gate calls, regardless of turn count
+    /// Minimum time between two gate calls, regardless of the count
     /// (Prime default: 20 minutes; `settings.autoRefine.cooldownMs`).
     pub cooldown: Duration,
-    pub remember: Remember,
-    pub forget: Forget,
+}
+
+/// Prime's `AutoRefineReason`: why a review is running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Trigger {
+    TurnInterval,
+    /// A context compaction happened: reviewed whatever the count, once the cooldown allows.
+    Compact,
+    /// The session is closing: a review that is due runs before it goes.
+    Dispose,
+}
+
+impl Trigger {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Trigger::TurnInterval => "turn_interval",
+            Trigger::Compact => "compact",
+            Trigger::Dispose => "dispose",
+        }
+    }
+}
+
+/// A gate call that is due: how many assistant messages it covers and why it runs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GateDue {
+    pub assistants: usize,
+    pub trigger: Trigger,
+}
+
+/// Prime counts assistant messages that are not error/abort (`agent-session.ts:4656-4659`). The
+/// engine's history has one `assistant` row per model response, so a tool-heavy turn yields many.
+fn assistants_since(raw: &[Value], seen: usize) -> usize {
+    raw.iter().skip(seen).filter(|m| m["role"] == "assistant" && m["is_error"].as_bool() != Some(true)).count()
+}
+
+/// Whether a review is due for `session`, given its history `raw`: `Ok` with what to review, or
+/// `Err` with the `learning.skip` reason and the assistant count. `compact_pending` is a compaction not yet reviewed.
+pub(crate) fn due(
+    store: &sovereign_prime::entries::EntryStore,
+    session: &str,
+    learning: &Learning,
+    raw: &[Value],
+    trigger: Trigger,
+    compact_pending: bool,
+    now: i64,
+) -> Result<GateDue, (&'static str, usize)> {
+    // An undo or rewind can leave fewer messages than the watermark.
+    let seen = store.watermark(session).min(raw.len());
+    let assistants = assistants_since(raw, seen);
+    let cooldown_ms = learning.cooldown.as_millis() as i64;
+    match store.learn_checkpoint(session, assistants, learning.turn_interval, cooldown_ms, now, compact_pending) {
+        Ok(Some(assistants)) => Ok(GateDue { assistants, trigger: if compact_pending { Trigger::Compact } else { trigger } }),
+        Ok(None) if compact_pending || assistants >= learning.turn_interval => Err(("cooldown", assistants)),
+        Ok(None) => Err(("below_interval", assistants)),
+        Err(_) => Err(("store_error", assistants)),
+    }
+}
+
+/// A `learning.*` span for one model call: its tokens, duration and error, if any.
+fn call_span(
+    kind: &'static str,
+    session: &str,
+    trigger: Trigger,
+    reply: &anyhow::Result<jcode_provider_core::SimpleCompletion>,
+    started: i64,
+) -> Span {
+    let mut span = Span::new(kind).session(session).attr("trigger", trigger.as_str());
+    span = span.took_ms(crate::observability::now().saturating_sub(started).max(0) as u64);
+    match reply {
+        Ok(done) => {
+            if let Some(u) = done.usage {
+                span = span.tokens(u.input, u.output);
+            }
+            span
+        }
+        Err(err) => span.error(err.to_string()),
+    }
 }
 
 /// `config.get learning.enabled`: Prime's auto-refine switch (on by default).
@@ -49,21 +118,6 @@ pub(crate) fn set_learning_enabled(home: &str, value: &serde_json::Value) -> any
     sovereign_prime::entries::EntryStore::open_cached(std::path::Path::new(home))?
         .set_setting("learning.enabled", if on { "true" } else { "false" })?;
     Ok(on)
-}
-
-/// Runs `f` with the bridge to jcode's memory store (`None` when learning is
-/// off, in which case memory entries just carry their text).
-pub(crate) fn with_sink<R>(
-    learning: Option<&Learning>,
-    cwd: Option<String>,
-    f: impl FnOnce(Option<&MemorySink<'_>>) -> R,
-) -> R {
-    let Some(l) = learning else { return f(None) };
-    let remember = |text: &str, category: &str, user_stated: bool| {
-        (l.remember)(text, category, user_stated, cwd.as_deref())
-    };
-    let forget = |id: &str| (l.forget)(id);
-    f(Some(&MemorySink { remember: &remember, forget: &forget }))
 }
 
 const MAX_TOOL_LINES: usize = 40;
@@ -106,11 +160,12 @@ struct GateReview {
 
 /// Prime's `autoRefineInstructions`: what the approving gate saw (its rationale and
 /// instructions) is handed to the refine pass, which would otherwise start blind.
-fn approved_instructions(review: &GateReview) -> String {
-    let mut text = String::from(
-        "Automatic refine review approved this checkpoint. Only create/update/delete entries if there is clear \
-         evidence that should help this session or future ones; prefer an empty edits array over speculative or \
-         one-off memories.",
+fn approved_instructions(trigger: Trigger, review: &GateReview) -> String {
+    let mut text = format!(
+        "Automatic refine review triggered by {}. Only create/update/delete entries if there is clear evidence \
+         that should help this session or future ones; prefer an empty edits array over speculative or one-off \
+         entries. Do not promote anything global unless explicitly requested.",
+        trigger.as_str()
     );
     if let Some(r) = &review.rationale {
         text.push_str(&format!(" Reviewer rationale: {r}"));
@@ -124,8 +179,9 @@ fn approved_instructions(review: &GateReview) -> String {
 /// The gate already found a lesson in this exact window, so an empty or unparsable proposal is a
 /// miss to correct once, not a result (Prime records nothing either, but its reviewer is a stronger model).
 const APPROVED_RETRY: &str = "\n\nThe reviewer found a durable lesson in this conversation, so your previous reply \
-    (empty or not valid JSON) was wrong. Propose the edit the reviewer described: a `memory` entry for a stated \
-    fact, preference or correction. Reply with the JSON object only.";
+    (empty or not valid JSON) was wrong. Propose the edit the reviewer described: a `prompt` or `subagent` \
+    entry (or a `skill` where offered) for a reusable convention, procedure or delegation. Reply with the JSON \
+    object only.";
 
 /// The refine pass for an approving gate: one call, plus one corrective retry when it comes back
 /// without an applicable edit. `record` sees every model call (reply and start time).
@@ -136,22 +192,32 @@ async fn refine_approved(
     store: &sovereign_prime::entries::EntryStore,
     session: &str,
     fresh: &[Turn],
+    due: &GateDue,
     review: &GateReview,
-    learning: &Learning,
-    cwd: Option<String>,
     record: &mut (dyn FnMut(&anyhow::Result<jcode_provider_core::SimpleCompletion>, i64) + Send),
 ) -> anyhow::Result<anyhow::Result<sovereign_prime::refine::RefineOutcome>> {
-    let mut instructions = approved_instructions(review);
+    let mut instructions = approved_instructions(due.trigger, review);
     let mut attempt = 0;
     loop {
         let (system, user) = sovereign_prime::refine::build_request(store, session, fresh, Some(&instructions), false);
         let started = crate::observability::now();
         let reply = complete(system, user).await;
         record(&reply, started);
+        emit(call_span("learning.refine", session, due.trigger, &reply, started).attr("attempt", attempt as u64));
         let text = reply?.text;
-        match with_sink(Some(learning), cwd.clone(), |sink| {
-            sovereign_prime::refine::apply(store, session, &text, fresh, false, "auto", sink)
-        }) {
+        let applied = sovereign_prime::refine::apply(store, session, &text, false, "auto");
+        let span = Span::new("learning.apply").session(session).attr("trigger", due.trigger.as_str());
+        emit(match &applied {
+            Ok(done) => span
+                .attr("approved", true)
+                .attr("changeset", done.changeset_id.as_str())
+                .attr("edits", serde_json::to_value(&done.by_kind).unwrap_or_default())
+                .attr("created", done.created.len() as u64)
+                .attr("updated", done.updated.len() as u64)
+                .attr("deleted", done.deleted.len() as u64),
+            Err(err) => span.attr("approved", false).attr("rejected", format!("{err:#}")),
+        });
+        match applied {
             Err(err) if attempt == 0 && (format!("{err:#}").contains("no durable lesson") || format!("{err:#}").contains("not valid JSON")) => {
                 attempt += 1;
                 instructions.push_str(APPROVED_RETRY);
@@ -161,18 +227,27 @@ async fn refine_approved(
     }
 }
 
-fn gate_request(turns_since_last_review: usize, fresh: &[Turn]) -> (String, String) {
+fn gate_request(store: &sovereign_prime::entries::EntryStore, session: &str, due: &GateDue, fresh: &[Turn]) -> (String, String) {
     let system = "You are this agent's automatic /refine review gate. Decide whether this checkpoint should run \
                   /refine. Auto /refine writes local Continual Harness state by default, so approve when the \
                   trajectory contains evidence useful to this session's future turns. Reject one-off noise, \
-                  unsupported hypotheses, and transient tool output. Return JSON only: {\"shouldRefine\": true|false, \
-                  \"rationale\": <short reason>, \"instructions\": <optional concise instructions for /refine if \
-                  shouldRefine is true>}."
+                  unsupported hypotheses, and transient tool output. Ask for global refinement only for durable \
+                  cross-session lessons or explicitly project-qualified lessons likely to be reused in future \
+                  sessions. Return JSON only: {\"shouldRefine\": true|false, \"rationale\": <short reason>, \
+                  \"instructions\": <optional concise instructions for /refine if shouldRefine is true>}."
         .to_string();
     let user = format!(
-        "Trigger: turn_interval; {turns_since_last_review} assistant turns since the last auto-refine review.\n\n\
-         Conversation:\n{}",
-        transcript(fresh)
+        "<trigger>\n{}; {} assistant turns since the last auto-refine review\n</trigger>\n\n\
+         <current_harness_state>\n{}\n</current_harness_state>\n\n\
+         <refinement_history>\n{}\n</refinement_history>\n\n\
+         <conversation>\n{}\n</conversation>\n\n\
+         Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. \
+         Prefer local harness edits for current task progress, temporary blockers, and current-run coordination.",
+        due.trigger.as_str(),
+        due.assistants,
+        sovereign_prime::refine::overview(store, session),
+        sovereign_prime::refine::history(store, session),
+        transcript(fresh, GATE_TRANSCRIPT_CHARS)
     );
     (system, user)
 }
@@ -189,16 +264,14 @@ fn parse_gate_review(reply: &str) -> GateReview {
 }
 
 /// One learning checkpoint over `session`'s unexamined messages: the pending
-/// scheduled `/refine` request (if any) always runs first, then the
-/// turn-interval gate. `turns_since_review` is the caller's count of
-/// assistant turns since the last gate call (kept in `rpc.rs`, which also
-/// enforces the turn-interval and cooldown before calling `pass` at all).
+/// scheduled `/refine` request (if any) always runs first, then the gate.
+/// `gate` is `Some` when [`due`] said a review is due (the caller in `rpc.rs`
+/// enforces the interval, cooldown and busy checks before calling `pass` at all).
 /// Returns a short human summary when something ran.
 pub(crate) async fn pass(
     conn: &Arc<Conn>,
     session: &str,
-    learning: &Learning,
-    gate_due: Option<usize>,
+    gate: Option<GateDue>,
 ) -> anyhow::Result<Option<String>> {
     let complete = conn.config().complete.clone().ok_or_else(|| anyhow::anyhow!("no model available"))?;
     let history = conn.history(session).await?;
@@ -228,9 +301,8 @@ pub(crate) async fn pass(
                 session, "learning", Some("Scheduled refine"), None, None, started,
                 reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
             );
-            let cwd = conn.session_cwd(session).await;
             refine_summary = match reply {
-                Ok(done) => match with_sink(Some(learning), cwd, |sink| sovereign_prime::refine::apply(store, session, &done.text, &turns, global, "refine-tool", sink)) {
+                Ok(done) => match sovereign_prime::refine::apply(store, session, &done.text, global, "refine-tool") {
                     Ok(outcome) => Some(outcome.summary),
                     Err(err) => Some(format!("no change ({err:#})")),
                 },
@@ -239,20 +311,19 @@ pub(crate) async fn pass(
         }
     }
     // Not a checkpoint turn: only the scheduled request above was due.
-    let (Some(turns_since_review), Some(store)) = (gate_due, &store) else {
+    let (Some(due), Some(store)) = (gate, &store) else {
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     };
-    // An undo or rewind can leave fewer messages than the watermark.
     // The watermark counts raw messages: compaction drops old tool rows, so it can't index `turns`.
     let seen = store.watermark(session).min(raw.len());
     let fresh_owned = compact_tools(&raw[seen..]);
     let fresh = &fresh_owned[..];
     if fresh.is_empty() {
+        emit(Span::new("learning.skip").session(session).attr("trigger", due.trigger.as_str()).attr("reason", "no_new_messages"));
         return Ok(refine_summary.map(|s| format!("Refined: {s}.")));
     }
 
-    let cwd = conn.session_cwd(session).await;
-    let learned = checkpoint(&complete, store, session, raw.len(), turns_since_review, fresh, learning, cwd, &mut |title, reply, started| {
+    let learned = checkpoint(&complete, store, session, raw.len(), &due, fresh, &mut |title, reply, started| {
         conn.observer.record_aux(
             session, "learning", Some(title), None, None, started,
             reply.as_ref().ok().and_then(|d| d.usage), reply.as_ref().err().map(|e| e.to_string()).as_deref(),
@@ -275,19 +346,23 @@ async fn checkpoint(
     store: &sovereign_prime::entries::EntryStore,
     session: &str,
     raw_len: usize,
-    turns_since_review: usize,
+    due: &GateDue,
     fresh: &[Turn],
-    learning: &Learning,
-    cwd: Option<String>,
     record: &mut (dyn FnMut(&str, &anyhow::Result<jcode_provider_core::SimpleCompletion>, i64) + Send),
 ) -> anyhow::Result<Option<String>> {
-    // The gate: one cheap call, always asked once the turn-interval and cooldown allow it (the
+    // The gate: one cheap call, always asked once the interval and cooldown allow it (the
     // caller in `rpc.rs` enforces both). No keyword pre-filter: Prime has none either.
-    let (gsystem, guser) = gate_request(turns_since_review, fresh);
+    let (gsystem, guser) = gate_request(store, session, due, fresh);
     let started = crate::observability::now();
     let greply = complete(gsystem, guser).await;
     record("Auto-refine gate", &greply, started);
-    let review = parse_gate_review(&greply?.text);
+    let gate_span = call_span("learning.gate", session, due.trigger, &greply, started).attr("assistants", due.assistants as u64);
+    let review = match &greply {
+        Ok(done) => parse_gate_review(&done.text),
+        Err(_) => GateReview { should_refine: false, rationale: None, instructions: None },
+    };
+    emit(gate_span.attr("approved", review.should_refine));
+    greply?;
     let judged = || -> anyhow::Result<()> {
         store.set_watermark(session, raw_len)?;
         store.learn_reviewed(session, crate::observability::now())
@@ -296,7 +371,7 @@ async fn checkpoint(
         judged()?;
         return Ok(None);
     }
-    let outcome = refine_approved(complete, store, session, fresh, &review, learning, cwd, &mut |reply, started| {
+    let outcome = refine_approved(complete, store, session, fresh, due, &review, &mut |reply, started| {
         record("Auto-refine", reply, started)
     })
     .await?;
@@ -366,6 +441,30 @@ mod tests {
         assert!(!parse_gate_review("{\"shouldRefine\": false}").should_refine);
     }
 
+    /// An entry store in its own temp home, removed on drop.
+    struct TempStore(sovereign_prime::entries::EntryStore, std::path::PathBuf);
+
+    impl TempStore {
+        fn new() -> Self {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let home = std::env::temp_dir().join(format!("learn-store-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            Self(sovereign_prime::entries::EntryStore::open(&home).unwrap(), home)
+        }
+    }
+
+    impl std::ops::Deref for TempStore {
+        type Target = sovereign_prime::entries::EntryStore;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.1).ok();
+        }
+    }
+
     fn scripted(replies: Vec<&str>) -> (crate::Complete, Arc<std::sync::Mutex<Vec<String>>>) {
         let replies = Arc::new(std::sync::Mutex::new(replies.into_iter().map(String::from).collect::<std::collections::VecDeque<_>>()));
         let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -383,22 +482,72 @@ mod tests {
         (complete, prompts)
     }
 
+    const LESSON: &str = r#"{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{"action":"create","kind":"prompt","title":"Nim","content":"Write quick scripts in Nim"}]}"#;
+
+    fn gate_due() -> GateDue {
+        GateDue { assistants: 25, trigger: Trigger::TurnInterval }
+    }
+
+    fn msgs(assistants: usize) -> Vec<Value> {
+        let mut rows = vec![serde_json::json!({ "role": "user", "content": "do the thing" })];
+        for i in 0..assistants {
+            rows.push(serde_json::json!({ "role": "assistant", "content": format!("step {i}") }));
+            rows.push(serde_json::json!({ "role": "tool", "content": "ok", "tool_name": "bash" }));
+        }
+        rows
+    }
+
+    fn learning(interval: usize, cooldown: Duration) -> Learning {
+        Learning { turn_interval: interval, cooldown }
+    }
+
+    #[test]
+    fn one_prompt_with_25_assistant_messages_triggers_a_review_and_24_do_not() {
+        let store = TempStore::new();
+        let l = learning(25, Duration::from_secs(1200));
+        assert_eq!(due(&store, "s1", &l, &msgs(24), Trigger::TurnInterval, false, 1_000).unwrap_err().0, "below_interval");
+        // Tool rows and errored assistant rows do not count.
+        let mut errored = msgs(24);
+        errored.push(serde_json::json!({ "role": "assistant", "content": "", "is_error": true }));
+        assert_eq!(due(&store, "s1", &l, &errored, Trigger::TurnInterval, false, 1_001).unwrap_err().0, "below_interval");
+        let d = due(&store, "s1", &l, &msgs(25), Trigger::TurnInterval, false, 1_002).unwrap();
+        assert_eq!((d.assistants, d.trigger), (25, Trigger::TurnInterval));
+    }
+
+    #[test]
+    fn only_messages_after_the_last_review_are_counted() {
+        let store = TempStore::new();
+        let l = learning(25, Duration::ZERO);
+        store.set_watermark("s1", msgs(10).len()).unwrap();
+        assert_eq!(due(&store, "s1", &l, &msgs(30), Trigger::TurnInterval, false, 1_000).unwrap_err(), ("below_interval", 20));
+        assert_eq!(due(&store, "s1", &l, &msgs(35), Trigger::TurnInterval, false, 1_001).unwrap().assistants, 25);
+    }
+
+    #[test]
+    fn compaction_and_dispose_triggers_and_the_cooldown() {
+        let store = TempStore::new();
+        let l = learning(25, Duration::from_millis(1_000));
+        let few = msgs(3);
+        // Compaction reviews whatever the count; dispose does not.
+        assert_eq!(due(&store, "s1", &l, &few, Trigger::Dispose, false, 5_000).unwrap_err().0, "below_interval");
+        assert_eq!(due(&store, "s1", &l, &few, Trigger::TurnInterval, true, 5_000).unwrap().trigger, Trigger::Compact);
+        assert_eq!(due(&store, "s1", &l, &msgs(25), Trigger::Dispose, false, 5_000).unwrap().trigger, Trigger::Dispose);
+        // Once a review ran, both are deferred while cooling, then due again.
+        store.learn_reviewed("s1", 5_000).unwrap();
+        assert_eq!(due(&store, "s1", &l, &few, Trigger::TurnInterval, true, 5_500).unwrap_err().0, "cooldown");
+        assert_eq!(due(&store, "s1", &l, &msgs(60), Trigger::TurnInterval, false, 5_500).unwrap_err().0, "cooldown");
+        assert_eq!(due(&store, "s1", &l, &few, Trigger::TurnInterval, true, 6_001).unwrap().trigger, Trigger::Compact);
+    }
+
     #[tokio::test]
     async fn an_approved_gate_hands_its_lesson_to_refine_and_a_blank_reply_is_retried_once() {
         let home = std::env::temp_dir().join(format!("learn-handoff-{}", std::process::id()));
         let fresh = vec![Turn { role: "user".into(), text: "From now on write quick scripts in Nim. Remember that.".into() }];
         let review = parse_gate_review(r#"{"shouldRefine": true, "rationale": "stated preference", "instructions": "save: quick scripts in Nim"}"#);
-        let lesson = r#"{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{"action":"create","kind":"memory","title":"Nim","category":"preference","content":"Write quick scripts in Nim"}]}"#;
-        let learning = Learning {
-            turn_interval: 1,
-            cooldown: Duration::ZERO,
-            remember: Arc::new(|_, _, _, _| Ok("mem-1".into())),
-            forget: Arc::new(|_| None),
-        };
         // First reply: the model says nothing durable; the retry produces the edit.
-        let (complete, prompts) = scripted(vec![r#"{"summary":"none","edits":[]}"#, lesson]);
+        let (complete, prompts) = scripted(vec![r#"{"summary":"none","edits":[]}"#, LESSON]);
         let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
-        let outcome = refine_approved(&complete, &store, "s1", &fresh, &review, &learning, None, &mut |_, _| {}).await.unwrap().unwrap();
+        let outcome = refine_approved(&complete, &store, "s1", &fresh, &gate_due(), &review, &mut |_, _| {}).await.unwrap().unwrap();
         assert_eq!(outcome.created.len(), 1);
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2, "exactly one retry");
@@ -407,10 +556,31 @@ mod tests {
         assert!(prompts[1].contains("previous reply"), "the retry says why");
 
         // Two blanks in a row is a genuine miss, surfaced (not looped).
-        let (complete, prompts) = scripted(vec!["{\"edits\":[]}", "{\"edits\":[]}", lesson]);
+        let (complete, prompts) = scripted(vec!["{\"edits\":[]}", "{\"edits\":[]}", LESSON]);
         let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
-        let err = refine_approved(&complete, &store, "s1", &fresh, &review, &learning, None, &mut |_, _| {}).await.unwrap().unwrap_err();
+        let err = refine_approved(&complete, &store, "s1", &fresh, &gate_due(), &review, &mut |_, _| {}).await.unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("no durable lesson") && prompts.lock().unwrap().len() == 2);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[tokio::test]
+    async fn a_memory_proposal_is_rejected_and_reported_in_the_apply_span() {
+        let home = std::env::temp_dir().join(format!("learn-memory-{}", std::process::id()));
+        let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
+        let fresh = vec![Turn { role: "user".into(), text: "I prefer Nim.".into() }];
+        let review = parse_gate_review(r#"{"shouldRefine": true}"#);
+        let memory = r#"{"summary":"s","edits":[{"action":"create","kind":"memory","title":"Nim","category":"preference","content":"Prefers Nim"}]}"#;
+        let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = spans.clone();
+        jcode_base::obs_sink::install(move |span| sink.lock().unwrap().push(span));
+        let (complete, _) = scripted(vec![memory]);
+        let err = refine_approved(&complete, &store, "memory-span", &fresh, &gate_due(), &review, &mut |_, _| {}).await.unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("memory extraction"), "{err:#}");
+        assert!(store.list_visible("memory-span", None).unwrap().is_empty());
+        let spans = spans.lock().unwrap();
+        let apply = spans.iter().find(|s| s.kind == "learning.apply" && s.session_id.as_deref() == Some("memory-span")).expect("apply span");
+        assert_eq!(apply.attributes["approved"], false);
+        assert!(apply.attributes["rejected"].as_str().unwrap().contains("memory extraction"));
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -419,38 +589,45 @@ mod tests {
         let home = std::env::temp_dir().join(format!("learn-retry-{}", std::process::id()));
         let store = sovereign_prime::entries::EntryStore::open(&home).unwrap();
         let fresh = vec![Turn { role: "user".into(), text: "From now on write quick scripts in Nim.".into() }];
-        let learning = Learning {
-            turn_interval: 1,
-            cooldown: Duration::from_secs(3600),
-            remember: Arc::new(|_, _, _, _| Ok("mem-1".into())),
-            forget: Arc::new(|_| None),
-        };
         let gate_yes = r#"{"shouldRefine": true, "rationale": "preference", "instructions": "save Nim"}"#;
-        let lesson = r#"{"summary":"s","rationale":"r","expectedOutcome":"e","edits":[{"action":"create","kind":"memory","title":"Nim","category":"preference","content":"Write quick scripts in Nim"}]}"#;
-        let (complete, _) = scripted(vec!["ERR", gate_yes, "ERR", lesson]);
+        let (complete, _) = scripted(vec!["ERR", gate_yes, "ERR", LESSON]);
         let run = |complete: &crate::Complete| {
-            let (complete, store, fresh, learning) = (complete.clone(), &store, &fresh, &learning);
-            async move { checkpoint(&complete, store, "s1", 7, 1, fresh, learning, None, &mut |_, _, _| {}).await }
+            let (complete, store, fresh) = (complete.clone(), &store, &fresh);
+            async move { checkpoint(&complete, store, "s1", 7, &gate_due(), fresh, &mut |_, _, _| {}).await }
         };
         // Gate 429: nothing is judged, the checkpoint is still due (cooldown untouched).
         assert!(run(&complete).await.is_err());
         assert_eq!(store.watermark("s1"), 0);
-        assert!(store.learn_checkpoint("s1", 1, 3_600_000, crate::observability::now()).unwrap().is_some());
+        assert!(store.learn_checkpoint("s1", 25, 25, 3_600_000, crate::observability::now(), false).unwrap().is_some());
         // Gate approves but the refine call 429s: still not judged.
         assert!(run(&complete).await.is_err());
         assert_eq!(store.watermark("s1"), 0);
         // Next checkpoint succeeds end to end and only now closes the window and starts the cooldown.
-        let (complete, _) = scripted(vec![gate_yes, lesson]);
+        let (complete, _) = scripted(vec![gate_yes, LESSON]);
         assert!(run(&complete).await.unwrap().is_some());
         assert_eq!(store.watermark("s1"), 7);
-        assert!(store.learn_checkpoint("s1", 1, 3_600_000, crate::observability::now()).unwrap().is_none());
+        assert!(store.learn_checkpoint("s1", 25, 25, 3_600_000, crate::observability::now(), false).unwrap().is_none());
         std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
-    fn gate_request_is_one_bounded_call_with_the_turn_count() {
+    fn the_gate_sees_the_harness_overview_and_history_and_the_transcript_is_capped_at_40k() {
+        let store = TempStore::new();
+        sovereign_prime::refine::apply(&store, "s1", LESSON, false, "refine").unwrap();
         let turns = vec![Turn { role: "user".into(), text: "hello".into() }];
-        let (_, user) = gate_request(25, &turns);
-        assert!(user.contains("25 assistant turns") && user.contains("hello"));
+        let (_, user) = gate_request(&store, "s1", &GateDue { assistants: 25, trigger: Trigger::Compact }, &turns);
+        assert!(user.contains("compact; 25 assistant turns") && user.contains("hello"));
+        assert!(user.contains("prompt: 1") && user.contains("Nim") && user.contains("Expected outcome: e"), "{user}");
+        let long: Vec<Turn> = (0..3000).map(|i| Turn { role: "user".into(), text: format!("m{i} {}", "x".repeat(50)) }).collect();
+        let (_, user) = gate_request(&store, "s1", &gate_due(), &long);
+        let conversation = user.split("<conversation>").nth(1).unwrap().split("</conversation>").next().unwrap();
+        assert!(conversation.len() <= GATE_TRANSCRIPT_CHARS + 2 && conversation.contains("m2999"));
+    }
+
+    #[test]
+    fn the_approved_instructions_keep_primes_no_global_promotion_rule() {
+        let review = GateReview { should_refine: true, rationale: Some("why".into()), instructions: None };
+        let text = approved_instructions(Trigger::Dispose, &review);
+        assert!(text.contains("triggered by dispose") && text.contains("Do not promote anything global unless explicitly requested."));
     }
 }

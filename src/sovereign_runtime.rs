@@ -856,50 +856,9 @@ fn sovereign_learning() -> sovereign_gateway::learn::Learning {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20 * 60_000);
-    let remember: sovereign_gateway::learn::Remember = std::sync::Arc::new(
-        |text: &str, category: &str, user_stated: bool, cwd: Option<&str>| {
-            use crate::memory::{MemoryCategory, MemoryEntry, MemoryManager, TrustLevel};
-            // Learned lessons are about the user and how they work: global scope,
-            // with the chat's project attached so project scope can be added later.
-            let manager = match cwd {
-                Some(dir) => MemoryManager::new().with_project_dir(dir.to_string()),
-                None => MemoryManager::new(),
-            };
-            let category = match category {
-                "preference" => MemoryCategory::Preference,
-                "correction" => MemoryCategory::Correction,
-                _ => MemoryCategory::Fact,
-            };
-            let mut entry = MemoryEntry::new(category, text.to_string());
-            entry.trust = if user_stated {
-                TrustLevel::High
-            } else {
-                TrustLevel::Medium
-            };
-            entry.source = Some("prime-learning".to_string());
-            manager.remember_global(entry)
-        },
-    );
-    let forget: sovereign_gateway::learn::Forget = std::sync::Arc::new(|id: &str| {
-        use crate::memory::{MemoryCategory, MemoryManager};
-        let manager = MemoryManager::new();
-        // Hand the text back so a rolled-back refine delete can restore it.
-        let saved = manager.list_all().ok().and_then(|all| all.into_iter().find(|m| m.id == id));
-        let _ = manager.forget(id);
-        saved.map(|m| {
-            let category = match m.category {
-                MemoryCategory::Preference => "preference",
-                MemoryCategory::Correction => "correction",
-                _ => "fact",
-            };
-            (m.content, category.to_string())
-        })
-    });
     sovereign_gateway::learn::Learning {
         turn_interval,
         cooldown: std::time::Duration::from_millis(cooldown_ms),
-        remember,
-        forget,
     }
 }
 

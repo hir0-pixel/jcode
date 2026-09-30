@@ -45,12 +45,10 @@ pub(super) async fn route(
             let Some(id) = body["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string) else {
                 return Some(respond(stream, "400 Bad Request", &json!({"detail": "id is required"})).await);
             };
-            let (home, learning) = (config.home.clone(), config.learning.clone());
+            let home = config.home.clone();
             match blocking(move || {
                 let store = store(Path::new(&home))?;
-                crate::learn::with_sink(learning.as_ref(), None, |sink| {
-                    sovereign_prime::refine::rollback(&store, "", Some(&id), sink)
-                })
+                sovereign_prime::refine::rollback(&store, "", Some(&id))
             })
             .await
             {
@@ -514,7 +512,7 @@ mod tests {
         assert_eq!(body["entries"][0]["title"], "Scaffold");
         assert_eq!(body["changesets"][0]["id"], cs);
         assert_eq!(body["changesets"][0]["rolledBack"], false);
-        sovereign_prime::refine::rollback(&store, "", Some(&cs), None).unwrap();
+        sovereign_prime::refine::rollback(&store, "", Some(&cs)).unwrap();
         let after = harness(&store).unwrap();
         assert!(after["entries"].as_array().unwrap().is_empty());
         assert_eq!(after["changesets"].as_array().unwrap().len(), 2);

@@ -12,7 +12,7 @@
 
 use super::*;
 use rand::Rng;
-use sovereign_prime::refine::{Turn, transcript};
+use sovereign_prime::refine::{REFINE_TRANSCRIPT_CHARS, Turn, transcript};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -113,7 +113,7 @@ impl Conn {
             .clone()
             .ok_or_else(|| RpcError::internal(anyhow!("no model is available for /btw")))?;
         let history = self.history(&parent).await.map_err(RpcError::internal)?;
-        let snapshot = transcript(&turns(&history));
+        let snapshot = transcript(&turns(&history), REFINE_TRANSCRIPT_CHARS);
         let task_id = task_id("btw");
         let conn = self.clone();
         let reply_task = task_id.clone();
@@ -178,7 +178,7 @@ impl Conn {
         lines.extend(PREVIEW_RULES.iter().map(|r| r.to_string()));
         if !recent.is_empty() {
             lines.push(PREVIEW_HISTORY_NOTE.to_string());
-            lines.push(transcript(&recent));
+            lines.push(transcript(&recent, REFINE_TRANSCRIPT_CHARS));
         }
         let task_id = task_id("preview");
         let note = if recent.is_empty() {

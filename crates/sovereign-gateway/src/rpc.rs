@@ -2,11 +2,13 @@
 //! events translated back into Hermes `event` notifications.
 
 use crate::approvals::{Client, Hub};
+use crate::learn::Trigger;
 use crate::map::{self, Out, SessionState};
 use crate::observability::Observer;
 use crate::{Config, MAX_FRAME_BYTES};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
+use jcode_base::obs_sink::{Span, emit};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -32,6 +34,8 @@ mod spawn_tree;
 mod toolsets;
 
 const HARNESS_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a closing session (or a finished headless run) waits for its last learning review.
+const DISPOSE_LEARNING_WAIT: Duration = Duration::from_secs(30);
 /// How long `prompt.submit` waits for jcode to acknowledge the message. The
 /// turn itself streams afterwards and may run for minutes.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -316,7 +320,12 @@ pub(crate) struct Conn {
     /// Sessions created here that have not had a turn yet, so jcode has not
     /// persisted them; only these are merged into `session.list` from `known`.
     fresh: Mutex<std::collections::HashSet<String>>,
-    learning_now: Mutex<std::collections::HashSet<String>>,
+    /// Sessions with a learning pass running (std mutex: the guard releases on drop, even when the pass is cancelled).
+    learning_now: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Sessions whose context was compacted and not yet reviewed (Prime's `_compactAutoRefinePending`).
+    compact_pending: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Learning passes started here; a headless run waits for them before closing its links.
+    learning_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The engine-level driver's link (see `driver.rs`), not a desktop window.
     driver: bool,
     next_id: AtomicU64,
@@ -361,7 +370,9 @@ impl Conn {
             link_tasks: Mutex::new(Vec::new()),
             known: Mutex::new(HashMap::new()),
             fresh: Mutex::new(Default::default()),
-            learning_now: Mutex::new(Default::default()),
+            learning_now: Default::default(),
+            compact_pending: Default::default(),
+            learning_tasks: Default::default(),
             driver,
             next_id: AtomicU64::new(1),
             next_server_request: AtomicU64::new(1),
@@ -691,9 +702,15 @@ impl Conn {
                         self.clone().maybe_steer_heartbeat(session_id.clone());
                     }
                     let payload_for_loop = completed.then(|| payload.clone());
+                    let compacted = ty == "status.update" && payload["kind"] == "compress";
                     self.emit(ty, Some(&session_id), payload).await;
+                    if compacted {
+                        // Prime reviews after a compaction whatever the count, once the cooldown allows.
+                        self.compact_pending.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone());
+                        self.schedule_learning(session_id.clone(), Trigger::Compact);
+                    }
                     if let Some(loop_payload) = payload_for_loop {
-                        self.schedule_learning(session_id.clone());
+                        self.schedule_learning(session_id.clone(), Trigger::TurnInterval);
                         driver::turn_done(self.clone(), session_id, loop_payload);
                     }
                 }
@@ -805,57 +822,116 @@ impl Conn {
         Ok(result)
     }
 
-    /// Check, right after a completed turn, whether this chat is due an
-    /// auto-refine gate call (Prime's `_maybeAutoRefine`, `turn_interval`
-    /// reason: no idle wait, just a turn counter and a cooldown). Runs as a
-    /// spawned task only so it never blocks the turn's own response; the
-    /// check itself happens immediately, not after a delay.
-    fn schedule_learning(self: &Arc<Self>, session: String) {
+    /// Check, right after a completed turn or a compaction, whether this chat is due an auto-refine
+    /// gate call (Prime's `_maybeAutoRefine`: an assistant-message counter, a compaction flag and a
+    /// cooldown, no idle wait). Runs as a spawned task only so it never blocks the turn's own
+    /// response; the check itself happens immediately. The task is remembered so a headless run can
+    /// let it finish before it closes its links ([`close_links`]).
+    fn schedule_learning(self: &Arc<Self>, session: String, trigger: Trigger) {
+        if self.config.learning.is_none() {
+            return;
+        }
+        let conn = self.clone();
+        let task = tokio::spawn(async move { conn.learning_check(&session, trigger).await });
+        let mut tasks = self.learning_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task);
+    }
+
+    /// One learning check for `session`: skip (with a `learning.skip` span saying why) or run the pass.
+    async fn learning_check(self: &Arc<Self>, session: &str, trigger: Trigger) {
         let Some(learning) = self.config.learning.clone() else {
             return;
         };
-        let conn = self.clone();
-        tokio::spawn(async move {
-            // The model-callable `refine` tool / REPL `refine` schedule a
-            // request that runs at the end of the turn, independent of the
-            // checkpoint counter (Prime runs those immediately, too).
-            let store = conn.entry_store().await;
-            let scheduled = store.as_ref().and_then(|store| store.refine_pending(&session).ok()).unwrap_or(false);
-            // Counters and the `learning.enabled` switch live in sovereign.db.
-            let gate_due = store.as_ref().filter(|store| store.learning_enabled()).and_then(|store| {
-                let cooldown_ms = learning.cooldown.as_millis() as i64;
-                store.learn_checkpoint(&session, learning.turn_interval, cooldown_ms, crate::observability::now()).ok().flatten()
+        let skip = |reason: &str, assistants: Option<usize>| {
+            let span = Span::new("learning.skip").session(session).attr("trigger", trigger.as_str()).attr("reason", reason);
+            emit(match assistants {
+                Some(n) => span.attr("assistants", n as u64).attr("interval", learning.turn_interval as u64),
+                None => span,
             });
-            if gate_due.is_none() && !scheduled {
-                return;
+        };
+        // The model-callable `refine` tool / REPL `refine` schedule a
+        // request that runs at the end of the turn, independent of the
+        // checkpoint counter (Prime runs those immediately, too).
+        let store = self.entry_store().await;
+        let scheduled = store.as_ref().and_then(|store| store.refine_pending(session).ok()).unwrap_or(false);
+        // The `learning.enabled` switch lives in sovereign.db.
+        let enabled = store.as_ref().is_some_and(|store| store.learning_enabled());
+        if !enabled && !scheduled {
+            return skip("disabled", None);
+        }
+        // A closing session is reviewed even mid-turn bookkeeping; otherwise wait for the turn to end.
+        if trigger != Trigger::Dispose && self.sessions.lock().await.get(session).is_some_and(SessionState::turn_active) {
+            return skip("busy", None);
+        }
+        struct Running<'a>(&'a Conn, String);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.learning_now.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
             }
-            if conn
-                .sessions
-                .lock()
-                .await
-                .get(&session)
-                .is_some_and(SessionState::turn_active)
-            {
-                return;
+        }
+        if !self.learning_now.lock().unwrap_or_else(|e| e.into_inner()).insert(session.to_string()) {
+            return skip("in_progress", None);
+        }
+        let _running = Running(self, session.to_string());
+        let mut gate = None;
+        if let (true, Some(store)) = (enabled, &store) {
+            let history = match self.history(session).await {
+                Ok(history) => history,
+                Err(err) => return eprintln!("sovereign: learning check for {session} failed: {err:#}"),
+            };
+            let raw = history["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let compact = self.compact_pending.lock().unwrap_or_else(|e| e.into_inner()).contains(session);
+            match crate::learn::due(store, session, &learning, raw, trigger, compact, crate::observability::now()) {
+                // Prime reviews top-level sessions only (`_rlmDepth === 0`).
+                Ok(_) if self.is_child_session(session).await => skip("depth>0", None),
+                Ok(due) => gate = Some(due),
+                Err((reason, assistants)) => skip(reason, Some(assistants)),
             }
-            if !conn.learning_now.lock().await.insert(session.clone()) {
-                return;
-            }
-            let result = crate::learn::pass(&conn, &session, &learning, gate_due).await;
-            conn.learning_now.lock().await.remove(&session);
-            match result {
-                Ok(Some(text)) => {
-                    conn.emit(
-                        "status.update",
-                        Some(&session),
-                        json!({ "kind": "learning", "text": text }),
-                    )
-                    .await
+        }
+        if gate.is_none() && !scheduled {
+            return;
+        }
+        let compacted = gate.is_some_and(|d| d.trigger == Trigger::Compact);
+        match crate::learn::pass(self, session, gate).await {
+            Ok(result) => {
+                if compacted {
+                    self.compact_pending.lock().unwrap_or_else(|e| e.into_inner()).remove(session);
                 }
-                Ok(None) => {}
-                Err(err) => eprintln!("sovereign: learning pass for {session} failed: {err:#}"),
+                if let Some(text) = result {
+                    self.emit("status.update", Some(session), json!({ "kind": "learning", "text": text })).await;
+                }
             }
-        });
+            Err(err) => eprintln!("sovereign: learning pass for {session} failed: {err:#}"),
+        }
+    }
+
+    /// Whether `session` is a sub-agent or fork (it has a parent); Prime reviews top-level sessions only.
+    async fn is_child_session(&self, session: &str) -> bool {
+        if self.known.lock().await.get(session).is_some_and(|info| !info["parent_session_id"].is_null()) {
+            return true;
+        }
+        let id = session.to_string();
+        tokio::task::spawn_blocking(move || jcode_base::session::Session::load_startup_stub(&id).ok().and_then(|s| s.parent_id).is_some())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Prime's review before dispose (`_drainPendingRefinementForDisposal`): wait (bounded) for a
+    /// pass already running, then run the review if it is due, before the session's state goes.
+    pub(crate) async fn learn_before_dispose(self: &Arc<Self>, session: &str) {
+        if self.config.learning.is_none() {
+            return;
+        }
+        let review = async {
+            while self.learning_now.lock().unwrap_or_else(|e| e.into_inner()).contains(session) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            self.learning_check(session, Trigger::Dispose).await;
+        };
+        if tokio::time::timeout(DISPOSE_LEARNING_WAIT, review).await.is_err() {
+            emit(Span::new("learning.skip").session(session).attr("trigger", "dispose").attr("reason", "timeout"));
+        }
     }
 
     /// Deliver a due RLM "steer" heartbeat to a busy session right now, via
@@ -1571,6 +1647,7 @@ impl Conn {
             // act on a database that has never seen these sessions.
             "session.close" => {
                 let id = sid()?;
+                self.learn_before_dispose(id).await;
                 let closed = self.links.lock().await.remove(id).is_some();
                 self.client.sessions.lock().await.remove(id);
                 Ok(json!({ "closed": closed }))
@@ -1589,6 +1666,7 @@ impl Conn {
                         "session is running; stop it before deleting",
                     ));
                 }
+                self.learn_before_dispose(&id).await;
                 self.links.lock().await.remove(&id);
                 self.client.sessions.lock().await.remove(&id);
                 crate::sessions_rest::delete_everywhere(&self.config, &id).await.map_err(RpcError::internal)?;
@@ -2205,9 +2283,7 @@ impl Conn {
                     .ok_or_else(|| anyhow!("/refine needs an open session"))?;
                 let id = rest.iter().find(|w| **w != "--global").copied();
                 let store = EntryStore::open_cached(std::path::Path::new(&self.config.home))?;
-                crate::learn::with_sink(self.config.learning.as_ref(), None, |sink| {
-                    sovereign_prime::refine::rollback(&store, sid, id, sink)
-                })
+                sovereign_prime::refine::rollback(&store, sid, id)
             })(),
             ["goal", rest @ ..] => (|| -> anyhow::Result<String> {
                 let sid = session_id
@@ -2291,10 +2367,7 @@ impl Conn {
                         reply.as_ref().err().map(|err| err.to_string()).as_deref(),
                     );
                     let reply = reply?.text;
-                    let cwd = self.session_cwd(sid).await;
-                    match crate::learn::with_sink(self.config.learning.as_ref(), cwd, |sink| {
-                        sovereign_prime::refine::apply(&store, sid, &reply, &turns, global, "refine", sink)
-                    }) {
+                    match sovereign_prime::refine::apply(&store, sid, &reply, global, "refine") {
                         Ok(outcome) => {
                             let mut text = format!(
                                 "Refined ({}): {}\n",
@@ -2891,9 +2964,32 @@ async fn end_run(conn: &Arc<Conn>, session_key: Option<&str>) {
             runs.remove(key);
         }
     }
-    for task in conn.link_tasks.lock().await.drain(..) {
-        task.abort();
+    close_links(conn).await;
+}
+
+/// Abort a connection's link tasks. A learning pass it started still needs its history link, so
+/// while one is running the abort waits (bounded) in the background; the caller is not delayed.
+async fn close_links(conn: &Arc<Conn>) {
+    let running: Vec<_> = {
+        let mut tasks = conn.learning_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.drain(..).filter(|t| !t.is_finished()).collect()
+    };
+    if running.is_empty() {
+        for task in conn.link_tasks.lock().await.drain(..) {
+            task.abort();
+        }
+        return;
     }
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + DISPOSE_LEARNING_WAIT;
+        for task in running {
+            let _ = tokio::time::timeout_at(deadline, task).await;
+        }
+        for task in conn.link_tasks.lock().await.drain(..) {
+            task.abort();
+        }
+    });
 }
 
 pub async fn run(
@@ -3016,9 +3112,14 @@ pub async fn run(
 
     writer.abort();
     hub.remove(client.id).await;
-    for task in conn.link_tasks.lock().await.drain(..) {
-        task.abort();
+    // The window is gone: review the chats it had open that are due, then let the links go.
+    let open: Vec<String> = conn.links.lock().await.keys().cloned().collect();
+    for session in open {
+        if !conn.sessions.lock().await.get(&session).is_some_and(SessionState::turn_active) {
+            conn.schedule_learning(session, Trigger::Dispose);
+        }
     }
+    close_links(&conn).await;
     Ok(())
 }
 
@@ -3162,6 +3263,34 @@ mod tests {
         end_run(&conn, Some("telegram:end-run")).await;
         assert!(!ACTIVE_RUNS.lock().unwrap().contains_key("telegram:end-run"));
         assert!(conn.link_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_headless_run_lets_its_learning_pass_finish_before_its_links_close() {
+        let conn = test_conn("end-run-learning");
+        conn.ensure_control().await.unwrap();
+        let (release, held) = oneshot::channel::<()>();
+        conn.learning_tasks.lock().unwrap().push(tokio::spawn(async move {
+            let _ = held.await;
+        }));
+        end_run(&conn, None).await; // returns at once, links stay up for the pass
+        assert!(!conn.link_tasks.lock().await.is_empty(), "the pass still needs its history link");
+        release.send(()).unwrap();
+        for _ in 0..50 {
+            if conn.link_tasks.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the links were never closed after the pass finished");
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_with_nothing_due_returns_at_once_and_frees_the_running_mark() {
+        let conn = test_conn("dispose-nothing");
+        // No learning configured in the test config: nothing to review, nothing left marked.
+        conn.learn_before_dispose("s1").await;
+        assert!(conn.learning_now.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

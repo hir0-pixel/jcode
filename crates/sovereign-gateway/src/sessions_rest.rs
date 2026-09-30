@@ -260,7 +260,7 @@ mod tests {
             control.set_goal(sid, Some(&SessionGoal::new("ship"))).unwrap();
             control.upsert_heartbeat(&Heartbeat::new(sid, "check", 60)).unwrap();
             entries.park_save(&format!("req-{sid}"), sid, "{}", 5).unwrap();
-            entries.learn_checkpoint(sid, 5, 0, 1).unwrap();
+            entries.learn_checkpoint(sid, 1, 5, 0, 1, false).unwrap();
             entries.set_watermark(sid, 3).unwrap();
             entries.set_setting(&format!("session_surface:{sid}"), "cron@1").unwrap();
             entries.set_setting(&format!("bot_session:chat-{sid}"), sid).unwrap();

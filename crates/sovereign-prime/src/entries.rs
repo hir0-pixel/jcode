@@ -212,7 +212,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Action::Create => "create",
             Action::Update => "update",
@@ -906,27 +906,24 @@ impl EntryStore {
         self.setting("learning.enabled").is_none_or(|v| v != "false")
     }
 
-    /// Count one finished assistant turn for `session` and say whether the
-    /// auto-refine gate is due (`interval` turns and `cooldown_ms` since the
-    /// last gate call). Due stays due until `learn_reviewed` resets the counter and stamps the time. Persisted, so
-    /// a reconnect or restart keeps counting (Prime's per-session counters).
-    pub fn learn_checkpoint(&self, session: &str, interval: usize, cooldown_ms: i64, now: i64) -> Result<Option<usize>> {
+    /// Record how many assistant messages `session` has produced since its last review and say
+    /// whether a review is due (Prime's `_assistantTurnsSinceAutoRefine`, which counts assistant
+    /// messages that are not error/abort). Due needs `interval` messages, or `force` (a compaction,
+    /// which Prime reviews regardless of the count), and `cooldown_ms` since the last review
+    /// (`last > 0`, as Prime). Due stays due until `learn_reviewed` resets the count and stamps the
+    /// time. Persisted, so a reconnect or restart keeps the cooldown.
+    pub fn learn_checkpoint(&self, session: &str, assistants: usize, interval: usize, cooldown_ms: i64, now: i64, force: bool) -> Result<Option<usize>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO harness_learn_state(session, turns, last_review_ms) VALUES (?1, 1, 0) \
-             ON CONFLICT(session) DO UPDATE SET turns = turns + 1",
-            [session],
+            "INSERT INTO harness_learn_state(session, turns, last_review_ms) VALUES (?1, ?2, 0) \
+             ON CONFLICT(session) DO UPDATE SET turns = ?2",
+            params![session, assistants as i64],
         )?;
-        let (turns, last): (i64, i64) = conn.query_row(
-            "SELECT turns, last_review_ms FROM harness_learn_state WHERE session = ?1",
-            [session],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if (turns as usize) < interval || now - last < cooldown_ms {
+        let last: i64 = conn.query_row("SELECT last_review_ms FROM harness_learn_state WHERE session = ?1", [session], |r| r.get(0))?;
+        if (last > 0 && now - last < cooldown_ms) || (assistants < interval && !force) {
             return Ok(None);
         }
-        // Still due until `learn_reviewed`: a review dropped for a busy turn is retried next turn.
-        Ok(Some(turns as usize))
+        Ok(Some(assistants))
     }
 
     /// The gate actually ran for `session`: restart the turn count and the cooldown.
@@ -1076,20 +1073,21 @@ mod tests {
     }
 
     #[test]
-    fn learn_counters_persist_across_reopen() {
+    fn learn_state_persists_across_reopen_and_compaction_ignores_the_count_but_not_the_cooldown() {
         let dir = std::env::temp_dir().join(format!("learn-state-{}", uuid::Uuid::new_v4()));
-        let due = |store: &EntryStore, now| store.learn_checkpoint("s1", 3, 1_000, now).unwrap();
+        let due = |store: &EntryStore, n, now, force| store.learn_checkpoint("s1", n, 3, 1_000, now, force).unwrap();
         let store = EntryStore::open(&dir).unwrap();
-        assert_eq!((due(&store, 5_000), due(&store, 5_001)), (None, None));
+        assert_eq!((due(&store, 1, 5_000, false), due(&store, 2, 5_001, false)), (None, None));
         drop(store);
-        // A restart keeps the count: the third turn trips the gate, then cooldown holds.
         let store = EntryStore::open(&dir).unwrap();
-        assert_eq!(due(&store, 5_002), Some(3));
+        assert_eq!(due(&store, 3, 5_002, false), Some(3));
         // Not reviewed yet (say the turn was busy): still due, the window is not lost.
-        assert_eq!(due(&store, 5_003), Some(4));
+        assert_eq!(due(&store, 4, 5_003, false), Some(4));
+        // A compaction is due at any count.
+        assert_eq!(due(&store, 1, 5_003, true), Some(1));
         store.learn_reviewed("s1", 5_003).unwrap();
-        assert_eq!((due(&store, 5_004), due(&store, 5_005), due(&store, 5_006)), (None, None, None));
-        assert_eq!(due(&store, 9_000), Some(4));
+        assert_eq!((due(&store, 9, 5_004, false), due(&store, 9, 5_500, true)), (None, None), "cooling defers both");
+        assert_eq!((due(&store, 9, 6_003, false), due(&store, 1, 6_003, true)), (Some(9), Some(1)));
         std::fs::remove_dir_all(dir).ok();
     }
 

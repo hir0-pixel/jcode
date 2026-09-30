@@ -5,17 +5,19 @@
 //! This is the one apply/gate path shared by the interactive `/refine`
 //! command, the model-callable `refine` tool (scheduled at turn end), the
 //! `refine` REPL host function, and the automatic learning pass
-//! (`sovereign-gateway`'s `learn.rs`) - there is no second CRUD path: a
-//! learned memory is a `memory`-kind entry here whose text lives once, in
-//! jcode's own memory store (see [`MemorySink`]), and a learned skill is a `skill`-kind
+//! (`sovereign-gateway`'s `learn.rs`) - there is no second CRUD path. Refine
+//! writes `prompt`, `skill` and `subagent` entries only: fact-type memories
+//! are jcode extraction's job (design D20). A learned skill is a `skill`-kind
 //! entry here, materialized as an importable `SKILL.md` by
 //! [`crate::skill_files`].
 
 use crate::entries::{Action, AppliedEdit, EntryKind, EntryPatch, EntryStore, NewEntry, Scope};
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-const MAX_TRANSCRIPT_CHARS: usize = 60_000;
+/// Prime's transcript caps (`refinement.ts`): the gate reads the last 40k characters, refine the last 80k.
+pub const GATE_TRANSCRIPT_CHARS: usize = 40_000;
+pub const REFINE_TRANSCRIPT_CHARS: usize = 80_000;
 
 /// One transcript message (`role` is user / assistant / tool / ...).
 pub struct Turn {
@@ -23,23 +25,18 @@ pub struct Turn {
     pub text: String,
 }
 
-/// Lowercased, whitespace-collapsed text, for comparing a quote to a message.
-pub(crate) fn normalize(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
 pub(crate) fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// Transcript text for a refine or gate request: newest turns win the budget.
-pub fn transcript(turns: &[Turn]) -> String {
+/// Transcript text for a refine or gate request: newest turns win the `cap` (in characters).
+pub fn transcript(turns: &[Turn], cap: usize) -> String {
     let mut picked = Vec::new();
     let mut used = 0;
     for turn in turns.iter().rev() {
         let entry = format!("[{}]\n{}\n", turn.role, turn.text.trim());
         // +1 for the separator added by join below.
-        if used + entry.len() + 1 > MAX_TRANSCRIPT_CHARS {
+        if used + entry.len() + 1 > cap {
             break;
         }
         used += entry.len() + 1;
@@ -94,6 +91,55 @@ pub struct RefineOutcome {
     pub created: Vec<String>,
     pub updated: Vec<String>,
     pub deleted: Vec<String>,
+    /// Applied edits per entry kind (`prompt`, `skill`, `subagent`), for the `learning.apply` span.
+    pub by_kind: std::collections::BTreeMap<&'static str, usize>,
+}
+
+/// Whether learned skills can be called: they are Python procedures, run by the REPL, which exists
+/// only inside the sovereign engine (`SOVEREIGN_REPL_WORKER`). Without it a skill is inert text.
+pub fn skills_available() -> bool {
+    std::env::var_os("SOVEREIGN_REPL_WORKER").is_some()
+}
+
+/// Prime's `overviewForPrompt`: per-kind counts, then up to 40 entries of each with scope, id, title,
+/// path, version and (collapsed, 240-char) content.
+pub fn overview(store: &EntryStore, session: &str) -> String {
+    let all = store.list_visible(session, None).unwrap_or_default();
+    let mut lines = Vec::new();
+    for kind in ["prompt", "skill", "subagent"] {
+        let of_kind: Vec<_> = all.iter().filter(|e| e.kind.as_str() == kind).collect();
+        lines.push(format!("{kind}: {}", of_kind.len()));
+        for e in of_kind.iter().take(40) {
+            let content: String = e.content.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(240).collect();
+            lines.push(format!("- [{}:{}] {} ({}, v{}): {content}", e.scope.as_str(), e.id, e.title, e.path, e.version));
+        }
+        if of_kind.len() > 40 {
+            lines.push(format!("- +{} more {kind} entries", of_kind.len() - 40));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Prime's `historyForPrompt`: the last 20 refinements, oldest first.
+pub fn history(store: &EntryStore, session: &str) -> String {
+    let mut recent = store.recent_changesets(Some(session), 20).unwrap_or_default();
+    if recent.is_empty() {
+        return "No prior refinement history.".to_string();
+    }
+    recent.reverse();
+    recent
+        .iter()
+        .map(|cs| {
+            let edits: Vec<String> = cs
+                .edits
+                .iter()
+                .map(|e| format!("applied {} {}:{}", e.action.as_str(), e.after.as_ref().or(e.before.as_ref()).map_or("entry", |x| x.kind.as_str()), e.id))
+                .collect();
+            let rollback = cs.rollback_of.as_deref().map(|r| format!(" rollbackOf={r}")).unwrap_or_default();
+            format!("[{}]{rollback} {}\n{}\nExpected outcome: {}", cs.id, cs.summary, edits.join(", "), cs.expected_outcome)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// (system, user) prompts for a /refine (or auto-review) model call.
@@ -104,93 +150,77 @@ pub fn build_request(
     instructions: Option<&str>,
     global: bool,
 ) -> (String, String) {
+    build_request_with(store, session, turns, instructions, global, skills_available())
+}
+
+fn build_request_with(
+    store: &EntryStore,
+    session: &str,
+    turns: &[Turn],
+    instructions: Option<&str>,
+    global: bool,
+    skills: bool,
+) -> (String, String) {
     let scope_word = if global {
         "global (applies to every session)"
     } else {
         "local to this session"
     };
+    let (kinds, kind_names) = if skills {
+        (
+            "3 kinds - prompt (a system-prompt addendum), skill (a reusable procedure exposed as a Python call), \
+             subagent (a reusable delegation spec: name, instructions, allowed tools, model hint, all as free text \
+             in `content`). A skill create/update MUST also include a `reference` object \
+             {\"type\": \"python\", \"import\": <module>, \"callable\": <function name>} (or `call_pattern` instead \
+             of `callable`) and an `arguments` object describing accepted inputs (`{}` only if the callable truly \
+             takes none) - without both, the skill is inert text nobody can call.",
+            "\"prompt\"|\"skill\"|\"subagent\"",
+        )
+    } else {
+        (
+            "2 kinds - prompt (a system-prompt addendum), subagent (a reusable delegation spec: name, \
+             instructions, allowed tools, model hint, all as free text in `content`). There is no skill kind here.",
+            "\"prompt\"|\"subagent\"",
+        )
+    };
     let system = format!(
-        "You maintain an agent's Continual Harness: durable entries of 4 kinds - prompt (a system-prompt addendum), \
-         memory (a durable fact, preference, or correction worth remembering - put the memory text itself in \
-         `content`; set `category` to \"fact\"|\"preference\"|\"correction\"), skill (a reusable procedure exposed \
-         as a Python call), subagent (a reusable delegation spec: name, instructions, allowed tools, model hint, \
-         all as free text in `content`). A skill create/update MUST also include a `reference` object \
-         {{\"type\": \"python\", \"import\": <module>, \"callable\": <function name>}} (or `call_pattern` instead \
-         of `callable`) and an `arguments` object describing accepted inputs (`{{}}` only if the callable truly \
-         takes none) - without both, the skill is inert text nobody can call. Propose at most {MAX_EDITS} small, \
-         evidence-backed edits, scoped {scope_word}. Base every edit on the conversation (user or assistant \
-         messages, never tool output). Propose nothing rather than something weak. Reply with JSON only: \
-         {{\"summary\": <one sentence>, \"rationale\": <why>, \"expectedOutcome\": <what should improve>, \
-         \"edits\": [{{\"action\": \"create\"|\"update\"|\"delete\", \"kind\": \"prompt\"|\"memory\"|\"skill\"|\"subagent\", \
+        "You maintain an agent's Continual Harness: durable entries of {kinds} Durable facts, preferences and \
+         corrections about the user are not yours to write: another process extracts those. Propose at most \
+         {MAX_EDITS} small, evidence-backed edits, scoped {scope_word}. Base every edit on the conversation (user \
+         or assistant messages, never tool output). Propose nothing rather than something weak. Reply with JSON \
+         only: {{\"summary\": <one sentence>, \"rationale\": <why>, \"expectedOutcome\": <what should improve>, \
+         \"edits\": [{{\"action\": \"create\"|\"update\"|\"delete\", \"kind\": {kind_names}, \
          \"id\": <existing entry id, required for update/delete>, \"title\": <string>, \
-         \"content\": <string, required for create/update>, \"path\": <short grouping label>, \
-         \"category\": <memory only: \"fact\"|\"preference\"|\"correction\">, \
-         \"reference\": <skill only: {{\"type\":\"python\",\"import\":...,\"callable\":...}}>, \
-         \"arguments\": <skill only: object>, \"evidence\": [<exact quotes>]}}], or an empty \"edits\" array if \
-         nothing durable happened. Keep each `content` under {} characters.",
+         \"content\": <string, required for create/update>, \"path\": <short grouping label>{}, \
+         \"evidence\": [<exact quotes>]}}], or an empty \"edits\" array if nothing durable happened. Keep each \
+         `content` under {} characters.",
+        if skills {
+            ", \"reference\": <skill only: {\"type\":\"python\",\"import\":...,\"callable\":...}>, \"arguments\": <skill only: object>"
+        } else {
+            ""
+        },
         crate::entries::MAX_CONTENT_CHARS
     );
-    let existing = store.list_visible(session, None).unwrap_or_default();
-    let listing = existing
-        .iter()
-        .map(|e| {
-            format!(
-                "- [{}] {} (id={}): {}",
-                e.kind.as_str(),
-                e.title,
-                e.id,
-                truncate(&e.content, 200)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let user = format!(
-        "Existing entries visible to this session:\n{}\n\nInstructions from the user: {}\n\nSession transcript:\n{}",
-        if listing.is_empty() {
-            "(none)".to_string()
-        } else {
-            listing
-        },
+        "<current_harness_state>\n{}\n</current_harness_state>\n\n<refinement_history>\n{}\n</refinement_history>\n\n\
+         Instructions from the user: {}\n\nSession transcript:\n{}",
+        overview(store, session),
+        history(store, session),
         instructions.unwrap_or("(none; use your judgement about what is worth keeping)"),
-        transcript(turns),
+        transcript(turns, REFINE_TRANSCRIPT_CHARS),
     );
     (system, user)
 }
 
-/// Stores a proposed memory's text durably (jcode's own memory store, never
-/// Python) and returns its id. `category` is `fact`|`preference`|`correction`;
-/// the bool is whether the evidence was quoted from the user (trust level).
-pub type Remember<'a> = dyn Fn(&str, &str, bool) -> Result<String> + 'a;
-/// Removes a memory previously stored through [`Remember`], returning its
-/// `(text, category)` so a rolled-back refine delete can restore it.
-pub type Forget<'a> = dyn Fn(&str) -> Option<(String, String)> + 'a;
-
-/// The bridge to jcode's memory store. A `memory`-kind entry keeps only a
-/// short label plus `reference.memory_id`; the text itself exists once, in
-/// jcode's store, where jcode's own recall reads it. Without a sink (learning
-/// off) the entry simply carries the text.
-pub struct MemorySink<'a> {
-    pub remember: &'a Remember<'a>,
-    pub forget: &'a Forget<'a>,
-}
-
-fn memory_id(entry: &crate::entries::HarnessEntry) -> Option<&str> {
-    entry.reference["memory_id"].as_str()
-}
-
 /// Validate the model's proposal against the session and apply it as one
 /// changeset (rejecting the whole proposal if any single edit fails a gate).
-/// `memory`, when given, keeps memory text in jcode's single memory store
-/// (see [`MemorySink`]).
-pub fn apply(
-    store: &EntryStore,
-    session: &str,
-    reply: &str,
-    turns: &[Turn],
-    global: bool,
-    source: &str,
-    memory: Option<&MemorySink<'_>>,
-) -> Result<RefineOutcome> {
+/// `memory` entries are refused (extraction owns them), and so are `skill` entries when
+/// [`skills_available`] is false.
+pub fn apply(store: &EntryStore, session: &str, reply: &str, global: bool, source: &str) -> Result<RefineOutcome> {
+    apply_with(store, session, reply, global, source, skills_available())
+}
+
+fn apply_with(store: &EntryStore, session: &str, reply: &str, global: bool, source: &str, skills: bool) -> Result<RefineOutcome> {
     let proposal = parse_json_object(reply).context("the refine reply was not valid JSON")?;
     let edits = proposal["edits"].as_array().cloned().unwrap_or_default();
     if edits.is_empty() {
@@ -202,12 +232,6 @@ pub fn apply(
             edits.len()
         );
     }
-    let user_text: String = turns
-        .iter()
-        .filter(|t| t.role == "user")
-        .map(|t| normalize(&t.text))
-        .collect::<Vec<_>>()
-        .join("\n");
     let scope = if global { Scope::Global } else { Scope::Local };
     let mut applied_ops: Vec<AppliedEdit> = Vec::new();
     // Skill files are written only once the changeset is committed.
@@ -215,20 +239,12 @@ pub fn apply(
     let (mut created, mut updated, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
     let result: Result<()> = (|| {
         for edit in &edits {
-            // Prime's `validateEdit` has no evidence-substring gate (its
-            // `evidence` is the rationale text), so quotes are advisory: they
-            // only decide whether a memory is trusted as user-stated.
-            let quotes: Vec<String> = edit["evidence"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(normalize)
-                .collect();
+            // Prime's `validateEdit` has no evidence-substring gate (its `evidence` is the rationale text).
             match edit["action"].as_str().unwrap_or_default() {
                 "create" => {
                     let kind = EntryKind::parse(edit["kind"].as_str().unwrap_or_default())
                         .context("rejected: edit has no valid kind")?;
+                    reject_kind(kind, skills)?;
                     let title = edit["title"].as_str().unwrap_or_default();
                     let content = edit["content"].as_str().unwrap_or_default();
                     if content.trim().is_empty() {
@@ -264,20 +280,6 @@ pub fn apply(
                         new_entry.reference = reference.clone();
                         new_entry.arguments = edit["arguments"].clone();
                     }
-                    if kind == EntryKind::Memory {
-                        if let Some(MemorySink { remember, .. }) = memory {
-                            let category = match edit["category"].as_str() {
-                                Some(k @ ("fact" | "preference" | "correction")) => k,
-                                _ => "fact",
-                            };
-                            let user_stated = quotes.iter().any(|q| q.len() >= 12 && user_text.contains(q.as_str()));
-                            let memory_id = remember(content, category, user_stated)
-                                .context("rejected: could not store the memory")?;
-                            new_entry.reference = json!({ "memory_id": memory_id });
-                            new_entry.content =
-                                if title.trim().is_empty() { truncate(content, 80) } else { title.to_string() };
-                        }
-                    }
                     if let Some(reference) = &skill_reference {
                         let slug = crate::skill_files::slugify(title);
                         if slug.is_empty() || slug.len() > crate::skill_files::MAX_NAME_CHARS {
@@ -304,6 +306,7 @@ pub fn apply(
                     let before = store
                         .get(id)?
                         .context("rejected: update targets an entry that does not exist")?;
+                    reject_kind(before.kind, skills)?;
                     if before.kind == EntryKind::Skill {
                         let reference = if edit["reference"].is_object() {
                             edit["reference"].clone()
@@ -359,6 +362,9 @@ pub fn apply(
                     let id = edit["id"]
                         .as_str()
                         .context("rejected: a delete edit has no id")?;
+                    if let Some(existing) = store.get(id)? {
+                        reject_kind(existing.kind, skills)?;
+                    }
                     let before = store.delete(id)?;
                     deleted.push(id.to_string());
                     applied_ops.push(AppliedEdit {
@@ -379,9 +385,6 @@ pub fn apply(
             match op.action {
                 Action::Create => {
                     let _ = store.delete(&op.id);
-                    if let (Some(sink), Some(id)) = (memory, op.after.as_ref().and_then(memory_id)) {
-                        (sink.forget)(id);
-                    }
                 }
                 Action::Delete => {
                     if let Some(before) = &op.before {
@@ -414,16 +417,6 @@ pub fn apply(
         }
         return Err(err);
     }
-    if let Some(sink) = memory {
-        for op in applied_ops.iter_mut().filter(|op| op.action == Action::Delete) {
-            let Some(before) = op.before.as_mut() else { continue };
-            let Some(id) = memory_id(before).map(str::to_string) else { continue };
-            // Keep the text in the changeset so a rollback can put it back.
-            if let Some((text, category)) = (sink.forget)(&id) {
-                before.metadata["memory"] = json!({ "text": text, "category": category });
-            }
-        }
-    }
     let summary = proposal["summary"]
         .as_str()
         .unwrap_or("updated the Continual Harness")
@@ -436,6 +429,10 @@ pub fn apply(
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let mut by_kind = std::collections::BTreeMap::new();
+    for entry in applied_ops.iter().filter_map(|op| op.after.as_ref().or(op.before.as_ref())) {
+        *by_kind.entry(entry.kind.as_str()).or_insert(0) += 1;
+    }
     let changeset_id = store.record_changeset(
         (!global).then_some(session),
         scope,
@@ -459,7 +456,17 @@ pub fn apply(
         created,
         updated,
         deleted,
+        by_kind,
     })
+}
+
+/// Refine's kinds are `prompt`, `skill` (only where the REPL can run it) and `subagent`.
+fn reject_kind(kind: EntryKind, skills: bool) -> Result<()> {
+    match kind {
+        EntryKind::Memory => bail!("rejected: memory entries are written by memory extraction, not refine"),
+        EntryKind::Skill if !skills => bail!("rejected: skills need the Python REPL, which is not available here"),
+        _ => Ok(()),
+    }
 }
 
 /// A `SKILL.md` a committed skill edit still has to write.
@@ -523,37 +530,12 @@ fn undo_skill_file(before: Option<&crate::entries::HarnessEntry>, after: Option<
 }
 
 /// `/refine rollback [id]` (and the `refine.status()`-adjacent host call):
-/// undoes the given changeset, or the most recent one for `session`. Memories
-/// that changeset created are forgotten from jcode's store too.
-pub fn rollback(
-    store: &EntryStore,
-    session: &str,
-    id: Option<&str>,
-    memory: Option<&MemorySink<'_>>,
-) -> Result<String> {
+/// undoes the given changeset, or the most recent one for `session`.
+pub fn rollback(store: &EntryStore, session: &str, id: Option<&str>) -> Result<String> {
     let done = store.rollback(id, Some(session))?;
     if let Some(target) = done.rollback_of.as_deref().and_then(|t| store.changeset(t).ok().flatten()) {
-        for edit in &target.edits {
-            match (&edit.action, memory) {
-                (Action::Create, Some(sink)) => {
-                    if let Some(id) = edit.after.as_ref().and_then(memory_id) {
-                        (sink.forget)(id);
-                    }
-                }
-                // A rolled-back delete: the entry row is back, so put the memory back too.
-                (Action::Delete, Some(sink)) => {
-                    let Some(before) = &edit.before else { continue };
-                    let saved = &before.metadata["memory"];
-                    if let Some(text) = saved["text"].as_str() {
-                        let restored = (sink.remember)(text, saved["category"].as_str().unwrap_or("fact"), true)?;
-                        store.update(&before.id, EntryPatch { reference: Some(json!({ "memory_id": restored })), ..Default::default() })?;
-                    }
-                }
-                _ => {}
-            }
-            if edit.action != Action::Delete {
-                undo_skill_file(edit.before.as_ref(), edit.after.as_ref());
-            }
+        for edit in target.edits.iter().filter(|e| e.action != Action::Delete) {
+            undo_skill_file(edit.before.as_ref(), edit.after.as_ref());
         }
     }
     // The rollback changeset's summary already reads "Rolled back: ...".
@@ -617,7 +599,7 @@ mod tests {
             }],
         })
         .to_string();
-        let outcome = apply(&store, "s1", &reply, &turns(), false, "refine", None).unwrap();
+        let outcome = apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
         assert_eq!(outcome.created.len(), 1);
         assert!(store.get(&outcome.created[0]).unwrap().is_some());
         let cs = store.changeset(&outcome.changeset_id).unwrap().unwrap();
@@ -635,7 +617,7 @@ mod tests {
             ],
         })
         .to_string();
-        assert!(apply(&store, "s1", &reply, &turns(), false, "refine", None).is_err());
+        assert!(apply_with(&store, "s1", &reply, false, "refine", true).is_err());
         assert!(
             store.list_visible("s1", None).unwrap().is_empty(),
             "the valid first edit was rolled back too"
@@ -651,63 +633,57 @@ mod tests {
                        "evidence": ["scaffold Cargo.toml, src/lib.rs, and tests in that order"]}],
         })
         .to_string();
-        apply(&store, "s1", &reply, &turns(), false, "refine", None).unwrap();
+        apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
         assert!(status(&store, "s1").contains("1 entries"));
-        rollback(&store, "s1", None, None).unwrap();
+        rollback(&store, "s1", None).unwrap();
         assert_eq!(store.list_visible("s1", None).unwrap().len(), 0);
     }
 
     #[test]
-    fn memory_text_lives_once_in_jcode_and_rollback_forgets_it() {
+    fn the_memory_kind_is_refused_for_create_update_and_delete() {
         let store = EntryStore::memory().unwrap();
-        let reply = json!({
+        let create = json!({
             "summary": "learned a preference", "rationale": "r", "expectedOutcome": "e",
-            "edits": [{"action": "create", "kind": "memory", "title": "Nim for scripts", "category": "preference",
-                       "content": "Prefers Nim for quick scripts"}],
+            "edits": [{"action": "create", "kind": "memory", "title": "Nim", "category": "preference", "content": "Prefers Nim"}],
         })
         .to_string();
-        let calls = std::cell::RefCell::new(Vec::new());
-        let forgotten = std::cell::RefCell::new(Vec::new());
-        let remember = |text: &str, category: &str, user_stated: bool| {
-            calls.borrow_mut().push((text.to_string(), category.to_string(), user_stated));
-            Ok("mem-1".to_string())
-        };
-        let forget = |id: &str| {
-            forgotten.borrow_mut().push(id.to_string());
-            Some(("Prefers Nim for quick scripts".to_string(), "preference".to_string()))
-        };
-        let sink = MemorySink { remember: &remember, forget: &forget };
-        let outcome = apply(&store, "s1", &reply, &turns(), false, "refine", Some(&sink)).unwrap();
-        assert_eq!(calls.borrow().len(), 1);
-        assert_eq!(calls.borrow()[0].0, "Prefers Nim for quick scripts");
-        assert_eq!(calls.borrow()[0].1, "preference");
-        let entry = store.get(&outcome.created[0]).unwrap().unwrap();
-        assert_eq!(entry.reference["memory_id"], "mem-1");
-        assert_eq!(entry.content, "Nim for scripts", "the text is not duplicated in the entry");
-        rollback(&store, "s1", None, Some(&sink)).unwrap();
-        assert_eq!(*forgotten.borrow(), vec!["mem-1".to_string()]);
+        let err = apply_with(&store, "s1", &create, false, "refine", true).unwrap_err();
+        assert!(err.to_string().contains("memory extraction"), "{err}");
+        assert!(store.list_visible("s1", None).unwrap().is_empty());
+        // An old memory-kind row is left alone too.
+        let old = store.create(NewEntry::new(EntryKind::Memory, Scope::Local, "Nim", "Nim").with_session("s1")).unwrap();
+        for edit in [json!({"action": "delete", "id": old.id}), json!({"action": "update", "id": old.id, "content": "x"})] {
+            let reply = json!({"summary": "s", "edits": [edit]}).to_string();
+            assert!(apply_with(&store, "s1", &reply, false, "refine", true).is_err());
+        }
+        assert!(store.get(&old.id).unwrap().is_some());
+        let (system, _) = build_request_with(&store, "s1", &turns(), None, false, true);
+        assert!(!system.contains("\"memory\""), "the memory kind is not offered: {system}");
     }
 
     #[test]
-    fn rolling_back_a_memory_delete_restores_the_memory() {
+    fn skills_are_neither_offered_nor_accepted_without_the_repl() {
         let store = EntryStore::memory().unwrap();
-        let entry = store
-            .create(NewEntry::new(EntryKind::Memory, Scope::Local, "Nim", "Nim").with_session("s1").with_path("m/nim"))
-            .unwrap();
-        store.update(&entry.id, EntryPatch { reference: Some(json!({ "memory_id": "old" })), ..Default::default() }).unwrap();
-        let reply = json!({ "summary": "drop", "edits": [{ "action": "delete", "id": entry.id }] }).to_string();
-        let restored = std::cell::RefCell::new(Vec::new());
-        let remember = |text: &str, category: &str, _: bool| {
-            restored.borrow_mut().push((text.to_string(), category.to_string()));
-            Ok("new".to_string())
-        };
-        let forget = |id: &str| (id == "old").then(|| ("Prefers Nim".to_string(), "preference".to_string()));
-        let sink = MemorySink { remember: &remember, forget: &forget };
-        apply(&store, "s1", &reply, &turns(), false, "refine", Some(&sink)).unwrap();
-        assert!(store.get(&entry.id).unwrap().is_none());
-        rollback(&store, "s1", None, Some(&sink)).unwrap();
-        assert_eq!(*restored.borrow(), vec![("Prefers Nim".to_string(), "preference".to_string())]);
-        assert_eq!(store.get(&entry.id).unwrap().unwrap().reference["memory_id"], "new");
+        let (with, _) = build_request_with(&store, "s1", &turns(), None, false, true);
+        let (without, _) = build_request_with(&store, "s1", &turns(), None, false, false);
+        assert!(with.contains("\"skill\"") && !without.contains("\"skill\"") && !without.contains("Python call"));
+        let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "e", "edits": [
+            {"action": "create", "kind": "skill", "title": "Do Thing", "content": "steps",
+             "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}}]}).to_string();
+        let err = apply_with(&store, "s1", &reply, false, "refine", false).unwrap_err();
+        assert!(err.to_string().contains("REPL"), "{err}");
+    }
+
+    #[test]
+    fn the_request_carries_the_overview_and_refinement_history() {
+        let store = EntryStore::memory().unwrap();
+        let reply = json!({"summary": "learned scaffold order", "rationale": "r", "expectedOutcome": "crates follow it",
+            "edits": [{"action": "create", "kind": "prompt", "title": "Scaffold", "content": "Cargo.toml first", "path": "c/s"}]}).to_string();
+        apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
+        let (_, user) = build_request_with(&store, "s1", &turns(), None, false, true);
+        assert!(user.contains("<current_harness_state>") && user.contains("prompt: 1") && user.contains("Scaffold (c/s, v1)"), "{user}");
+        assert!(user.contains("learned scaffold order") && user.contains("Expected outcome: crates follow it"), "{user}");
+        assert_eq!(history(&EntryStore::memory().unwrap(), "s1"), "No prior refinement history.");
     }
 
     /// Skill tests point JCODE_HOME at their own directory, one at a time.
@@ -736,7 +712,7 @@ mod tests {
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::write(mine.join("SKILL.md"), "---\nname: do-thing\ndescription: mine\n---\nmy steps").unwrap();
         let store = EntryStore::memory().unwrap();
-        let err = apply(&store, "s1", &skill_edit("create", "Do Thing", "steps", None), &turns(), false, "refine", None).unwrap_err();
+        let err = apply_with(&store, "s1", &skill_edit("create", "Do Thing", "steps", None), false, "refine", true).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert!(std::fs::read_to_string(mine.join("SKILL.md")).unwrap().contains("my steps"));
         assert!(store.list_visible("s1", None).unwrap().is_empty());
@@ -747,19 +723,19 @@ mod tests {
     fn undo_removes_only_the_file_the_change_created_and_a_rename_moves_the_skill() {
         let (_lock, home) = skills_home();
         let store = EntryStore::memory().unwrap();
-        let created = apply(&store, "s1", &skill_edit("create", "Do Thing", "v1 steps", None), &turns(), false, "refine", None).unwrap();
+        let created = apply_with(&store, "s1", &skill_edit("create", "Do Thing", "v1 steps", None), false, "refine", true).unwrap();
         let dir = home.join("skills/do-thing");
         assert!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap().contains(crate::skill_files::MARKER));
         std::fs::write(dir.join("notes.txt"), "user notes").unwrap();
         // Retitling moves the skill: the old file goes, nothing is orphaned.
         let id = created.created[0].clone();
-        apply(&store, "s1", &skill_edit("update", "Do Other", "v2 steps", Some(&id)), &turns(), false, "refine", None).unwrap();
+        apply_with(&store, "s1", &skill_edit("update", "Do Other", "v2 steps", Some(&id)), false, "refine", true).unwrap();
         assert!(!dir.join("SKILL.md").exists() && home.join("skills/do-other/SKILL.md").exists());
         // Rolling the rename back restores the old file and content; the user's extra file survives.
-        rollback(&store, "s1", None, None).unwrap();
+        rollback(&store, "s1", None).unwrap();
         assert!(!home.join("skills/do-other").exists());
         assert!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap().contains("v1 steps"));
-        rollback(&store, "s1", None, None).unwrap();
+        rollback(&store, "s1", None).unwrap();
         assert!(!dir.join("SKILL.md").exists());
         assert_eq!(std::fs::read_to_string(dir.join("notes.txt")).unwrap(), "user notes");
         std::fs::remove_dir_all(home).ok();
@@ -774,7 +750,7 @@ mod tests {
              "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}},
             {"action": "explode"},
         ]}).to_string();
-        assert!(apply(&store, "s1", &reply, &turns(), false, "refine", None).is_err());
+        assert!(apply_with(&store, "s1", &reply, false, "refine", true).is_err());
         assert!(!home.join("skills/fine-skill").exists());
         std::fs::remove_dir_all(home).ok();
     }
@@ -784,7 +760,7 @@ mod tests {
         let (_lock, home) = skills_home();
         let store = EntryStore::memory().unwrap();
         let title = "Tricky: \"quoted\" #1 --- x";
-        apply(&store, "s1", &skill_edit("create", title, "line one\nline: two\n---\nthree", None), &turns(), false, "refine", None).unwrap();
+        apply_with(&store, "s1", &skill_edit("create", title, "line one\nline: two\n---\nthree", None), false, "refine", true).unwrap();
         let text = std::fs::read_to_string(home.join("skills").join(crate::skill_files::slugify(title)).join("SKILL.md")).unwrap();
         let front = text.strip_prefix("---\n").unwrap().split("\n---\n").next().unwrap();
         let yaml: serde_yaml::Value = serde_yaml::from_str(front).unwrap();
@@ -804,10 +780,10 @@ mod tests {
                        "reference": {"type": "python", "import": "mod", "callable": "run"}, "arguments": {}}],
         })
         .to_string();
-        apply(&store, "s1", &reply, &turns(), false, "refine", None).unwrap();
+        apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
         let file = home.join("skills/do-thing/SKILL.md");
         assert!(file.exists());
-        rollback(&store, "s1", None, None).unwrap();
+        rollback(&store, "s1", None).unwrap();
         assert!(!file.exists() && store.list_visible("s1", None).unwrap().is_empty());
         std::fs::remove_dir_all(home).ok();
     }
@@ -821,7 +797,7 @@ mod tests {
                        "evidence": ["scaffold Cargo.toml, src/lib.rs, and tests in that order"]}],
         })
         .to_string();
-        assert!(apply(&store, "s1", &no_reference, &turns(), false, "refine", None).is_err());
+        assert!(apply_with(&store, "s1", &no_reference, false, "refine", true).is_err());
         assert!(store.list_visible("s1", None).unwrap().is_empty());
     }
 
@@ -830,8 +806,8 @@ mod tests {
         let long: Vec<Turn> = (0..2000)
             .map(|i| Turn { role: "user".into(), text: format!("message {i} {}", "x".repeat(50)) })
             .collect();
-        let t = transcript(&long);
-        assert!(t.len() <= MAX_TRANSCRIPT_CHARS);
+        let t = transcript(&long, GATE_TRANSCRIPT_CHARS);
+        assert!(t.len() <= GATE_TRANSCRIPT_CHARS);
         assert!(t.contains("message 1999") && !t.contains("message 0 "));
     }
 }
