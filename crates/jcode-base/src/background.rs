@@ -702,6 +702,8 @@ impl BackgroundTaskManager {
         let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
 
         let wrapper_handle = tokio::spawn(async move {
+            // Cancelling the task drops the handle, which only detaches the work: abort it too.
+            let _reap = AbortOnDrop::new(handle.abort_handle());
             let tool_result = handle.await;
             let duration_secs = started_at.elapsed().as_secs_f64();
 
@@ -1415,6 +1417,24 @@ impl BackgroundTaskManager {
         }
     }
 
+    /// Cancel every still-running task of one session (a finished headless run must not leave
+    /// its commands behind). Returns how many were cancelled.
+    pub async fn cancel_session(&self, session_id: &str) -> usize {
+        let mut cancelled = 0;
+        for task in self.list().await {
+            if task.session_id == session_id
+                && task.status == BackgroundTaskStatus::Running
+                && matches!(
+                    self.cancel_with_grace(&task.task_id, std::time::Duration::from_millis(100)).await,
+                    Ok(true)
+                )
+            {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// Abort every live in-process task before an exec-based server reload.
     ///
     /// `exec` replaces the process image without running destructors, so
@@ -1665,6 +1685,28 @@ impl Default for BackgroundTaskManager {
 static BACKGROUND_MANAGER: std::sync::OnceLock<BackgroundTaskManager> = std::sync::OnceLock::new();
 
 /// Get the global background task manager
+/// Aborts a spawned task when dropped, unless disarmed. A tool task outlives a dropped JoinHandle,
+/// so a cancelled turn would otherwise leave its tool (and the command it runs) executing.
+pub struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    pub fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub fn global() -> &'static BackgroundTaskManager {
     BACKGROUND_MANAGER.get_or_init(BackgroundTaskManager::new)
 }

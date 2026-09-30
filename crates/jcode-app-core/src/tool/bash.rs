@@ -1042,6 +1042,9 @@ impl BashTool {
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Own process group: killing the group reaps a pipeline's children too, not just the shell.
+        #[cfg(unix)]
+        command.process_group(0);
 
         // Never inherit the host's stdin: a command that reads it would block
         // until the timeout. Only pipe it when an interactive bridge answers.
@@ -1053,6 +1056,8 @@ impl BashTool {
         let mut child = command.spawn()?;
 
         let child_pid = child.id().unwrap_or(0);
+        #[cfg(unix)]
+        let group_pid = child.id();
         let stdin_handle = child.stdin.take();
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -1152,7 +1157,12 @@ impl BashTool {
                     None
                 };
 
+                // Aborted with the turn (or cancelled as a background task): kill the whole group.
+                #[cfg(unix)]
+                let mut group_guard = ProcessGroupKillGuard::new(group_pid);
                 let status = child.wait().await?;
+                #[cfg(unix)]
+                group_guard.disarm();
 
                 if let Some(task) = stdin_task {
                     task.abort();
@@ -1175,6 +1185,8 @@ impl BashTool {
                 Ok(ToolOutput::new(output).with_title(title_for_work))
             });
 
+        // The caller's turn being dropped must stop the command; a promotion below keeps it running.
+        let mut abort_guard = super::inflight::AbortOnDrop::new(work_handle.abort_handle());
         match tokio::time::timeout(timeout_duration, &mut work_handle).await {
             Ok(join_result) => match join_result {
                 Ok(Ok(output)) => Ok(output),
@@ -1182,6 +1194,7 @@ impl BashTool {
                 Err(join_err) => Err(anyhow::anyhow!("Command task panicked: {}", join_err)),
             },
             Err(_) => {
+                abort_guard.disarm();
                 // Timed out, but the command is still running. Instead of killing
                 // it, promote it to a background task so it keeps running, renders
                 // as a background-task card, and the agent is told where to find it.

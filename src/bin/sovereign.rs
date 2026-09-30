@@ -334,6 +334,12 @@ fn install_ollama_signal_unload() {
                 };
             for _ in signals.forever() {
                 unload_ollama_from_warm_file();
+                // Reap the commands still running in-process: a bash that hit its timeout was
+                // promoted to a background task and would otherwise outlive the engine.
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    rt.block_on(jcode::background::global().abort_live_tasks_for_reload());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200)); // let the aborted tasks drop their children
                 std::process::exit(0);
             }
         });

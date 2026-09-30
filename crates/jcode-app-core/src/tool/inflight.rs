@@ -108,3 +108,5 @@ mod tests {
         assert!(!is_tool_in_flight(""));
     }
 }
+
+pub use jcode_base::background::AbortOnDrop;

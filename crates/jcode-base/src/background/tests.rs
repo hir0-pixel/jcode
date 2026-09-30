@@ -859,3 +859,29 @@ async fn disarm_stall_watchdog_clears_state() -> Result<()> {
     manager.cancel(&info.task_id).await?;
     Ok(())
 }
+
+struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cancel_session_stops_the_adopted_work_not_just_its_wrapper() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = dropped.clone();
+    let work = tokio::spawn(async move {
+        let _sentinel = SetOnDrop(flag);
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        Ok(jcode_tool_types::ToolOutput::new("never"))
+    });
+    manager.adopt("bash", "s-run", work).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(manager.cancel_session("other").await, 0);
+    assert_eq!(manager.cancel_session("s-run").await, 1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "the work was aborted, so its child is killed");
+}

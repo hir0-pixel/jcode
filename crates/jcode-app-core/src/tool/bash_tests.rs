@@ -1319,3 +1319,28 @@ async fn test_detached_promoted_command_reports_intermediate_progress() {
     let _ = tokio::fs::remove_file(output_file).await;
     let _ = tokio::fs::remove_file(status_file).await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dropped_foreground_bash_kills_its_whole_process_group() {
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinInputRequest>();
+    tokio::spawn(async move { while stdin_rx.recv().await.is_some() {} });
+    let task = tokio::spawn(async move {
+        BashTool::new()
+            .execute(json!({"command": "sleep 7612 | sleep 7613"}), make_ctx(Some(stdin_tx)))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let running = || {
+        std::process::Command::new("pgrep")
+            .args(["-f", "sleep 761[23]"])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false)
+    };
+    assert!(running(), "the pipeline is running");
+    task.abort(); // the turn was cancelled: the tool future is dropped
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let left = std::process::Command::new("ps").args(["-eo", "pid,ppid,pgid,stat,command"]).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("sleep 761")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    assert!(!running(), "the shell and its pipeline children are gone: {left}");
+}

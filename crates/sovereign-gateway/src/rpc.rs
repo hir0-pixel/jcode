@@ -2939,6 +2939,11 @@ pub(crate) async fn agent_run(
             let _ = conn.dispatch("session.interrupt", &json!({ "session_id": session_id })).await;
         }
         hub.unmark_headless(&session_id).await;
+        // A cron run is over: nothing will poll a command it left running (a foreground command
+        // that hit its timeout is promoted to a background task, not killed).
+        if opts.surface == "cron" {
+            jcode_base::background::global().cancel_session(&session_id).await;
+        }
         // The turn is over and its transcript is the record: free its buffered live events.
         conn.observer.release_replay(&session_id);
         // Only now is the session guaranteed persisted (jcode does not write a
