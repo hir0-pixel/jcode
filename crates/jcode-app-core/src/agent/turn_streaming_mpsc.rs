@@ -659,8 +659,9 @@ impl Agent {
                             .as_ref()
                             .and_then(|id| streaming_tools.remove(id))
                         {
-                            tool.input =
-                                ToolCall::parse_streamed_input_to_object(&current_tool_input);
+                            tool.input = super::tool_args_repair::parse_streamed_tool_input(
+                                &current_tool_input,
+                            );
                             tool.refresh_intent_from_input();
 
                             let _ = event_tx.send(ServerEvent::ToolExec {
@@ -1061,7 +1062,6 @@ impl Agent {
                 || usage_cache_read.is_some()
                 || usage_cache_creation.is_some()
             {
-
                 let input = usage_input.unwrap_or(0);
                 let output = usage_output.unwrap_or(0);
                 let total = self
@@ -1553,7 +1553,8 @@ impl Agent {
                             let output = cap_tool_output_for_history(&tc.name, output);
                             let verdict =
                                 repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
-                            guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
+                            guard_stop =
+                                guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
@@ -1586,8 +1587,10 @@ impl Agent {
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
-                            let verdict = repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
-                            guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
+                            let verdict =
+                                repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
+                            guard_stop =
+                                guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),

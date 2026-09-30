@@ -13,6 +13,7 @@ mod repeat_guard;
 mod response_recovery;
 mod status;
 mod streaming;
+mod tool_args_repair;
 mod tools;
 mod turn_execution;
 mod turn_loops;

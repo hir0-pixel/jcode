@@ -384,8 +384,9 @@ impl Agent {
                             .and_then(|id| streaming_tools.remove(id))
                         {
                             // Parse the accumulated JSON
-                            let tool_input =
-                                ToolCall::parse_streamed_input_to_object(&current_tool_input);
+                            let tool_input = super::tool_args_repair::parse_streamed_tool_input(
+                                &current_tool_input,
+                            );
                             tool.input = tool_input.clone();
                             tool.intent = ToolCall::intent_from_input(&tool_input);
 
@@ -1105,7 +1106,8 @@ impl Agent {
                 match result {
                     Ok(output) => {
                         let output = cap_tool_output_for_history(&tc.name, output);
-                        let verdict = repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
+                        let verdict =
+                            repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
                         guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),

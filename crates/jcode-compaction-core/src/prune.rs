@@ -41,9 +41,15 @@ pub fn prune_old_tool_results(messages: &mut [Message], protect_tail: usize) -> 
     let mut calls: HashMap<String, (String, String)> = HashMap::new();
     for msg in messages.iter() {
         for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, input, .. } = block {
+            if let ContentBlock::ToolUse {
+                id, name, input, ..
+            } = block
+            {
                 let args = input.to_string();
-                calls.insert(id.clone(), (name.clone(), truncate_str_boundary(&args, 80).to_string()));
+                calls.insert(
+                    id.clone(),
+                    (name.clone(), truncate_str_boundary(&args, 80).to_string()),
+                );
             }
         }
     }
@@ -52,9 +58,11 @@ pub fn prune_old_tool_results(messages: &mut [Message], protect_tail: usize) -> 
         for block in msg.content.iter_mut() {
             match block {
                 // Pass 2: old large results become a one-line gist.
-                ContentBlock::ToolResult { tool_use_id, content, .. }
-                    if content.len() > PRUNE_MIN_CHARS && !is_placeholder(content) =>
-                {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if content.len() > PRUNE_MIN_CHARS && !is_placeholder(content) => {
                     let (name, args) = calls.get(tool_use_id.as_str()).cloned().unwrap_or_default();
                     let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
                     *content = format!(
@@ -95,13 +103,33 @@ mod tests {
     use jcode_message_types::Role;
 
     fn msg(role: Role, block: ContentBlock) -> Message {
-        Message { role, content: vec![block], timestamp: None, tool_duration_ms: None }
+        Message {
+            role,
+            content: vec![block],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
     }
     fn call(id: &str, input: serde_json::Value) -> Message {
-        msg(Role::Assistant, ContentBlock::ToolUse { id: id.into(), name: "read".into(), input, thought_signature: None })
+        msg(
+            Role::Assistant,
+            ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read".into(),
+                input,
+                thought_signature: None,
+            },
+        )
     }
     fn result(id: &str, content: &str) -> Message {
-        msg(Role::User, ContentBlock::ToolResult { tool_use_id: id.into(), content: content.into(), is_error: None })
+        msg(
+            Role::User,
+            ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: content.into(),
+                is_error: None,
+            },
+        )
     }
     fn res(m: &Message) -> &str {
         match &m.content[0] {
@@ -125,7 +153,10 @@ mod tests {
         let big = "line one\n".to_string() + &"x".repeat(5000);
         let big2 = "other\n".to_string() + &"y".repeat(5000);
         let mut ms = vec![
-            call("a", serde_json::json!({"path":"f","content":"z".repeat(3000)})),
+            call(
+                "a",
+                serde_json::json!({"path":"f","content":"z".repeat(3000)}),
+            ),
             result("a", &big),
             call("b", serde_json::json!({})),
             result("b", &big2),
@@ -143,7 +174,12 @@ mod tests {
     #[test]
     fn dedupes_identical_results_keeping_newest() {
         let big = "same ".repeat(100);
-        let mut ms = vec![call("a", serde_json::json!({})), result("a", &big), call("b", serde_json::json!({})), result("b", &big)];
+        let mut ms = vec![
+            call("a", serde_json::json!({})),
+            result("a", &big),
+            call("b", serde_json::json!({})),
+            result("b", &big),
+        ];
         prune_old_tool_results(&mut ms, 4);
         assert!(res(&ms[1]).starts_with("[Duplicate"));
         assert_eq!(res(&ms[3]), big);
