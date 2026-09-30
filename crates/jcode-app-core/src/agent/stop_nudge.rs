@@ -23,7 +23,13 @@ const ACTION_PHRASES: [&str; 17] = [
     "plan:", "next steps:",
 ];
 
-const VERIFY_NUDGE: &str = "<system-reminder>You edited files this turn but never ran the tests. Run the project's tests and read any failures before finishing (if pytest is not installed, use `python3 -m unittest`).</system-reminder>";
+const VERIFY_NUDGE: &str = "<system-reminder>Before finishing: re-read the task's explicit requirements (exact names, paths, commands, formats) and check each against your result; run or exercise what you built (use python3 -m unittest if pytest is missing); fix anything that fails. If you cannot fully solve it, write your best-effort result to the requested output first.</system-reminder>";
+const QUESTION_NUDGE: &str = "<system-reminder>No user is available to answer. Act on the most likely reading of the task now, do the work, and verify it.</system-reminder>";
+const FAILED_CHECK_NUDGE: &str = "<system-reminder>Your last check failed and nothing changed since. Fix it or explain precisely what blocks you, and still write your best result.</system-reminder>";
+const OFFER_PHRASES: [&str; 9] = [
+    "i can run", "i can do", "if you want", "if you'd like", "would you like", "do you want me to",
+    "shall i", "should i", "let me know if you want me to",
+];
 const ACTION_NUDGE: &str = "<system-reminder>Continue by calling the tool now, or state the final result.</system-reminder>";
 
 type Runner<'a> = &'a dyn Fn(&str, &std::path::Path, std::time::Duration) -> sovereign_prime::agent_loop::GateResult;
@@ -50,6 +56,11 @@ pub(super) struct StopNudge {
     passed: bool,
     last_fail_stop: bool,
     no_marker_logged: bool,
+    // Headless runs (no user to answer) and the last check-looking bash run.
+    headless: bool,
+    last_write: u32,
+    last_check: u32,
+    last_check_exit: i64,
 }
 
 fn enabled() -> bool {
@@ -65,6 +76,11 @@ fn auto_verify_enabled() -> bool {
 fn looks_like_test_run(command: &str) -> bool {
     let c = command.to_ascii_lowercase();
     TEST_MARKERS.iter().any(|m| c.contains(m))
+}
+
+fn looks_like_check(command: &str) -> bool {
+    let c = command.to_ascii_lowercase();
+    looks_like_test_run(command) || ["test", "check", "verify", "validate", "lint"].iter().any(|m| c.contains(m))
 }
 
 fn is_code_path(p: &str) -> bool {
@@ -159,6 +175,7 @@ impl super::Agent {
                     st.get_goal(id).ok().flatten().is_some_and(|g| g.status == GoalStatus::Active)
                         || st.get_autonomous(id).ok().flatten().is_some_and(|a| a.status == AutonomousStatus::Active)
                 });
+        n.headless = jcode_base::headless::is(&self.session.id);
         if n.gate_ok {
             n.baseline = super::auto_verify::git_changed(cwd.as_deref().unwrap());
             n.cwd = cwd;
@@ -174,6 +191,7 @@ impl StopNudge {
         self.used_tools = true;
         self.seq += 1;
         if exit_code == 0 && EDIT_TOOLS.contains(&tool) {
+            self.last_write = self.seq;
             if edits_code(input) {
                 self.edited = true;
                 self.last_edit = self.seq;
@@ -186,6 +204,10 @@ impl StopNudge {
         if tool == "bash" && input["command"].as_str().is_some_and(looks_like_test_run) {
             self.last_test = self.seq;
             self.last_test_exit = exit_code;
+        }
+        if tool == "bash" && input["command"].as_str().is_some_and(looks_like_check) {
+            self.last_check = self.seq;
+            self.last_check_exit = exit_code;
         }
     }
 
@@ -289,8 +311,12 @@ impl StopNudge {
         let lower = text.to_ascii_lowercase();
         let (nudge, reason) = if self.edited && self.last_test <= self.last_edit && !self.gate_ran {
             (VERIFY_NUDGE, "verify_nudge")
+        } else if !self.gate_ran && self.last_check > self.last_write && self.last_check_exit != 0 {
+            (FAILED_CHECK_NUDGE, "failed_check_nudge")
         } else if self.used_tools && announces_action(&lower) {
             (ACTION_NUDGE, "action_nudge")
+        } else if self.headless && !self.edited && asks_or_offers(&lower) {
+            (QUESTION_NUDGE, "question_nudge")
         } else {
             return false;
         };
@@ -317,6 +343,13 @@ fn real_runner(cmd: &str, dir: &std::path::Path, t: std::time::Duration) -> sove
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(run),
         _ => run(),
     }
+}
+
+/// The final paragraph asks the user something or offers to do the work.
+fn asks_or_offers(lower: &str) -> bool {
+    let body = lower.trim_end();
+    let para = body.rsplit("\n\n").next().unwrap_or(body);
+    para.ends_with('?') || OFFER_PHRASES.iter().any(|p| para.contains(p))
 }
 
 /// The reply ends on a promise to act: its last sentence, or the lead-in line
@@ -408,6 +441,41 @@ mod tests {
         assert!(n.on_text_only_stop("s", "Next, I'll fix it."));
         n.observe("read", &json!({}), 0);
         assert!(!n.on_text_only_stop("s", "I'll fix it."), "max 2");
+    }
+
+    #[test]
+    fn headless_question_ending_nudged_once_interactive_not() {
+        let mut n = StopNudge::default();
+        n.headless = true;
+        n.observe("bash", &json!({"command": "ls"}), 0);
+        assert!(n.on_text_only_stop("s", "I can't tell.\n\nWhat operating system are you using?"));
+        assert_eq!(n.take_pending(), Some(QUESTION_NUDGE.to_string()));
+        assert!(!n.on_text_only_stop("s", "Would you like me to?"), "no progress since");
+        let mut n = StopNudge::default();
+        n.observe("bash", &json!({"command": "ls"}), 0);
+        assert!(!n.on_text_only_stop("s", "What operating system are you using?"));
+        let mut n = StopNudge::default();
+        n.headless = true;
+        assert!(n.on_text_only_stop("s", "I can run that fix if you want."));
+        let mut n = StopNudge::default();
+        n.headless = true;
+        assert!(!n.on_text_only_stop("s", "Done. Let me know if you need anything else."));
+    }
+
+    #[test]
+    fn failing_last_check_nudged_unless_fixed_or_passed() {
+        let mut n = StopNudge::default();
+        n.observe("bash", &json!({"command": "python3 check.py"}), 1);
+        assert!(n.on_text_only_stop("s", "Done."));
+        assert_eq!(n.take_pending(), Some(FAILED_CHECK_NUDGE.to_string()));
+        let mut n = StopNudge::default();
+        n.observe("bash", &json!({"command": "python3 check.py"}), 1);
+        n.observe("write", &json!({"file_path": "out.txt"}), 0);
+        assert!(!n.on_text_only_stop("s", "Done."));
+        let mut n = StopNudge::default();
+        n.observe("bash", &json!({"command": "python3 check.py"}), 1);
+        n.observe("bash", &json!({"command": "python3 check.py"}), 0);
+        assert!(!n.on_text_only_stop("s", "Done."));
     }
 
     #[test]

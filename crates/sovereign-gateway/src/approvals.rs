@@ -306,10 +306,12 @@ impl Hub {
     }
 
     pub async fn mark_headless(&self, session_id: &str, surface: &'static str) {
+        jcode_base::headless::mark(session_id);
         self.headless.lock().await.insert(session_id.to_string(), surface);
     }
 
     pub async fn unmark_headless(&self, session_id: &str) {
+        jcode_base::headless::unmark(session_id);
         self.headless.lock().await.remove(session_id);
     }
 

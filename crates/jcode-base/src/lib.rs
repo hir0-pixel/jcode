@@ -43,6 +43,7 @@ pub mod external_auth;
 pub mod gateway;
 pub mod generated_image;
 pub mod github;
+pub mod headless;
 pub mod hooks;
 pub mod id;
 pub mod import;
