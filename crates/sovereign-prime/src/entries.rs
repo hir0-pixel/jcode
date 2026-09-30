@@ -129,6 +129,8 @@ pub struct HarnessEntry {
     pub updated_at_ms: i64,
     pub version: i64,
     pub seq: i64,
+    /// Whether the row is live. Snapshots record it so a rollback restores exactly that.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,8 +140,11 @@ pub struct NewEntry {
     pub content: String,
     pub path: String,
     pub scope: Scope,
-    /// The session a `Local` entry is learned in; its working directory picks the project scope.
+    /// The session a `Local` entry is learned in: the entry lives in `session:<id>` (this session only).
     pub session: Option<String>,
+    /// A `Local` entry meant for the session's whole project instead (`project:<hash>` of its working
+    /// directory; `global` if the session has none).
+    pub project: bool,
     pub reference: Value,
     pub arguments: Value,
     pub metadata: Value,
@@ -160,6 +165,7 @@ impl NewEntry {
             path: String::new(),
             scope,
             session: None,
+            project: false,
             reference: json!({}),
             arguments: json!({}),
             metadata: json!({}),
@@ -172,6 +178,10 @@ impl NewEntry {
     }
     pub fn with_session(mut self, session: impl Into<String>) -> Self {
         self.session = Some(session.into());
+        self
+    }
+    pub fn in_project(mut self) -> Self {
+        self.project = true;
         self
     }
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
@@ -280,7 +290,7 @@ fn entry_to_json(e: &HarnessEntry) -> Value {
         "id": e.id, "kind": e.kind.as_str(), "title": e.title, "content": e.content, "path": e.path,
         "scope": e.memory_scope, "reference": e.reference, "arguments": e.arguments,
         "metadata": e.metadata, "source": e.source, "created_at_ms": e.created_at_ms,
-        "updated_at_ms": e.updated_at_ms, "version": e.version, "seq": e.seq,
+        "updated_at_ms": e.updated_at_ms, "version": e.version, "seq": e.seq, "active": e.active,
     })
 }
 
@@ -314,6 +324,7 @@ fn entry_from_json(v: &Value) -> Option<HarnessEntry> {
         updated_at_ms: v["updated_at_ms"].as_i64().unwrap_or(0),
         version: v["version"].as_i64().unwrap_or(1),
         seq: v["seq"].as_i64().unwrap_or(0),
+        active: v["active"].as_bool().unwrap_or(true),
     })
 }
 
@@ -339,6 +350,7 @@ fn applied_edit_from_json(v: &Value) -> Option<AppliedEdit> {
 fn to_memory(e: &HarnessEntry) -> MemoryEntry {
     let mut m = MemoryEntry::new(MemoryCategory::Custom(e.kind.as_str().to_string()), e.content.clone());
     m.id = e.id.clone();
+    m.active = e.active;
     m.tags = if e.title.trim().is_empty() { Vec::new() } else { vec![e.title.clone()] };
     m.source = Some(e.source.clone());
     m.created_at = chrono::DateTime::from_timestamp_millis(e.created_at_ms).unwrap_or_default();
@@ -380,6 +392,7 @@ fn from_memory(memory_scope: &str, m: &MemoryEntry) -> Option<HarnessEntry> {
         updated_at_ms: m.updated_at.timestamp_millis(),
         version: meta.version.max(1),
         seq: meta.seq,
+        active: m.active,
     })
 }
 
@@ -448,13 +461,17 @@ impl EntryStore {
         self.setting(&format!("session_dir:{session}")).filter(|d| !d.trim().is_empty()).map(|d| learned::project_scope(&d))
     }
 
-    /// Where a new entry goes: `global` when asked for, else the session's project, else `global`.
+    /// Where a new entry goes: `global` when asked for; a local one is this session's own scope
+    /// (`session:<id>`, Prime's "local"), or the session's project when it is explicitly project-wide.
     fn scope_for_new(&self, e: &NewEntry) -> Result<String> {
         match e.scope {
             Scope::Global => Ok("global".to_string()),
             Scope::Local => {
                 let session = e.session.as_deref().context("a local entry needs a session")?;
-                Ok(self.project_scope_of(session).unwrap_or_else(|| "global".to_string()))
+                if e.project {
+                    return Ok(self.project_scope_of(session).unwrap_or_else(|| "global".to_string()));
+                }
+                Ok(format!("session:{session}"))
             }
         }
     }
@@ -573,6 +590,7 @@ impl EntryStore {
             updated_at_ms: at,
             version: 1,
             seq,
+            active: true,
         })
     }
 
@@ -610,6 +628,7 @@ impl EntryStore {
             path: existing.path,
             scope: Scope::Global,
             session: None,
+            project: false,
             reference: existing.reference,
             arguments: existing.arguments,
             metadata: existing.metadata,
@@ -633,6 +652,7 @@ impl EntryStore {
             path: existing.path,
             scope: Scope::Local,
             session: Some(session.to_string()),
+            project: true,
             reference: existing.reference,
             arguments: existing.arguments,
             metadata: existing.metadata,
@@ -654,6 +674,21 @@ impl EntryStore {
         source: &str,
     ) -> Result<String> {
         let conn = self.conn.lock().unwrap_or_else(|err| err.into_inner());
+        Self::insert_changeset(&conn, session, scope, summary, rationale, expected_outcome, edits, rollback_of, source)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_changeset(
+        conn: &Connection,
+        session: Option<&str>,
+        scope: Scope,
+        summary: &str,
+        rationale: &str,
+        expected_outcome: &str,
+        edits: &[AppliedEdit],
+        rollback_of: Option<&str>,
+        source: &str,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let ops = Value::Array(edits.iter().map(applied_edit_to_json).collect()).to_string();
         conn.execute(
@@ -730,67 +765,50 @@ impl EntryStore {
         if target.rolled_back {
             bail!("changeset {} was already rolled back", target.id);
         }
+        // Every step is idempotent: a row that is already gone (expired, deleted since) is a no-op,
+        // a snapshot of the retired `memory` kind (unreadable now) is skipped, and restoring writes
+        // the row exactly as recorded. A rollback interrupted midway can therefore simply be run again.
         let mut inverse = Vec::new();
         for edit in target.edits.iter().rev() {
             match edit.action {
                 Action::Create => {
-                    let after = edit
-                        .after
-                        .as_ref()
-                        .context("create edit missing its snapshot")?;
-                    let before = self.delete(&after.id)?;
-                    inverse.push(AppliedEdit {
-                        action: Action::Delete,
-                        id: after.id.clone(),
-                        before: Some(before),
-                        after: None,
-                    });
+                    let Some(after) = edit.after.as_ref() else { continue };
+                    let Some((scope, m)) = learned::delete(&self.db, &after.id)? else { continue };
+                    if let Some(before) = from_memory(&scope, &m) {
+                        inverse.push(AppliedEdit { action: Action::Delete, id: after.id.clone(), before: Some(before), after: None });
+                    }
                 }
                 Action::Delete => {
-                    let before = edit
-                        .before
-                        .as_ref()
-                        .context("delete edit missing its snapshot")?;
+                    let Some(before) = edit.before.as_ref() else { continue };
                     let after = self.restore(before)?;
-                    inverse.push(AppliedEdit {
-                        action: Action::Create,
-                        id: before.id.clone(),
-                        before: None,
-                        after: Some(after),
-                    });
+                    inverse.push(AppliedEdit { action: Action::Create, id: before.id.clone(), before: None, after: Some(after) });
                 }
                 Action::Update => {
-                    let before = edit
-                        .before
-                        .as_ref()
-                        .context("update edit missing its snapshot")?;
+                    let Some(before) = edit.before.as_ref() else { continue };
                     let after = self.restore(before)?;
-                    inverse.push(AppliedEdit {
-                        action: Action::Update,
-                        id: before.id.clone(),
-                        before: edit.after.clone(),
-                        after: Some(after),
-                    });
+                    inverse.push(AppliedEdit { action: Action::Update, id: before.id.clone(), before: edit.after.clone(), after: Some(after) });
                 }
             }
         }
-        {
-            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute(
-                "UPDATE harness_changesets SET rolled_back = 1 WHERE id = ?1",
-                [&target.id],
+        // Mark the target and record the inverse changeset in one transaction.
+        let rollback_id = {
+            let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.transaction()?;
+            tx.execute("UPDATE harness_changesets SET rolled_back = 1 WHERE id = ?1", [&target.id])?;
+            let id = Self::insert_changeset(
+                &tx,
+                target.session.as_deref(),
+                target.scope,
+                &format!("Rolled back: {}", target.summary),
+                "user-requested rollback",
+                "restore the prior state",
+                &inverse,
+                Some(&target.id),
+                "refine",
             )?;
-        }
-        let rollback_id = self.record_changeset(
-            target.session.as_deref(),
-            target.scope,
-            &format!("Rolled back: {}", target.summary),
-            "user-requested rollback",
-            "restore the prior state",
-            &inverse,
-            Some(&target.id),
-            "refine",
-        )?;
+            tx.commit()?;
+            id
+        };
         self.changeset(&rollback_id)?
             .context("just-recorded changeset vanished")
     }
@@ -918,6 +936,9 @@ impl EntryStore {
             params![format!("session_surface:{session}"), session],
         )?;
         conn.execute("DELETE FROM engine_settings WHERE key = ?1", [format!("session_dir:{session}")])?;
+        drop(conn);
+        // The session's memory-extraction marker lives in the memory database.
+        jcode_base::memory::forget_session_meta(&self.db, session)?;
         Ok(())
     }
 
@@ -1289,7 +1310,7 @@ mod tests {
         let store = EntryStore::temp().unwrap();
         store.set_session_dir("s1", "/work/a").unwrap();
         let e = store.create(entry(EntryKind::Skill, Scope::Local, Some("s1"))).unwrap();
-        assert_eq!(e.memory_scope, learned::project_scope("/work/a"), "a session with a directory learns into its project");
+        assert_eq!(e.memory_scope, "session:s1", "local means this session only, even with a working directory");
         let db = raw(&store);
         let (category, scope, content): (String, String, String) = db
             .query_row(
@@ -1300,9 +1321,13 @@ mod tests {
             .unwrap();
         assert_eq!((category.as_str(), scope, content.as_str()), ("skill", e.memory_scope.clone(), "Content"));
         assert!(db.prepare("SELECT 1 FROM harness_entries").is_err(), "the old table does not exist");
-        // No directory: global.
-        let g = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s9"))).unwrap();
+        // Explicitly project-wide: the project of the session's directory; global without one.
+        let p = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1")).in_project()).unwrap();
+        assert_eq!(p.memory_scope, learned::project_scope("/work/a"));
+        let g = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s9")).in_project()).unwrap();
         assert_eq!((g.memory_scope.as_str(), g.scope), ("global", Scope::Global));
+        let s9 = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s9"))).unwrap();
+        assert_eq!(s9.memory_scope, "session:s9");
         // Delete removes the memory row.
         store.delete(&e.id).unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM memories WHERE id = ?1", [&e.id], |r| r.get::<_, i64>(0)).unwrap(), 0);
@@ -1373,5 +1398,65 @@ mod tests {
         let skill = store.create(s).unwrap();
         let (_, m) = learned::get(&store.db, &skill.id).unwrap().unwrap();
         assert_eq!(learned::is_kept_out_of_recall(&m), crate::skill_files::skills_dir().is_some(), "a skill is left to the skill list only when its SKILL.md exists");
+    }
+
+    #[test]
+    fn a_local_note_is_visible_to_its_session_only_and_dies_with_it() {
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        store.set_session_dir("s2", "/work/a").unwrap();
+        let local = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let project = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1")).in_project().with_path("topic/b")).unwrap();
+        let ids = |s: &str| store.list_visible(s, None).unwrap().into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert!(ids("s1").contains(&local.id) && ids("s1").contains(&project.id));
+        assert!(!ids("s2").contains(&local.id), "another session in the same project never sees it");
+        let marker = |k: &str| raw(&store).query_row("SELECT count(*) FROM memory_meta WHERE key = ?1", [k], |r| r.get::<_, i64>(0)).unwrap();
+        raw(&store).execute("INSERT INTO memory_meta(key, value) VALUES ('extracted_through:s1', '12'), ('extracted_through:s2', '4')", []).unwrap();
+        assert!(ids("s2").contains(&project.id));
+        store.forget_session("s1").unwrap();
+        assert!(!ids("s1").contains(&local.id), "the session-local note is dropped");
+        assert!(ids("s2").contains(&project.id), "the project note outlives the session");
+        assert_eq!(marker("extracted_through:s1"), 0, "the extraction marker is dropped with the session");
+        assert_eq!(marker("extracted_through:s2"), 1);
+    }
+
+    #[test]
+    fn rollback_tolerates_missing_rows_and_old_memory_snapshots() {
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        let made = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let kept = store.create(entry(EntryKind::Prompt, Scope::Local, Some("s1"))).unwrap();
+        let removed = store.delete(&kept.id).unwrap();
+        // A snapshot of the retired `memory` kind, as an old changeset stored it.
+        let legacy = json!({"action": "create", "id": "old", "before": null,
+            "after": {"id": "old", "kind": "memory", "scope": "local", "session": "s1", "title": "", "content": "x"}});
+        let edits = vec![
+            AppliedEdit { action: Action::Create, id: made.id.clone(), before: None, after: Some(made.clone()) },
+            AppliedEdit { action: Action::Delete, id: kept.id.clone(), before: Some(removed.clone()), after: None },
+            applied_edit_from_json(&legacy).unwrap(),
+        ];
+        // The created entry is already gone (expired/deleted since): rolling back must not fail midway.
+        store.delete(&made.id).unwrap();
+        let cs = store.record_changeset(Some("s1"), Scope::Local, "mixed", "r", "e", &edits, None, "refine").unwrap();
+        let rolled = store.rollback(Some(&cs), None).unwrap();
+        assert_eq!(rolled.rollback_of.as_deref(), Some(cs.as_str()));
+        assert_eq!(rolled.edits.len(), 1, "only the delete was undone");
+        assert_eq!(store.get(&kept.id).unwrap().unwrap().id, kept.id, "the deleted entry is back");
+        assert!(store.changeset(&cs).unwrap().unwrap().rolled_back);
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_active_flag_it_recorded() {
+        let store = EntryStore::temp().unwrap();
+        let e = store.create(entry(EntryKind::Prompt, Scope::Global, None)).unwrap();
+        assert!(e.active);
+        let mut snap = entry_to_json(&e);
+        assert_eq!(snap["active"], true);
+        snap["active"] = json!(false);
+        let inactive = entry_from_json(&snap).unwrap();
+        assert!(!inactive.active);
+        store.restore(&inactive).unwrap();
+        assert!(store.get(&e.id).unwrap().is_none(), "restored inactive: hidden from the active view");
+        assert!(entry_from_json(&{ let mut v = entry_to_json(&e); v.as_object_mut().unwrap().remove("active"); v }).unwrap().active, "old snapshots default to active");
     }
 }

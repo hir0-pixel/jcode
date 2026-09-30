@@ -164,7 +164,7 @@ fn build_request_with(
     let scope_word = if global {
         "global (applies to every session)"
     } else {
-        "local to this session"
+        "local to this session (set an edit's \"scope\" to \"project\" only for a lesson that holds for the whole project)"
     };
     let (kinds, kind_names) = if skills {
         (
@@ -281,6 +281,10 @@ fn apply_with(store: &EntryStore, session: &str, reply: &str, global: bool, sour
                     }
                     if !global {
                         new_entry = new_entry.with_session(session);
+                        // Session-only by default; a lesson that holds for the whole project says so.
+                        if edit["scope"].as_str() == Some("project") {
+                            new_entry = new_entry.in_project();
+                        }
                     }
                     if let Some(reference) = &skill_reference {
                         new_entry.reference = reference.clone();
@@ -616,6 +620,22 @@ mod tests {
         assert!(store.get(&outcome.created[0]).unwrap().is_some());
         let cs = store.changeset(&outcome.changeset_id).unwrap().unwrap();
         assert_eq!(cs.edits.len(), 1);
+        let entry = store.get(&outcome.created[0]).unwrap().unwrap();
+        assert_eq!(entry.memory_scope, "session:s1", "a refine lesson is session-local unless it says otherwise");
+    }
+
+    #[test]
+    fn an_edit_can_ask_for_the_project_scope() {
+        let store = EntryStore::temp().unwrap();
+        store.set_session_dir("s1", "/work/a").unwrap();
+        let reply = json!({"summary": "s", "rationale": "r", "expectedOutcome": "e", "edits": [{
+            "action": "create", "kind": "prompt", "title": "T", "content": "Use cargo nextest here.",
+            "scope": "project", "evidence": ["x"],
+        }]})
+        .to_string();
+        let outcome = apply_with(&store, "s1", &reply, false, "refine", true).unwrap();
+        let entry = store.get(&outcome.created[0]).unwrap().unwrap();
+        assert_eq!(entry.memory_scope, jcode_base::memory::learned::project_scope("/work/a"));
     }
 
     #[test]
