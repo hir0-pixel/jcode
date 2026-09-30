@@ -104,76 +104,82 @@ impl QualityGate {
     }
 }
 
-/// Run a quality gate. A passed gate means only that gate passed.
-pub fn run_gate(gate: &mut QualityGate) -> GateResult {
+/// Run a quality gate in `cwd`. A passed gate means only that gate passed.
+pub fn run_gate(gate: &mut QualityGate, cwd: Option<&Path>) -> GateResult {
     gate.attempts += 1;
-    let timeout = Duration::from_secs(gate.timeout_seconds.max(1) as u64);
-    let started = Instant::now();
-    let mut child = match Command::new("sh")
-        .arg("-c")
-        .arg(&gate.command)
+    let r = run_command(&gate.command, cwd, Duration::from_secs(gate.timeout_seconds.max(1) as u64));
+    gate.last_exit_code = Some(r.exit_code);
+    r
+}
+
+/// Run `sh -c command` in `cwd` in its own process group. Pipes are drained on
+/// separate threads (no buffer deadlock); on timeout the whole group is killed.
+/// `output` is the last 3000 chars of stdout+stderr (exit 124 = timeout).
+pub fn run_command(command: &str, cwd: Option<&Path>, timeout: Duration) -> GateResult {
+    use std::os::unix::process::CommandExt;
+    use std::io::Read;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .process_group(0);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
-            gate.last_exit_code = Some(127);
-            return GateResult {
-                passed: false,
-                exit_code: 127,
-                output: format!("failed to spawn gate: {err}"),
-            };
+            return GateResult { passed: false, exit_code: 127, output: format!("failed to spawn gate: {err}") };
         }
     };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status.code().unwrap_or(1) as i64;
-                gate.last_exit_code = Some(code);
-                let stdout = {
-                    let mut buf = String::new();
-                    if let Some(mut out) = child.stdout.take() {
-                        let _ = std::io::Read::read_to_string(&mut out, &mut buf);
-                    }
-                    if let Some(mut err) = child.stderr.take() {
-                        let _ = std::io::Read::read_to_string(&mut err, &mut buf);
-                    }
-                    buf.chars()
-                        .rev()
-                        .take(3000)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect()
-                };
-                return GateResult {
-                    passed: code == 0,
-                    exit_code: code,
-                    output: stdout,
-                };
+    // Keep only the tail of each stream while draining.
+    fn drain<R: Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut tail = Vec::new();
+            let Some(mut r) = r else { return tail };
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = r.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > 64 * 1024 {
+                    let cut = tail.len() - 32 * 1024;
+                    tail.drain(..cut);
+                }
             }
+            tail
+        })
+    }
+    let out_h = drain(child.stdout.take());
+    let err_h = drain(child.stderr.take());
+    let pgid = child.id() as i32;
+    let started = Instant::now();
+    let (code, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status.code().unwrap_or(1) as i64, false),
             Ok(None) if started.elapsed() >= timeout => {
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
                 let _ = child.kill();
                 let _ = child.wait();
-                gate.last_exit_code = Some(124);
-                return GateResult {
-                    passed: false,
-                    exit_code: 124,
-                    output: format!("gate timed out after {}s", gate.timeout_seconds),
-                };
+                break (124, true);
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => {
-                gate.last_exit_code = Some(1);
-                return GateResult {
-                    passed: false,
-                    exit_code: 1,
-                    output: err.to_string(),
-                };
-            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break (1, false),
         }
+    };
+    // Grandchildren holding the pipes open would block the join; reap the group.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let mut text = String::from_utf8_lossy(&err_h.join().unwrap_or_default()).into_owned();
+    // stderr first keeps test failures (usually stderr) nearest the tail.
+    text.insert_str(0, &String::from_utf8_lossy(&out_h.join().unwrap_or_default()));
+    if timed_out {
+        text.push_str(&format!("\ngate timed out after {}s", timeout.as_secs()));
     }
+    let output = text.chars().rev().take(3000).collect::<String>().chars().rev().collect();
+    GateResult { passed: code == 0, exit_code: code, output }
 }
 
 #[derive(Debug, Clone)]
@@ -1406,7 +1412,7 @@ pub fn after_turn_in(
                 let mut all_passed = true;
                 let mut failed_output = String::new();
                 for gate in &mut auto.gates {
-                    let result = run_gate(gate);
+                    let result = run_gate(gate, cwd);
                     if !result.passed {
                         all_passed = false;
                         failed_output = result.output;
@@ -1998,6 +2004,30 @@ pub fn control_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_command_uses_cwd_and_drains_verbose_output() {
+        let dir = std::env::temp_dir().join(format!("gate-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = run_command("pwd; head -c 400000 /dev/zero | tr '\\0' x; echo END; exit 3", Some(&dir), Duration::from_secs(20));
+        assert_eq!(r.exit_code, 3);
+        assert!(r.output.contains("END"));
+        assert!(r.output.len() <= 3000);
+        let r = run_command("pwd", Some(&dir), Duration::from_secs(20));
+        assert!(r.passed && r.output.trim().ends_with(dir.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn run_command_timeout_kills_grandchildren() {
+        let marker = format!("sleep {}", 300 + std::process::id() % 97);
+        let t = Instant::now();
+        let r = run_command(&format!("{marker} & wait"), None, Duration::from_millis(500));
+        assert_eq!(r.exit_code, 124);
+        assert!(t.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(200));
+        let ps = Command::new("pgrep").args(["-f", &marker]).output().unwrap();
+        assert!(String::from_utf8_lossy(&ps.stdout).trim().is_empty(), "grandchild survived");
+    }
+
     use super::*;
 
     #[test]
