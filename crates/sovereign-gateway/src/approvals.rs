@@ -325,13 +325,18 @@ impl Hub {
     /// An approval nobody can answer now (a cron / bot turn, or a goal with no desktop): allowed by
     /// the user's Hermes config or an earlier late approval (`once`), otherwise denied and parked as
     /// a normal desktop `approval` prompt so the user can approve it later.
-    pub(crate) async fn unattended(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
+    pub(crate) async fn unattended(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str, cwd: Option<&std::path::Path>) -> String {
         let surface = self.headless.lock().await.get(session_id).copied().unwrap_or("goal");
         let granted = self.once_grants.lock().await.remove(&(session_id.to_string(), command.to_string())) || self.sticky(session_id, command).await;
         let home = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
         let allowlisted = home.as_deref().is_some_and(|home| allowlisted(home, command));
         if granted || allowlisted || home.is_some_and(|home| policy_allows(&home, surface)) {
             self.audit(session_id, tool, command, "once", if granted { "user-later" } else if allowlisted { "allowlist" } else { "policy" });
+            return "once".into();
+        }
+        // Tidying the session's own working directory needs no one's approval.
+        if cwd.is_some_and(|cwd| jcode_command_risk::confined_to_workdir(command, &jcode_command_risk::RiskContext::from_env(Some(cwd.to_path_buf())))) {
+            self.audit(session_id, tool, command, "once", "workdir");
             return "once".into();
         }
         self.audit(session_id, tool, command, "deny", "headless-deny");
@@ -417,8 +422,13 @@ impl Hub {
     /// Ask the user whether `command` may run. Returns the Hermes choice
     /// (`once` / `session` / `always` / `deny`).
     pub async fn decide(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str) -> String {
+        self.decide_in(session_id, tool, command, reason, None).await
+    }
+
+    /// [`Hub::decide`] for a command run from `cwd`, so an unattended run may allow what stays inside it.
+    pub async fn decide_in(self: &Arc<Self>, session_id: &str, tool: &str, command: &str, reason: &str, cwd: Option<&std::path::Path>) -> String {
         if self.headless.lock().await.contains_key(session_id) {
-            return self.unattended(session_id, tool, command, reason).await;
+            return self.unattended(session_id, tool, command, reason, cwd).await;
         }
         // A late `once` approval is for this session's next attempt at exactly this command: spend it
         // here, so a stale grant can't wave through some later unattended run.
@@ -452,7 +462,7 @@ impl Hub {
             showing
         };
         if clients.is_empty() {
-            return self.unattended(session_id, tool, command, reason).await;
+            return self.unattended(session_id, tool, command, reason, cwd).await;
         }
         let request_id = format!("approval-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
@@ -479,7 +489,7 @@ impl Hub {
         self.pending.lock().await.remove(&request_id);
         self.shown.lock().await.remove(&request_id);
         if choice == PARK {
-            return self.unattended(session_id, tool, command, reason).await;
+            return self.unattended(session_id, tool, command, reason, cwd).await;
         }
         match choice.as_str() {
             "session" => {
@@ -655,7 +665,8 @@ pub mod hook {
         // Both set by the engine on this process alone (see [`super::ticket_env`]).
         let addr = std::env::var(super::ADDR_ENV).map_err(|_| "no approval endpoint")?;
         let secret = std::env::var(super::TICKET_ENV).map_err(|_| "no approval ticket")?;
-        let body = json!({ "session_id": session, "tool": "bash", "command": command, "reason": reason }).to_string();
+        let cwd = std::env::var("JCODE_HOOK_CWD").ok();
+        let body = json!({ "session_id": session, "tool": "bash", "command": command, "reason": reason, "cwd": cwd }).to_string();
         let mut stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
         stream.set_read_timeout(Some(HOOK_TIMEOUT)).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
@@ -1049,6 +1060,23 @@ mod tests {
         assert!(allows("approvals:\n  mode: \"off\"\n", "cron"));
         assert!(!allows(": not yaml [", "cron"));
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn headless_runs_may_tidy_their_own_working_directory_only() {
+        let hub = Arc::new(Hub::default());
+        hub.mark_headless("s", "bot").await;
+        let cwd = std::env::temp_dir().join(format!("factr-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        for cmd in ["rm -rf x", "chmod -R u+w build"] {
+            assert_eq!(hub.decide_in("s", "bash", cmd, "r", Some(&cwd)).await, "once", "{cmd}");
+        }
+        for cmd in ["rm -rf ..", "rm -rf .", "rm -rf /tmp/other-dir", "git clean -fdx ../x"] {
+            assert_eq!(hub.decide_in("s", "bash", cmd, "r", Some(&cwd)).await, "deny", "{cmd}");
+        }
+        assert_eq!(hub.decide("s", "bash", "rm -rf x", "r").await, "deny", "no cwd known: unchanged");
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[tokio::test]

@@ -704,3 +704,42 @@ fn scratch_redirect_is_safe_even_when_the_variable_is_not_exported() {
         assert!(!assess(bad, &ctx).level.runs_immediately(), "{bad}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn confined_to_workdir_allows_only_strictly_inside_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cwd.join("sub")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), cwd.join("escape")).unwrap();
+    let ctx = RiskContext {
+        working_dir: Some(cwd.clone()),
+        home_dir: Some(PathBuf::from("/home/u")),
+        scratch_dir: None,
+    };
+    for ok in ["rm -rf x", "rm -rf sub/deep", "chmod -R 755 sub", "rm -rf build/*.o", &format!("rm -rf {}/x", cwd.display())] {
+        assert!(confined_to_workdir(ok, &ctx), "{ok}");
+    }
+    for bad in [
+        "rm -rf .",
+        "rm -rf ..",
+        "rm -rf ../sibling",
+        "rm -rf /",
+        "rm -rf $HOME",
+        "rm -rf ~",
+        "rm -rf $UNKNOWN/x",
+        "rm -rf escape",
+        "rm -rf escape/x",
+        "rm -rf sub/../..",
+        &format!("rm -rf {}/x", outside.path().display()),
+    ] {
+        assert!(!confined_to_workdir(bad, &ctx), "{bad}");
+    }
+    // A working directory that is home (or /) confines nothing.
+    let home_ctx = RiskContext { home_dir: Some(cwd.clone()), ..ctx.clone() };
+    assert!(!confined_to_workdir("rm -rf x", &home_ctx));
+    // chmod -R is not labelled a delete.
+    let f = &assess("chmod -R 755 sub", &ctx).findings[0];
+    assert!(!f.reason.contains("delete"), "{}", f.reason);
+}

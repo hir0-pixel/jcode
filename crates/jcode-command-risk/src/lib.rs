@@ -237,6 +237,18 @@ pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
     RiskAssessment::from_findings(findings)
 }
 
+/// True when everything destructive in `command` stays strictly inside the working directory
+/// (symlinks followed; not the directory itself, home or `/`): every finding is Low with a
+/// concrete target there. Lets a run nobody can answer tidy its own workspace.
+pub fn confined_to_workdir(command: &str, ctx: &RiskContext) -> bool {
+    let assessment = assess(command, ctx);
+    assessment.level == RiskLevel::Low
+        && assessment.findings.iter().all(|f| {
+            f.level == RiskLevel::Low
+                && f.target.as_deref().is_some_and(|t| paths::strictly_inside_workdir(t, ctx))
+        })
+}
+
 /// Resolve `out=/some/path` followed by `>"$out"`: a variable assigned exactly once in the
 /// command, at the start of a segment, to a fully known path is replaced by that path in later
 /// tokens, so the real target is classified instead of an opaque "$out". Anything not fully

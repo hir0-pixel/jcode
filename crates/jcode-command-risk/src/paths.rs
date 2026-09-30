@@ -287,7 +287,7 @@ pub fn classify_target(
         // The routine case: an agent tidying up its own workspace.
         return recursive.then(|| RiskFinding {
             level: RiskLevel::Low,
-            reason: "recursive delete inside the working directory".to_string(),
+            reason: "recursive operation inside the working directory".to_string(),
             target: Some(expanded.display().to_string()),
         });
     }
@@ -306,6 +306,49 @@ pub fn classify_target(
             .to_string(),
         target: Some(expanded.display().to_string()),
     })
+}
+
+/// `path` with symlinks resolved: the deepest existing ancestor is canonicalized and the rest
+/// appended, so a not-yet-existing target still resolves against the real filesystem.
+fn resolve_real(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(mut real) = cur.canonicalize() {
+            real.extend(rest.iter().rev());
+            return real;
+        }
+        match cur.file_name().map(|n| n.to_owned()) {
+            Some(name) => {
+                rest.push(name);
+                cur.pop();
+            }
+            None => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Whether `target` (as a finding reports it) is strictly inside the working directory once
+/// symlinks are followed. Glob components are dropped: a glob cannot leave its parent.
+pub(crate) fn strictly_inside_workdir(target: &str, ctx: &RiskContext) -> bool {
+    let (Some(cwd), home) = (&ctx.working_dir, &ctx.home_dir) else { return false };
+    let cwd = resolve_real(&normalize(cwd));
+    if cwd.parent().is_none() || home.as_ref().is_some_and(|h| resolve_real(&normalize(h)) == cwd) {
+        return false;
+    }
+    let expanded = expand(target, ctx);
+    if expanded.to_string_lossy().contains(['$', '`']) {
+        return false;
+    }
+    let mut fixed = PathBuf::new();
+    for c in expanded.components() {
+        if c.as_os_str().to_string_lossy().contains(['*', '?', '[']) {
+            break;
+        }
+        fixed.push(c.as_os_str());
+    }
+    let real = resolve_real(&fixed);
+    real.starts_with(&cwd) && real != cwd
 }
 
 /// Temp directories are conventionally disposable, so deleting inside them is

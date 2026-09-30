@@ -687,7 +687,8 @@ async fn handle(
             )
             .await;
         };
-        let choice = hub.decide(&session, &tool, &command, &reason).await;
+        let cwd = serde_json::from_slice::<serde_json::Value>(&body).ok().and_then(|v| v["cwd"].as_str().map(std::path::PathBuf::from));
+        let choice = hub.decide_in(&session, &tool, &command, &reason, cwd.as_deref()).await;
         return respond(&mut stream, "200 OK", &json!({"choice": choice})).await;
     }
     let public = json!({"ok": true, "version": config.version, "auth_required": false});
