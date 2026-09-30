@@ -413,6 +413,19 @@ impl Config {
                 self.agents.swarm_max_concurrent_agents = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_MODEL") {
+            let trimmed = v.trim();
+            self.agents.memory_model = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_SIDECAR_ENABLED")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.agents.memory_sidecar_enabled = parsed;
+        }
         if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BACKEND") {
             let trimmed = v.trim();
             if !trimmed.is_empty() {

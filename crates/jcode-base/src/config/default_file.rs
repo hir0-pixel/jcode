@@ -466,7 +466,13 @@ swarm_max_concurrent_agents = 32
 # swarm_strip_layout = "vertical"
 #
 # Memory recall is local: an indexed full-text search over stored memories,
-# no model call and nothing sent anywhere. Learning from chats is the Prime
+# no model call. Automatic extraction of new memories from a chat is one call
+# to the active provider every 12 user turns, at session end and before
+# compaction. Env overrides: JCODE_MEMORY_SIDECAR_ENABLED, JCODE_MEMORY_MODEL
+# memory_sidecar_enabled = true
+# memory_model = "your-cheaper-model"
+#
+# Learning from chats beyond facts is the Prime
 # learning loop (on by default; the `learning.enabled` engine setting).
 
 [terminal]

@@ -526,6 +526,17 @@ pub(crate) fn once(path: &Path, key: &str, f: impl FnOnce() -> Result<usize>) ->
     Ok(n)
 }
 
+pub(crate) fn meta_get(path: &Path, key: &str) -> Result<Option<String>> {
+    with_db(path, |db| Ok(db.query_row("SELECT value FROM memory_meta WHERE key=?1", [key], |r| r.get(0)).optional()?))
+}
+
+pub(crate) fn meta_set(path: &Path, key: &str, value: &str) -> Result<()> {
+    with_db(path, |db| {
+        db.execute("INSERT OR REPLACE INTO memory_meta(key, value) VALUES (?1, ?2)", params![key, value])?;
+        Ok(())
+    })
+}
+
 /// One-time import of the old JSON graphs (`memory/global.json`,
 /// `memory/projects/<hash>.json`); each file is renamed `*.json.imported`.
 pub(crate) fn import_json_once(db_path: &Path, memory_dir: &Path, load: impl Fn(&Path) -> Result<MemoryGraph>) -> Result<usize> {

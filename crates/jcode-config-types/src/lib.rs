@@ -612,6 +612,11 @@ pub struct AgentsConfig {
     /// as chips on a single row.
     #[serde(default)]
     pub swarm_strip_layout: SwarmStripLayout,
+    /// Optional model override for automatic memory extraction only.
+    pub memory_model: Option<String>,
+    /// Whether automatic memory extraction (an LLM call on the active provider) runs.
+    #[serde(default = "default_memory_sidecar_enabled")]
+    pub memory_sidecar_enabled: bool,
     /// Embedding backend (conversation compaction): "local" MiniLM or "openai".
     #[serde(default = "default_memory_embedding_backend")]
     pub memory_embedding_backend: String,
@@ -642,6 +647,10 @@ fn default_swarm_max_concurrent_agents() -> usize {
     32
 }
 
+fn default_memory_sidecar_enabled() -> bool {
+    true
+}
+
 fn default_memory_embedding_backend() -> String {
     "local".to_string()
 }
@@ -662,6 +671,8 @@ impl Default for AgentsConfig {
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
+            memory_model: None,
+            memory_sidecar_enabled: default_memory_sidecar_enabled(),
             memory_embedding_backend: default_memory_embedding_backend(),
             memory_embedding_model: None,
             memory_embedding_base_url: None,

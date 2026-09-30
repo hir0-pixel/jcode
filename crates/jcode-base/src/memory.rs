@@ -315,6 +315,10 @@ impl MemoryManager {
     /// Store without embedding inference. Exact duplicates reinforce an existing
     /// entry only within the requested scope, never mutate a different project.
     pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
+        Ok(self.remember_project_outcome(entry)?.id().to_string())
+    }
+
+    fn remember_project_outcome(&self, entry: MemoryEntry) -> Result<crate::memory_store::Remembered> {
         anyhow::ensure!(
             self.project_scope().is_some(),
             "Project memory requires a working directory; use global scope explicitly"
@@ -325,18 +329,59 @@ impl MemoryManager {
         let db = self.db_path()?;
         let outcome = crate::memory_store::remember(&db, &scope, entry)?;
         forget_graph(&format!("{}#{scope}", db.display()));
-        Ok(outcome.id().to_string())
+        Ok(outcome)
     }
 
     /// Writes just this memory's row: rewriting the whole graph lost a concurrent writer's rows.
     pub fn remember_global(&self, entry: MemoryEntry) -> Result<String> {
+        Ok(self.remember_global_outcome(entry)?.id().to_string())
+    }
+
+    fn remember_global_outcome(&self, entry: MemoryEntry) -> Result<crate::memory_store::Remembered> {
         let db = self.db_path()?;
         if !self.test_mode {
             self.import_json_once(&db)?;
         }
         let outcome = crate::memory_store::remember(&db, "global", entry)?;
         forget_graph(&format!("{}#global", db.display()));
-        Ok(outcome.id().to_string())
+        Ok(outcome)
+    }
+
+    /// Where automatic extraction writes: project scope, or global when there is no working directory.
+    pub(crate) fn remember_extracted(&self, entry: MemoryEntry) -> Result<crate::memory_store::Remembered> {
+        if self.project_scope().is_some() {
+            self.remember_project_outcome(entry)
+        } else {
+            self.remember_global_outcome(entry)
+        }
+    }
+
+    /// Active memories (project and global) sharing words with `text`, best match first, for the
+    /// extraction prompt's "already known" list. Not filtered by the recall term floor.
+    pub(crate) fn related_to(&self, text: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for term in crate::memory_recall::local_terms(text) {
+            *counts.entry(term).or_default() += 1;
+        }
+        let mut terms: Vec<(String, usize)> = counts.into_iter().collect();
+        terms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let terms: Vec<String> = terms.into_iter().take(48).map(|(t, _)| t).collect();
+        let mut scopes = vec!["global".to_string()];
+        scopes.extend(self.project_scope());
+        let db = self.db_path()?;
+        if !self.test_mode {
+            self.import_json_once(&db)?;
+        }
+        crate::memory_store::search(&db, &scopes, &terms, limit)
+    }
+
+    /// Small per-database bookkeeping value (`memory_meta`), e.g. `extracted_through:<session>`.
+    pub(crate) fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        crate::memory_store::meta_get(&self.db_path()?, key)
+    }
+
+    pub(crate) fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        crate::memory_store::meta_set(&self.db_path()?, key, value)
     }
 
     /// Insert or update a memory with a stable ID in the project graph.
