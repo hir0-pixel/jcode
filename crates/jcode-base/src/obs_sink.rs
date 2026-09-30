@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone)]
 pub struct Span {
     /// `memory.write`, `memory.recall`, `memory.inject`, `memory.extract`, `memory.skip`,
-    /// `learning.gate`, `learning.refine`, `learning.apply`, `learning.skip`.
+    /// `learning.gate`, `learning.refine`, `learning.apply`, `learning.skip`, `loop.guard`.
     pub kind: &'static str,
     pub session_id: Option<String>,
     pub error: Option<String>,

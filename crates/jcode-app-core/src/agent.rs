@@ -9,6 +9,7 @@ mod messages;
 mod model_usage_tests;
 mod prompting;
 mod provider;
+mod repeat_guard;
 mod response_recovery;
 mod status;
 mod streaming;

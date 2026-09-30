@@ -112,6 +112,7 @@ impl Agent {
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
+        let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
 
         loop {
             // Never open a new provider request after a cancel. Several paths
@@ -203,6 +204,9 @@ impl Agent {
 
             // Inject memory as a user message at the end (preserves cache prefix)
             let mut messages_with_memory: Vec<Message> = messages.iter().cloned().collect();
+            if let Some(reminder) = repeat_guard.take_reminder() {
+                messages_with_memory.push(Message::user(&reminder));
+            }
             if let Some(memory) = memory_pending.as_ref() {
                 let memory_count = memory.count.max(1);
                 let computed_age_ms = memory.computed_at.elapsed().as_millis() as u64;
@@ -1359,6 +1363,7 @@ impl Agent {
             // Execute tools and add results
             let tool_count = tool_calls.len();
             let mut tool_results_dirty = false;
+            let mut guard_stop: Option<anyhow::Error> = None;
             for tool_index in 0..tool_count {
                 // === INJECTION POINT C (before): Check for urgent abort before each tool (except first) ===
                 if tool_index > 0 && self.has_urgent_interrupt() {
@@ -1546,6 +1551,9 @@ impl Agent {
                     match result {
                         Ok(output) => {
                             let output = cap_tool_output_for_history(&tc.name, output);
+                            let verdict =
+                                repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
+                            guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
@@ -1578,6 +1586,8 @@ impl Agent {
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
+                            let verdict = repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
+                            guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                             let _ = event_tx.send(ServerEvent::ToolDone {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
@@ -1693,6 +1703,9 @@ impl Agent {
 
             if tool_results_dirty {
                 self.session.save()?;
+            }
+            if let Some(err) = guard_stop {
+                return Err(err);
             }
 
             if !generated_image_contexts.is_empty() {

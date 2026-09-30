@@ -63,6 +63,7 @@ impl Agent {
         let mut fable_guardrail_reconsiderations = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
+        let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
 
         loop {
             // Do not start another provider request once a cancel has been
@@ -146,6 +147,10 @@ impl Agent {
                 messages_with_memory.push(Message::user(Self::BATCH_NUDGE));
                 batch_nudge_pending = false;
                 sequential_single_tool_rounds = 0;
+            }
+
+            if let Some(reminder) = repeat_guard.take_reminder() {
+                messages_with_memory.push(Message::user(&reminder));
             }
 
             logging::info(&format!(
@@ -958,6 +963,7 @@ impl Agent {
 
             // Execute tools and add results
             let mut tool_results_dirty = false;
+            let mut guard_stop: Option<anyhow::Error> = None;
             for tc in tool_calls {
                 let message_id = assistant_message_id
                     .clone()
@@ -1099,6 +1105,8 @@ impl Agent {
                 match result {
                     Ok(output) => {
                         let output = cap_tool_output_for_history(&tc.name, output);
+                        let verdict = repeat_guard.observe(&tc.name, &tc.input, &output.output, false);
+                        guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                         Bus::global().publish(BusEvent::ToolUpdated(ToolEvent {
                             session_id: self.session.id.clone(),
                             message_id: message_id.clone(),
@@ -1144,6 +1152,8 @@ impl Agent {
                         }));
 
                         let error_msg = format!("Error: {}", e);
+                        let verdict = repeat_guard.observe(&tc.name, &tc.input, &error_msg, true);
+                        guard_stop = guard_stop.or(repeat_guard.handle(&self.session.id, &verdict));
                         if trace {
                             eprintln!(
                                 "[trace] tool_exec_error name={} id={} {}",
@@ -1169,6 +1179,9 @@ impl Agent {
 
             if tool_results_dirty {
                 self.session.save()?;
+            }
+            if let Some(err) = guard_stop {
+                return Err(err);
             }
 
             if !generated_image_contexts.is_empty() {
