@@ -1867,11 +1867,13 @@ impl Default for CompactionManager {
 /// Generate summary using the provider
 async fn generate_compaction_artifact(
     provider: Arc<dyn Provider>,
-    messages: Vec<Message>,
+    mut messages: Vec<Message>,
     mut existing_summary: Option<Summary>,
     pending_model_calls: PendingModelCalls,
     instructions: Option<String>,
 ) -> GeneratedCompaction {
+    // Mask old tool output first so the summary reads less (Hermes prune passes).
+    jcode_compaction_core::prune_old_tool_results(&mut messages, 4);
     let start = Instant::now();
     let mut model_calls = Vec::new();
     if let Some(summary) = existing_summary.as_mut()

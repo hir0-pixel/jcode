@@ -1,4 +1,6 @@
 use jcode_message_types::{ContentBlock, Message, Role};
+mod prune;
+pub use prune::prune_old_tool_results;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
