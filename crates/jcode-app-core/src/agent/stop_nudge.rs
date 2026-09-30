@@ -24,6 +24,7 @@ const ACTION_PHRASES: [&str; 17] = [
 ];
 
 const VERIFY_NUDGE: &str = "<system-reminder>Before finishing: re-read the task's explicit requirements (exact names, paths, commands, formats) and check each against your result; run or exercise what you built (use python3 -m unittest if pytest is missing); fix anything that fails. If you cannot fully solve it, write your best-effort result to the requested output first.</system-reminder>";
+const STEER: &str = "Two attempts have not fixed this. Step back: read the failing output again, write down two different hypotheses for the cause, test the most likely one with a quick command before editing again, and do not repeat an edit you already tried.";
 const QUESTION_NUDGE: &str = "<system-reminder>No user is available to answer. Act on the most likely reading of the task now, do the work, and verify it.</system-reminder>";
 const FAILED_CHECK_NUDGE: &str = "<system-reminder>Your last check failed and nothing changed since. Fix it or explain precisely what blocks you, and still write your best result.</system-reminder>";
 const OFFER_PHRASES: [&str; 9] = [
@@ -52,6 +53,7 @@ pub(super) struct StopNudge {
     baseline: Vec<String>,
     rounds: u32,
     last_fail: Option<u64>,
+    last_count: Option<usize>,
     gate_ran: bool,
     passed: bool,
     last_fail_stop: bool,
@@ -76,6 +78,33 @@ fn auto_verify_enabled() -> bool {
 fn looks_like_test_run(command: &str) -> bool {
     let c = command.to_ascii_lowercase();
     TEST_MARKERS.iter().any(|m| c.contains(m))
+}
+
+/// Failing-test count from a runner's output (pytest/cargo `N failed`, unittest
+/// `FAILED (failures=N, errors=M)`, go `FAIL` lines); output length when unparsable.
+fn fail_count(out: &str) -> usize {
+    let words: Vec<&str> = out.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')')).filter(|w| !w.is_empty()).collect();
+    let mut n = 0;
+    let mut found = false;
+    for (i, w) in words.iter().enumerate() {
+        if *w == "failed" && i > 0 {
+            if let Ok(k) = words[i - 1].parse::<usize>() {
+                n += k;
+                found = true;
+            }
+        }
+        for key in ["failures=", "errors="] {
+            if let Some(k) = w.strip_prefix(key).and_then(|v| v.parse::<usize>().ok()) {
+                n += k;
+                found = true;
+            }
+        }
+    }
+    let go = out.lines().filter(|l| l.trim_start().starts_with("--- FAIL")).count();
+    if go > 0 {
+        return n + go;
+    }
+    if found { n } else { out.len() }
 }
 
 fn looks_like_check(command: &str) -> bool {
@@ -143,6 +172,19 @@ fn hash_str(s: &str) -> u64 {
 }
 
 impl super::Agent {
+    /// Goal and autonomous sessions run their own gates.
+    pub(super) fn in_goal_or_autonomous(&self) -> bool {
+        jcode_base::storage::jcode_dir()
+            .ok()
+            .and_then(|h| sovereign_prime::agent_loop::ControlStore::open_cached(&h).ok())
+            .is_some_and(|st| {
+                use sovereign_prime::agent_loop::{AutonomousStatus, GoalStatus};
+                let id = &self.session.id;
+                st.get_goal(id).ok().flatten().is_some_and(|g| g.status == GoalStatus::Active)
+                    || st.get_autonomous(id).ok().flatten().is_some_and(|a| a.status == AutonomousStatus::Active)
+            })
+    }
+
     /// Per-turn nudge/gate state. The gate is off for subagents, goal and
     /// autonomous sessions (their own gates), past a hard deadline, and when
     /// the cwd is missing, `/`, or a home directory.
@@ -166,15 +208,7 @@ impl super::Agent {
             && self.session.parent_id.is_none()
             && !past_deadline
             && cwd.as_deref().is_some_and(|d| d.is_dir() && !is_home(d))
-            && !jcode_base::storage::jcode_dir()
-                .ok()
-                .and_then(|h| sovereign_prime::agent_loop::ControlStore::open_cached(&h).ok())
-                .is_some_and(|st| {
-                    use sovereign_prime::agent_loop::{AutonomousStatus, GoalStatus};
-                    let id = &self.session.id;
-                    st.get_goal(id).ok().flatten().is_some_and(|g| g.status == GoalStatus::Active)
-                        || st.get_autonomous(id).ok().flatten().is_some_and(|a| a.status == AutonomousStatus::Active)
-                });
+            && !self.in_goal_or_autonomous();
         n.headless = jcode_base::headless::is(&self.session.id);
         if n.gate_ok {
             n.baseline = super::auto_verify::git_changed(cwd.as_deref().unwrap());
@@ -287,9 +321,15 @@ impl StopNudge {
             self.last_fail_stop = true;
             return Some(false);
         }
+        let count = fail_count(&r.output);
+        let steer = self.last_count.replace(count).is_some_and(|prev| count >= prev);
+        if steer {
+            jcode_base::obs_sink::emit(self.guard_span(session_id, "auto_verify_steer", name, 0));
+        }
         self.pending = Some(format!(
-            "<system-reminder>Auto-verify: `{cmd}` failed (exit {}, round {}/{}). Last output:\n{}\nFix the failures, then finish.</system-reminder>",
-            r.exit_code, self.rounds, cfg.auto_verify_rounds.max(1), r.output
+            "<system-reminder>Auto-verify: `{cmd}` failed (exit {}, round {}/{}). Last output:\n{}\nFix the failures, then finish.{}</system-reminder>",
+            r.exit_code, self.rounds, cfg.auto_verify_rounds.max(1), r.output,
+            if steer { format!("\n\n{STEER}") } else { String::new() }
         ));
         Some(true)
     }
@@ -533,6 +573,25 @@ mod tests {
         assert!(n.take_pending().is_none(), "gate replaces the verify nudge");
         assert!(!n.on_text_only_stop_with("s", "Fixed.", &run));
         assert!(results.borrow().is_empty());
+    }
+
+    #[test]
+    fn steer_when_failure_count_does_not_improve() {
+        let run_with = |outs: Vec<&'static str>| {
+            let (mut n, _d) = gate_nudge(&[("Cargo.toml", "")]);
+            n.observe("edit", &json!({"file_path": "a.rs"}), 0);
+            let outs = RefCell::new(outs);
+            let run = |_: &str, _: &std::path::Path, _: std::time::Duration| fail(outs.borrow_mut().remove(0));
+            assert!(n.on_text_only_stop_with("s", "x", &run));
+            let first = n.take_pending().unwrap();
+            n.observe("edit", &json!({"file_path": "a.rs"}), 0);
+            assert!(n.on_text_only_stop_with("s", "x", &run));
+            (first, n.take_pending().unwrap())
+        };
+        let (a, b) = run_with(vec!["test result: FAILED. 0 passed; 2 failed; in 0.1s", "x\ntest result: FAILED. 0 passed; 2 failed;"]);
+        assert!(!a.contains("Two attempts") && b.contains("Two attempts"));
+        let (_, b) = run_with(vec!["3 failed in 1s", "1 failed in 1s, other"]);
+        assert!(!b.contains("Two attempts"));
     }
 
     #[test]

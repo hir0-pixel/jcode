@@ -112,6 +112,16 @@ impl Agent {
         result
     }
 
+    /// First message of a fresh top-level session in a real project directory.
+    fn wants_env_snapshot(&self) -> bool {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let dir = self.session.working_dir.as_deref().map(std::path::Path::new);
+        super::env_snapshot::enabled()
+            && self.session.parent_id.is_none()
+            && dir.is_some_and(|d| d.is_dir() && d != std::path::Path::new("/") && home.as_deref() != Some(d))
+            && !self.in_goal_or_autonomous()
+    }
+
     /// Append and persist a user message without starting a model turn.
     pub(crate) fn append_user_context_message(
         &mut self,
@@ -144,6 +154,14 @@ impl Agent {
         }
 
         let starts_turn = blocks.len() > 1 || !user_message.trim().is_empty();
+        if starts_turn && self.session.messages.is_empty() && self.wants_env_snapshot() {
+            if let Some(dir) = self.session.working_dir.as_deref() {
+                blocks.push(ContentBlock::Text {
+                    text: super::env_snapshot::snapshot(std::path::Path::new(dir)),
+                    cache_control: None,
+                });
+            }
+        }
         let input_id = self.add_message_with_display_role(Role::User, blocks, display_role);
         if starts_turn {
             self.begin_model_usage_turn(&input_id);

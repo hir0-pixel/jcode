@@ -655,6 +655,10 @@ pub struct AgentsConfig {
     /// Maximum auto-verify gate runs per turn.
     #[serde(default = "default_auto_verify_rounds")]
     pub auto_verify_rounds: u32,
+    /// Add a one-line environment snapshot (cwd, tools on PATH, files) to a
+    /// session's first user message. Env: `JCODE_ENV_SNAPSHOT=0` disables.
+    #[serde(default = "default_verify_on_stop")]
+    pub environment_snapshot: bool,
 }
 
 fn default_auto_verify_timeout_s() -> u64 {
@@ -708,6 +712,7 @@ impl Default for AgentsConfig {
             auto_verify: default_verify_on_stop(),
             auto_verify_timeout_s: default_auto_verify_timeout_s(),
             auto_verify_rounds: default_auto_verify_rounds(),
+            environment_snapshot: default_verify_on_stop(),
         }
     }
 }
