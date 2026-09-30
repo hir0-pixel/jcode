@@ -1369,3 +1369,47 @@ pub fn forget_session_meta(db: &std::path::Path, session: &str) -> Result<usize>
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod scope_hash_tests {
+    /// Project scopes are `DefaultHasher` of the directory, and the directory itself is not stored,
+    /// so a toolchain that changes the hash would orphan every project scope with no way to migrate.
+    #[test]
+    fn project_scope_hash_is_pinned() {
+        assert_eq!(super::learned::project_scope("/work/a"), "project:8c9f0d145e24a070");
+    }
+}
+
+#[cfg(test)]
+mod single_row_tests {
+    use super::*;
+
+    #[test]
+    fn forget_expire_and_tag_do_not_delete_a_row_remembered_meanwhile() {
+        let _guard = crate::storage::lock_test_env();
+        let old = std::env::var("JCODE_HOME").ok();
+        let dir = std::env::temp_dir().join(format!("jcode-single-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::env::set_var("JCODE_HOME", &dir);
+        let manager = MemoryManager::new_test();
+        let a = manager.remember_global(MemoryEntry::new(MemoryCategory::Fact, "alpha deploy rule")).unwrap();
+        let b = manager.remember_global(MemoryEntry::new(MemoryCategory::Fact, "beta cache rule")).unwrap();
+        let stale = manager.load_global_graph().unwrap();
+        // The extractor remembers while a maintenance call is between its load and its write.
+        let fresh = manager.remember_global(MemoryEntry::new(MemoryCategory::Fact, "gamma fresh extraction")).unwrap();
+        assert!(manager.expire(&a, "wrong").unwrap());
+        assert!(manager.forget(&b).unwrap());
+        manager.tag_memory(&fresh, "extracted").unwrap();
+        let after = manager.load_global_graph().unwrap();
+        assert!(after.memories.contains_key(&fresh), "the fresh memory survives expire, forget and tag");
+        assert!(after.memories[&fresh].tags.contains(&"extracted".to_string()));
+        assert!(!after.memories[&a].active && !after.memories.contains_key(&b));
+        assert_eq!(stale.memories.len(), 2);
+        assert!(manager.tag_memory("nope", "x").is_err());
+        match old {
+            Some(v) => crate::env::set_var("JCODE_HOME", v),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

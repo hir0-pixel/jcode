@@ -87,9 +87,49 @@ const MIGRATIONS: &[Step] = &[
     // 6: Prime's learned entries (prompt / skill / subagent) are memories: `harness_entries` moves into
     // `memories` with the same ids (its changesets keep resolving) and the table is dropped.
     Step::Code(learned_entries_into_memories),
+    // 7: facts migration 6 parked in `session:<id>` (a scope recall never searches) move to the project
+    // scope of that session's directory when Prime recorded one, else `global`.
+    Step::Code(session_facts_to_project_or_global),
 ];
 
-/// Migration 6. A session-local entry keeps its reach as scope `session:<id>`; a `memory`-kind
+/// Where a session's facts belong: the project scope of the directory Prime recorded for it
+/// (`engine_settings` `session_dir:<id>`), else `global`.
+fn session_home_scope(conn: &Connection, session: &str) -> Result<String> {
+    if !conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='engine_settings'")?.exists([])? {
+        return Ok("global".into());
+    }
+    let dir: Option<String> = conn
+        .query_row("SELECT value FROM engine_settings WHERE key=?1", [format!("session_dir:{session}")], |r| r.get(0))
+        .ok()
+        .filter(|d: &String| !d.trim().is_empty());
+    Ok(dir.map_or_else(|| "global".into(), |d| crate::memory::learned::project_scope(&d)))
+}
+
+/// Migration 7. Recall searches `global` and the current project only, so a fact left in `session:<id>`
+/// was never seen again. Learned entries stay in their session scope (Prime reads it).
+fn session_facts_to_project_or_global(conn: &Connection) -> Result<()> {
+    if !conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'")?.exists([])?
+        || !conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_entries'")?.exists([])?
+    {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT m.rid, m.scope FROM memories m JOIN memory_entries e ON e.rid = m.rid
+             WHERE m.scope LIKE 'session:%' AND json_extract(e.entry, '$.category') = 'fact'",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (rid, scope) in rows {
+        let home = session_home_scope(conn, scope.trim_start_matches("session:"))?;
+        crate::memory_store::ensure_scope(conn, &home)?;
+        conn.execute("UPDATE OR IGNORE memories SET scope=?1 WHERE rid=?2", params![home, rid])?;
+    }
+    Ok(())
+}
+
+/// Migration 6. A session-local entry keeps its reach as scope `session:<id>` (a `memory`-kind one goes to
+/// its session's project scope, else `global`); a `memory`-kind
 /// entry that only pointed at a memory row is dropped, one that carried its own text becomes a fact.
 fn learned_entries_into_memories(conn: &Connection) -> Result<()> {
     if !conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='harness_entries'")?.exists([])? {
@@ -113,6 +153,8 @@ fn learned_entries_into_memories(conn: &Connection) -> Result<()> {
         let json = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| serde_json::json!({}));
         let (reference, arguments, metadata) = (json(&reference), json(&arguments), json(&metadata));
         let scope = match (scope.as_str(), session) {
+            // A fact would never be recalled from a session scope: it goes where the session worked.
+            ("local", Some(session)) if kind == "memory" => session_home_scope(conn, &session)?,
             ("local", Some(session)) => format!("session:{session}"),
             _ => "global".to_string(),
         };
@@ -455,8 +497,8 @@ mod tests {
         let path = dir.join("sovereign.db");
         v5_file_with_entries(&path);
         let conn = open(&path, "CREATE TABLE IF NOT EXISTS engine_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
-        assert_eq!(version(&conn).unwrap(), 6);
-        assert!(dir.join("sovereign.db.pre-v6.bak").exists(), "the file is backed up before the first migration");
+        assert_eq!(version(&conn).unwrap(), 7);
+        assert!(dir.join("sovereign.db.pre-v7.bak").exists(), "the file is backed up before the first migration");
         assert!(conn.prepare("SELECT 1 FROM harness_entries").is_err(), "the old table is gone");
         let rows: Vec<(String, String, String, String)> = conn
             .prepare("SELECT m.id, m.scope, m.content, json_extract(e.entry, '$.category') FROM memories m JOIN memory_entries e ON e.rid = m.rid ORDER BY m.id")
@@ -488,7 +530,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         // The engine before this one (v5) refuses the migrated file.
         let err = refuse_newer(version(&conn).unwrap(), 5).unwrap_err().to_string();
-        assert!(err.contains("schema v6, newer than this engine (v5)"), "{err}");
+        assert!(err.contains("schema v7, newer than this engine (v5)"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -498,8 +540,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conn = open(&dir.join("sovereign.db"), "").unwrap();
-        assert_eq!(version(&conn).unwrap(), 6);
+        assert_eq!(version(&conn).unwrap(), 7);
         assert!(conn.prepare("SELECT 1 FROM memories").is_err(), "the memory store makes its own tables");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const SETTINGS: &str = "CREATE TABLE IF NOT EXISTS engine_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+    fn scopes_of(conn: &Connection, id: &str) -> Vec<String> {
+        conn.prepare("SELECT scope FROM memories WHERE id = ?1")
+            .unwrap()
+            .query_map([id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_6_puts_a_sessions_facts_in_its_project_scope_else_global() {
+        let dir = std::env::temp_dir().join(format!("migrate6-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        v5_file_with_entries(&path);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(SETTINGS).unwrap();
+        raw.execute_batch(
+            "INSERT INTO engine_settings VALUES ('session_dir:s1', '/work/a');
+             INSERT INTO harness_entries VALUES
+               ('f1','memory','Nim','Prefers Nim locally','','local','s1','{}','{}','{}','auto',1000,1000,1,12),
+               ('f2','memory','Rust','Prefers Rust locally','','local','s2','{}','{}','{}','auto',1000,1000,1,13);",
+        )
+        .unwrap();
+        drop(raw);
+        let conn = open(&path, SETTINGS).unwrap();
+        assert_eq!(scopes_of(&conn, "f1"), vec![crate::memory::learned::project_scope("/work/a")]);
+        assert_eq!(scopes_of(&conn, "f2"), vec!["global".to_string()]);
+        assert_eq!(scopes_of(&conn, "p2"), vec!["session:s1".to_string()], "a learned entry keeps its session scope");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_7_moves_facts_already_parked_in_session_scopes() {
+        let dir = std::env::temp_dir().join(format!("migrate7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        let conn = open(&path, SETTINGS).unwrap();
+        conn.execute_batch(crate::memory_store::TABLES).unwrap();
+        for (id, scope, category) in [("a", "session:s1", "fact"), ("b", "session:s2", "fact"), ("c", "session:s1", "preference")] {
+            let mut entry = crate::memory_types::MemoryEntry::new(
+                if category == "fact" { crate::memory_types::MemoryCategory::Fact } else { crate::memory_types::MemoryCategory::Preference },
+                format!("parked {id}"),
+            );
+            entry.id = id.into();
+            let rid: i64 = conn
+                .query_row("INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, 1, ?3, '') RETURNING rid", params![id, scope, entry.content], |r| r.get(0))
+                .unwrap();
+            conn.execute("INSERT INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, NULL)", params![rid, serde_json::to_string(&entry).unwrap()]).unwrap();
+        }
+        conn.execute("INSERT INTO engine_settings VALUES ('session_dir:s1', '/work/a')", []).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6").unwrap();
+        drop(conn);
+        let conn = open(&path, SETTINGS).unwrap();
+        assert_eq!(version(&conn).unwrap(), 7);
+        assert_eq!(scopes_of(&conn, "a"), vec![crate::memory::learned::project_scope("/work/a")]);
+        assert_eq!(scopes_of(&conn, "b"), vec!["global".to_string()]);
+        assert_eq!(scopes_of(&conn, "c"), vec!["session:s1".to_string()], "only facts move");
+        assert_eq!(conn.query_row("SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'parked'", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
