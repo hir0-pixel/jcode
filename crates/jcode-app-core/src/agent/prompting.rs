@@ -67,6 +67,9 @@ impl Agent {
         let session_id = &self.session.id;
 
         let fresh_user_turn = crate::message::ends_with_fresh_user_turn(&messages);
+        if fresh_user_turn && crate::memory_extract::note_user_turn(session_id) {
+            self.extract_memories(crate::memory_extract::Trigger::Periodic);
+        }
         if fresh_user_turn {
             crate::memory_agent::recall_local_now(
                 session_id,
@@ -84,6 +87,23 @@ impl Agent {
         };
 
         pending
+    }
+
+    /// Extract new memories from this session's messages that were not yet covered (spawned,
+    /// never blocks). Session end, the 12-turn periodic run and compaction all come through here
+    /// or through the same `memory_extract::spawn`.
+    pub(crate) fn extract_memories(&self, trigger: crate::memory_extract::Trigger) {
+        if !self.memory_enabled {
+            return;
+        }
+        let messages = &self.session.messages;
+        crate::memory_extract::spawn(
+            trigger,
+            &self.session.id,
+            self.session.working_dir.as_deref(),
+            messages.len(),
+            |from| messages[from..].iter().map(|m| m.to_message()).collect(),
+        );
     }
 
     fn append_current_turn_system_reminder(&self, split: &mut crate::prompt::SplitSystemPrompt) {

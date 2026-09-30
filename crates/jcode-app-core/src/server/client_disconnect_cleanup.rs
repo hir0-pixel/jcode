@@ -231,6 +231,12 @@ pub(super) async fn cleanup_client_connection(
                     }
 
                     let sid = client_session_id.to_string();
+                    // Session end: extract what the periodic runs have not covered yet, then drop
+                    // the session's per-process memory state (counters, injected ids, pending).
+                    agent.extract_memories(crate::memory_extract::Trigger::SessionEnd);
+                    crate::memory_extract::forget_session(&sid);
+                    crate::memory::clear_injected_memories(&sid);
+                    crate::memory::clear_pending_memory(&sid);
                     drop(agent);
                     let event = match disposition {
                         DisconnectDisposition::Closed => {

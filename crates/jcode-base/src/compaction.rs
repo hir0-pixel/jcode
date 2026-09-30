@@ -213,6 +213,10 @@ pub struct CompactionManager {
     /// Total turns seen (for tracking)
     total_turns: usize,
 
+    /// Session whose about-to-be-summarized messages get a memory extraction first
+    /// (session id, working dir). `None` when memory is off.
+    memory_target: Option<(String, Option<String>)>,
+
     /// When true, session restore/reseed has just loaded old history and
     /// compaction must stay disabled until a genuinely new message is added.
     suppress_compaction_until_new_message: bool,
@@ -280,6 +284,7 @@ impl CompactionManager {
             pending_trigger: None,
             pending_cutoff: 0,
             total_turns: 0,
+            memory_target: None,
             suppress_compaction_until_new_message: false,
             token_budget: Self::capped_budget(&cfg, DEFAULT_TOKEN_BUDGET),
             model_token_budget: DEFAULT_TOKEN_BUDGET,
@@ -298,6 +303,29 @@ impl CompactionManager {
     }
 
     /// Reset all compaction state
+    /// Name the session whose messages get a memory extraction just before they are
+    /// summarized or dropped (`None` turns it off).
+    pub fn set_memory_target(&mut self, target: Option<(String, Option<String>)>) {
+        self.memory_target = target;
+    }
+
+    /// Extract memories from `all_messages[..upto]` before those messages are replaced by a
+    /// summary. Spawned, so compaction never waits on it; the full history stays in the session,
+    /// so a run skipped by the floors or cooldown is picked up by a later trigger.
+    fn extract_memories_before_compacting(&self, all_messages: &[Message], upto: usize) {
+        let Some((session_id, working_dir)) = &self.memory_target else {
+            return;
+        };
+        let upto = upto.min(all_messages.len());
+        crate::memory_extract::spawn(
+            crate::memory_extract::Trigger::Compaction,
+            session_id,
+            working_dir.as_deref(),
+            upto,
+            |from| all_messages[from.min(upto)..upto].to_vec(),
+        );
+    }
+
     pub fn reset(&mut self) {
         *self = Self::new();
     }
@@ -968,6 +996,7 @@ impl CompactionManager {
             return;
         }
 
+        self.extract_memories_before_compacting(all_messages, self.compacted_count + cutoff);
         // Snapshot messages to summarize (must clone for the async task)
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
@@ -1211,6 +1240,7 @@ impl CompactionManager {
             return Err("Cannot compact - would split tool call/result pairs".to_string());
         }
 
+        self.extract_memories_before_compacting(all_messages, self.compacted_count + cutoff);
         let messages_to_summarize: Vec<Message> = active[..cutoff].to_vec();
         let msg_count = messages_to_summarize.len();
         let existing_summary = self.active_summary.clone();
@@ -1624,6 +1654,8 @@ impl CompactionManager {
         if cutoff == 0 {
             return Err("Cannot compact — would split tool call/result pairs".to_string());
         }
+
+        self.extract_memories_before_compacting(all_messages, self.compacted_count + cutoff);
 
         // This hard compact will advance `compacted_count` and supersede any
         // in-flight background (reactive/proactive/semantic) compaction. That

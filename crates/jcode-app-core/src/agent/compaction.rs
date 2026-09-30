@@ -64,6 +64,7 @@ impl Agent {
 
         match compaction.try_write() {
             Ok(mut manager) => {
+                self.point_compaction_at_memory(&mut manager);
                 let stats = manager.stats_with(&messages);
                 let status_msg = format!(
                     "**Context Status:**\n\
@@ -105,6 +106,13 @@ impl Agent {
                 false,
             ),
         }
+    }
+
+    /// Tell the compaction manager which session to extract memories for before it drops messages.
+    pub(super) fn point_compaction_at_memory(&self, manager: &mut crate::compaction::CompactionManager) {
+        manager.set_memory_target(self.memory_enabled.then(|| {
+            (self.session.id.clone(), self.session.working_dir.clone())
+        }));
     }
 
     fn is_context_limit_error(error: &str) -> bool {
@@ -153,6 +161,7 @@ impl Agent {
 
         let (dropped, usage_pct) = match compaction.try_write() {
             Ok(mut manager) => {
+                self.point_compaction_at_memory(&mut manager);
                 let (dropped, usage_pct) = {
                     let all_messages = self.session.provider_messages();
                     manager.update_observed_input_tokens(context_limit);
