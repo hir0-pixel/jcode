@@ -106,7 +106,7 @@ const say = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a
 
 // ---------------------------------------------------------------- selection
 const SET = flag('set', 'full')
-const selection = JSON.parse(fs.readFileSync(path.join(__dirname, SET === '40' ? 'polyglot-exercises-40.json' : 'polyglot-exercises.json'), 'utf8'))
+const selection = JSON.parse(fs.readFileSync(path.join(__dirname, SET === '40' ? 'polyglot-exercises-40.json' : SET === 'topup' ? 'polyglot-exercises-topup.json' : 'polyglot-exercises.json'), 'utf8'))
 /** Fixed, deterministic order: languages as listed, exercises alphabetically within each. */
 const EXERCISES = selection.languages.flatMap(lang => (selection.exercises[lang] || []).map(name => ({ lang, name })))
 
