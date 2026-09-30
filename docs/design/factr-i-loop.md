@@ -26,3 +26,17 @@ jcode's loop (`crates/jcode-app-core/src/agent/turn_loops.rs`) stays the loop. O
 - OpenHands-style alternating-action stuck detection (outside): add only if the repeat guard misses real loops.
 
 GAIA: no GAIA code exists in Prime (only SWE-bench in its docs); do not run it until asked. NVIDIA AVO (arXiv 2603.24517) reached 100% on the ARC-AGI-3 public set; its ratchet and supervisor are already in `goal_ratchet.rs`.
+
+## Added after the tool-call audit (all tested; each justified by Hermes, Prime or jcode)
+| Mechanism | Source | Notes |
+|---|---|---|
+| Fuzzy `edit` fallback (line-trimmed, then whitespace/smart-quote normalized; unique whole-line match only; relative indentation must match; CRLF kept; result says "fuzzy match at line N") | Hermes `tools/fuzzy_match.py`, Prime `edit-diff.ts` | `tool/edit_fuzzy.rs` |
+| One-line syntax note after edit/write/patch (Python, JSON; JS/Go/Rust only if a checker is on PATH; never refuses the write; skips when unsure) | Hermes `file_operations.py` | `tool/syntax_check.rs` |
+| Short completion guidance in the prompt; tool-use enforcement line only for Hermes' model families (not Claude) | Hermes `prompt_builder.py` | `system_prompt.md`, `prompting.rs` |
+| Stop nudges: run tests after code edits; continue after an announced action without a tool call; one per turn; `JCODE_VERIFY_ON_STOP=0` disables | Hermes `verification_stop.py` / `turn_stop_gates.py` (opt-in there, default on here) | `agent/stop_nudge.rs` |
+| Repeat guard blocks the call at 5 (same tool and input) and ends the turn only at 10 | Hermes `tool_guardrails.py` | `agent/repeat_guard.rs` |
+| Bedrock: retry with jittered backoff, prompt caching on supported models, cache usage reported, snake_case stop reasons, tools enabled for newer Claude ids, 32k default max tokens, consecutive same-role messages merged | Hermes/Prime Bedrock adapters | `jcode-provider-bedrock` |
+| Streamed tool calls without an id get one; truncated (length-stop) tool calls are discarded unless their JSON parses unrepaired | Hermes | `jcode-provider-openrouter`, `response_recovery.rs` |
+| Bash: 48 KB output cap (12 KB head + tail, full text spilled), timeout promotes to a background task, process groups killed on turn cancel, session delete, cron run end and SIGTERM | Prime `bash.ts`, Hermes terminal tool | `tool/bash.rs`, `background.rs` |
+| Unattended runs allow commands whose every target is inside the session working directory (symlink escapes, `..`, `/`, `$HOME`, unresolved variables still denied) | Hermes `approvals.mode` semantics, Prime (no gate) | `jcode-command-risk`, `approvals.rs` |
+| Bridge answers the daemon's stdin probe without ending the turn early (was F2) | jcode fix | `docs/benchmark-findings.md` |
