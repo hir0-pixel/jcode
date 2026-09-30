@@ -1,23 +1,28 @@
-# Factr-I loop: what to take from Prime (separate from the memory design)
+# Factr-I loop: what was taken from Prime, Hermes and outside harnesses
 
-Decision: keep jcode's loop (`crates/jcode-app-core/src/agent/turn_loops.rs`). Port individual mechanisms only when Prime's source shows a win and an eval confirms it. Evidence below is code reading, not benchmark data. Paths: `PA` = `/tmp/prime-agent/packages/coding-agent/src/core`, agent loop in `/tmp/prime-agent/packages/agent/src/agent-loop.ts`.
+jcode's loop (`crates/jcode-app-core/src/agent/turn_loops.rs`) stays the loop. Only mechanisms that an original (Hermes, Prime) has, or that outside evidence backs, were added. `PA` = `/tmp/prime-agent/packages/coding-agent/src/core`, `H` = stock Hermes.
 
-| # | Mechanism (Prime source) | Verdict | Reason and precondition |
-|---|---|---|---|
-| L1 | Parallel tool execution (`agent-loop.ts:667-726`, sequential opt-out `:593-596`) | candidate | jcode runs calls one by one (`turn_streaming_mpsc.rs:1362`, `turn_loops.rs:961`). Before porting, resolve the per-tool urgent-interrupt behaviour and keep result order (`turn_streaming_mpsc.rs:1362-1366`). `bash`/`edit`/`write` stay sequential. |
-| L2 | 50 KB / 2000-line tool output cap, tail plus spill file (`PA/tools/truncate.ts:11-12`, `bash.ts:651`) | candidate | jcode caps history at 512K chars (`app/agent/tools.rs:5`). |
-| L3 | Completion-audit wording (`PA/goals.ts:213-231`) | candidate | text only, goal mode. |
-| L4 | Provider retry policy (`PA/provider-retry.ts:60-107`) | check first | verify whether provider crates already retry (`turn_loops.rs:185-198` retries only context-limit errors). |
-| L5 | Structured compaction template (`PA/compaction/compaction.ts:434-467`) | candidate | Prime's template is about 1.5 KB vs jcode's about 0.6 KB `SUMMARY_PROMPT`; token neutrality is unverified, measure it. |
-| L6 | Later compaction threshold (`compaction.ts:221-225`) | no | jcode resets its cache on compaction; unmeasured trade-off. |
-| L7 | Python-REPL-only tool model, 6.9 KB doctrine (`PA/prompts/rlm.ts:14-52`) | no | jcode already has a `repl` tool and a about 1.3 KB base prompt. Prime's higher RAM (about 510 MiB mean) is measured, its cause is not attributed. |
-| L8 | Keep jcode's empty/partial response recovery (`response_recovery.rs:241-375`), cache discipline | keep | no Prime equivalent found. |
-| L9 | Todo gate digest (`base/src/todo.rs:400`) | verify, delete if unwired | no caller found outside tests. |
+## Taken (built and tested)
+| Mechanism | Source | Where |
+|---|---|---|
+| Repeated tool-call guard (warn at 3, stop at 5; same failing result counts; `bg` and polls exempt) | Hermes `agent/tool_guardrails.py` | `agent/repeat_guard.rs`, span `loop.guard` |
+| Tool output in history capped at 50 KB, 40% head / 60% tail, full text spilled to a private file (0600, purged after 7 days) | Hermes `tools/tool_output_truncate.py`, Prime `tools/truncate.ts` | `agent/tools.rs` |
+| Structured compaction summary (Goal / Constraints / Progress / Key Decisions / Next Steps / Critical Context) and the live todo list re-attached | Prime `compaction/compaction.ts` | `jcode-compaction-core` |
+| Old tool results pruned before the summary: identical results deduped, old large results reduced to a one-line gist, big tool-call arguments shrunk; last 4 messages protected | Hermes `agent/context_compressor.py` (`_prune_old_tool_results`); outside evidence: observation masking matched LLM summarization at about half the cost (arXiv 2508.21433) | `jcode-compaction-core/src/prune.rs` |
+| Malformed tool-call JSON repaired before "invalid arguments" is reported | Hermes `_repair_tool_call_arguments` | `agent/tool_args_repair.rs` |
+| Goals, subgoals, autonomous mode with gates and limits, verifier ratchet with checkpoints, supervisor on plateau | Prime + NVIDIA AVO | `sovereign-prime/src/agent_loop.rs`, `goal_ratchet.rs` |
+| Response recovery (empty/partial/truncated replies) | jcode (no equivalent in Prime) | `agent/response_recovery.rs` |
+| Hermes tool names resolve to native tools (`terminal`, `read_file`, `write_file`, `patch`, `search_files`, `web_extract`, `web_search`) | Hermes prompts/skills | `jcode-tool-types` |
 
-GAIA: the code has no GAIA references (grep finds one compaction fixture); docs mention SWE-bench. The claim that Prime scores well on GAIA is unverified. Its plausible edge is the persistent Python REPL plus Serper search, and a search key is the user's to supply. No GAIA until the user says go.
+## Not taken, with reason
+- Prime's Python-REPL-only tool model and 6.9 KB doctrine: jcode already has a `repl` tool and a 1.3 KB base prompt; RAM would rise.
+- Prime's small turn limits (12 turns / 3 continuations): Hermes and jcode are more generous.
+- Wait-and-resume on provider usage limits (Prime `agent-session.ts:1148`): the harness runs on local Ollama.
+- Later compaction threshold (Prime): unmeasured trade-off against the cache reset.
 
-Eval (only with the user's approval; the polyglot benchmark stays with the benchmarks chat): pick exercises from the 34 Python set with the highest tool-call counts, run each candidate against the current binary with at least 3 repeats on the same local model, compare first-try pass, tokens, wall time and RSS. Keep a port only if there is no pass loss beyond a stated tolerance (set before running) and tokens or time drop by at least a set threshold. Measure L1, L2 and L5 one at a time.
+## Candidates that wait for benchmark data (no original has them, or unmeasured)
+- Parallel tool execution (Prime `agent-loop.ts:667-726`): jcode runs calls one by one and offers `batch`. Port only if a benchmark shows wall-time loss.
+- Text-parsed tool-call fallback for small local models (Goose "tool shim", outside): neither Hermes nor Prime has it; add only if tool-call failures show up in the local-model runs.
+- OpenHands-style alternating-action stuck detection (outside): add only if the repeat guard misses real loops.
 
-## Prime advantages over stock Hermes (first-pass code comparison, headers and greps only)
-Prime is ahead on: host-run gate commands with bounded retries and failure text fed back (`PA/autonomous.ts:58-65,447`); a hard keep-going headless mode (`autonomous.ts:52-63`, limits 12 turns / 3 continuations / 80k tokens / 30 min); wait-and-resume on provider usage limits (`PA/agent-session.ts:1148`); a persistent Python REPL as the main interface (`PA/tools/ipython.ts:685`). Hermes is ahead on todo tool, loop/repetition guards, tool breadth, head+tail truncation, fallback chain, iteration limits, memory/skill machinery.
-Take for Factr-I: L10 host-run gates (check the existing verify-command ratchet in `SP/goal_ratchet.rs` and `SP/agent_loop.rs:69-108` first), L11 keep-going mode for headless runs with time/token limits, L12 usage-limit wait-and-resume (low value for local Ollama). Do not take Prime's small turn limits.
+GAIA: no GAIA code exists in Prime (only SWE-bench in its docs); do not run it until asked. NVIDIA AVO (arXiv 2603.24517) reached 100% on the ARC-AGI-3 public set; its ratchet and supervisor are already in `goal_ratchet.rs`.
