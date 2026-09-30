@@ -204,3 +204,24 @@ fn extraction_without_working_dir_writes_global() {
         assert_eq!(manager.list_all().unwrap().len(), 1);
     });
 }
+
+#[test]
+fn detailed_recall_counts_candidates_and_suppressed() {
+    with_temp_home(|| {
+        let manager = MemoryManager::new_test();
+        for text in ["Release tooling is written in Nim", "Release notes go in the changelog file", "Unrelated fact about gardening"] {
+            manager.remember_project(MemoryEntry::new(MemoryCategory::Fact, text)).unwrap();
+        }
+        let recall = manager
+            .recall_local_detailed(Some("recall-1"), "where does the release tooling live", 5, crate::memory::MemoryScope::All)
+            .unwrap();
+        assert!(recall.candidates >= recall.entries.len());
+        assert_eq!(recall.suppressed, recall.candidates - recall.entries.len());
+        assert!(recall.terms.contains(&"release".to_string()));
+        let first = recall.entries[0].id.clone();
+        crate::memory::mark_memories_known("recall-1", &[first], "test");
+        let again = manager.recall_local_detailed(Some("recall-1"), "where does the release tooling live", 5, crate::memory::MemoryScope::All).unwrap();
+        assert!(again.suppressed >= 1);
+        crate::memory::clear_injected_memories("recall-1");
+    });
+}

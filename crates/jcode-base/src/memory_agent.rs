@@ -3,11 +3,11 @@
 //! Recall runs inline for the user turn being answered: an indexed full-text
 //! query over the stored memories (`MemoryManager::recall_local`), published
 //! as pending memory that the caller takes right away, so inject-once and
-//! never-pad bookkeeping stay in one place. Nothing here calls a model: the
-//! old background pipeline (remote relevance service, LLM memory extraction)
-//! is gone; learning belongs to the Prime loop.
+//! never-pad bookkeeping stay in one place. Recall calls no model. Writing
+//! memories from a chat is `memory_extract` (facts) and the Prime loop.
 
 use crate::memory::{self, MemoryManager};
+use crate::obs_sink::{self, Span};
 
 fn manager_for_working_dir(working_dir: Option<&str>) -> MemoryManager {
     match working_dir {
@@ -29,12 +29,28 @@ pub fn recall_local_now(
         return;
     }
     let manager = manager_for_working_dir(working_dir);
-    let Ok(relevant) = manager.recall_local(Some(session_id), query, 5, memory::MemoryScope::All) else {
+    let Ok(recall) = manager.recall_local_detailed(Some(session_id), query, 5, memory::MemoryScope::All) else {
         return;
     };
+    let ids = |entries: &[memory::MemoryEntry]| entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+    obs_sink::emit(
+        Span::new("memory.recall")
+            .session(session_id)
+            .attr("terms", recall.terms.iter().take(12).cloned().collect::<Vec<_>>())
+            .attr("candidates", recall.candidates)
+            .attr("returned", ids(&recall.entries))
+            .attr("suppressed", recall.suppressed),
+    );
+    let relevant = recall.entries;
     let Some(prompt) = memory::format_relevant_prompt(&relevant, 5) else {
         return;
     };
+    obs_sink::emit(
+        Span::new("memory.inject")
+            .session(session_id)
+            .attr("ids", ids(&relevant))
+            .attr("chars", prompt.chars().count()),
+    );
     let display = memory::format_relevant_display_prompt(&relevant, 5);
     memory::set_pending_memory_for_project_with_selection(
         session_id,

@@ -157,6 +157,15 @@ pub struct MemoryRelevanceResult {
     pub selected_entries: Vec<MemoryEntry>,
 }
 
+/// Result of a local recall with the numbers behind it (for the `memory.recall` span).
+#[derive(Default)]
+pub struct LocalRecall {
+    pub terms: Vec<String>,
+    pub candidates: usize,
+    pub entries: Vec<MemoryEntry>,
+    pub suppressed: usize,
+}
+
 impl MemoryManager {
     pub fn new() -> Self {
         Self {
@@ -895,11 +904,17 @@ impl MemoryManager {
     /// already injected into `session_id`, applies the never-pad floor
     /// (`memory_recall::meets_term_floor`) and returns at most `limit`, best first.
     pub fn recall_local(&self, session_id: Option<&str>, query: &str, limit: usize, scope: MemoryScope) -> Result<Vec<MemoryEntry>> {
+        Ok(self.recall_local_detailed(session_id, query, limit, scope)?.entries)
+    }
+
+    /// [`Self::recall_local`] plus what it looked at: the query terms, how many candidates the
+    /// index returned and how many were suppressed (already injected, or under the term floor).
+    pub fn recall_local_detailed(&self, session_id: Option<&str>, query: &str, limit: usize, scope: MemoryScope) -> Result<LocalRecall> {
         let mut terms = crate::memory_recall::local_terms(query);
         terms.sort();
         terms.dedup();
         if terms.is_empty() || limit == 0 {
-            return Ok(Vec::new());
+            return Ok(LocalRecall { terms, ..Default::default() });
         }
         let mut scopes = Vec::new();
         if scope.includes_global() {
@@ -916,12 +931,15 @@ impl MemoryManager {
         }
         // A few extra candidates so the injected/floor filters rarely starve the result.
         let candidates = crate::memory_store::search(&db, &scopes, &terms, limit * 4)?;
-        Ok(candidates
+        let found = candidates.len();
+        let entries: Vec<MemoryEntry> = candidates
             .into_iter()
             .filter(|e| session_id.is_none_or(|s| !is_memory_injected(s, &e.id)))
             .filter(|e| crate::memory_recall::meets_term_floor(&terms, e))
             .take(limit)
-            .collect())
+            .collect();
+        let suppressed = found.saturating_sub(entries.len());
+        Ok(LocalRecall { terms, candidates: found, entries, suppressed })
     }
 
     /// Load the existing project graph without generating embeddings.
