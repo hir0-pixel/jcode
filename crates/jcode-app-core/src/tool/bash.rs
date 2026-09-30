@@ -545,23 +545,23 @@ impl PromotedCommandProgress {
 async fn collect_output_reporting_progress<R>(
     reader: Option<R>,
     progress: std::sync::Arc<PromotedCommandProgress>,
-) -> String
-where
+    buf: std::sync::Arc<std::sync::Mutex<String>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = String::new();
     let Some(reader) = reader else {
-        return buf;
+        return;
     };
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(Some(update)) = parse_progress_line(&line) {
             progress.record(update).await;
         }
-        buf.push_str(&line);
-        buf.push('\n');
+        if let Ok(mut b) = buf.lock() {
+            b.push_str(&line);
+            b.push('\n');
+        }
     }
-    buf
 }
 
 /// Tail a detached background task's output file and translate progress lines
@@ -639,18 +639,29 @@ struct ProcessGroupKillGuard {
 #[cfg(unix)]
 impl ProcessGroupKillGuard {
     fn new(pid: Option<u32>) -> Self {
+        if let Some(p) = pid {
+            crate::background::register_process_group(p as i32);
+        }
         Self { pid }
     }
 
-    fn disarm(&mut self) {
+    /// Stop guarding without killing or unregistering: the group stays in the shutdown registry.
+    fn release(&mut self) {
         self.pid = None;
+    }
+
+    fn disarm(&mut self) {
+        if let Some(p) = self.pid.take() {
+            crate::background::unregister_process_group(p as i32);
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for ProcessGroupKillGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
+        if let Some(pid) = self.pid.take() {
+            crate::background::unregister_process_group(pid as i32);
             let _ = crate::platform::signal_detached_process_group(pid, libc::SIGKILL);
         }
     }
@@ -1083,14 +1094,18 @@ impl BashTool {
         // the still-running task off to the background manager instead of killing it.
         let mut work_handle: tokio::task::JoinHandle<Result<ToolOutput>> =
             tokio::spawn(async move {
-                let stdout_task = tokio::spawn(collect_output_reporting_progress(
+                let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let mut stdout_task = tokio::spawn(collect_output_reporting_progress(
                     stdout_handle,
                     stdout_progress,
+                    stdout_buf.clone(),
                 ));
 
-                let stderr_task = tokio::spawn(collect_output_reporting_progress(
+                let mut stderr_task = tokio::spawn(collect_output_reporting_progress(
                     stderr_handle,
                     stderr_progress,
+                    stderr_buf.clone(),
                 ));
 
                 let stdin_task = if has_stdin_channel {
@@ -1162,15 +1177,33 @@ impl BashTool {
                 #[cfg(unix)]
                 let mut group_guard = ProcessGroupKillGuard::new(group_pid);
                 let status = child.wait().await?;
-                #[cfg(unix)]
-                group_guard.disarm();
 
                 if let Some(task) = stdin_task {
                     task.abort();
                 }
 
-                let stdout = stdout_task.await.unwrap_or_default();
-                let stderr = stderr_task.await.unwrap_or_default();
+                // Shell exited: drain the pipes, but a backgrounded grandchild may hold them open
+                // forever. After a short grace, return what was captured; the guard stays armed
+                // until this task ends, and the grandchild is left to session/turn reaping.
+                let drained = tokio::time::timeout(Duration::from_secs(2), async {
+                    let _ = (&mut stdout_task).await;
+                    let _ = (&mut stderr_task).await;
+                })
+                .await
+                .is_ok();
+                if !drained {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                }
+                #[cfg(unix)]
+                if drained {
+                    group_guard.disarm();
+                } else {
+                    // Leave the group alive (registered) for session reaping; do not SIGKILL on drop.
+                    group_guard.release();
+                }
+                let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
+                let stderr = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
 
                 let mut output = String::new();
                 if !stdout.is_empty() {

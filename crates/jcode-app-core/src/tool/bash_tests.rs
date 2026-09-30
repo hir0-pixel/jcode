@@ -1344,3 +1344,34 @@ async fn a_dropped_foreground_bash_kills_its_whole_process_group() {
     let left = std::process::Command::new("ps").args(["-eo", "pid,ppid,pgid,stat,command"]).output().map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains("sleep 761")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
     assert!(!running(), "the shell and its pipeline children are gone: {left}");
 }
+
+#[tokio::test]
+async fn shutdown_kills_registered_process_groups() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sleep")
+        .arg("300")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = child.id() as i32;
+    crate::background::register_process_group(pgid);
+    // Kill only our group (the registry is global and other tests run in parallel).
+    assert_eq!(crate::background::kill_process_groups(&[pgid], Duration::from_millis(50)), 1);
+    crate::background::unregister_process_group(pgid);
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn backgrounded_grandchild_does_not_hang_the_tool() {
+    let started = Instant::now();
+    let out = BashTool::new()
+        .execute(
+            json!({"command": "sleep 30 & echo hi", "timeout": 20000}),
+            make_ctx(None),
+        )
+        .await;
+    let out = out.expect("bash ok");
+    assert!(out.output.contains("hi"), "{}", out.output);
+    assert!(started.elapsed() < Duration::from_secs(8));
+}

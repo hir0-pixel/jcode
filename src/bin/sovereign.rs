@@ -341,6 +341,7 @@ fn install_ollama_signal_unload() {
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
                     rt.block_on(jcode::background::global().abort_live_tasks_for_reload());
                 }
+                jcode::background::kill_registered_process_groups(std::time::Duration::from_millis(500));
                 std::thread::sleep(std::time::Duration::from_millis(200)); // let the aborted tasks drop their children
                 std::process::exit(0);
             }

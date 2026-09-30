@@ -1707,6 +1707,55 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Live command process-group ids (each bash command runs in its own group, so a signal to the
+/// engine never reaches them). The shutdown path kills every registered group.
+#[cfg(unix)]
+static LIVE_PROCESS_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<i32>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(unix)]
+pub fn register_process_group(pgid: i32) {
+    if let Ok(mut g) = LIVE_PROCESS_GROUPS.lock() {
+        g.get_or_insert_with(Default::default).insert(pgid);
+    }
+}
+
+#[cfg(unix)]
+pub fn unregister_process_group(pgid: i32) {
+    if let Ok(mut g) = LIVE_PROCESS_GROUPS.lock() {
+        if let Some(set) = g.as_mut() {
+            set.remove(&pgid);
+        }
+    }
+}
+
+/// SIGTERM every registered process group, wait `grace`, then SIGKILL them. Returns the count.
+#[cfg(unix)]
+pub fn kill_registered_process_groups(grace: std::time::Duration) -> usize {
+    let groups: Vec<i32> = LIVE_PROCESS_GROUPS
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .map(|s| s.into_iter().collect())
+        .unwrap_or_default();
+    kill_process_groups(&groups, grace)
+}
+
+#[cfg(unix)]
+pub fn kill_process_groups(groups: &[i32], grace: std::time::Duration) -> usize {
+    if groups.is_empty() {
+        return 0;
+    }
+    for g in groups {
+        unsafe { libc::kill(-*g, libc::SIGTERM) };
+    }
+    std::thread::sleep(grace);
+    for g in groups {
+        unsafe { libc::kill(-*g, libc::SIGKILL) };
+    }
+    groups.len()
+}
+
 pub fn global() -> &'static BackgroundTaskManager {
     BACKGROUND_MANAGER.get_or_init(BackgroundTaskManager::new)
 }
