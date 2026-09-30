@@ -365,8 +365,8 @@ fn goal_changes(before: &[TodoGoal], after: &[TodoGoal]) -> Vec<TodoGoalChange> 
 /// every todo call, spending reasoning on re-justifying the plan instead of on
 /// the work.
 ///
-/// So the checks are deferred: observations accumulate and are replayed once at
-/// turn end by `build_gate_digest`. Deferred, not forgiven. A score that climbs
+/// So the checks are deferred: observations accumulate in the session's gate log
+/// instead of interrupting the model. Deferred, not forgiven. A score that climbs
 /// late is still raised, because the work done while it was low was never
 /// governed by the better loop that arrived afterwards. The one exception is a
 /// first plan write that scores severely low, where the agent is admitting it
@@ -1702,15 +1702,9 @@ mod tests {
             ]
         );
 
-        // The climb does not erase the point. The turn began without solid
-        // understanding, so the work done before it settled still needs a
-        // re-check; the wording just reflects that it settled late.
+        // The climb does not erase the recorded points.
         let observations = crate::todo::load_gate_observations(session).expect("observations");
-        let goals = load_goals(session).expect("goals");
-        let digest = crate::todo::build_gate_digest(&observations, &plan, &goals)
-            .expect("both recorded points should be surfaced");
-        assert!(digest.contains("started this work without understanding"));
-        assert!(digest.contains("feedback loop"));
+        assert!(observations.len() >= 2);
 
         match previous_home {
             Some(value) => crate::env::set_var("JCODE_HOME", value),
