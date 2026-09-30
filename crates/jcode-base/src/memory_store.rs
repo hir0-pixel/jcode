@@ -16,7 +16,8 @@
 //! the file 9x larger.
 
 use crate::memory_graph::{ClusterEntry, Edge, GraphMetadata, MemoryGraph, TagEntry};
-use crate::memory_types::MemoryEntry;
+use crate::memory_recall::{local_terms, singular};
+use crate::memory_types::{MemoryEntry, TrustLevel};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -242,10 +243,91 @@ pub(crate) fn save_graph(path: &Path, scope: &str, graph: &MemoryGraph, previous
     })
 }
 
-/// Add `entry` to `scope` (or reinforce an identical active one) by writing only that row and the
-/// small graph-shape row, in one immediate transaction, so a concurrent writer's rows are never
-/// rewritten or deleted. Returns the memory's id.
-pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<String> {
+/// What `remember` did with an entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Remembered {
+    /// A new row was written.
+    Inserted(String),
+    /// An identical active memory was reinforced.
+    Reinforced(String),
+    /// A near-duplicate (same category, same meaning) was folded into an existing memory.
+    Merged { id: String, similarity: f32 },
+}
+
+impl Remembered {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Inserted(id) | Self::Reinforced(id) | Self::Merged { id, .. } => id,
+        }
+    }
+}
+
+const MERGE_THRESHOLD: f32 = 0.80;
+const MERGE_CANDIDATES: usize = 8;
+const POLARITY: &[&str] =
+    &["not", "no", "never", "without", "cannot", "don", "doesn", "isn", "won", "aren", "avoid", "instead"];
+const FILLER: &[&str] = &[
+    "the", "and", "for", "are", "but", "you", "your", "with", "this", "that", "from", "have", "has", "was", "were", "will",
+    "would", "can", "could", "should", "what", "when", "where", "which", "who", "how", "why", "into", "about", "there",
+    "their", "they", "them", "then", "than", "also", "just", "like", "please", "does", "did", "our", "its", "any", "all",
+];
+
+/// Meaning-bearing tokens of a memory's text: lowercase words, plurals folded, filler dropped.
+/// Negations stay in, and so do numbers, so "prefers X" and "prefers not X", or "port 80" and
+/// "port 8080", never look alike.
+fn merge_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !FILLER.contains(w) && (w.len() > 1 || w.chars().any(|c| c.is_ascii_digit())))
+        .map(|w| if w.chars().any(|c| c.is_ascii_digit()) { w.to_owned() } else { singular(w) })
+        .collect()
+}
+
+/// Words spelled like code (paths, snake_case, kebab-case, camelCase, dotted names), compared
+/// verbatim and case-sensitively: `foo/bar` and `foo-bar` are different things.
+fn code_words(text: &str) -> std::collections::BTreeSet<&str> {
+    text.split_whitespace()
+        .map(|w| w.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"', '\'']).trim_start_matches(['(', '"', '\'']))
+        .filter(|w| w.chars().skip(1).any(|c| c.is_uppercase() || "/\\_-.:".contains(c)))
+        .collect()
+}
+
+/// Similarity of two memory texts in 0..=1, or 0 when a negation, a number or a code spelling differs.
+fn similarity(a: &str, b: &str) -> f32 {
+    if code_words(a) != code_words(b) {
+        return 0.0;
+    }
+    let (ta, tb) = (merge_tokens(a), merge_tokens(b));
+    let has = |t: &std::collections::BTreeSet<String>, keep: &dyn Fn(&str) -> bool| -> Vec<String> {
+        t.iter().filter(|w| keep(w)).cloned().collect()
+    };
+    let polarity = |w: &str| POLARITY.contains(&w);
+    let numeric = |w: &str| w.chars().any(|c| c.is_ascii_digit());
+    if has(&ta, &polarity) != has(&tb, &polarity) || has(&ta, &numeric) != has(&tb, &numeric) {
+        return 0.0;
+    }
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return 0.0;
+    }
+    ta.intersection(&tb).count() as f32 / union as f32
+}
+
+fn trust_rank(t: &TrustLevel) -> u8 {
+    match t {
+        TrustLevel::High => 2,
+        TrustLevel::Medium => 1,
+        TrustLevel::Low => 0,
+    }
+}
+
+/// Add `entry` to `scope`, folding it into an existing memory when it says the same thing:
+/// an identical active one is reinforced, a near-duplicate of the same category (see
+/// `similarity`) is merged into its best match. Writes only the rows involved, in one immediate
+/// transaction, so a concurrent writer's rows are never rewritten or deleted. When a merge
+/// replaces the survivor's wording with a longer one, the old wording is kept as an inactive row
+/// superseded by the survivor, so a wrong merge can be undone.
+pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remembered> {
     with_db(path, |db| {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let wanted = entry.content.trim().to_string();
@@ -264,11 +346,39 @@ pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<S
                 }
             }
         }
-        let id = if let Some((rid, mut existing)) = dup {
+        let outcome = if let Some((rid, mut existing)) = dup {
             existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
             let (json, embedding) = split_embedding(&existing)?;
             tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
-            existing.id
+            Remembered::Reinforced(existing.id)
+        } else if let Some((rid, mut survivor, score)) = best_match(&tx, scope, &entry)? {
+            survivor.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
+            if trust_rank(&entry.trust) > trust_rank(&survivor.trust) {
+                survivor.trust = entry.trust.clone();
+            }
+            if wanted.len() > survivor.content.trim().len() {
+                // Keep the old wording, inactive, so the merge can be reversed.
+                let mut old = survivor.clone();
+                old.id = format!("{}~was{}", survivor.id, survivor.reinforcements.len());
+                old.tags.clear();
+                old.reinforcements.clear();
+                old.supersede(&survivor.id);
+                let old_rid: i64 = tx.query_row(
+                    "INSERT INTO memories(id, scope, active, content, tags) VALUES (?1, ?2, 0, ?3, '')
+                     ON CONFLICT(scope, id) DO UPDATE SET content=excluded.content RETURNING rid",
+                    params![old.id, scope, old.content],
+                    |r| r.get(0),
+                )?;
+                let (json, embedding) = split_embedding(&old)?;
+                tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![old_rid, json, embedding])?;
+                survivor.content = wanted.clone();
+                survivor.set_embedding(None, None);
+                survivor.refresh_search_text();
+                tx.execute("UPDATE memories SET content=?1 WHERE rid=?2", params![survivor.content, rid])?;
+            }
+            let (json, embedding) = split_embedding(&survivor)?;
+            tx.execute("INSERT OR REPLACE INTO memory_entries(rid, entry, embedding) VALUES (?1, ?2, ?3)", params![rid, json, embedding])?;
+            Remembered::Merged { id: survivor.id, similarity: score }
         } else {
             // add_memory owns the tag nodes and edges; run it on the stored shape without the memories.
             let shape: Option<String> = tx.query_row("SELECT graph FROM memory_graphs WHERE scope=?1", [scope], |r| r.get(0)).optional()?;
@@ -305,11 +415,44 @@ pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<S
                 "INSERT INTO memory_graphs(scope, graph) VALUES (?1, ?2) ON CONFLICT(scope) DO UPDATE SET graph=excluded.graph",
                 params![scope, serde_json::to_string(&shape)?],
             )?;
-            id
+            Remembered::Inserted(id)
         };
         tx.commit()?;
-        Ok(id)
+        Ok(outcome)
     })
+}
+
+/// The active memory in `scope` that `entry` most closely repeats (same category, similarity at or
+/// above `MERGE_THRESHOLD`), found through the FTS index so only a handful of rows are compared.
+fn best_match(tx: &rusqlite::Transaction, scope: &str, entry: &MemoryEntry) -> Result<Option<(i64, MemoryEntry, f32)>> {
+    let mut terms = local_terms(&entry.content);
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() {
+        return Ok(None);
+    }
+    let query = terms.iter().map(|t| format!("\"{}\"", t.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
+    let mut stmt = tx.prepare_cached(
+        "SELECT top.rid, e.entry, e.embedding, m.content FROM (
+             SELECT m.rid, bm25(memories_fts) AS score FROM memories_fts JOIN memories m ON m.rid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1 AND m.active = 1 AND m.scope = ?2 ORDER BY score LIMIT ?3
+         ) top JOIN memories m ON m.rid = top.rid JOIN memory_entries e ON e.rid = top.rid ORDER BY top.score",
+    )?;
+    let mut best: Option<(i64, MemoryEntry, f32)> = None;
+    let rows = stmt.query_map(params![query, scope, MERGE_CANDIDATES as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?, r.get::<_, String>(3)?))
+    })?;
+    for row in rows {
+        let (rid, json, embedding, content) = row?;
+        let score = similarity(&entry.content, &content);
+        if score >= MERGE_THRESHOLD && best.as_ref().is_none_or(|(_, _, b)| score > *b) {
+            let existing = join_embedding(&json, embedding)?;
+            if existing.category == entry.category {
+                best = Some((rid, existing, score));
+            }
+        }
+    }
+    Ok(best)
 }
 
 /// Active memories in `scopes` matching any of `terms` (already lowercased
@@ -434,8 +577,8 @@ mod tests {
         theirs.add_memory(MemoryEntry::new(MemoryCategory::Fact, "theirs"));
         save_graph(&path, "global", &theirs, None).unwrap();
         // Our write, made from the stale view, must not delete theirs.
-        let id = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap();
-        let again = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap();
+        let id = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap().id().to_string();
+        let again = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "ours")).unwrap().id().to_string();
         assert_eq!(id, again);
         let all = load_graph(&path, "global").unwrap().unwrap();
         let mut texts: Vec<_> = all.memories.values().map(|m| m.content.as_str()).collect();
@@ -611,5 +754,75 @@ mod tests {
             let save_ms = t.elapsed().as_secs_f64() * 1e3;
             eprintln!("n={n:>6}: recall {recall_ms:6.2} ms/turn ({} hits), save one new memory {save_ms:6.2} ms", hits.len());
         }
+    }
+
+    fn pref(text: &str) -> MemoryEntry {
+        MemoryEntry::new(MemoryCategory::Preference, text)
+    }
+
+    fn active_count(path: &Path, scope: &str) -> usize {
+        load_graph(path, scope).unwrap().map(|g| g.active_memories().count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_paraphrase_merges_into_the_existing_memory() {
+        let (_d, path) = db();
+        let first = remember(&path, "global", pref("The user prefers tabs over spaces in Rust code")).unwrap();
+        let second = remember(&path, "global", pref("User prefers tabs over spaces in Rust code.")).unwrap();
+        assert!(matches!(first, Remembered::Inserted(_)));
+        assert!(matches!(second, Remembered::Merged { .. }), "{second:?}");
+        assert_eq!(second.id(), first.id());
+        assert_eq!(active_count(&path, "global"), 1);
+    }
+
+    #[test]
+    fn opposite_or_different_numbers_do_not_merge() {
+        let (_d, path) = db();
+        remember(&path, "global", pref("prefers to use semicolons in JavaScript files")).unwrap();
+        let negated = remember(&path, "global", pref("prefers not to use semicolons in JavaScript files")).unwrap();
+        assert!(matches!(negated, Remembered::Inserted(_)), "{negated:?}");
+        remember(&path, "global", pref("dev server runs on port 8080 for this project")).unwrap();
+        let other = remember(&path, "global", pref("dev server runs on port 3000 for this project")).unwrap();
+        assert!(matches!(other, Remembered::Inserted(_)), "{other:?}");
+        assert_eq!(active_count(&path, "global"), 4);
+    }
+
+    #[test]
+    fn different_categories_and_scopes_stay_separate() {
+        let (_d, path) = db();
+        remember(&path, "global", pref("always run the linter before committing changes")).unwrap();
+        let fact = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "always run the linter before committing changes")).unwrap();
+        assert!(matches!(fact, Remembered::Inserted(_)));
+        let other = remember(&path, "project:x", pref("always run the linter before committing changes")).unwrap();
+        assert!(matches!(other, Remembered::Inserted(_)));
+    }
+
+    #[test]
+    fn a_longer_wording_replaces_the_survivor_and_the_old_text_is_kept_inactive() {
+        let (_d, path) = db();
+        let first = remember(&path, "global", pref("prefers tabs over spaces in Rust code")).unwrap();
+        let merged = remember(&path, "global", pref("prefers tabs over spaces in Rust code always")).unwrap();
+        assert!(matches!(merged, Remembered::Merged { .. }), "{merged:?}");
+        let graph = load_graph(&path, "global").unwrap().unwrap();
+        let survivor = &graph.memories[first.id()];
+        assert_eq!(survivor.content, "prefers tabs over spaces in Rust code always");
+        assert_eq!(survivor.strength, 2);
+        let old = graph.memories.values().find(|m| !m.active).expect("old wording kept");
+        assert_eq!(old.content, "prefers tabs over spaces in Rust code");
+        assert_eq!(old.superseded_by.as_deref(), Some(first.id()));
+        assert_eq!(graph.active_memories().count(), 1);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_higher_trust() {
+        let (_d, path) = db();
+        let mut low = pref("prefers dark mode in every editor");
+        low.trust = TrustLevel::Low;
+        let first = remember(&path, "global", low).unwrap();
+        let mut high = pref("prefers dark mode in every editor.");
+        high.trust = TrustLevel::High;
+        remember(&path, "global", high).unwrap();
+        let graph = load_graph(&path, "global").unwrap().unwrap();
+        assert_eq!(graph.memories[first.id()].trust, TrustLevel::High);
     }
 }

@@ -319,10 +319,13 @@ impl MemoryManager {
             self.project_scope().is_some(),
             "Project memory requires a working directory; use global scope explicitly"
         );
-        let mut graph = self.load_project_graph()?;
-        let id = Self::remember_in_graph(&mut graph, entry);
-        self.save_project_graph(&graph)?;
-        Ok(id)
+        // Loading first imports any legacy notes for this project (once) into the store.
+        self.load_project_graph()?;
+        let scope = self.project_scope().expect("checked above");
+        let db = self.db_path()?;
+        let outcome = crate::memory_store::remember(&db, &scope, entry)?;
+        forget_graph(&format!("{}#{scope}", db.display()));
+        Ok(outcome.id().to_string())
     }
 
     /// Writes just this memory's row: rewriting the whole graph lost a concurrent writer's rows.
@@ -331,27 +334,9 @@ impl MemoryManager {
         if !self.test_mode {
             self.import_json_once(&db)?;
         }
-        let id = crate::memory_store::remember(&db, "global", entry)?;
+        let outcome = crate::memory_store::remember(&db, "global", entry)?;
         forget_graph(&format!("{}#global", db.display()));
-        Ok(id)
-    }
-
-    fn remember_in_graph(graph: &mut MemoryGraph, entry: MemoryEntry) -> String {
-        let normalized = entry.content.trim();
-        let duplicate = graph
-            .active_memories()
-            .into_iter()
-            .find(|existing| {
-                existing.category == entry.category && existing.content.trim() == normalized
-            })
-            .map(|existing| existing.id.clone());
-        if let Some(id) = duplicate {
-            if let Some(existing) = graph.get_memory_mut(&id) {
-                existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
-            }
-            return id;
-        }
-        graph.add_memory(entry)
+        Ok(outcome.id().to_string())
     }
 
     /// Insert or update a memory with a stable ID in the project graph.

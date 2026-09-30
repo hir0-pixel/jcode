@@ -35,7 +35,7 @@ pub(crate) fn local_terms(text: &str) -> Vec<String> {
 }
 
 /// Fold simple plurals so "scripts" matches "script" ("class" stays).
-fn singular(word: &str) -> String {
+pub(crate) fn singular(word: &str) -> String {
     match word.strip_suffix('s') {
         Some(stem) if stem.len() >= 3 && !stem.ends_with('s') => stem.to_owned(),
         _ => word.to_owned(),

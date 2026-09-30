@@ -985,3 +985,25 @@ fn focus_query_text_falls_back_when_all_stripped() {
     // Nothing substantive survives -> fall back to raw rather than empty.
     assert_eq!(focused, raw);
 }
+
+#[test]
+fn project_and_global_writes_both_fold_paraphrases() {
+    with_temp_home(|_| {
+        let manager = MemoryManager::new().with_project_dir("/merge-project");
+        let a = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Preference, "prefers small commits with clear messages"))
+            .unwrap();
+        let b = manager
+            .remember_project(MemoryEntry::new(MemoryCategory::Preference, "Prefers small commits, with clear messages."))
+            .unwrap();
+        assert_eq!(a, b);
+        let g1 = manager
+            .remember_global(MemoryEntry::new(MemoryCategory::Preference, "answers should stay short and plain"))
+            .unwrap();
+        let g2 = manager
+            .remember_global(MemoryEntry::new(MemoryCategory::Preference, "Answers should stay short and plain."))
+            .unwrap();
+        assert_eq!(g1, g2);
+        assert_eq!(manager.load_project_graph().unwrap().active_memories().count(), 1);
+    });
+}
