@@ -749,7 +749,7 @@ impl Conn {
                         // Hermes's approval config decides, else deny and park it for the desktop.
                         let conn = self.clone();
                         tokio::spawn(async move {
-                            let choice = conn.hub.unattended(&session_id, &tool_name, &description, "").await;
+                            let choice = conn.hub.unattended(&session_id, &tool_name, &description, "", None).await;
                             let _ = conn.resolve_approval(&session_id, &request_id, &choice).await;
                         });
                         continue;
