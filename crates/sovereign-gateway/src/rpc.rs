@@ -588,9 +588,33 @@ impl Conn {
                         .await
                         .insert(session_id.to_string(), reply["session"].clone());
                 }
+                self.adopt_old_session(session_id).await;
                 Ok(reply)
             }
             Err(err) => Err(err),
+        }
+    }
+
+    /// A session attached for the first time in this process that pre-dates the engine has no
+    /// extraction marker or learning watermark: stamp both at its current length, so only messages
+    /// that arrive from now on are extracted or reviewed (closing or deleting it costs no model call).
+    async fn adopt_old_session(self: &Arc<Self>, session_id: &str) {
+        let id = session_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(stored) = jcode_base::session::Session::load(&id) {
+                jcode_base::memory_extract::adopt_session(&id, stored.messages.len());
+            }
+        })
+        .await;
+        let Some(store) = self.entry_store().await else { return };
+        if store.watermark(session_id) > 0 {
+            return;
+        }
+        if let Ok(history) = self.call(json!({ "req": "get_history", "session_id": session_id })).await {
+            let seen = history["messages"].as_array().map_or(0, Vec::len);
+            if seen > 0 {
+                let _ = store.set_watermark(session_id, seen);
+            }
         }
     }
 
@@ -1671,7 +1695,10 @@ impl Conn {
                         "session is running; stop it before deleting",
                     ));
                 }
-                self.learn_before_dispose(&id).await;
+                // Only a session attached in this process can have new activity to review.
+                if self.links.lock().await.contains_key(&id) {
+                    self.learn_before_dispose(&id).await;
+                }
                 self.links.lock().await.remove(&id);
                 self.client.sessions.lock().await.remove(&id);
                 crate::sessions_rest::delete_everywhere(&self.config, &id).await.map_err(RpcError::internal)?;

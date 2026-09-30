@@ -88,8 +88,9 @@ const MIGRATIONS: &[Step] = &[
     // `memories` with the same ids (its changesets keep resolving) and the table is dropped.
     Step::Code(learned_entries_into_memories),
     // 7: facts migration 6 parked in `session:<id>` (a scope recall never searches) move to the project
-    // scope of that session's directory when Prime recorded one, else `global`.
-    Step::Code(session_facts_to_project_or_global),
+    // scope of that session's directory when Prime recorded one, else `global`. Also drops the empty
+    // `obs_*` tables an older engine left beside the renamed EveStack tables (never one holding rows).
+    Step::Code(migration_7),
 ];
 
 /// Where a session's facts belong: the project scope of the directory Prime recorded for it
@@ -103,6 +104,21 @@ fn session_home_scope(conn: &Connection, session: &str) -> Result<String> {
         .ok()
         .filter(|d: &String| !d.trim().is_empty());
     Ok(dir.map_or_else(|| "global".into(), |d| crate::memory::learned::project_scope(&d)))
+}
+
+fn migration_7(conn: &Connection) -> Result<()> {
+    session_facts_to_project_or_global(conn)?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'obs\\_%' ESCAPE '\\'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        if !conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM \"{quoted}\")"), [], |r| r.get::<_, bool>(0))? {
+            conn.execute_batch(&format!("DROP TABLE \"{quoted}\""))?;
+        }
+    }
+    Ok(())
 }
 
 /// Migration 7. Recall searches `global` and the current project only, so a fact left in `session:<id>`
@@ -608,6 +624,28 @@ mod tests {
         assert_eq!(scopes_of(&conn, "b"), vec!["global".to_string()]);
         assert_eq!(scopes_of(&conn, "c"), vec!["session:s1".to_string()], "only facts move");
         assert_eq!(conn.query_row("SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'parked'", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_7_drops_only_the_empty_obs_tables_left_beside_the_renamed_ones() {
+        let dir = std::env::temp_dir().join(format!("migrate7-obs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sovereign.db");
+        let conn = open(&path, SETTINGS).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE obs_runs(id TEXT); CREATE TABLE obs_spans(id TEXT); INSERT INTO obs_spans VALUES('kept');
+             CREATE TABLE observed(id TEXT); PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&path, SETTINGS).unwrap();
+        let has = |t: &str| conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get::<_, i64>(0)).unwrap() == 1;
+        assert!(!has("obs_runs"), "empty leftover is dropped");
+        assert!(has("obs_spans"), "a table holding rows stays");
+        assert!(has("observed"), "only obs_ tables are considered");
+        assert!(has("fact_turn") && has("spans"), "the EveStack tables are untouched");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

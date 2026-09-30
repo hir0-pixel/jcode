@@ -87,6 +87,23 @@ pub fn note_user_turn(session_id: &str) -> bool {
     state.turns.is_multiple_of(PERIODIC_INTERVAL)
 }
 
+/// A session first seen in this process (attached, resumed or closed without a user turn here) that
+/// has no `extracted_through` marker pre-dates extraction: stamp the marker at its current message
+/// count, so only messages that arrive from now on are ever extracted. Once per session per process.
+pub fn adopt_session(session_id: &str, total: usize) {
+    {
+        let mut sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.contains_key(session_id) {
+            return;
+        }
+        sessions.insert(session_id.to_string(), SessionState::default());
+    }
+    let manager = MemoryManager::new();
+    if matches!(manager.meta_get(&through_key(session_id)), Ok(None)) {
+        let _ = manager.meta_set(&through_key(session_id), &total.to_string());
+    }
+}
+
 /// Drop a closed session's counters (upstream's map grew without bound).
 pub fn forget_session(session_id: &str) {
     SESSIONS.lock().unwrap_or_else(|p| p.into_inner()).remove(session_id);

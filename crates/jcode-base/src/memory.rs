@@ -341,6 +341,7 @@ impl MemoryManager {
         let db = self.db_path()?;
         let outcome = crate::memory_store::remember(&db, &scope, entry)?;
         forget_graph(&format!("{}#{scope}", db.display()));
+        forget_graph(&format!("{}#global", db.display()));
         Ok(outcome)
     }
 

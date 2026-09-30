@@ -233,6 +233,9 @@ pub(super) async fn cleanup_client_connection(
                     let sid = client_session_id.to_string();
                     // Session end: extract what the periodic runs have not covered yet, then drop
                     // the session's per-process memory state (counters, injected ids, pending).
+                    // A session with no user turn in this process and no marker pre-dates extraction:
+                    // stamp it instead of extracting its whole old history.
+                    crate::memory_extract::adopt_session(&sid, agent.message_count());
                     agent.extract_memories(crate::memory_extract::Trigger::SessionEnd);
                     crate::memory_extract::forget_session(&sid);
                     crate::memory::clear_injected_memories(&sid);

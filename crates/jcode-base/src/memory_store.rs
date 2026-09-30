@@ -357,6 +357,22 @@ pub(crate) fn remember(path: &Path, scope: &str, entry: MemoryEntry) -> Result<R
     Ok(outcome)
 }
 
+/// The active memory in `scope` with exactly this text and category.
+fn find_exact(tx: &rusqlite::Transaction, scope: &str, wanted: &str, entry: &MemoryEntry) -> Result<Option<(i64, MemoryEntry)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT m.rid, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid
+         WHERE m.scope=?1 AND m.active=1 AND trim(m.content)=?2",
+    )?;
+    for row in stmt.query_map(params![scope, wanted], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))? {
+        let (rid, json, embedding) = row?;
+        let existing = join_embedding(&json, embedding)?;
+        if existing.category == entry.category {
+            return Ok(Some((rid, existing)));
+        }
+    }
+    Ok(None)
+}
+
 fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remembered> {
     with_db(path, |db| {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -366,21 +382,16 @@ fn remember_row(path: &Path, scope: &str, entry: MemoryEntry) -> Result<Remember
             return Ok(outcome);
         }
         let wanted = entry.content.trim().to_string();
-        let mut dup = None;
+        // A project write that says what the global scope already says folds into the global
+        // memory (recall reads both scopes). A global write never touches project rows.
+        let scope = if scope != "global"
+            && (find_exact(&tx, "global", &wanted, &entry)?.is_some() || best_match(&tx, "global", &entry)?.is_some())
         {
-            let mut stmt = tx.prepare_cached(
-                "SELECT m.rid, e.entry, e.embedding FROM memories m JOIN memory_entries e ON e.rid = m.rid
-                 WHERE m.scope=?1 AND m.active=1 AND trim(m.content)=?2",
-            )?;
-            for row in stmt.query_map(params![scope, wanted], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<Vec<u8>>>(2)?)))? {
-                let (rid, json, embedding) = row?;
-                let existing = join_embedding(&json, embedding)?;
-                if existing.category == entry.category {
-                    dup = Some((rid, existing));
-                    break;
-                }
-            }
-        }
+            "global"
+        } else {
+            scope
+        };
+        let dup = find_exact(&tx, scope, &wanted, &entry)?;
         let outcome = if let Some((rid, mut existing)) = dup {
             existing.reinforce(entry.source.as_deref().unwrap_or("dedup"), 0);
             cap_reinforcements(&mut existing);
@@ -1181,7 +1192,27 @@ mod tests {
         let fact = remember(&path, "global", MemoryEntry::new(MemoryCategory::Fact, "always run the linter before committing changes")).unwrap();
         assert!(matches!(fact, Remembered::Inserted(_)));
         let other = remember(&path, "project:x", pref("always run the linter before committing changes")).unwrap();
-        assert!(matches!(other, Remembered::Inserted(_)));
+        assert!(matches!(other, Remembered::Reinforced(_)), "a project write folds into the global twin: {other:?}");
+        assert_eq!(active_count(&path, "project:x"), 0);
+        // Project A and project B still stay separate.
+        let a = remember(&path, "project:a", pref("the deploy script lives in tools/ship")).unwrap();
+        let b = remember(&path, "project:b", pref("the deploy script lives in tools/ship")).unwrap();
+        assert!(matches!(a, Remembered::Inserted(_)) && matches!(b, Remembered::Inserted(_)));
+        // A global write leaves project rows alone.
+        let g = remember(&path, "global", pref("the deploy script lives in tools/ship")).unwrap();
+        assert!(matches!(g, Remembered::Inserted(_)));
+        assert_eq!(active_count(&path, "project:a"), 1);
+    }
+
+    #[test]
+    fn a_project_paraphrase_merges_into_the_global_memory() {
+        let (_d, path) = db();
+        let g = remember(&path, "global", pref("The user prefers tabs over spaces in Rust code")).unwrap();
+        let p = remember(&path, "project:x", pref("User prefers tabs over spaces in Rust code.")).unwrap();
+        assert!(matches!(p, Remembered::Merged { .. }), "{p:?}");
+        assert_eq!(p.id(), g.id());
+        assert_eq!(active_count(&path, "project:x"), 0);
+        assert_eq!(active_count(&path, "global"), 1);
     }
 
     #[test]

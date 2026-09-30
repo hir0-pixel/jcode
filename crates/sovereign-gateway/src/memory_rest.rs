@@ -74,7 +74,7 @@ fn row(scope: &str, entry: &MemoryEntry) -> Value {
 pub(crate) fn add(content: &str, category: &str, source: &str) -> Result<String> {
     let mut entry = MemoryEntry::new(category.parse().unwrap_or(MemoryCategory::Fact), content);
     entry.source = Some(source.to_string());
-    MemoryManager::new().upsert_global_memory(entry)
+    MemoryManager::new().remember_global(entry)
 }
 
 /// Replace one memory's text (its row only); `false` when the id is unknown.
@@ -171,6 +171,20 @@ mod tests {
         assert!(entry.source.unwrap().contains("policy changed"));
         assert!(!MemoryManager::new().expire("nope", "").unwrap());
         forget(&id).unwrap();
+    }
+
+    #[test]
+    fn adding_the_same_memory_twice_stores_it_once() {
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("memory-rest-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: JCODE_HOME is only touched under ENV_LOCK.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        let first = add("staging deploys need two approvals", "fact", "desktop").unwrap();
+        let second = add("Staging deploys need two approvals.", "fact", "desktop").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(all().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

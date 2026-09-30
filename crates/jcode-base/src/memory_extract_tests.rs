@@ -282,3 +282,22 @@ fn session_end_after_periodic_does_not_repeat_or_drop() {
         assert_eq!(read_marker(&manager, "end-1"), 120);
     });
 }
+
+#[test]
+fn a_session_that_pre_dates_extraction_is_stamped_and_only_new_messages_are_extracted() {
+    with_temp_home(|| {
+        let manager = MemoryManager::new();
+        let old = chat(40);
+        adopt_session("legacy-1", old.len());
+        assert_eq!(extracted_through(&manager, "legacy-1", old.len()), old.len());
+        assert!(matches!(plan_run(&manager, Trigger::SessionEnd, "legacy-1", &old, true), Plan::Skip("no_new_messages")));
+        let mut grown = old.clone();
+        grown.extend(chat(3));
+        let job = job_of(plan_run(&manager, Trigger::SessionEnd, "legacy-1", &grown, true));
+        assert_eq!(job.from, old.len());
+        // Adopting again, or after real activity, never moves a marker.
+        adopt_session("legacy-1", grown.len());
+        assert_eq!(extracted_through(&manager, "legacy-1", grown.len()), old.len());
+        forget_session("legacy-1");
+    });
+}
