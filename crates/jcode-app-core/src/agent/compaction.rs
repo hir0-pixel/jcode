@@ -113,6 +113,7 @@ impl Agent {
         manager.set_memory_target(self.memory_enabled.then(|| {
             (self.session.id.clone(), self.session.working_dir.clone())
         }));
+        manager.set_plan_session(Some(self.session.id.clone()));
     }
 
     fn is_context_limit_error(error: &str) -> bool {

@@ -1278,3 +1278,25 @@ fn max_context_tokens_applies_at_construction_and_reloads_before_requests() {
     manager.ensure_context_fits(&[], Arc::new(MockSummaryProvider));
     assert_eq!(manager.token_budget(), 128_000);
 }
+
+#[test]
+fn live_plan_is_appended_and_replaced_not_duplicated() {
+    let todo = |content: &str, status: &str, id: &str| jcode_task_types::TodoItem {
+        content: content.into(),
+        status: status.into(),
+        priority: "medium".into(),
+        id: id.into(),
+        ..Default::default()
+    };
+    let todos = vec![
+        todo("ship guard", "in_progress", "1"),
+        todo("old work", "completed", "2"),
+    ];
+    let once = attach_live_plan("## Goal\nx".to_string(), &todos);
+    assert!(once.contains("ship guard"));
+    assert!(!once.contains("old work"));
+    let twice = attach_live_plan(once, &[todo("next", "pending", "3")]);
+    assert_eq!(twice.matches(LIVE_PLAN_HEADING).count(), 1);
+    assert!(twice.contains("next") && !twice.contains("ship guard"));
+    assert_eq!(attach_live_plan("s".into(), &[]), "s");
+}

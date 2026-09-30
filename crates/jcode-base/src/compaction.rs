@@ -217,6 +217,10 @@ pub struct CompactionManager {
     /// (session id, working dir). `None` when memory is off.
     memory_target: Option<(String, Option<String>)>,
 
+    /// Session whose todo list is re-attached to every new summary so the live plan
+    /// survives compaction.
+    plan_session: Option<String>,
+
     /// When true, session restore/reseed has just loaded old history and
     /// compaction must stay disabled until a genuinely new message is added.
     suppress_compaction_until_new_message: bool,
@@ -285,6 +289,7 @@ impl CompactionManager {
             pending_cutoff: 0,
             total_turns: 0,
             memory_target: None,
+            plan_session: None,
             suppress_compaction_until_new_message: false,
             token_budget: Self::capped_budget(&cfg, DEFAULT_TOKEN_BUDGET),
             model_token_budget: DEFAULT_TOKEN_BUDGET,
@@ -307,6 +312,20 @@ impl CompactionManager {
     /// summarized or dropped (`None` turns it off).
     pub fn set_memory_target(&mut self, target: Option<(String, Option<String>)>) {
         self.memory_target = target;
+    }
+
+    /// Name the session whose todo list is appended to each new summary.
+    pub fn set_plan_session(&mut self, session_id: Option<String>) {
+        self.plan_session = session_id;
+    }
+
+    fn with_live_plan(&self, summary_text: String) -> String {
+        let todos = self
+            .plan_session
+            .as_deref()
+            .and_then(|id| crate::todo::load_todos(id).ok())
+            .unwrap_or_default();
+        attach_live_plan(summary_text, &todos)
     }
 
     /// Extract memories from `all_messages[..upto]` before those messages are replaced by a
@@ -1338,7 +1357,7 @@ impl CompactionManager {
                             .map(message_char_count)
                             .sum();
                         let summary = Summary {
-                            text: result.summary_text,
+                            text: self.with_live_plan(result.summary_text),
                             openai_encrypted_content: result.openai_encrypted_content,
                             covers_up_to_turn: result.covers_up_to_turn,
                             original_turn_count: self.pending_cutoff,
@@ -1694,7 +1713,7 @@ impl CompactionManager {
         );
 
         let summary = Summary {
-            text: summary_text,
+            text: self.with_live_plan(summary_text),
             openai_encrypted_content: None,
             covers_up_to_turn: cutoff,
             original_turn_count: cutoff,
@@ -2076,6 +2095,34 @@ pub async fn build_transfer_compaction_state_with_model_calls(
         original_turn_count: total_turns,
         compacted_count: 0,
     }))
+}
+
+const LIVE_PLAN_HEADING: &str = "## Live plan (todo list at compaction)";
+const LIVE_PLAN_MAX_ITEMS: usize = 40;
+
+/// Append the current todo list to a summary, replacing any plan section a previous
+/// compaction left behind. Finished items are dropped: the summary already says what is done.
+fn attach_live_plan(summary_text: String, todos: &[jcode_task_types::TodoItem]) -> String {
+    let base = match summary_text.find(LIVE_PLAN_HEADING) {
+        Some(at) => summary_text[..at].trim_end().to_string(),
+        None => summary_text,
+    };
+    let open: Vec<_> = todos
+        .iter()
+        .filter(|t| {
+            !crate::todo::todo_status_is_completed(&t.status)
+                && !crate::todo::todo_status_is_cancelled(&t.status)
+        })
+        .take(LIVE_PLAN_MAX_ITEMS)
+        .collect();
+    if open.is_empty() {
+        return base;
+    }
+    let mut out = format!("{base}\n\n{LIVE_PLAN_HEADING}\n");
+    for t in open {
+        out.push_str(&format!("- [{}] {} (id {})\n", t.status, t.content, t.id));
+    }
+    out
 }
 
 #[cfg(test)]
