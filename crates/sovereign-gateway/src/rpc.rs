@@ -2818,6 +2818,8 @@ pub(crate) async fn agent_run(
             let _ = conn.dispatch("session.interrupt", &json!({ "session_id": session_id })).await;
         }
         hub.unmark_headless(&session_id).await;
+        // The turn is over and its transcript is the record: free its buffered live events.
+        conn.observer.release_replay(&session_id);
         // Only now is the session guaranteed persisted (jcode does not write a
         // session record until its first turn), so hide it from session.list
         // here rather than before the turn — the same mechanism a user's own

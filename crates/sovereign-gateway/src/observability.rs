@@ -627,6 +627,18 @@ impl Observer {
         (events, entry.seq, last_seen < entry.evicted_through, self.replay_epoch.clone())
     }
 
+    /// Drop a finished headless run's buffered events (they are otherwise held until the
+    /// process-wide caps evict them). The sequence is kept, so a client that reconnects with an
+    /// older `last_seen` is told it was truncated and reloads the history.
+    pub fn release_replay(&self, sid: &str) {
+        let mut replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = replay.sessions.get_mut(sid) else { return };
+        let freed = std::mem::take(&mut entry.bytes);
+        entry.events = VecDeque::new();
+        entry.evicted_through = entry.seq;
+        replay.bytes -= freed;
+    }
+
     pub fn replay_stats(&self) -> Value {
         let replay = self.replay.lock().unwrap_or_else(|e| e.into_inner());
         json!({
@@ -1377,6 +1389,29 @@ mod tests {
         assert_eq!(events[0]["seq"], 2);
         assert!(!epoch.is_empty());
         assert_eq!(observer.replay_stats()["events"], REPLAY_EVENTS);
+        drop(observer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn released_replay_frees_events_and_reports_truncation() {
+        let dir = std::env::temp_dir().join(format!("sovereign-replay-release-{}", now()));
+        let observer = Observer::open(&dir, "ollama", "local", None).unwrap();
+        for i in 0..3 {
+            observer.replay_event(json!({"session_id":"s","type":"message.delta","payload":{"i":i}}));
+        }
+        observer.release_replay("s");
+        assert_eq!(observer.replay_stats()["events"], 0);
+        assert_eq!(observer.replay_stats()["bytes"], 0);
+        let (events, seq, truncated, _) = observer.replay_since("s", 1);
+        assert!(events.is_empty());
+        assert_eq!(seq, 3);
+        assert!(truncated);
+        let next = observer.replay_event(json!({"session_id":"s","type":"message.delta","payload":{}}));
+        assert_eq!(next["seq"], 4);
+        let (events, _, truncated, _) = observer.replay_since("s", 3);
+        assert_eq!(events.len(), 1);
+        assert!(!truncated);
         drop(observer);
         std::fs::remove_dir_all(dir).unwrap();
     }
