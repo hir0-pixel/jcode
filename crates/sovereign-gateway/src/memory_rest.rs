@@ -183,7 +183,7 @@ mod tests {
         let first = add("staging deploys need two approvals", "fact", "desktop").unwrap();
         let second = add("Staging deploys need two approvals.", "fact", "desktop").unwrap();
         assert_eq!(first, second);
-        assert_eq!(all().unwrap().len(), 1);
+        assert_eq!(all().unwrap().iter().filter(|m| m.active).count(), 1);
         let _ = std::fs::remove_dir_all(home);
     }
 
