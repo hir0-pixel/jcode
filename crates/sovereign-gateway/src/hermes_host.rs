@@ -25,7 +25,10 @@ impl HermesHost for Host {
         let features = self.features.clone().ok_or_else(|| anyhow!(UNAVAILABLE))?;
         // Held so the idle reaper cannot stop the backend under a long-running tool.
         let _lease = features.lease();
-        let port = features.port().await.map_err(|e| anyhow!("{UNAVAILABLE}: {e}"))?;
+        let port = features.port().await.map_err(|e| {
+            // The full error (a backend's usage dump, say) is in hermes-backend.log, not the model's context.
+            anyhow!("{UNAVAILABLE}: {}", e.to_string().lines().next().unwrap_or_default())
+        })?;
         features.touch(path, "agent-tool");
         let url = format!("http://127.0.0.1:{port}{path}");
         let client = reqwest::Client::builder().timeout(CALL_TIMEOUT).build()?;
@@ -130,6 +133,19 @@ mod tests {
         let broken = Host { features: Some(Arc::new(Features::new(vec!["/nonexistent/hermes".into()]))), hub };
         let err = broken.call("GET", "/api/agent-tools", None).await.unwrap_err().to_string();
         assert!(err.starts_with(UNAVAILABLE), "{err}");
+        // A backend that rejects its flags and prints usage: the model sees one line, not the dump.
+        let dir = std::env::temp_dir().join(format!("hermes-usage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hermes");
+        std::fs::write(&script, "#!/bin/sh\necho 'usage: hermes [-h] {chat,serve}' >&2\necho 'hermes: error: unrecognized arguments: --secrets-stdin' >&2\nexit 2\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let usage = Host { features: Some(Arc::new(Features::new(vec![script.to_string_lossy().into_owned()]))), hub: Arc::new(Hub::default()) };
+        let err = usage.call("GET", "/api/agent-tools", None).await.unwrap_err().to_string();
+        assert!(err.starts_with(UNAVAILABLE) && !err.contains("usage:") && !err.contains("secrets-stdin") && !err.contains('\n'), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

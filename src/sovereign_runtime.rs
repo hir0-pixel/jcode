@@ -790,7 +790,7 @@ async fn unload_ollama_model(model: &str) {
 
 /// Command that starts Hermes's Python backend for the features the Rust
 /// harness does not own: `SOVEREIGN_HERMES_CMD` (empty disables), else the
-/// managed install, else `hermes` on PATH.
+/// engine-managed install. Never a `hermes` found on PATH: it may be a different program.
 /// `SOVEREIGN_HERMES_CMD`: a program plus leading args, or one path to a program (which may hold spaces).
 fn split_hermes_cmd(cmd: &str) -> Option<Vec<String>> {
     if std::path::Path::new(cmd).is_file() {
@@ -807,16 +807,12 @@ fn hermes_feature_command() -> Option<Vec<String>> {
     if let Ok(cmd) = std::env::var("SOVEREIGN_HERMES_CMD") {
         return split_hermes_cmd(&cmd);
     }
-    let managed = dirs::home_dir()?.join(".hermes/hermes-agent/venv/bin/hermes");
-    if managed.is_file() {
-        return Some(vec![managed.to_string_lossy().into_owned()]);
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join("hermes"))
-            .find(|p| p.is_file())
-            .map(|p| vec![p.to_string_lossy().into_owned()])
-    })
+    managed_hermes_command(&dirs::home_dir()?)
+}
+
+fn managed_hermes_command(home: &std::path::Path) -> Option<Vec<String>> {
+    let managed = home.join(".hermes/hermes-agent/venv/bin/hermes");
+    managed.is_file().then(|| vec![managed.to_string_lossy().into_owned()])
 }
 
 /// Write a file readable only by the current user (tokens, ready files).
@@ -874,6 +870,18 @@ mod tests {
         assert_eq!(super::split_hermes_cmd(&bin), Some(vec![bin.clone()]));
         assert_eq!(super::split_hermes_cmd("python3 -m hermes_cli.main"), Some(vec!["python3".into(), "-m".into(), "hermes_cli.main".into()]));
         assert_eq!(super::split_hermes_cmd("  "), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_the_managed_hermes_is_used_never_one_on_path() {
+        let dir = std::env::temp_dir().join(format!("hermes-managed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::managed_hermes_command(&dir), None);
+        let bin = dir.join(".hermes/hermes-agent/venv/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hermes"), "").unwrap();
+        assert_eq!(super::managed_hermes_command(&dir), Some(vec![bin.join("hermes").to_string_lossy().into_owned()]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
