@@ -343,6 +343,18 @@ function treeRssMib(root, table, marker) {
   for (const p of pids) kib += table.get(p).rss
   return kib / 1024
 }
+/** Kill anything an arm left running with its cwd inside this exercise's sandbox (e.g. a model-written
+ *  test that never exits), so it cannot hold memory or inflate later exercises' RSS. Same for every arm. */
+function reapStragglers(dir) {
+  try {
+    const out = execFileSync('lsof', ['-a', '-d', 'cwd', '-Fpn'], { encoding: 'utf8', timeout: 10000, maxBuffer: 64 << 20 })
+    let pid = null
+    for (const line of out.split('\n')) {
+      if (line[0] === 'p') pid = Number(line.slice(1))
+      else if (line[0] === 'n' && pid && pid !== process.pid && line.slice(1).startsWith(dir)) { try { process.kill(pid, 'SIGKILL') } catch {} }
+    }
+  } catch {}
+}
 function startSampler(root, marker) {
   const samples = []
   const tick = () => samples.push(treeRssMib(root, psSnapshot(), marker))
@@ -623,6 +635,7 @@ async function runArm(arm, only, langFilter) {
       }
       fs.appendFileSync(metaPath, JSON.stringify(rec) + '\n')
       say(arm, run_id, `pass@1=${rec.pass1} pass@2=${rec.pass} calls=${pm.model_calls} ${rec.wall_ms}ms rss=${rec.rss_peak_mib}/${rec.rss_mean_mib}MiB`)
+      reapStragglers(parent)
       fs.rmSync(parent, { recursive: true, force: true })
     }
   } finally {
