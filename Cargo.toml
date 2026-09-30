@@ -131,7 +131,7 @@ jemalloc-prof = [
 # these features just forward down the stack.
 embeddings = ["jcode-app-core/embeddings"]
 # Live AWS Bedrock support (the AWS SDK stack) lives in jcode-provider-bedrock;
-# forwards down through jcode-tui -> jcode-app-core -> jcode-base.
+# forwards down through jcode-app-core -> jcode-base.
 bedrock = ["jcode-app-core/bedrock"]
 pdf = ["jcode-app-core/pdf"]
 
