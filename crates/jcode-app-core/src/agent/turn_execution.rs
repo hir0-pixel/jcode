@@ -112,8 +112,14 @@ impl Agent {
         result
     }
 
-    /// First message of a fresh top-level session in a real project directory.
+    /// First message of a fresh top-level HEADLESS session (benchmarks, cron, REST runs) in a real
+    /// project directory. Interactive desktop chats never get it: the block would show in the
+    /// user's own first message. `JCODE_ENV_SNAPSHOT=1` forces it on.
     fn wants_env_snapshot(&self) -> bool {
+        let forced = std::env::var("JCODE_ENV_SNAPSHOT").is_ok_and(|v| v == "1");
+        if !forced && !jcode_base::headless::is(&self.session.id) {
+            return false;
+        }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let dir = self.session.working_dir.as_deref().map(std::path::Path::new);
         super::env_snapshot::enabled()
