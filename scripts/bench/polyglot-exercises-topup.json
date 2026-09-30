@@ -1,0 +1,41 @@
+{
+  "seed": 42,
+  "requested_count": 21,
+  "actual_count": 21,
+  "languages": [
+    "go",
+    "javascript",
+    "java"
+  ],
+  "per_language": 7,
+  "exercises": {
+    "go": [
+      "beer-song",
+      "counter",
+      "crypto-square",
+      "dnd-character",
+      "kindergarten-garden",
+      "ledger",
+      "matrix"
+    ],
+    "javascript": [
+      "beer-song",
+      "bottle-song",
+      "rational-numbers",
+      "scale-generator",
+      "state-of-tic-tac-toe",
+      "two-bucket",
+      "zebra-puzzle"
+    ],
+    "java": [
+      "all-your-base",
+      "bottle-song",
+      "forth",
+      "go-counting",
+      "rest-api",
+      "transpose",
+      "zipper"
+    ]
+  },
+  "note": "top-up drawn before any results were seen; same seed as the 40-set"
+}
