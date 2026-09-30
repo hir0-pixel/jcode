@@ -17,20 +17,47 @@ const SELF_LIMITED_CEILING_CHARS: usize = 512 * 1024;
 fn spill_dir() -> Option<std::path::PathBuf> {
     let dir = jcode_base::storage::jcode_dir().ok()?.join("tool-output");
     std::fs::create_dir_all(&dir).ok()?;
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| sweep_old_spills(&dir));
     Some(dir)
 }
 
+/// Delete spill files older than 7 days (once per process, on first use).
+fn sweep_old_spills(dir: &std::path::Path) {
+    let cutoff = std::time::Duration::from_secs(7 * 24 * 3600);
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > cutoff);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Same tool + same content => same file name, so a repeated output neither writes
+/// another file nor changes the capped text (which the repeat guard hashes).
 fn spill_full_output(tool_name: &str, text: &str) -> Option<std::path::PathBuf> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
     let safe: String = tool_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let path = spill_dir()?.join(format!("{safe}-{stamp}.txt"));
-    std::fs::write(&path, text).ok()?;
+    let path = spill_dir()?.join(format!("{safe}-{:016x}.txt", h.finish()));
+    if !path.exists() {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        opts.open(&path).ok()?.write_all(text.as_bytes()).ok()?;
+    }
     Some(path)
 }
 
@@ -276,6 +303,22 @@ mod cap_tests {
         let mid = "y".repeat(100_000);
         assert_eq!(cap_tool_output_for_history("bash", ToolOutput::new("ok")).output, "ok");
         assert_eq!(cap_tool_output_for_history("read", ToolOutput::new(mid.clone())).output, mid);
+    }
+
+    #[test]
+    fn identical_oversized_output_reuses_one_private_spill_file() {
+        let _env = jcode_base::storage::lock_test_env();
+        let text = "z".repeat(120_000);
+        let a = cap_tool_output_for_history("bash", ToolOutput::new(text.clone())).output;
+        let b = cap_tool_output_for_history("bash", ToolOutput::new(text)).output;
+        assert_eq!(a, b, "repeat guard hashes the capped text; it must be stable");
+        let path = a.split("saved to ").nth(1).and_then(|r| r.split(';').next()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
