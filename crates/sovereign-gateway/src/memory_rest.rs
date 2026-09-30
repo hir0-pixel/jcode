@@ -35,16 +35,9 @@ pub(crate) fn find(id: &str) -> Option<MemoryEntry> {
     all().ok()?.into_iter().find(|m| m.id == id)
 }
 
-/// Remove `id` from whichever scope holds it.
+/// Remove `id` from whichever scope holds it (one row; no other memory is rewritten).
 pub(crate) fn forget(id: &str) -> Result<bool> {
-    let manager = MemoryManager::new();
-    for (scope, mut graph) in manager.every_scope_graph()? {
-        if graph.remove_memory(id).is_some() {
-            manager.save_graph_for_scope(&scope, &graph)?;
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    MemoryManager::new().forget_anywhere(id)
 }
 
 fn status() -> Result<Value> {
@@ -59,20 +52,16 @@ fn status() -> Result<Value> {
     }))
 }
 
-/// Forget every memory in `target` (`memory` | `user` | `all`); returns the labels cleared.
+/// Forget every memory in `target` (`memory` | `user` | `all`); returns the ids cleared. Prime's
+/// learned entries (prompt, skill, subagent) are never touched: they reset through the learning REST,
+/// with a changeset. One scoped DELETE per scope.
 fn reset(target: &str) -> Result<Value> {
-    let mut deleted = Vec::new();
-    for entry in all()? {
-        let hit = match target {
-            "all" => true,
-            "user" => is_user(&entry),
-            _ => !is_user(&entry),
-        };
-        if hit && forget(&entry.id)? {
-            deleted.push(entry.id);
-        }
-    }
-    Ok(json!({ "ok": true, "deleted": deleted }))
+    let only_preferences = match target {
+        "all" => None,
+        "user" => Some(true),
+        _ => Some(false),
+    };
+    Ok(json!({ "ok": true, "deleted": MemoryManager::new().reset_all(only_preferences)? }))
 }
 
 fn row(scope: &str, entry: &MemoryEntry) -> Value {
@@ -88,21 +77,9 @@ pub(crate) fn add(content: &str, category: &str, source: &str) -> Result<String>
     MemoryManager::new().upsert_global_memory(entry)
 }
 
-/// Replace one memory's text; `false` when the id is unknown.
+/// Replace one memory's text (its row only); `false` when the id is unknown.
 pub(crate) fn edit(id: &str, content: &str) -> Result<bool> {
-    let manager = MemoryManager::new();
-    for (scope, mut graph) in manager.every_scope_graph()? {
-        let Some(memory) = graph.get_memory_mut(id) else {
-            continue;
-        };
-        memory.content = content.to_string();
-        memory.updated_at = chrono::Utc::now();
-        memory.refresh_search_text();
-        memory.embedding = None; // stale for the new text; recomputed by backfill
-        manager.save_graph_for_scope(&scope, &graph)?;
-        return Ok(true);
-    }
-    Ok(false)
+    MemoryManager::new().edit_content(id, content)
 }
 
 /// Memories (any scope) no harness entry points at (the model's own `memory` tool
@@ -194,6 +171,28 @@ mod tests {
         assert!(entry.source.unwrap().contains("policy changed"));
         assert!(!MemoryManager::new().expire("nope", "").unwrap());
         forget(&id).unwrap();
+    }
+
+    #[test]
+    fn reset_leaves_learned_entries_alone_and_forget_keeps_other_rows() {
+        let _env = crate::hermes_env::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("memory-rest-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        // SAFETY: JCODE_HOME is only touched under ENV_LOCK.
+        unsafe { std::env::set_var("JCODE_HOME", &home) };
+        let mut prompt = MemoryEntry::new(MemoryCategory::Custom("prompt".into()), "Always run the linter");
+        prompt.id = "learned-1".into();
+        jcode_base::memory::learned::put(&home.join("sovereign.db"), "global", prompt).unwrap();
+        let (keep, drop_me) = (add("keep me", "fact", "test").unwrap(), add("forget me", "fact", "test").unwrap());
+        assert!(forget(&drop_me).unwrap());
+        assert!(find(&keep).is_some(), "forgetting one row leaves the rest");
+        let pref = add("likes terse", "preference", "test").unwrap();
+        assert_eq!(reset("memory").unwrap()["deleted"], json!([keep]));
+        assert_eq!(reset("all").unwrap()["deleted"], json!([pref]));
+        let learned = jcode_base::memory::learned::get(&home.join("sovereign.db"), "learned-1").unwrap();
+        assert!(learned.is_some(), "Prime's learned entry survives every reset");
+        jcode_base::memory::learned::close(&home.join("sovereign.db"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
