@@ -102,10 +102,22 @@ fn edits_code(input: &serde_json::Value) -> bool {
     paths.iter().any(|p| is_code_path(p))
 }
 
+/// Hash of a test run's output with timing tokens (`0.02s`, `(0.00s)`, `1.5`) dropped,
+/// so the same failure compares equal across runs ("1 failed in 0.02s" vs "0.03s").
 fn hash_str(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
+    for line in s.lines() {
+        for tok in line.split_whitespace() {
+            let t = tok.trim_matches(|c: char| "()[],".contains(c));
+            let t = t.strip_suffix("ms").or_else(|| t.strip_suffix('s')).unwrap_or(t);
+            if t.contains('.') && t.parse::<f64>().is_ok() {
+                continue;
+            }
+            tok.hash(&mut h);
+        }
+        '\n'.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -318,6 +330,12 @@ fn announces_action(lower: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn failure_hash_ignores_timings() {
+        assert_eq!(hash_str("1 failed in 0.02s\nok (0.00s)"), hash_str("1 failed in 0.03s\nok (0.01s)"));
+        assert_ne!(hash_str("1 failed in 0.02s"), hash_str("2 failed in 0.02s"));
+    }
 
     #[test]
     fn verify_nudge_once_after_edit_without_tests() {

@@ -36,7 +36,7 @@ pub(super) fn detect_test_command(dir: &Path) -> Option<(&'static str, String)> 
                 .into(),
         ));
     }
-    if ["", "tests", "test"].iter().any(|sub| has_py_tests(&dir.join(sub))) {
+    if let Some(sub) = ["", "tests", "test"].into_iter().find(|sub| has_py_tests(&dir.join(sub))) {
         let pytest = std::process::Command::new("python3")
             .args(["-c", "import pytest"])
             .stdout(std::process::Stdio::null())
@@ -46,7 +46,9 @@ pub(super) fn detect_test_command(dir: &Path) -> Option<(&'static str, String)> 
         return Some(if pytest {
             ("pytest", "python3 -m pytest -x -q".into())
         } else {
-            ("unittest", "python3 -m unittest".into())
+            // Bare `unittest` only finds `test*.py` (not Exercism's `x_test.py`) and
+            // reports "Ran 0 tests ... OK", a false pass.
+            ("unittest", format!("python3 -m unittest discover -s {} -p '*test*.py'", if sub.is_empty() { "." } else { sub }))
         });
     }
     None
@@ -132,7 +134,7 @@ mod tests {
         assert_eq!(cmd(&[("pom.xml", "")]).unwrap(), "mvn -q test");
         assert!(cmd(&[("CMakeLists.txt", "")]).unwrap().ends_with("--output-on-failure"));
         let py = cmd(&[("x_test.py", "")]).unwrap();
-        assert!(py == "python3 -m pytest -x -q" || py == "python3 -m unittest");
+        assert!(py == "python3 -m pytest -x -q" || py.starts_with("python3 -m unittest discover -s . -p"));
         assert!(cmd(&[("test_x.py", "")]).is_some());
         assert!(cmd(&[("main.py", "")]).is_none());
         assert!(cmd(&[]).is_none());
