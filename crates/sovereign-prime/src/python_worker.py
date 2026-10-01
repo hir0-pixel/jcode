@@ -41,8 +41,29 @@ async def llm_query(prompt):
     return await host_call("llm_query", prompt)
 
 
-async def load(path):
-    return await host_call("load", path)
+async def llm_query_batch(prompts):
+    """Run up to 64 sub-queries (8 at once) as ONE host call; replies in order, an 'Error: ...' string per failed item."""
+    if isinstance(prompts, (str, bytes)):
+        raise TypeError("llm_query_batch expects a list of strings")
+    return json.loads(await host_call("llm_query_batch", json.dumps([str(p) for p in prompts])))
+
+
+MAX_LOAD_BYTES = 64 * 1024 * 1024
+
+
+async def load(path, start=0, length=None):
+    """Read a workspace file (or the byte slice start:start+length) as text; only the slice is read from disk."""
+    info = json.loads(await host_call("load_path", path))
+    start = max(0, int(start))
+    want = max(0, info["size"] - start)
+    if length is not None:
+        want = min(want, max(0, int(length)))
+    if want > MAX_LOAD_BYTES:
+        raise RuntimeError(f"{path}: {want} bytes requested, the limit is 64 MB per call; pass start/length")
+    with open(info["path"], "rb") as handle:
+        handle.seek(start)
+        data = handle.read(want)
+    return data.decode("utf-8", "replace")
 
 
 async def refine(op="run", instructions=None, global_=False):
@@ -126,6 +147,7 @@ sys.modules["rlm"] = _rlm_module
 
 namespace.update({
     "llm_query": llm_query,
+    "llm_query_batch": llm_query_batch,
     "load": load,
     "refine": refine,
     "goal": goal,

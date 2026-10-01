@@ -133,7 +133,11 @@ impl ReplTool {
 
 fn clip(text: &str) -> String {
     match text.char_indices().nth(MAX_OUTPUT_CHARS) {
-        Some((cut, _)) => format!("{}\n… [output truncated]", &text[..cut]),
+        Some((cut, _)) => format!(
+            "{}\n… [output truncated at {MAX_OUTPUT_CHARS} chars; page it, e.g. print(s[{MAX_OUTPUT_CHARS}:{}])]",
+            &text[..cut],
+            MAX_OUTPUT_CHARS * 2
+        ),
         None => text.to_string(),
     }
 }
@@ -167,6 +171,12 @@ impl Tool for ReplTool {
             Box::pin(async move {
                 let provider =
                     crate::provider::active_provider_fork().context("no active model provider")?;
+                // The fork has its own state, so this never changes the session's model.
+                if let Some(sub) = crate::config::config().agents.repl_sub_model.as_deref() {
+                    if let Err(error) = provider.set_model(sub) {
+                        crate::logging::warn(&format!("repl_sub_model {sub}: {error}"));
+                    }
+                }
                 let provider_name = provider.name().to_string();
                 let model = provider.model();
                 let started = SystemTime::now()

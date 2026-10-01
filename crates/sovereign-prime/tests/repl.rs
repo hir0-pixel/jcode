@@ -568,3 +568,24 @@ async fn memory_blowup_is_contained_in_the_worker() {
         .unwrap();
     assert_eq!(out.value.as_deref(), Some("2"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_query_and_sliced_load_work_in_the_sandbox() {
+    let h = host!();
+    let dir = workdir();
+    let out = h
+        .run(
+            "s",
+            "r = await llm_query_batch(['a', 'b'])\ns = await load('src/notes.txt', 6, 4)\n(r, s)",
+            Some(&dir),
+            upper(),
+            no_refine(),
+            sovereign_prime::host::ExtraHostFns::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.value.as_deref(), Some("(['A', 'B'], 'beta')"));
+    assert_eq!(out.host_calls, 2, "a batch counts as one host call");
+    std::fs::remove_dir_all(dir).unwrap();
+}

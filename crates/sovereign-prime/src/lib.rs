@@ -17,4 +17,4 @@ pub use host::{LlmQuery, ReplHost, RunOutput};
 
 /// Tool description shown to the model; kept short because it is sent on every request.
 pub const TOOL_DESCRIPTION: &str =
-    "Python REPL; macOS sandbox, otherwise per-cell approval (headless denied).";
+    "Python REPL: load, llm_query_batch; sandboxed (macOS) or approved per cell.";
