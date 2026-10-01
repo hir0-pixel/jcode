@@ -741,6 +741,24 @@ async fn run_turn_streaming_mpsc_emits_model_changed_on_midstream_switch() {
 }
 
 #[tokio::test]
+async fn headless_first_message_gets_env_snapshot_despite_session_context_message() {
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    assert!(!agent.session.messages.is_empty(), "the session-context message precedes the task");
+    let dir = std::env::temp_dir().join(format!("env-snap-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    agent.session.working_dir = Some(dir.to_string_lossy().into_owned());
+    jcode_base::headless::mark(&agent.session.id);
+    agent.append_user_context_message("do the task", vec![]).unwrap();
+    jcode_base::headless::unmark(&agent.session.id);
+    let last = agent.session.messages.last().unwrap();
+    assert_eq!(last.content.len(), 2, "task text plus environment snapshot block");
+    assert!(content_text(&last.content[1..]).len() <= 600);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn messages_for_provider_replays_persisted_native_compaction_in_auto_mode() {
     let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
     let registry = Registry::new(provider.clone()).await;
