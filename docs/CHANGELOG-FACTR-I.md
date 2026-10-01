@@ -50,8 +50,18 @@ Every capability change, why it was made, and where it is. Commit ids are short 
 | `websearch`: 5 results, 200-char snippets, 2 per host, Wikipedia fallback | D (success falls with more searches) | 05f79d574 |
 | `read` opens xlsx/docx/pptx as text; search-stall nudge | D GAIA (13 xlsx files); W Magentic-One stall replanning | 8a7636ec9 |
 
+## Added for the benchmark brief (general capabilities; evidence D = Prime/Hermes benchmark traces, aggregates only)
+| Change | Why | Commits |
+|---|---|---|
+| Output-format nudge: when the task text explicitly requires a labelled final line (any quoted uppercase label such as `FINAL ANSWER:`), one nudge if the final reply lacks it; fixed to skip the session-context message in headless runs | D (a missing marker counts as a fail on 5-6% of answers in both rivals) | ca089fc31, 6d1b214a7 |
+| Provider safety-filter refusal: every provider's refusal wording maps to one stop reason; one retry of the SAME request, then a clear final message (no rewording to evade the filter); the REST run error now carries the message | D (a Hermes task lost to a refusal); jcode's reword-to-evade call sites removed | 8b037f207, 3c690a52f |
+| Large-input rule in the prompt (never read huge inputs whole; load in code, slice, aggregate in code) | W RLM/Prime/OOLONG; costs 202 characters | 94424c9b0 |
+| Python REPL available by default but deferred (zero schema tokens until `load_tools`), system python3 fallback on macOS, `llm_query_batch` (8 concurrent, one host call), `load(path,start,length)` slices up to 64 MB, 120 s only while a host call is in flight, optional `agents.repl_sub_model`, worker stopped when a one-shot run ends | O Prime (persistent REPL, RLM); W Recursive Language Models | 330e6eaa9, bc0965e10, b3ef146eb, d4efbbf85 |
+| Environment snapshot now appears in headless first messages (it was never shown before the fix) | D | 2b7287a33 |
+| `SOVEREIGN_LEARNING_ENABLED=0` for a learning-off run | benchmark fairness | 588783a86 |
+
 ## Removed
-About 39k lines of unused jcode-era files, docs, scripts and modules (`f6deb85e0`, `5fd6867a5`, `bb8eab337`, `9e8b719b9`, `ecd7d4928`), the unwired todo gate digest (`e73e9ff6b`) and the memory JSONL log (`ec8461fea`).
+jcode's reword-to-evade refusal call sites (`8b037f207`), about 39k lines of unused jcode-era files, docs, scripts and modules (`f6deb85e0`, `5fd6867a5`, `bb8eab337`, `9e8b719b9`, `ecd7d4928`), the unwired todo gate digest (`e73e9ff6b`) and the memory JSONL log (`ec8461fea`).
 
 ## Known limits
 Gateway `session.close` triggers extraction only when the connection drops (30 s grace); a grandchild process holding a pipe is reaped at shutdown only; Bedrock paths were tested offline only; the Python REPL tool is off by default and cannot fetch or parse web pages; no audio transcription.
