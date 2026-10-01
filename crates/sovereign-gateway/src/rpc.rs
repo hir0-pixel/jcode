@@ -2995,7 +2995,10 @@ fn turn_reply(payload: &Value, session_id: &str, surface: &str) -> Value {
         "ok": ok,
         "interrupted": interrupted,
         "text": payload["text"].as_str().unwrap_or_default(),
-        "error": if ok { Value::Null } else { json!(format!("the turn did not complete cleanly ({status})")) },
+        "error": if ok { Value::Null } else { json!(match payload["error"].as_str().filter(|m| !m.is_empty()) {
+            Some(detail) => format!("the turn did not complete cleanly ({status}): {detail}"),
+            None => format!("the turn did not complete cleanly ({status})"),
+        }) },
         "session_id": session_id,
         "usage": if usage.is_null() { Value::Null } else { json!({ "input_tokens": usage["input"], "output_tokens": usage["output"], "cached_tokens": usage["cache_read"] }) },
     })
@@ -3403,6 +3406,14 @@ mod tests {
         assert!(!second.is_finished(), "the second message waits for the first turn");
         drop(first);
         tokio::time::timeout(Duration::from_secs(2), second).await.expect("released").unwrap();
+    }
+
+    #[test]
+    fn a_failed_turn_reply_carries_the_stop_message() {
+        let refused = turn_reply(&json!({ "status": "error", "text": "", "error": "Provider refused" }), "s", "cron");
+        assert!(refused["error"].as_str().unwrap().ends_with("(error): Provider refused"), "{refused}");
+        let bare = turn_reply(&json!({ "status": "error", "text": "" }), "s", "cron");
+        assert_eq!(bare["error"], "the turn did not complete cleanly (error)");
     }
 
     #[tokio::test]
