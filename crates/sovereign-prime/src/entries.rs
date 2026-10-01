@@ -944,7 +944,9 @@ impl EntryStore {
 
     /// Whether Prime's auto-refine runs: on unless the user turned it off.
     pub fn learning_enabled(&self) -> bool {
-        self.setting("learning.enabled").is_none_or(|v| v != "false")
+        // `SOVEREIGN_LEARNING_ENABLED=0` turns it off for a whole process (benchmark runners).
+        std::env::var("SOVEREIGN_LEARNING_ENABLED").map_or(true, |v| v != "0")
+            && self.setting("learning.enabled").is_none_or(|v| v != "false")
     }
 
     /// Record how many assistant messages `session` has produced since its last review and say
