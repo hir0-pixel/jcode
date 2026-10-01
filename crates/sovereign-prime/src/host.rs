@@ -428,14 +428,44 @@ fn sandbox_profile(
     skills: &Path,
 ) -> String {
     format!(
-        "(version 1)\n(deny default)\n(import \"system.sb\")\n(deny network*)\n(deny file-write*)\n(deny file-read* (subpath \"/etc\"))\n(deny file-read* (subpath \"/private/etc\"))\n(deny file-read* (subpath \"/Volumes\"))\n(allow process-exec (literal \"{}\"))\n(allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/Library/Developer/CommandLineTools\"))\n(allow file-write* (subpath \"{}\") (subpath \"{}\"))\n",
+        "(version 1)\n(deny default)\n(import \"system.sb\")\n(deny network*)\n(deny file-write*)\n(allow file-read-metadata)\n(deny file-read* (subpath \"/etc\"))\n(deny file-read* (subpath \"/private/etc\"))\n(deny file-read* (subpath \"/Volumes\"))\n(allow process-exec (literal \"{}\") (subpath \"{}\"))\n(allow file-read* (subpath \"{}\") (subpath \"{}\") (subpath \"{}\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/Library/Developer/CommandLineTools\"))\n(allow file-write* (subpath \"{}\") (subpath \"{}\"))\n",
         sbpl_path(python),
+        sbpl_path(runtime),
         sbpl_path(runtime),
         sbpl_path(project),
         sbpl_path(skills),
         sbpl_path(project),
         sbpl_path(temp)
     )
+}
+
+/// Stdlib-only fallback interpreter when Hermes's is not staged: the first
+/// `python3` on PATH. Only where the macOS sandbox exists, and never the
+/// `/usr/bin/python3` Xcode shim (it can open an installer dialog and cannot
+/// be exec'd inside the sandbox), so a missing interpreter just means no tool.
+pub fn system_python() -> Option<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
+    return None;
+    #[cfg(target_os = "macos")]
+    {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        let found = std::env::split_paths(&path)
+            .map(|dir| dir.join("python3"))
+            .find(|p| p.is_file())?;
+        if found == Path::new("/usr/bin/python3") {
+            return [
+                "/Library/Developer/CommandLineTools/usr/bin/python3",
+                "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/Current/bin/python3",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file());
+        }
+        Some(found)
+    }
 }
 
 fn python_runtime_root(python: &Path) -> Result<PathBuf> {
@@ -572,4 +602,27 @@ pub async fn load(workdir: Option<&Path>, path: &str) -> Result<String> {
     }
     let bytes = tokio::fs::read(&resolved).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod system_python_tests {
+    use super::system_python;
+
+    #[test]
+    fn finds_python3_on_path_and_none_when_absent() {
+        let dir = std::env::temp_dir().join(format!("fake-py-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("python3"), "").unwrap();
+        let saved = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", &dir) };
+        let found = system_python();
+        unsafe { std::env::set_var("PATH", dir.join("nothing")) };
+        let missing = system_python();
+        match saved {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        assert_eq!(found, Some(dir.join("python3")));
+        assert_eq!(missing, None);
+    }
 }

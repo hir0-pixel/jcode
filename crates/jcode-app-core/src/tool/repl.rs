@@ -108,10 +108,21 @@ pub async fn stop_session(session_id: &str) {
 }
 
 impl ReplTool {
-    /// `None` when Hermes's bundled interpreter is unavailable.
+    /// `None` when the REPL is off or no interpreter is available: Hermes's
+    /// bundled one, else (macOS sandbox only) the system `python3`.
     pub fn from_env() -> Option<Self> {
         let host = HOST.get_or_init(|| {
-            let python = std::env::var_os("SOVEREIGN_HERMES_PYTHON").map(PathBuf::from)?;
+            let python = match std::env::var_os("SOVEREIGN_HERMES_PYTHON") {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    let enabled = std::env::var("JCODE_REPL").map_or(true, |v| v != "0")
+                        && crate::config::config().agents.repl;
+                    if !enabled {
+                        return None;
+                    }
+                    sovereign_prime::host::system_python()?
+                }
+            };
             python
                 .is_file()
                 .then(|| sovereign_prime::ReplHost::new(python))

@@ -26,6 +26,7 @@ pub(crate) const DEFERRED: &[(&str, &str)] = &[
     ("memory", "save and recall persistent memories"),
     ("open", "open or reveal a file or URL for the user"),
     ("refine", "keep a durable user preference or correction for future sessions"),
+    ("repl", "Python for big inputs: load, slice, count, llm_query_batch"),
     ("replace", "literal or regex replace across many files, all or none"),
     ("session_goal", "set, track, complete the unattended session goal"),
     ("session_search", "search past chat sessions"),

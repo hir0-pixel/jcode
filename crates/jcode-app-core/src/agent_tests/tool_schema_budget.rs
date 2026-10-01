@@ -107,3 +107,17 @@ async fn explicit_allowlist_is_never_deferred() {
     let defs = agent.tool_definitions().await;
     assert_eq!(names(&defs), ["read", "todo"]);
 }
+
+#[tokio::test]
+async fn repl_is_deferred_until_loaded() {
+    let _guard = crate::storage::lock_test_env();
+    let mut agent = sovereign_agent().await;
+    assert!(!names(&agent.tool_definitions().await).contains(&"repl"));
+    let out = agent
+        .execute_tool("load_tools", serde_json::json!({"names": ["repl"]}))
+        .await
+        .unwrap();
+    assert!(out.output.contains("Loaded: repl."), "{}", out.output);
+    model_calls(&mut agent, "load_tools", serde_json::json!({"names": ["repl"]}));
+    assert!(names(&agent.tool_definitions().await).contains(&"repl"));
+}

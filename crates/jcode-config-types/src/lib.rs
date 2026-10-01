@@ -659,6 +659,14 @@ pub struct AgentsConfig {
     /// session's first user message. Env: `JCODE_ENV_SNAPSHOT=0` disables.
     #[serde(default = "default_verify_on_stop")]
     pub environment_snapshot: bool,
+    /// Offer the deferred `repl` tool (Python in a sandbox; uses Hermes's
+    /// interpreter or the system `python3`). Env: `JCODE_REPL=0` disables.
+    #[serde(default = "default_verify_on_stop")]
+    pub repl: bool,
+    /// Optional model for `llm_query` / `llm_query_batch` sub-calls
+    /// (default: the active model).
+    #[serde(default)]
+    pub repl_sub_model: Option<String>,
 }
 
 fn default_auto_verify_timeout_s() -> u64 {
@@ -713,6 +721,8 @@ impl Default for AgentsConfig {
             auto_verify_timeout_s: default_auto_verify_timeout_s(),
             auto_verify_rounds: default_auto_verify_rounds(),
             environment_snapshot: default_verify_on_stop(),
+            repl: default_verify_on_stop(),
+            repl_sub_model: None,
         }
     }
 }
