@@ -14,6 +14,10 @@ Requesting input from user is a blocking action. Use this sparsely.
 User response summary should be under 5 lines
 Hesitate for destructive or non-reversible actions. Examples: Completing a payment, deleting a database, sending an email.
 
+## Recursive REPL
+
+When the `repl` tool is available (load it with `load_tools`), keep large inputs in persistent Python variables: `load(path, start, length)` reads a slice, `llm_query(prompt)` asks a sub-model, `llm_query_batch(prompts)` runs up to 64 at once. Print only what you need.
+
 ## Coding
 
 Commit as you go.
