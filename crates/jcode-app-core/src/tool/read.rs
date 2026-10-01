@@ -46,16 +46,6 @@ struct NormalizedReadRange {
     style: ReadRangeStyle,
 }
 
-impl NormalizedReadRange {
-    fn next_offset(self) -> usize {
-        self.offset + self.limit
-    }
-
-    fn next_start_line(self) -> usize {
-        self.next_offset() + 1
-    }
-}
-
 fn normalize_read_range(params: &ReadInput) -> Result<NormalizedReadRange> {
     let has_start_end = params.start_line.is_some() || params.end_line.is_some();
     let has_mixed_offset = match (params.start_line, params.end_line, params.offset) {
@@ -123,7 +113,7 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file. Supports text files, image files, and PDFs."
+        "Read a file. Supports text, image, PDF, xlsx/docx/pptx."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -179,8 +169,10 @@ impl Tool for ReadTool {
             return handle_pdf_file(&path, &params.file_path);
         }
 
+        let office = super::office_text::is_office_file(&path);
+
         // Check for binary files
-        if is_binary_file(&path) {
+        if !office && is_binary_file(&path) {
             return Ok(ToolOutput::new(format!(
                 "Binary file detected: {}\nUse appropriate tools to handle binary files.",
                 params.file_path
@@ -188,7 +180,13 @@ impl Tool for ReadTool {
         }
 
         // Read file
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = if office {
+            super::office_text::extract(&path)?
+        } else {
+            tokio::fs::read_to_string(&path).await?
+        };
+        let char_cap = if office { 12_000 } else { usize::MAX };
+        let mut capped_at: Option<usize> = None;
 
         // Single-pass: count lines while building output
         let mut output = String::with_capacity(range.limit.min(2000) * 80);
@@ -202,8 +200,12 @@ impl Tool for ReadTool {
                 if i < range.offset {
                     continue;
                 }
-                if i >= end_exclusive {
+                if i >= end_exclusive || capped_at.is_some() {
                     // Still need to count remaining lines
+                    continue;
+                }
+                if output.len() >= char_cap {
+                    capped_at = Some(i);
                     continue;
                 }
                 let line_num = i + 1;
@@ -221,7 +223,7 @@ impl Tool for ReadTool {
             }
         }
 
-        let end = end_exclusive.min(total_lines);
+        let end = capped_at.unwrap_or_else(|| end_exclusive.min(total_lines));
 
         // Publish file touch event for swarm coordination
         Bus::global().publish(BusEvent::FileTouch(FileTouch {
@@ -254,8 +256,8 @@ impl Tool for ReadTool {
         // Add metadata
         if end < total_lines {
             let continuation_hint = match range.style {
-                ReadRangeStyle::OffsetLimit => format!("offset={}", range.next_offset()),
-                ReadRangeStyle::StartEnd => format!("start_line={}", range.next_start_line()),
+                ReadRangeStyle::OffsetLimit => format!("offset={end}"),
+                ReadRangeStyle::StartEnd => format!("start_line={}", end + 1),
             };
             output.push_str(&format!(
                 "\n... {} more lines (use {} to continue)\n",

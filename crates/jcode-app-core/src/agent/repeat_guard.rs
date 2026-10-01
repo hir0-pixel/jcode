@@ -19,6 +19,7 @@ use std::hash::{Hash, Hasher};
 pub(super) const WARN_AFTER: u32 = 3;
 pub(super) const BLOCK_AFTER: u32 = 5;
 pub(super) const STOP_AFTER: u32 = 10;
+pub(super) const SEARCH_STALL_AFTER: u32 = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GuardVerdict {
@@ -40,6 +41,8 @@ pub(super) struct RepeatGuard {
     last_tool: String,
     blocked: u32,
     pending_reminder: Option<String>,
+    searches_since_fetch: u32,
+    stall_nudged: bool,
 }
 
 fn hash_of(parts: &[&str]) -> u64 {
@@ -127,6 +130,7 @@ impl RepeatGuard {
             self.fail_count = 0;
             return GuardVerdict::Ok;
         }
+        self.track_search_stall(tool, result, is_error);
         self.last_input_sig = hash_of(&[tool, &input.to_string()]);
         self.last_tool = tool.to_string();
         let sig = hash_of(&[tool, &input.to_string(), result]);
@@ -159,6 +163,30 @@ impl RepeatGuard {
             GuardVerdict::Warn { tool: tool.to_string(), count }
         } else {
             GuardVerdict::Ok
+        }
+    }
+
+    /// Nudge once per turn after SEARCH_STALL_AFTER websearch calls with no
+    /// successful webfetch after them. Never blocks.
+    fn track_search_stall(&mut self, tool: &str, result: &str, is_error: bool) {
+        match tool {
+            "websearch" => self.searches_since_fetch += 1,
+            "webfetch" if !is_error && result.trim().len() >= 200 => self.searches_since_fetch = 0,
+            _ => return,
+        }
+        if self.searches_since_fetch >= SEARCH_STALL_AFTER && !self.stall_nudged {
+            self.stall_nudged = true;
+            let r = "<system-reminder>Several searches did not lead to a fetched source. Pick the most promising result and fetch it, or reformulate with different keywords; stop searching the same thing.</system-reminder>";
+            match &mut self.pending_reminder {
+                Some(p) => p.push_str(r),
+                None => self.pending_reminder = Some(r.to_string()),
+            }
+            jcode_base::obs_sink::emit(
+                jcode_base::obs_sink::Span::new("loop.guard")
+                    .attr("action", "nudge")
+                    .attr("reason", "search_stall")
+                    .attr("count", self.searches_since_fetch),
+            );
         }
     }
 
@@ -285,5 +313,37 @@ mod tests {
         for _ in 0..9 {
             assert_eq!(g.observe("bg", &json!({}), "running", false), GuardVerdict::Ok);
         }
+    }
+
+    #[test]
+    fn search_stall_nudges_once_after_five_searches_without_fetch() {
+        let mut g = RepeatGuard::default();
+        for i in 0..4 {
+            g.observe("websearch", &json!({"q": i}), "results", false);
+        }
+        assert!(g.take_reminder().is_none());
+        g.observe("websearch", &json!({"q": 4}), "results", false);
+        assert!(g.take_reminder().unwrap().contains("did not lead to a fetched source"));
+        for i in 5..12 {
+            g.observe("websearch", &json!({"q": i}), "results", false);
+        }
+        assert!(g.take_reminder().is_none());
+    }
+
+    #[test]
+    fn successful_fetch_resets_search_stall() {
+        let mut g = RepeatGuard::default();
+        for i in 0..4 {
+            g.observe("websearch", &json!({"q": i}), "r", false);
+        }
+        g.observe("webfetch", &json!({"u": 1}), &"page text ".repeat(40), false);
+        for i in 4..8 {
+            g.observe("websearch", &json!({"q": i}), "r", false);
+        }
+        assert!(g.take_reminder().is_none());
+        // a failed fetch does not count
+        g.observe("webfetch", &json!({"u": 2}), "Error: 403", true);
+        g.observe("websearch", &json!({"q": 9}), "r", false);
+        assert!(g.take_reminder().is_some());
     }
 }
