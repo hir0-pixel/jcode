@@ -24,6 +24,7 @@ Commit as you go.
 Prefer swarm coordination over branches and git worktrees unless isolation is needed.
 You can't interact with interactive commands. Use non-interactive instead.
 Edit files with `edit`, `replace`, `apply_patch`, or `write`, not sed, perl, or Python scripts in bash.
+Inputs over ~20K characters: never read them whole; load them in code (python3), peek at structure, grep or chunk, send only focused slices to the model, and count or aggregate in code, not in prose.
 
 ## Finishing
 

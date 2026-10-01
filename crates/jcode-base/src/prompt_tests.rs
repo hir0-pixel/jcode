@@ -776,3 +776,12 @@ fn skills_section_is_lazy_summary_not_full_bodies_with_20_skills() {
     // Full body text must never leak into the static section.
     assert!(!lazy_section.contains("Full instructions body"));
 }
+
+#[test]
+fn prompt_tells_model_to_process_large_inputs_in_code() {
+    let line = DEFAULT_SYSTEM_PROMPT
+        .lines()
+        .find(|l| l.starts_with("Inputs over ~20K characters"))
+        .expect("large-input rule present");
+    assert!(line.len() <= 220, "rule must stay short: {}", line.len());
+}
