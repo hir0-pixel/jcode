@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const SNIPPET_CHARS: usize = 200;
+
 /// Web search using DuckDuckGo or Bing (HTML scraping, with optional Bing API)
 pub struct WebSearchTool {
     client: reqwest::Client,
@@ -82,7 +84,9 @@ impl Tool for WebSearchTool {
 
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
         let params: WebSearchInput = serde_json::from_value(input)?;
-        let num_results = params.num_results.unwrap_or(8).min(20);
+        let num_results = params.num_results.unwrap_or(5).min(20);
+        // Over-fetch so per-host dedupe still leaves num_results.
+        let fetch_n = (num_results * 2).min(20);
 
         let config = crate::config::config();
         let mut engines = Vec::new();
@@ -102,7 +106,7 @@ impl Tool for WebSearchTool {
                 .search_with_engine(
                     engine,
                     &params.query,
-                    num_results,
+                    fetch_n,
                     BingSearchOptions {
                         market,
                         configured_api_key: config.websearch.bing_api_key.as_deref(),
@@ -122,11 +126,19 @@ impl Tool for WebSearchTool {
             }
         }
 
+        if results.is_empty() {
+            // Last resort: Wikipedia opensearch (never blocked, titles only).
+            if let Ok(found) = self.search_wikipedia(&params.query, num_results).await {
+                results = found;
+            }
+        }
+
         if results.is_empty()
             && let Some(err) = last_error
         {
             return Err(err);
         }
+        let results = tidy_results(results, num_results);
 
         if results.is_empty() {
             return Ok(ToolOutput::new(format!(
@@ -157,7 +169,40 @@ impl Tool for WebSearchTool {
     }
 }
 
+/// Keep at most 2 results per host, trim snippets, cap the count.
+fn tidy_results(results: Vec<SearchResult>, max: usize) -> Vec<SearchResult> {
+    let mut per_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    results
+        .into_iter()
+        .filter(|r| {
+            let host = reqwest::Url::parse(&r.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| r.url.clone());
+            let n = per_host.entry(host).or_default();
+            *n += 1;
+            *n <= 2
+        })
+        .take(max)
+        .map(|mut r| {
+            if r.snippet.chars().count() > SNIPPET_CHARS {
+                r.snippet = r.snippet.chars().take(SNIPPET_CHARS).collect::<String>() + "...";
+            }
+            r
+        })
+        .collect()
+}
+
 impl WebSearchTool {
+    async fn search_wikipedia(&self, query: &str, n: usize) -> Result<Vec<SearchResult>> {
+        let url = format!(
+            "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&limit={n}&search={}",
+            urlencoding::encode(query)
+        );
+        let v: Value = self.client.get(url).send().await?.json().await?;
+        Ok(parse_wikipedia_opensearch(&v))
+    }
+
     async fn search_with_engine(
         &self,
         engine: WebSearchEngine,
@@ -385,6 +430,24 @@ impl WebSearchTool {
 
 /// Map a parsed SearXNG JSON response to `SearchResult`s, dropping entries with
 /// empty URLs and capping to `num_results`.
+/// opensearch returns `[query, [titles], [descriptions], [urls]]`.
+fn parse_wikipedia_opensearch(v: &Value) -> Vec<SearchResult> {
+    let col = |i: usize| v.get(i).and_then(Value::as_array).cloned().unwrap_or_default();
+    let (titles, descs, urls) = (col(1), col(2), col(3));
+    titles
+        .iter()
+        .zip(urls.iter())
+        .enumerate()
+        .filter_map(|(i, (t, u))| {
+            Some(SearchResult {
+                title: t.as_str()?.to_string(),
+                url: u.as_str()?.to_string(),
+                snippet: descs.get(i).and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
 fn parse_searxng_results(response: SearxngResponse, num_results: usize) -> Vec<SearchResult> {
     response
         .results
@@ -646,6 +709,32 @@ fn html_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tidy_dedupes_hosts_trims_snippets_and_caps() {
+        let r = |u: &str, s: &str| SearchResult { title: "t".into(), url: u.into(), snippet: s.into() };
+        let long = "x".repeat(500);
+        let out = tidy_results(
+            vec![
+                r("https://a.com/1", &long),
+                r("https://a.com/2", "b"),
+                r("https://a.com/3", "c"),
+                r("https://b.com/1", "d"),
+                r("https://c.com/1", "e"),
+            ],
+            3,
+        );
+        let urls: Vec<_> = out.iter().map(|x| x.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.com/1", "https://a.com/2", "https://b.com/1"]);
+        assert_eq!(out[0].snippet.chars().count(), SNIPPET_CHARS + 3);
+    }
+
+    #[test]
+    fn parses_wikipedia_opensearch() {
+        let v = json!(["q", ["Rust"], ["A language"], ["https://en.wikipedia.org/wiki/Rust"]]);
+        let r = parse_wikipedia_opensearch(&v);
+        assert_eq!((r[0].title.as_str(), r[0].snippet.as_str()), ("Rust", "A language"));
+    }
 
     #[test]
     fn parses_bing_html_results() {
