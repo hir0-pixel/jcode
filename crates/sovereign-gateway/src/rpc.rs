@@ -2944,6 +2944,10 @@ pub(crate) async fn agent_run(
         if opts.surface == "cron" {
             jcode_base::background::global().cancel_session(&session_id).await;
         }
+        // A one-shot run has no chat to resume, so its Python REPL worker would outlive it.
+        if session_key.is_none() {
+            jcode_app_core::tool::stop_repl_session(&session_id).await;
+        }
         // The turn is over and its transcript is the record: free its buffered live events.
         conn.observer.release_replay(&session_id);
         // Only now is the session guaranteed persisted (jcode does not write a
