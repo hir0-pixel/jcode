@@ -213,18 +213,14 @@ impl super::Agent {
             && !self.in_goal_or_autonomous();
         n.headless = jcode_base::headless::is(&self.session.id);
         if self.session.parent_id.is_none() && !self.in_goal_or_autonomous() {
-            n.format_label = self
-                .session
-                .messages
-                .iter()
-                .find(|m| m.role == jcode_message_types::Role::User)
-                .and_then(|m| {
-                    m.content.iter().find_map(|b| match b {
-                        jcode_message_types::ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                })
-                .and_then(required_label);
+            n.format_label = first_task_text(
+                self.session
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == jcode_message_types::Role::User)
+                    .map(|m| m.content.as_slice()),
+            )
+            .and_then(required_label);
         }
         if n.gate_ok {
             n.baseline = super::auto_verify::git_changed(cwd.as_deref().unwrap());
@@ -410,6 +406,19 @@ fn real_runner(cmd: &str, dir: &std::path::Path, t: std::time::Duration) -> sove
     }
 }
 
+/// Text of the first user message that is the task itself: headless runs put a
+/// `<system-reminder>` session-context message first, which carries no task.
+fn first_task_text<'a>(user_messages: impl Iterator<Item = &'a [jcode_message_types::ContentBlock]>) -> Option<&'a str> {
+    user_messages
+        .filter_map(|blocks| {
+            blocks.iter().find_map(|b| match b {
+                jcode_message_types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .find(|t| !t.trim_start().starts_with("<system-reminder>"))
+}
+
 /// Literal uppercase label (e.g. `FINAL ANSWER:`) the task says the reply must
 /// end with / contain / start with: quoted, or the first unquoted label after a
 /// `[`/`<` placeholder, within a short window after a formatting verb.
@@ -472,6 +481,17 @@ mod tests {
         assert_eq!(l("Respond in this format: \"FINAL ANSWER: x\""), want);
         assert_eq!(l("Fix the bug in parse(); NOTE: tests are slow."), None);
         assert_eq!(l("Write a poem. Format: 'haiku' only."), None);
+    }
+
+    #[test]
+    fn task_text_skips_leading_session_context_reminder() {
+        use jcode_message_types::Message;
+        let msgs = [
+            Message::user("<system-reminder>\n# Session Context\nDate: x\n</system-reminder>"),
+            Message::user("Finish your answer with: FINAL ANSWER: [YOUR ANSWER]"),
+        ];
+        let task = first_task_text(msgs.iter().map(|m| m.content.as_slice()));
+        assert_eq!(task.and_then(required_label), Some("FINAL ANSWER:".to_string()));
     }
 
     #[test]
