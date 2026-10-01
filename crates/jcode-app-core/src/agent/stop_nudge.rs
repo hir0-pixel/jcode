@@ -63,6 +63,8 @@ pub(super) struct StopNudge {
     last_write: u32,
     last_check: u32,
     last_check_exit: i64,
+    // Literal labelled line the task demands in the final reply (e.g. `FINAL ANSWER:`).
+    format_label: Option<String>,
 }
 
 fn enabled() -> bool {
@@ -210,6 +212,20 @@ impl super::Agent {
             && cwd.as_deref().is_some_and(|d| d.is_dir() && !is_home(d))
             && !self.in_goal_or_autonomous();
         n.headless = jcode_base::headless::is(&self.session.id);
+        if self.session.parent_id.is_none() && !self.in_goal_or_autonomous() {
+            n.format_label = self
+                .session
+                .messages
+                .iter()
+                .find(|m| m.role == jcode_message_types::Role::User)
+                .and_then(|m| {
+                    m.content.iter().find_map(|b| match b {
+                        jcode_message_types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                })
+                .and_then(required_label);
+        }
         if n.gate_ok {
             n.baseline = super::auto_verify::git_changed(cwd.as_deref().unwrap());
             n.cwd = cwd;
@@ -353,6 +369,7 @@ impl StopNudge {
             return false;
         }
         let lower = text.to_ascii_lowercase();
+        let format_nudge;
         let (nudge, reason) = if self.edited && self.last_test <= self.last_edit && !self.gate_ran {
             (VERIFY_NUDGE, "verify_nudge")
         } else if !self.gate_ran && self.last_check > self.last_write && self.last_check_exit != 0 {
@@ -361,6 +378,10 @@ impl StopNudge {
             (ACTION_NUDGE, "action_nudge")
         } else if self.headless && !self.edited && asks_or_offers(&lower) {
             (QUESTION_NUDGE, "question_nudge")
+        } else if let Some(l) = self.format_label.as_deref().filter(|l| !has_label_line(text, l) && !text.trim().is_empty()) {
+            format_nudge = format!("<system-reminder>Your reply must end with the required line `{l} <value>` exactly as specified in the task (a single value unless the task asks for a list). Restate your final result in that format now.</system-reminder>");
+            self.format_label = None; // one format nudge per turn
+            (format_nudge.as_str(), "format_nudge")
         } else {
             return false;
         };
@@ -389,6 +410,32 @@ fn real_runner(cmd: &str, dir: &std::path::Path, t: std::time::Duration) -> sove
     }
 }
 
+/// Literal uppercase label (e.g. `FINAL ANSWER:`) the task says the reply must
+/// end with / contain / start with: quoted, or the first unquoted label after a
+/// `[`/`<` placeholder, within a short window after a formatting verb.
+fn required_label(task: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r#"(["'`\u{2018}\u{201C}])?\b([A-Z]{2,}(?: [A-Z]{2,}){0,3}:)(\s*[\[<])?"#).unwrap());
+    const VERBS: [&str; 10] = ["end", "finish", "conclude", "finali", "report", "respond", "reply", "answer", "template", "format"];
+    for c in re.captures_iter(task) {
+        let m = c.get(2)?;
+        if c.get(1).is_none() && c.get(3).is_none() {
+            continue;
+        }
+        let start = task[..m.start()].char_indices().rev().nth(120).map_or(0, |(i, _)| i);
+        let before = task[start..m.start()].to_ascii_lowercase();
+        if VERBS.iter().any(|v| before.contains(v)) {
+            return Some(m.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// Some line of the reply starts with the label (markdown emphasis ignored).
+fn has_label_line(text: &str, label: &str) -> bool {
+    text.lines().any(|l| l.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '`' | '_' | '#' | '>' | '-')).starts_with(label))
+}
+
 /// The final paragraph asks the user something or offers to do the work.
 fn asks_or_offers(lower: &str) -> bool {
     let body = lower.trim_end();
@@ -414,6 +461,33 @@ fn announces_action(lower: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn label_detected_from_phrasings() {
+        let l = |t: &str| required_label(t);
+        let want = Some("FINAL ANSWER:".to_string());
+        assert_eq!(l("Report your answer. Finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]"), want);
+        assert_eq!(l("Please answer with 'FINAL ANSWER: ...' at the end."), want);
+        assert_eq!(l("Conclude your reply with `FINAL ANSWER: <value>`."), want);
+        assert_eq!(l("Respond in this format: \"FINAL ANSWER: x\""), want);
+        assert_eq!(l("Fix the bug in parse(); NOTE: tests are slow."), None);
+        assert_eq!(l("Write a poem. Format: 'haiku' only."), None);
+    }
+
+    #[test]
+    fn format_nudge_once_and_only_when_missing() {
+        let task = "Finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]";
+        let mk = || StopNudge { format_label: required_label(task), ..Default::default() };
+        let mut n = mk();
+        assert!(n.on_text_only_stop("s", "It is 42."));
+        assert!(n.take_pending().unwrap().contains("`FINAL ANSWER: <value>`"));
+        n.observe("bash", &json!({"command": "ls"}), 0);
+        assert!(!n.on_text_only_stop("s", "Still 42."), "format nudge fires once");
+        let mut n = mk();
+        assert!(!n.on_text_only_stop("s", "Reasoning.\n\n**FINAL ANSWER: 42**"));
+        let mut n = StopNudge::default();
+        assert!(!n.on_text_only_stop("s", "It is 42."));
+    }
 
     #[test]
     fn failure_hash_ignores_timings() {
