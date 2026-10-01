@@ -335,7 +335,7 @@ fn dump_outputs() {
         } else {
             page.html.clone()
         };
-        let (capped, _) = super::truncate_output(md.clone());
+        let (capped, _) = super::window(&md);
         std::fs::write(format!("{out_dir}/{}.uncapped", page.name), &md).unwrap();
         std::fs::write(format!("{out_dir}/{}.capped", page.name), &capped).unwrap();
     }

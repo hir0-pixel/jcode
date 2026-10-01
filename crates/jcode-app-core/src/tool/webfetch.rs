@@ -1,15 +1,21 @@
 use super::{Tool, ToolContext, ToolOutput};
+use super::webfetch_net::{fetch_resilient, wikipedia_raw_url};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::time::Duration;
 
+/// Text pages are cut to this many bytes before conversion.
 const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
-/// Cap on the text handed back to the model. Full pages routinely exceed 150 KB
-/// (~40k tokens) which is rarely worth the context budget.
-const MAX_OUTPUT_CHARS: usize = 40_000;
+/// Default window handed to the model: head + tail of long pages. The full text
+/// is spilled to a file so `find`/`offset`/`grep`/`read` can reach the rest.
+const HEAD_CHARS: usize = 8_000;
+const TAIL_CHARS: usize = 4_000;
+const WINDOW_CHARS: usize = HEAD_CHARS + TAIL_CHARS;
+const FIND_MATCHES: usize = 5;
+const FIND_WINDOW: usize = 600;
 /// Links whose target exceeds this length are rendered as their anchor text
 /// only. Long URLs are typically encoded payloads (pre-filled editors, tracking
 /// parameters, data URIs) whose cost far exceeds their navigational value.
@@ -36,6 +42,10 @@ struct WebFetchInput {
     format: Option<String>,
     #[serde(default)]
     timeout: Option<u64>,
+    #[serde(default)]
+    find: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[async_trait]
@@ -66,6 +76,14 @@ impl Tool for WebFetchTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in seconds."
+                },
+                "find": {
+                    "type": "string",
+                    "description": "Regex; show matches."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Char offset."
                 }
             }
         })
@@ -74,125 +92,215 @@ impl Tool for WebFetchTool {
     async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
         let params: WebFetchInput = serde_json::from_value(input)?;
 
-        // Validate URL
         if !params.url.starts_with("http://") && !params.url.starts_with("https://") {
             return Err(anyhow::anyhow!("URL must start with http:// or https://"));
         }
 
-        let timeout = params.timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
+        let timeout = Duration::from_secs(params.timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT));
         let format = params.format.as_deref().unwrap_or("markdown");
 
-        let response = self
-            .client
-            .get(&params.url)
-            .header(
-                reqwest::header::USER_AGENT,
-                "Mozilla/5.0 (compatible; JCode/1.0)",
-            )
-            .timeout(Duration::from_secs(timeout))
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("HTTP error: {}", status));
+        // Wikipedia articles: the plain wikitext is smaller and cleaner than the HTML.
+        let wiki = if format == "html" { None } else { wikipedia_raw_url(&params.url) };
+        let mut fetched = None;
+        if let Some(raw) = wiki {
+            fetched = fetch_resilient(&self.client, &raw, timeout).await.ok();
         }
-
-        // Check content length
-        if let Some(len) = response.content_length()
-            && len as usize > MAX_SIZE
-        {
-            return Err(anyhow::anyhow!(
-                "Response too large: {} bytes (max {} bytes)",
-                len,
-                MAX_SIZE
-            ));
-        }
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let mut body_bytes = Vec::new();
-        let mut truncated = false;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let remaining = MAX_SIZE.saturating_sub(body_bytes.len());
-            if chunk.len() > remaining {
-                body_bytes.extend_from_slice(&chunk[..remaining]);
-                truncated = true;
-                break;
-            }
-            body_bytes.extend_from_slice(&chunk);
-        }
-
-        let mut body = String::from_utf8_lossy(&body_bytes).into_owned();
-        if truncated {
-            body.push_str(&format!(
-                "...\n\n(truncated, showing first {} bytes)",
-                MAX_SIZE
-            ));
-        }
-
-        // Format output
-        let output = match format {
-            "html" => body,
-            "text" => html_to_text(&body),
-            "markdown" => {
-                if content_type.contains("text/html") {
-                    html_to_markdown(&body)
-                } else {
-                    body
-                }
-            }
-            _ => {
-                if content_type.contains("text/html") {
-                    html_to_markdown(&body)
-                } else {
-                    body
-                }
-            }
+        let (fetched, archived) = match fetched {
+            Some(f) => f,
+            None => fetch_resilient(&self.client, &params.url, timeout)
+                .await
+                .map_err(|e| anyhow::anyhow!("{} fetching {}", e.msg, params.url))?,
         };
 
-        let full_len = output.len();
-        let (output, output_truncated) = truncate_output(output);
+        let mut notes = Vec::new();
+        if archived {
+            notes.push("original unavailable; archived copy (Wayback) used".to_string());
+        }
+        let ct = fetched.content_type.to_ascii_lowercase();
+        let bytes = fetched.bytes;
+        let hash = content_hash(&bytes);
 
-        let note = if output_truncated {
-            format!(
-                "\n\n(output truncated to {MAX_OUTPUT_CHARS} of {full_len} chars; \
-                 fetch a more specific URL or anchor for the rest)"
-            )
+        let text = if ct.contains("pdf") || bytes.starts_with(b"%PDF") {
+            match pdf_text(&bytes, &hash).await {
+                Ok(t) => t,
+                Err(msg) => return Ok(ToolOutput::new(format!("Fetched {} (PDF, {} bytes): {msg}", params.url, bytes.len()))),
+            }
+        } else if let Some(ext) = binary_ext(&ct, &bytes) {
+            let msg = match save_scratch(&bytes, &format!("webfetch-{hash}.{ext}")) {
+                Some(p) => format!("saved to {}; use read for documents or python to parse", p.display()),
+                None => "could not save to scratch dir".to_string(),
+            };
+            return Ok(ToolOutput::new(format!(
+                "Fetched {} ({ct}, {} bytes): {msg}",
+                params.url,
+                bytes.len()
+            )));
         } else {
-            String::new()
+            let mut bytes = bytes;
+            bytes.truncate(MAX_SIZE);
+            let body = String::from_utf8_lossy(&bytes).into_owned();
+            let is_html = ct.contains("html") || ct.is_empty() && body.trim_start().starts_with('<');
+            match format {
+                "html" => body,
+                "text" if is_html => html_to_text(&body),
+                "text" => body,
+                _ if is_html => html_to_markdown(&body),
+                _ => body,
+            }
         };
 
-        Ok(ToolOutput::new(format!(
-            "Fetched {} ({} bytes)\n\n{}{}",
-            params.url, full_len, output, note
-        )))
+        let total = text.chars().count();
+        let spill = (total > WINDOW_CHARS)
+            .then(|| save_scratch(text.as_bytes(), &format!("webfetch-{}.txt", content_hash(text.as_bytes()))))
+            .flatten();
+        let path_note = spill.map(|p| format!("; full text at {}", p.display())).unwrap_or_default();
+
+        let body = if let Some(pat) = params.find.as_deref().filter(|p| !p.is_empty()) {
+            let (hits, n) = find_windows(&text, pat);
+            notes.push(format!("{n} match(es) for {pat:?} in {total} chars{path_note}"));
+            hits
+        } else if let Some(off) = params.offset {
+            let (w, next) = offset_window(&text, off);
+            let more = next.map(|n| format!("; next offset={n}")).unwrap_or_default();
+            notes.push(format!("chars {off}..{} of {total}{more}{path_note}", off + w.chars().count()));
+            w
+        } else {
+            let (w, cut) = window(&text);
+            if cut {
+                notes.push(format!(
+                    "showing head {HEAD_CHARS} + tail {TAIL_CHARS} of {total} chars{path_note}; use find or offset"
+                ));
+            }
+            w
+        };
+
+        let note = if notes.is_empty() { String::new() } else { format!("\n({})", notes.join("; ")) };
+        Ok(ToolOutput::new(format!("Fetched {} ({total} chars){note}\n\n{body}", params.url)))
     }
 }
 
-/// Truncate at a char boundary, preferring to cut at the last newline so the tail
-/// is not a half-formed line.
-fn truncate_output(output: String) -> (String, bool) {
-    if output.len() <= MAX_OUTPUT_CHARS {
-        return (output, false);
+fn content_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Same scratch dir the bash tool uses (`JCODE_SCRATCH_DIR`, else `<jcode>/scratch`).
+fn scratch_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("JCODE_SCRATCH_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| crate::storage::jcode_dir().ok().map(|d| d.join("scratch")))?;
+    crate::storage::ensure_dir(&dir).ok()?;
+    Some(dir)
+}
+
+/// Write a private (0600) file under the scratch dir; same name is reused.
+fn save_scratch(bytes: &[u8], name: &str) -> Option<PathBuf> {
+    let path = scratch_dir()?.join(name);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        return Some(path);
     }
-    let mut cut = MAX_OUTPUT_CHARS;
-    while cut > 0 && !output.is_char_boundary(cut) {
-        cut -= 1;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    std::io::Write::write_all(&mut opts.open(&path).ok()?, bytes).ok()?;
+    Some(path)
+}
+
+/// File extension when the response is a non-text payload we must not decode.
+fn binary_ext(ct: &str, bytes: &[u8]) -> Option<&'static str> {
+    let by_type = [
+        ("spreadsheetml", "xlsx"),
+        ("ms-excel", "xls"),
+        ("wordprocessingml", "docx"),
+        ("msword", "doc"),
+        ("presentationml", "pptx"),
+        ("ms-powerpoint", "ppt"),
+        ("zip", "zip"),
+        ("audio/", "audio"),
+        ("video/", "video"),
+        ("image/", "img"),
+    ];
+    if let Some((_, ext)) = by_type.iter().find(|(k, _)| ct.contains(k)) {
+        return Some(ext);
     }
-    let slice = &output[..cut];
-    let cut = match slice.rfind('\n') {
-        Some(nl) if nl > MAX_OUTPUT_CHARS / 2 => nl,
-        _ => cut,
-    };
-    (output[..cut].to_string(), true)
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Some("zip");
+    }
+    (ct.contains("octet-stream") && bytes.iter().take(1024).any(|&b| b == 0)).then_some("bin")
+}
+
+#[cfg(feature = "pdf")]
+async fn pdf_text(bytes: &[u8], hash: &str) -> std::result::Result<String, String> {
+    let path = save_scratch(bytes, &format!("webfetch-{hash}.pdf")).ok_or("could not save to scratch dir")?;
+    let p = path.clone();
+    let text = tokio::task::spawn_blocking(move || jcode_pdf::extract_text(&p))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("no text extracted ({e}); saved to {}", path.display()))?;
+    let text = text.replace('\x0c', "\n\n");
+    if text.trim().is_empty() {
+        return Err(format!("no text layer (scanned?); saved to {}", path.display()));
+    }
+    Ok(text)
+}
+
+#[cfg(not(feature = "pdf"))]
+async fn pdf_text(bytes: &[u8], hash: &str) -> std::result::Result<String, String> {
+    let path = save_scratch(bytes, &format!("webfetch-{hash}.pdf"));
+    Err(format!("PDF text extraction not built in; saved to {path:?}"))
+}
+
+fn byte_at(text: &str, char_idx: usize) -> usize {
+    text.char_indices().nth(char_idx).map_or(text.len(), |(b, _)| b)
+}
+
+/// Short text whole; long text as head + tail. Bool is true when cut.
+pub(super) fn window(text: &str) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= WINDOW_CHARS {
+        return (text.to_string(), false);
+    }
+    let head = &text[..byte_at(text, HEAD_CHARS)];
+    let tail = &text[byte_at(text, total - TAIL_CHARS)..];
+    (format!("{head}\n\n[... {} chars omitted ...]\n\n{tail}", total - WINDOW_CHARS), true)
+}
+
+/// The next window at a char offset, plus the offset after it when more remains.
+fn offset_window(text: &str, offset: usize) -> (String, Option<usize>) {
+    let total = text.chars().count();
+    let start = offset.min(total);
+    let end = (start + WINDOW_CHARS).min(total);
+    let s = byte_at(text, start);
+    (text[s..byte_at(text, end)].to_string(), (end < total).then_some(end))
+}
+
+/// Up to 5 case-insensitive matches, each with ~600 chars of context and its char offset.
+fn find_windows(text: &str, pat: &str) -> (String, usize) {
+    let re = regex::Regex::new(&format!("(?i){pat}"))
+        .or_else(|_| regex::Regex::new(&format!("(?i){}", regex::escape(pat))))
+        .expect("escaped pattern compiles");
+    let mut out = String::new();
+    let (mut n, mut last_end) = (0, 0usize);
+    for m in re.find_iter(text) {
+        if m.start() < last_end {
+            continue;
+        }
+        n += 1;
+        if n > FIND_MATCHES {
+            break;
+        }
+        let ch = text[..m.start()].chars().count();
+        let from = ch.saturating_sub(FIND_WINDOW / 2);
+        let (s, e) = (byte_at(text, from), byte_at(text, from + FIND_WINDOW));
+        last_end = e;
+        out.push_str(&format!("--- match at char {ch} ---\n{}\n\n", &text[s..e]));
+    }
+    if n == 0 {
+        out.push_str("(no matches)");
+    }
+    (out, n.min(FIND_MATCHES))
 }
 
 mod html_regex {
@@ -513,27 +621,163 @@ mod tests {
         assert_eq!(text, "Visible");
     }
 
-    #[test]
-    fn caps_output_length() {
-        let long = "line of text\n".repeat(MAX_OUTPUT_CHARS);
-        let (out, truncated) = truncate_output(long);
-        assert!(truncated);
-        assert!(out.len() <= MAX_OUTPUT_CHARS);
+    // ---- network behaviour, against a local one-shot-per-connection server ----
+
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    fn http(status: &str, ct: &str, body: &[u8], extra: &str) -> Vec<u8> {
+        let mut r = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Serves `responses` in order, one per connection; returns base URL and raw requests seen.
+    fn serve(responses: Vec<Vec<u8>>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                log.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = s.write_all(&resp);
+            }
+        });
+        (url, seen)
+    }
+
+    fn tool() -> WebFetchTool {
+        WebFetchTool { client: reqwest::Client::builder().no_proxy().build().unwrap() }
+    }
+
+    async fn fetch(url: &str, extra: Value) -> String {
+        let mut input = json!({"url": url});
+        input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let ctx = ToolContext {
+            session_id: "s".into(),
+            message_id: "m".into(),
+            tool_call_id: "c".into(),
+            working_dir: None,
+            stdin_request_tx: None,
+            graceful_shutdown_signal: None,
+            execution_mode: super::super::ToolExecutionMode::AgentTurn,
+        };
+        tool().execute(input, ctx).await.unwrap().output
+    }
+
+    fn scratch() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = crate::storage::lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        crate::env::set_var("JCODE_SCRATCH_DIR", dir.path());
+        (guard, dir)
+    }
+
+    fn long_page() -> String {
+        let mut p = String::from("<html><body>");
+        for i in 0..2000 {
+            p.push_str(&format!("<p>paragraph {i:04} filler text here</p>"));
+        }
+        p.push_str("<p>the NEEDLE sits here</p></body></html>");
+        p
+    }
+
+    #[tokio::test]
+    async fn long_page_is_windowed_spilled_and_searchable() {
+        let (_g, dir) = scratch();
+        let page = long_page();
+        let (url, seen) = serve(vec![http("200 OK", "text/html", page.as_bytes(), ""); 3]);
+        let out = fetch(&url, json!({})).await;
+        assert!(out.len() < 13_500, "{}", out.len());
+        assert!(out.contains("paragraph 0000") && out.contains("NEEDLE") && out.contains("chars omitted"));
+        assert!(!out.contains("paragraph 1000"));
+        let path = out.split("full text at ").nth(1).unwrap().split(';').next().unwrap();
+        let spilled = std::fs::read_to_string(path).unwrap();
+        assert!(spilled.contains("paragraph 1000"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(path.starts_with(dir.path().to_str().unwrap()));
+
+        let found = fetch(&url, json!({"find": "paragraph 1000"})).await;
+        assert!(found.contains("--- match at char") && found.contains("paragraph 1000") && !found.contains("paragraph 0000"));
+
+        let paged = fetch(&url, json!({"offset": 12_000})).await;
+        assert!(paged.contains("chars 12000..24000") && paged.contains("next offset=24000"));
+        let ua = seen.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(ua.contains("user-agent: mozilla/5.0 (macintosh") && !ua.contains("jcode"), "{ua}");
+    }
+
+    #[tokio::test]
+    async fn retries_429_then_succeeds() {
+        let (_g, _d) = scratch();
+        let (url, seen) = serve(vec![
+            http("429 Too Many Requests", "text/plain", b"slow down", "Retry-After: 0\r\n"),
+            http("200 OK", "text/plain", b"hello world", ""),
+        ]);
+        let out = fetch(&url, json!({})).await;
+        assert!(out.contains("hello world"), "{out}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn xlsx_is_saved_not_printed() {
+        let (_g, dir) = scratch();
+        let body = b"PK\x03\x04\x00binary\xff\xfe";
+        let ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        let (url, _) = serve(vec![http("200 OK", ct, body, "")]);
+        let out = fetch(&url, json!({})).await;
+        assert!(out.contains("saved to") && out.contains(".xlsx") && !out.contains("binary"), "{out}");
+        let saved = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(std::fs::read(saved).unwrap(), body);
+    }
+
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn pdf_text_is_extracted() {
+        let (_g, _d) = scratch();
+        let stream = "BT /F1 18 Tf 20 100 Td (Hello PDF Marker) Tj ET";
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offs = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offs.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for o in offs {
+            pdf.push_str(&format!("{o:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        let (url, _) = serve(vec![http("200 OK", "application/pdf", pdf.as_bytes(), "")]);
+        let out = fetch(&url, json!({})).await;
+        assert!(out.contains("Hello PDF Marker"), "{out}");
     }
 
     #[test]
-    fn keeps_short_output_intact() {
-        let (out, truncated) = truncate_output("hello".to_string());
-        assert!(!truncated);
-        assert_eq!(out, "hello");
-    }
-
-    #[test]
-    fn truncation_respects_char_boundaries() {
-        // Multi-byte chars straddling the cut must not panic or corrupt output.
-        let long = "é".repeat(MAX_OUTPUT_CHARS);
-        let (out, truncated) = truncate_output(long);
-        assert!(truncated);
-        assert!(out.chars().all(|c| c == 'é'));
+    fn windows_handle_multibyte_and_short_text() {
+        assert_eq!(window("hi"), ("hi".to_string(), false));
+        let long = "é".repeat(WINDOW_CHARS + 50);
+        let (w, cut) = window(&long);
+        assert!(cut && w.contains("50 chars omitted"));
+        let (hits, n) = find_windows(&format!("{long} Zed"), "zed");
+        assert_eq!(n, 1);
+        assert!(hits.contains(&format!("char {}", long.chars().count() + 1)));
     }
 }

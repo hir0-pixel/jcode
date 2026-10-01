@@ -25,6 +25,7 @@ pub mod mcp;
 mod memory;
 mod open;
 mod patch;
+mod office_text;
 mod read;
 mod refine;
 mod repl;
@@ -43,6 +44,7 @@ pub(crate) mod session_search_index;
 mod skill;
 mod todo;
 mod webfetch;
+mod webfetch_net;
 mod websearch;
 mod write;
 
