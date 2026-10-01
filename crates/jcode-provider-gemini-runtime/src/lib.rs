@@ -895,12 +895,16 @@ impl Provider for GeminiProvider {
                         .filter(|msg| !msg.trim().is_empty())
                         .map(|msg| format!(": {}", msg.trim()))
                         .unwrap_or_default();
+                    jcode_base::logging::warn(&format!(
+                        "Gemini blocked the prompt ({}){}",
+                        block_reason, detail
+                    ));
                     let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "Gemini blocked the prompt ({}){}",
-                            block_reason,
-                            detail
-                        )))
+                        .send(Ok(StreamEvent::MessageEnd {
+                            stop_reason: Some(
+                                jcode_provider_core::refusal::REFUSAL_STOP_REASON.to_string(),
+                            ),
+                        }))
                         .await;
                     return;
                 }
@@ -918,12 +922,10 @@ impl Provider for GeminiProvider {
                 stop_reason = candidate
                     .finish_reason
                     .clone()
-                    .map(|reason| reason.to_lowercase());
+                    .map(|reason| reason.to_lowercase())
+                    .map(jcode_provider_core::refusal::normalize_stop_reason);
                 if candidate.content.is_none()
-                    && matches!(
-                        candidate.finish_reason.as_deref(),
-                        Some("SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "RECITATION")
-                    )
+                    && candidate.finish_reason.as_deref() == Some("RECITATION")
                 {
                     let reason = candidate.finish_reason.as_deref().unwrap_or("unknown");
                     let detail = candidate
@@ -1017,10 +1019,11 @@ impl Provider for GeminiProvider {
                         .finish_reason
                         .as_deref()
                         .map(|reason| {
-                            !matches!(
-                                reason.to_ascii_uppercase().as_str(),
-                                "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
-                            )
+                            !jcode_provider_core::refusal::is_refusal_reason(reason)
+                                && !matches!(
+                                    reason.to_ascii_uppercase().as_str(),
+                                    "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
+                                )
                         })
                         .unwrap_or(false);
                     if abnormal {

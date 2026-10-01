@@ -126,11 +126,53 @@ impl Agent {
             return false;
         };
         let reason = reason.trim().to_ascii_lowercase();
-        matches!(reason.as_str(), "refusal" | "content_filter" | "safety")
+        jcode_provider_core::refusal::is_refusal_reason(&reason)
             || reason.contains("guardrail")
             || reason.contains("policy_violation")
     }
 
+    /// Retry the SAME request once after a short jittered pause when the
+    /// provider's safety filter blocked a response with no useful output
+    /// (filters can be transient or false positives). Nothing is added to the
+    /// conversation: the request is not reworded. Returns true when the caller
+    /// should re-issue the request. Never counts against the nudge limit.
+    pub(crate) async fn maybe_retry_refusal(
+        &self,
+        stop_reason: Option<&str>,
+        visible_text_empty: bool,
+        retries: &mut u32,
+    ) -> bool {
+        if !visible_text_empty
+            || *retries >= 1
+            || !Self::is_guardrail_stop_reason(stop_reason)
+        {
+            return false;
+        }
+        *retries += 1;
+        self.emit_refusal_guard("refusal_retry", stop_reason);
+        let jitter_ms = if cfg!(test) {
+            0
+        } else {
+            500 + u64::from(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos()) % 1500)
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+        true
+    }
+
+    /// `loop.guard` span for a refusal: provider and stop code only, no text.
+    pub(crate) fn emit_refusal_guard(&self, reason: &str, stop_reason: Option<&str>) {
+        jcode_base::obs_sink::emit(
+            jcode_base::obs_sink::Span::new("loop.guard")
+                .session(&self.session.id)
+                .attr("reason", reason)
+                .attr("provider", self.provider.name())
+                .attr("stop_code", stop_reason.unwrap_or("unknown")),
+        );
+    }
+
+    #[allow(dead_code)] // superseded by the plain same-request retry above
     pub(crate) const FABLE_GUARDRAIL_RECONSIDERATION_PROMPTS: [&'static str; 3] = [
         "Reassess the user's request using its full context and likely intent rather than isolated keywords. Determine whether answering would enable a concrete harmful action. If no specific safety concern applies, answer normally. Preserve the refusal only when it is genuinely warranted, and briefly identify the specific concern.",
         "Review the request again and distinguish legitimate coding, debugging, defensive, educational, or analytical work from instructions that facilitate harm. If only part of the request is unsafe, help with the safe portions and narrowly limit the rest instead of issuing a blanket refusal.",
@@ -140,6 +182,7 @@ impl Agent {
     /// Try a small sequence of differently framed policy checks after Fable
     /// guardrails a response. Every prompt preserves warranted refusals, and the
     /// fixed suite size prevents an unbounded refusal/retry loop.
+    #[allow(dead_code)]
     pub(crate) fn maybe_reconsider_fable_guardrail(
         &mut self,
         stop_reason: Option<&str>,
@@ -203,7 +246,7 @@ impl Agent {
             .unwrap_or("unknown");
         if guardrail {
             return Some(format!(
-                "Provider guardrail stopped the response (stop_reason: {}). The model declined to answer this request. Rephrasing, narrowing the request, or providing more context may help.",
+                "Provider guardrail: the provider's safety filter blocked the response (stop_reason: {}). The request was not reworded to get around the filter. Any files already written or edited are left as they are.",
                 reason_label
             ));
         }

@@ -892,9 +892,12 @@ impl CopilotApiProvider {
                                     "length" => "max_tokens",
                                     other => other,
                                 };
+                                let stop_reason = jcode_provider_core::refusal::normalize_stop_reason(
+                                    stop_reason.to_string(),
+                                );
                                 let _ = tx
                                     .send(Ok(StreamEvent::MessageEnd {
-                                        stop_reason: Some(stop_reason.to_string()),
+                                        stop_reason: Some(stop_reason),
                                     }))
                                     .await;
                             }

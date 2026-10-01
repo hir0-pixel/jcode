@@ -484,6 +484,12 @@ pub fn parse_openai_response_event(
                 return stream_text_or_recovered_tool_call(&delta, pending);
             }
         }
+        "response.refusal.delta" => {
+            if let Some(delta) = event.delta {
+                *saw_text_delta = true;
+                return Some(StreamEvent::TextDelta(delta));
+            }
+        }
         "response.reasoning.delta" | "response.reasoning_summary_text.delta" => {
             if let Some(delta) = event.delta {
                 *saw_thinking_delta = true;
@@ -647,6 +653,28 @@ fn extract_last_assistant_message_phase(response: &Value) -> Option<String> {
 }
 
 fn extract_stop_reason_from_response(response: &Value) -> Option<String> {
+    jcode_provider_core::refusal::normalize_opt(extract_raw_stop_reason(response).or_else(|| {
+        response_has_refusal(response)
+            .then(|| jcode_provider_core::refusal::REFUSAL_STOP_REASON.to_string())
+    }))
+}
+
+/// A completed response whose assistant message holds a `refusal` content part.
+fn response_has_refusal(response: &Value) -> bool {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|out| {
+            out.iter().any(|item| {
+                item.get("content").and_then(Value::as_array).is_some_and(|c| {
+                    c.iter()
+                        .any(|p| p.get("type").and_then(Value::as_str) == Some("refusal"))
+                })
+            })
+        })
+}
+
+fn extract_raw_stop_reason(response: &Value) -> Option<String> {
     let status = response.get("status").and_then(|v| v.as_str());
     if status == Some("completed") {
         if extract_last_assistant_message_phase(response).as_deref() == Some("commentary") {
@@ -1365,5 +1393,15 @@ mod text_framing_tests {
             StreamEvent::TextDone, StreamEvent::TextDelta(c), StreamEvent::TextDone,
             StreamEvent::MessageEnd { .. }
         ] if a == "The cause is " && b == "the retry loop." && c == "Second message"));
+    }
+
+    #[test]
+    fn refusals_map_to_refusal_stop_reason() {
+        let incomplete = serde_json::json!({"status":"incomplete","incomplete_details":{"reason":"content_filter"}});
+        assert_eq!(extract_stop_reason_from_response(&incomplete).as_deref(), Some("refusal"));
+        let refused = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}]});
+        assert_eq!(extract_stop_reason_from_response(&refused).as_deref(), Some("refusal"));
+        let ok = serde_json::json!({"status":"completed","output":[]});
+        assert_eq!(extract_stop_reason_from_response(&ok), None);
     }
 }

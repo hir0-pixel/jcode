@@ -437,13 +437,27 @@ impl OpenRouterStream {
                         }
                     }
 
+                    // A non-empty `refusal` field/delta is a model refusal.
+                    if choice
+                        .get("delta")
+                        .or_else(|| choice.get("message"))
+                        .and_then(|d| d.get("refusal"))
+                        .and_then(|r| r.as_str())
+                        .is_some_and(|r| !r.trim().is_empty())
+                    {
+                        self.finish_reason =
+                            Some(jcode_provider_core::refusal::REFUSAL_STOP_REASON.to_string());
+                    }
+
                     // Check for finish reason
                     if let Some(finish_reason) =
                         choice.get("finish_reason").and_then(|f| f.as_str())
                     {
                         let finish_reason = finish_reason.trim();
                         if !finish_reason.is_empty() {
-                            self.finish_reason = Some(finish_reason.to_string());
+                            self.finish_reason = Some(jcode_provider_core::refusal::normalize_stop_reason(
+                                finish_reason.to_string(),
+                            ));
                         }
                         // Some proxies emit a finish reason after every delta, even
                         // while tool arguments are still streaming (#1326). Keep the
@@ -820,6 +834,29 @@ mod tests {
             event,
             Some(StreamEvent::MessageEnd { stop_reason: Some(reason) }) if reason == "length"
         ));
+    }
+
+    #[test]
+    fn content_filter_and_refusal_delta_map_to_refusal() {
+        for body in [
+            "data: {\"choices\":[{\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"I cannot\"}}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let mut stream = OpenRouterStream::new(
+                futures::stream::empty(),
+                "m".to_string(),
+                Arc::new(std::sync::Mutex::new(None)),
+            );
+            stream.buffer = body.to_string();
+            let mut end = None;
+            while let Some(ev) = stream.parse_next_event() {
+                if let StreamEvent::MessageEnd { stop_reason } = ev {
+                    end = stop_reason;
+                    break;
+                }
+            }
+            assert_eq!(end.as_deref(), Some("refusal"), "{body}");
+        }
     }
 
     #[test]

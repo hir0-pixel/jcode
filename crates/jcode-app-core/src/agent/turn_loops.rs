@@ -62,7 +62,7 @@ impl Agent {
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
-        let mut fable_guardrail_reconsiderations = 0u32;
+        let mut refusal_retries = 0u32;
         let mut sequential_single_tool_rounds = 0u32;
         let mut batch_nudge_pending = false;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
@@ -906,10 +906,14 @@ impl Agent {
                     }
                     continue;
                 }
-                if self.maybe_reconsider_fable_guardrail(
-                    stop_reason.as_deref(),
-                    &mut fable_guardrail_reconsiderations,
-                )? {
+                if self
+                    .maybe_retry_refusal(
+                        stop_reason.as_deref(),
+                        visible_text_is_empty,
+                        &mut refusal_retries,
+                    )
+                    .await
+                {
                     continue;
                 }
                 if self.maybe_continue_empty_post_tool_response(
@@ -941,8 +945,13 @@ impl Agent {
                     if print_output {
                         println!("\n[provider guardrail] {}", notice);
                     }
+                    if Self::is_guardrail_stop_reason(stop_reason.as_deref()) {
+                        self.emit_refusal_guard("refusal_final", stop_reason.as_deref());
+                    }
                     if text_content.trim().is_empty() {
                         text_content = format!("[provider guardrail] {}", notice);
+                    } else if Self::is_guardrail_stop_reason(stop_reason.as_deref()) {
+                        text_content = format!("{text_content}\n\n[provider guardrail] {notice}");
                     }
                 }
                 logging::info("Turn complete - no tool calls, returning");

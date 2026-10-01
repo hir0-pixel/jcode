@@ -111,7 +111,7 @@ impl Agent {
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
-        let mut fable_guardrail_reconsiderations = 0u32;
+        let mut refusal_retries = 0u32;
         let mut repeat_guard = super::repeat_guard::RepeatGuard::default();
         let mut stop_nudge = self.new_stop_nudge();
         let mut deadline = super::turn_deadline::TurnDeadline::new();
@@ -1268,10 +1268,13 @@ impl Agent {
                 }
                 if saw_message_end
                     && !self.is_graceful_shutdown()
-                    && self.maybe_reconsider_fable_guardrail(
-                        stop_reason.as_deref(),
-                        &mut fable_guardrail_reconsiderations,
-                    )?
+                    && self
+                        .maybe_retry_refusal(
+                            stop_reason.as_deref(),
+                            text_content.trim().is_empty(),
+                            &mut refusal_retries,
+                        )
+                        .await
                 {
                     continue;
                 }
@@ -1314,6 +1317,9 @@ impl Agent {
                                 !reasoning_content.trim().is_empty(),
                             )
                         {
+                            if Self::is_guardrail_stop_reason(stop_reason.as_deref()) {
+                                self.emit_refusal_guard("refusal_final", stop_reason.as_deref());
+                            }
                             logging::warn(&format!(
                                 "{}: turn ended with no visible output (stop_reason={:?}, reasoning_chars={})",
                                 Self::empty_turn_log_event(stop_reason.as_deref()),

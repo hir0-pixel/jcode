@@ -733,10 +733,11 @@ impl Provider for AntigravityProvider {
                     .finish_reason
                     .as_deref()
                     .map(|reason| {
-                        !matches!(
-                            reason.to_ascii_uppercase().as_str(),
-                            "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
-                        )
+                        !jcode_provider_core::refusal::is_refusal_reason(reason)
+                            && !matches!(
+                                reason.to_ascii_uppercase().as_str(),
+                                "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
+                            )
                     })
                     .unwrap_or(false);
                 if abnormal {
@@ -758,7 +759,10 @@ impl Provider for AntigravityProvider {
 
             let _ = tx
                 .send(Ok(StreamEvent::MessageEnd {
-                    stop_reason: candidate.finish_reason.clone(),
+                    stop_reason: candidate
+                        .finish_reason
+                        .clone()
+                        .map(jcode_provider_core::refusal::normalize_stop_reason),
                 }))
                 .await;
         });

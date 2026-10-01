@@ -384,7 +384,9 @@ impl BedrockProvider {
                 ConverseStreamOutput::MessageStop(stop) => Some(StreamEvent::MessageEnd {
                     // snake_case ("end_turn", "tool_use", "max_tokens") like every
                     // other provider; the turn loop matches on these strings.
-                    stop_reason: Some(stop.stop_reason().as_str().to_string()),
+                    stop_reason: Some(jcode_provider_core::refusal::normalize_stop_reason(
+                        stop.stop_reason().as_str().to_string(),
+                    )),
                 }),
                 ConverseStreamOutput::Metadata(meta) => meta.usage().map(|usage| {
                     StreamEvent::TokenUsage {

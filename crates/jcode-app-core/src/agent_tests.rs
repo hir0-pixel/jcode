@@ -2152,6 +2152,7 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 struct FableGuardrailProvider {
     calls: Arc<std::sync::Mutex<usize>>,
     prompts_seen: Arc<std::sync::Mutex<Vec<String>>>,
@@ -2215,41 +2216,6 @@ impl Provider for FableGuardrailProvider {
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(self.clone())
     }
-}
-
-#[tokio::test]
-async fn fable_guardrail_reconsideration_recovers_the_streaming_turn() {
-    let _guard = crate::storage::lock_test_env();
-    let fable = FableGuardrailProvider::default();
-    let calls = fable.calls.clone();
-    let prompts_seen = fable.prompts_seen.clone();
-    let provider: Arc<dyn Provider> = Arc::new(fable);
-    let registry = Registry::new(provider.clone()).await;
-    let mut agent = Agent::new(provider, registry);
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent
-        .run_once_streaming_mpsc("do this ordinary coding task", Vec::new(), None, tx)
-        .await
-        .expect("turn should recover from the guardrail");
-
-    let mut text = String::new();
-    while let Ok(event) = rx.try_recv() {
-        if let ServerEvent::TextDelta { text: delta } = event {
-            text.push_str(&delta);
-        }
-    }
-
-    assert_eq!(*calls.lock().unwrap(), 4);
-    let prompts = prompts_seen.lock().unwrap();
-    assert_eq!(prompts.len(), 3);
-    assert!(prompts[0].contains("concrete harmful action"));
-    assert!(prompts[1].contains("safe portions"));
-    assert!(prompts[2].contains("final, independent policy check"));
-    assert!(
-        text.contains("Reconsidered and completed safely"),
-        "{text:?}"
-    );
 }
 
 #[test]
@@ -2323,4 +2289,100 @@ fn learned_prompt_addenda_reach_the_prompt_without_python() {
     }
     assert!(prompt.contains("# Continual Harness") && prompt.contains("Always run the linter first."), "{prompt}");
     assert!(recorded, "the prompt note is in the injected-id record, so recall never repeats it");
+}
+
+/// Replays one scripted stop reason per request and counts the calls.
+#[derive(Clone)]
+struct RefusalScriptProvider {
+    script: Arc<std::sync::Mutex<std::collections::VecDeque<(&'static str, &'static str)>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for RefusalScriptProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (text, stop) = self.script.lock().unwrap().pop_front().unwrap_or(("extra", "end_turn"));
+        let mut events = Vec::new();
+        if !text.is_empty() {
+            events.push(StreamEvent::TextDelta(text.into()));
+        }
+        events.push(StreamEvent::MessageEnd { stop_reason: Some(stop.into()) });
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+    fn name(&self) -> &str {
+        "refusal-script-test"
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+async fn run_refusal_script(script: &[(&'static str, &'static str)]) -> (usize, String) {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider = RefusalScriptProvider {
+        script: Arc::new(std::sync::Mutex::new(script.iter().copied().collect())),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let mut agent = Agent::new(Arc::new(provider.clone()), Registry::empty());
+    let text = agent.run_once_capture("do the task").await.unwrap();
+    (provider.calls.load(std::sync::atomic::Ordering::SeqCst), text)
+}
+
+#[tokio::test]
+async fn refusal_then_success_continues_with_one_retry() {
+    let (calls, text) = run_refusal_script(&[("", "refusal"), ("all done", "end_turn")]).await;
+    assert_eq!(calls, 2);
+    assert!(text.contains("all done"), "{text}");
+    assert!(!text.to_lowercase().contains("guardrail"), "{text}");
+}
+
+#[tokio::test]
+async fn refusal_twice_ends_with_clear_message_and_no_third_call() {
+    let (calls, text) = run_refusal_script(&[("", "refusal"), ("", "content_filter")]).await;
+    assert_eq!(calls, 2);
+    assert!(text.contains("safety filter blocked"), "{text}");
+}
+
+#[tokio::test]
+async fn normal_turn_makes_one_call() {
+    let (calls, text) = run_refusal_script(&[("fine", "end_turn")]).await;
+    assert_eq!(calls, 1);
+    assert!(text.contains("fine"), "{text}");
+}
+
+#[tokio::test]
+async fn streaming_refusal_twice_retries_once_then_surfaces_guardrail() {
+    let _lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider = RefusalScriptProvider {
+        script: Arc::new(std::sync::Mutex::new(
+            [("", "refusal"), ("", "refusal")].into_iter().collect(),
+        )),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let mut agent = Agent::new(Arc::new(provider.clone()), Registry::empty());
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text { text: "do the task".into(), cache_control: None }],
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn_streaming_mpsc(tx).await.unwrap();
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let mut saw = false;
+    while let Ok(event) = rx.try_recv() {
+        saw |= matches!(event, ServerEvent::ProviderGuardrail { .. });
+    }
+    assert!(saw);
 }
